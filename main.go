@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"log"
 	"net/rpc"
@@ -26,8 +28,35 @@ type JobsDtoV1 struct {
 }
 
 func main() {
+
+	cert, err := tls.LoadX509KeyPair("/Users/ankit/Developer/deployment/certs-test/client.crt", "/Users/ankit/Developer/deployment/certs-test/client1.key")
+	if err != nil {
+		log.Fatalf("client: loadkeys: %s", err)
+	}
+	fmt.Println(len(cert.Certificate))
+	if len(cert.Certificate) != 2 {
+		log.Fatal("client.crt should have 2 concatenated certificates: client + CA")
+	}
+	ca, err := x509.ParseCertificate(cert.Certificate[1])
+	if err != nil {
+		log.Fatal(err)
+	}
+	certPool := x509.NewCertPool()
+	certPool.AddCert(ca)
+	config := tls.Config{
+		Certificates: []tls.Certificate{cert},
+		RootCAs:      certPool,
+	}
+
+	conn, err := tls.Dial("tcp", service, &config)
+	if err != nil {
+		log.Fatalf("client: dial: %s", err)
+	}
+	defer conn.Close()
+	log.Println("client: connected to: ", conn.RemoteAddr())
+
 	//	create and connect RPC client
-	client, err := rpc.Dial("tcp", service)
+	client := rpc.NewClient(conn)
 	if err != nil {
 		log.Fatal("dialing:", err)
 	}
