@@ -1,6 +1,5 @@
 .idea
 *.iml
-logs
 throw.txt
 throw.json
 .env
@@ -10,3 +9,5 @@ tools_build
 cover.out
 coverage.out
 deployment-runner
+go.work
+go.work.sum
