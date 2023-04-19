@@ -2,8 +2,8 @@ package commands
 
 import (
 	"fmt"
-	"github.com/deployment-io/jobs-runner-kit/enums/commands_enums"
-	"github.com/deployment-io/jobs-runner-kit/jobs"
+	"github.com/deployment-io/deployment-runner-kit/enums/commands_enums"
+	"github.com/deployment-io/deployment-runner-kit/jobs"
 )
 
 func Get(p commands_enums.Type) (jobs.Command, error) {

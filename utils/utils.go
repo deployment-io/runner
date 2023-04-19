@@ -3,8 +3,8 @@ package utils
 import (
 	"bufio"
 	"bytes"
-	"github.com/deployment-io/jobs-runner-kit/enums/parameters_enums"
-	"github.com/deployment-io/jobs-runner-kit/jobs"
+	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
+	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"strings"
 )
 

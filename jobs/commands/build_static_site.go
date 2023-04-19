@@ -3,9 +3,9 @@ package commands
 import (
 	"bytes"
 	"context"
+	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
+	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner/utils/loggers"
-	"github.com/deployment-io/jobs-runner-kit/enums/parameters_enums"
-	"github.com/deployment-io/jobs-runner-kit/jobs"
 	"os/exec"
 	"time"
 )

@@ -2,8 +2,8 @@ package client
 
 import (
 	"fmt"
-	"github.com/deployment-io/jobs-runner-kit/jobs"
-	"github.com/deployment-io/jobs-runner-kit/ping"
+	"github.com/deployment-io/deployment-runner-kit/jobs"
+	"github.com/deployment-io/deployment-runner-kit/ping"
 )
 
 func (r *RunnerClient) GetPendingJobs() ([]jobs.JobDtoV1, error) {

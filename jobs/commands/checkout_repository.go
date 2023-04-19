@@ -3,10 +3,10 @@ package commands
 import (
 	"bytes"
 	"fmt"
+	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
+	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner/utils/loggers"
-	"github.com/deployment-io/jobs-runner-kit/enums/parameters_enums"
-	"github.com/deployment-io/jobs-runner-kit/jobs"
-	"gopkg.in/src-d/go-git.v4"
+	git "gopkg.in/src-d/go-git.v4"
 	"gopkg.in/src-d/go-git.v4/plumbing"
 	"gopkg.in/src-d/go-git.v4/plumbing/transport/http"
 	"strings"

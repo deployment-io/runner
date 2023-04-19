@@ -3,11 +3,11 @@ package loggers
 import (
 	"bytes"
 	"fmt"
+	"github.com/deployment-io/deployment-runner-kit/enums/loggers_enums"
+	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
+	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner/utils"
 	"github.com/deployment-io/deployment-runner/utils/loggers/cloudwatch"
-	"github.com/deployment-io/jobs-runner-kit/enums/loggers_enums"
-	"github.com/deployment-io/jobs-runner-kit/enums/parameters_enums"
-	"github.com/deployment-io/jobs-runner-kit/jobs"
 )
 
 func Get(parameters map[parameters_enums.Key]interface{}) (jobs.Logger, error) {

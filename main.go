@@ -1,11 +1,11 @@
 package main
 
 import (
+	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner/client"
 	"github.com/deployment-io/deployment-runner/jobs/commands"
 	"github.com/deployment-io/deployment-runner/utils"
 	"github.com/deployment-io/deployment-runner/utils/loggers"
-	"github.com/deployment-io/jobs-runner-kit/jobs"
 	"log"
 	"time"
 )

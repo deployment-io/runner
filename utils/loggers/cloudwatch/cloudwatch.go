@@ -8,8 +8,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs/types"
-	"github.com/deployment-io/jobs-runner-kit/enums/parameters_enums"
-	jobTypes "github.com/deployment-io/jobs-runner-kit/jobs"
+	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
+	jobTypes "github.com/deployment-io/deployment-runner-kit/jobs"
 	"log"
 	"time"
 )
