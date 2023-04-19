@@ -38,8 +38,8 @@ github.com/creack/pty v1.1.9/go.mod h1:oKZEueFk5CKHvIhNR5MUki03XCEU+Q6VDXinZuGJ3
 github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
-github.com/deployment-io/jobs-runner-kit v0.0.0-20230412065348-928b69d80b39 h1:JMUPugsqD56Qcda1oDtgqyWKz6pkNFFgMgG3WAF7ITQ=
-github.com/deployment-io/jobs-runner-kit v0.0.0-20230412065348-928b69d80b39/go.mod h1:GiTiOJ6bZCWUUzcNK5GSgp5oQpse26OnrCkHE1JWeww=
+github.com/deployment-io/jobs-runner-kit v0.0.0-20230419045441-0fce9d678298 h1:oosODZrP360gOswH0uvwUVPizIBm5KeoRX92FGPLW9w=
+github.com/deployment-io/jobs-runner-kit v0.0.0-20230419045441-0fce9d678298/go.mod h1:GiTiOJ6bZCWUUzcNK5GSgp5oQpse26OnrCkHE1JWeww=
 github.com/emirpasic/gods v1.12.0/go.mod h1:YfzfFFoVP/catgzJb4IKIqXjX78Ha8FMSDh3ymbK86o=
 github.com/emirpasic/gods v1.18.1 h1:FXtiHYKDGKCW2KzwZKx0iC0PQmdlorYgdFG9jPXJ1Bc=
 github.com/emirpasic/gods v1.18.1/go.mod h1:8tpGGwCnJ5H4r6BWwaV6OrWmMoPhUl5jm/FMNAnJvWQ=

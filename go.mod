@@ -6,7 +6,7 @@ require (
 	github.com/aws/aws-sdk-go-v2 v1.17.8
 	github.com/aws/aws-sdk-go-v2/config v1.18.20
 	github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs v1.20.8
-	github.com/deployment-io/jobs-runner-kit v0.0.0-20230412065348-928b69d80b39
+	github.com/deployment-io/jobs-runner-kit v0.0.0-20230419045441-0fce9d678298
 	gopkg.in/src-d/go-git.v4 v4.13.1
 )
 

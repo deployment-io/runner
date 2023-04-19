@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"github.com/deployment-io/deployment-runner/utils/loggers"
 	"github.com/deployment-io/jobs-runner-kit/enums/parameters_enums"
-	"github.com/deployment-io/jobs-runner-kit/jobs/types"
+	"github.com/deployment-io/jobs-runner-kit/jobs"
 	"gopkg.in/src-d/go-git.v4"
 	"gopkg.in/src-d/go-git.v4/plumbing"
 	"gopkg.in/src-d/go-git.v4/plumbing/transport/http"
@@ -15,7 +15,34 @@ import (
 type CheckoutRepository struct {
 }
 
-func (cr *CheckoutRepository) Run(parameters map[parameters_enums.Key]interface{}, logger types.Logger) (map[parameters_enums.Key]interface{}, error) {
+func (cr *CheckoutRepository) getRepositoryDirectoryPath(parameters map[parameters_enums.Key]interface{}) (string, error) {
+	environmentID, err := jobs.GetParameterValue[string](parameters, parameters_enums.EnvironmentID)
+	if err != nil {
+		return "", err
+	}
+	deploymentID, err := jobs.GetParameterValue[string](parameters, parameters_enums.DeploymentID)
+	if err != nil {
+		return "", err
+	}
+	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationID)
+	if err != nil {
+		return "", err
+	}
+	repoGitProvider, err := jobs.GetParameterValue[string](parameters, parameters_enums.RepoGitProvider)
+	if err != nil {
+		return "", err
+	}
+	repoName, err := jobs.GetParameterValue[string](parameters, parameters_enums.RepoName)
+	if err != nil {
+		return "", err
+	}
+	repoName = strings.ReplaceAll(repoName, " ", "")
+
+	return fmt.Sprintf("/tmp/%s/%s/%s/%s/%s", organizationID, environmentID, deploymentID, repoGitProvider, repoName), nil
+
+}
+
+func (cr *CheckoutRepository) Run(parameters map[parameters_enums.Key]interface{}, logger jobs.Logger, jobContext *jobs.ContextV1) (map[parameters_enums.Key]interface{}, error) {
 	logBuffer := new(bytes.Buffer)
 	defer func() {
 		err := loggers.LogBuffer(logBuffer, logger)
@@ -23,86 +50,80 @@ func (cr *CheckoutRepository) Run(parameters map[parameters_enums.Key]interface{
 			//TODO send message back
 		}
 	}()
-	repoCloneUrl, ok := parameters[parameters_enums.RepoCloneUrl]
-	if !ok {
-		return parameters, fmt.Errorf("repository url is missing")
-	}
-	repoBranch, ok := parameters[parameters_enums.RepoBranch]
-	if !ok {
-		return parameters, fmt.Errorf("repository branch is missing")
-	}
-	repoProviderToken, ok := parameters[parameters_enums.RepoProviderToken]
-	if !ok {
-		return parameters, fmt.Errorf("repository provider token is missing")
+
+	repoCloneUrl, err := jobs.GetParameterValue[string](parameters, parameters_enums.RepoCloneUrl)
+	if err != nil {
+		return parameters, err
 	}
 
-	if repoCloneUrlString, isOK := repoCloneUrl.(string); isOK {
-		if repoProviderTokenString, isOK := repoProviderToken.(string); isOK {
-			after, found := strings.CutPrefix(repoCloneUrlString, "https://")
-			if found {
-				//TODO currently it's common for GitLab and GitHub. Might change in the future
-				repoCloneUrlWithToken := "https://oauth2:" + repoProviderTokenString + "@" + after
-				repoName := parameters[parameters_enums.RepoName]
-				if repoNameString, isOK := repoName.(string); isOK {
-					repoGitProvider := parameters[parameters_enums.RepoGitProvider]
-					if repoGitProviderString, isOK := repoGitProvider.(string); isOK {
-						repoNameString = strings.ReplaceAll(repoNameString, " ", "")
-						repoDirectoryPath := "/tmp/" + repoGitProviderString + "/" + repoNameString
-						repository, err := git.PlainClone(repoDirectoryPath, false, &git.CloneOptions{
-							URL:      repoCloneUrlWithToken,
-							Progress: logBuffer,
-							Auth: &http.BasicAuth{
-								Username: "oauth2",
-								Password: repoProviderTokenString,
-							},
-						})
+	repoBranch, err := jobs.GetParameterValue[string](parameters, parameters_enums.RepoBranch)
+	if err != nil {
+		return parameters, err
+	}
 
-						if err != nil {
-							if err == git.ErrRepositoryAlreadyExists {
-								repository, err = git.PlainOpen(repoDirectoryPath)
-								if err != nil {
-									return parameters, nil
-								}
-							} else {
-								return parameters, err
-							}
-						}
+	repoProviderToken, err := jobs.GetParameterValue[string](parameters, parameters_enums.RepoProviderToken)
+	if err != nil {
+		return parameters, err
+	}
 
-						worktree, err := repository.Worktree()
-						if err != nil {
-							return parameters, err
-						}
-						if repoBranchString, isOk := repoBranch.(string); isOk {
-							err = repository.Fetch(&git.FetchOptions{
-								Auth: &http.BasicAuth{
-									Username: "oauth2",
-									Password: repoProviderTokenString,
-								},
-								RemoteName: "origin",
-								Progress:   logBuffer,
-								Force:      true,
-							})
+	after, found := strings.CutPrefix(repoCloneUrl, "https://")
+	if found {
+		//TODO currently it's common for GitLab and GitHub. Might change in the future
+		repoCloneUrlWithToken := "https://oauth2:" + repoProviderToken + "@" + after
+		repoDirectoryPath, err := cr.getRepositoryDirectoryPath(parameters)
+		if err != nil {
+			return parameters, err
+		}
+		repository, err := git.PlainClone(repoDirectoryPath, false, &git.CloneOptions{
+			URL:      repoCloneUrlWithToken,
+			Progress: logBuffer,
+			Auth: &http.BasicAuth{
+				Username: "oauth2",
+				Password: repoProviderToken,
+			},
+		})
 
-							if err != nil && err != git.NoErrAlreadyUpToDate {
-								return parameters, err
-							}
-
-							err = worktree.Checkout(&git.CheckoutOptions{
-								Branch: plumbing.NewRemoteReferenceName("origin", repoBranchString),
-							})
-
-							if err != nil {
-								return parameters, err
-							}
-						}
-					}
+		if err != nil {
+			if err == git.ErrRepositoryAlreadyExists {
+				repository, err = git.PlainOpen(repoDirectoryPath)
+				if err != nil {
+					return parameters, nil
 				}
 			} else {
-				//clone url doesn't start with https://
-				//TODO send message back
+				return parameters, err
 			}
-
 		}
+
+		worktree, err := repository.Worktree()
+		if err != nil {
+			return parameters, err
+		}
+
+		err = repository.Fetch(&git.FetchOptions{
+			Auth: &http.BasicAuth{
+				Username: "oauth2",
+				Password: repoProviderToken,
+			},
+			RemoteName: "origin",
+			Progress:   logBuffer,
+			Force:      true,
+		})
+
+		if err != nil && err != git.NoErrAlreadyUpToDate {
+			return parameters, err
+		}
+
+		err = worktree.Checkout(&git.CheckoutOptions{
+			Branch: plumbing.NewRemoteReferenceName("origin", repoBranch),
+		})
+
+		if err != nil {
+			return parameters, err
+		}
+
+		parameters[parameters_enums.RepoDirectoryPath] = repoDirectoryPath
+	} else {
+		return parameters, fmt.Errorf("clone URL doesn't start with https://")
 	}
 
 	return parameters, nil

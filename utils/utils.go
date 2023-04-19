@@ -3,6 +3,8 @@ package utils
 import (
 	"bufio"
 	"bytes"
+	"github.com/deployment-io/jobs-runner-kit/enums/parameters_enums"
+	"github.com/deployment-io/jobs-runner-kit/jobs"
 	"strings"
 )
 
@@ -41,4 +43,33 @@ func GetLinesFromBuffer(logBuffer *bytes.Buffer) ([]string, error) {
 		return nil, err
 	}
 	return messages, nil
+}
+
+func LogError(jobContext *jobs.ContextV1) {
+
+}
+
+func GetJobContext(parameters map[parameters_enums.Key]interface{}) *jobs.ContextV1 {
+	environmentID, err := jobs.GetParameterValue[string](parameters, parameters_enums.EnvironmentID)
+	if err != nil {
+		environmentID = ""
+	}
+	deploymentID, err := jobs.GetParameterValue[string](parameters, parameters_enums.DeploymentID)
+	if err != nil {
+		deploymentID = ""
+	}
+	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationID)
+	if err != nil {
+		organizationID = ""
+	}
+	buildID, err := jobs.GetParameterValue[string](parameters, parameters_enums.BuildID)
+	if err != nil {
+		buildID = ""
+	}
+	return &jobs.ContextV1{
+		OrganizationID: organizationID,
+		EnvironmentID:  environmentID,
+		DeploymentID:   deploymentID,
+		BuildID:        buildID,
+	}
 }

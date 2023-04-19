@@ -7,10 +7,10 @@ import (
 	"github.com/deployment-io/deployment-runner/utils/loggers/cloudwatch"
 	"github.com/deployment-io/jobs-runner-kit/enums/loggers_enums"
 	"github.com/deployment-io/jobs-runner-kit/enums/parameters_enums"
-	"github.com/deployment-io/jobs-runner-kit/jobs/types"
+	"github.com/deployment-io/jobs-runner-kit/jobs"
 )
 
-func Get(parameters map[parameters_enums.Key]interface{}) (types.Logger, error) {
+func Get(parameters map[parameters_enums.Key]interface{}) (jobs.Logger, error) {
 	loggerType, ok := parameters[parameters_enums.LoggerType]
 	if !ok {
 		return nil, fmt.Errorf("logger type is missing in parameters")
@@ -26,7 +26,7 @@ func Get(parameters map[parameters_enums.Key]interface{}) (types.Logger, error) 
 	}
 }
 
-func LogBuffer(logBuffer *bytes.Buffer, logger types.Logger) error {
+func LogBuffer(logBuffer *bytes.Buffer, logger jobs.Logger) error {
 	if logBuffer.Len() == 0 {
 		return nil
 	}
