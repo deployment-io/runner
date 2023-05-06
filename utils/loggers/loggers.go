@@ -15,8 +15,8 @@ func Get(parameters map[parameters_enums.Key]interface{}) (jobs.Logger, error) {
 	if !ok {
 		return nil, fmt.Errorf("logger type is missing in parameters")
 	}
-	if lt, ok := loggerType.(uint); ok {
-		switch lt {
+	if lt, ok := loggerType.(int64); ok {
+		switch uint(lt) {
 		case uint(loggers_enums.Cloudwatch):
 			return cloudwatch.New(parameters)
 		}

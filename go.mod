@@ -3,10 +3,11 @@ module github.com/deployment-io/deployment-runner
 go 1.20
 
 require (
+	github.com/ankit-arora/go-utils v0.0.0-20230426122240-f74a4bcf6217
 	github.com/aws/aws-sdk-go-v2 v1.17.8
 	github.com/aws/aws-sdk-go-v2/config v1.18.20
 	github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs v1.20.8
-	github.com/deployment-io/deployment-runner-kit v0.0.0-20230419061257-236d5a5a9c1e
+	github.com/deployment-io/deployment-runner-kit v0.0.0-20230506153819-2609e09ac893
 	gopkg.in/src-d/go-git.v4 v4.13.1
 )
 
@@ -29,8 +30,9 @@ require (
 	github.com/rogpeppe/go-internal v1.10.0 // indirect
 	github.com/sergi/go-diff v1.0.0 // indirect
 	github.com/src-d/gcfg v1.4.0 // indirect
+	github.com/stretchr/testify v1.8.1 // indirect
 	github.com/xanzy/ssh-agent v0.2.1 // indirect
-	golang.org/x/crypto v0.0.0-20190701094942-4def268fd1a4 // indirect
+	golang.org/x/crypto v0.1.0 // indirect
 	golang.org/x/net v0.8.0 // indirect
 	golang.org/x/sys v0.7.0 // indirect
 	gopkg.in/check.v1 v1.0.0-20201130134442-10cb98267c6c // indirect

@@ -45,10 +45,6 @@ func GetLinesFromBuffer(logBuffer *bytes.Buffer) ([]string, error) {
 	return messages, nil
 }
 
-func LogError(jobContext *jobs.ContextV1) {
-
-}
-
 func GetJobContext(parameters map[parameters_enums.Key]interface{}) *jobs.ContextV1 {
 	environmentID, err := jobs.GetParameterValue[string](parameters, parameters_enums.EnvironmentID)
 	if err != nil {

@@ -9,14 +9,16 @@ import (
 
 type RunnerClient struct {
 	sync.Mutex
-	c           *rpc.Client
-	isConnected bool
-	isStarted   bool
+	c              *rpc.Client
+	isConnected    bool
+	isStarted      bool
+	organizationID string
+	token          string
 }
 
 var client = RunnerClient{}
 
-func connect(connectionURI string) error {
+func connect(connectionURI, organizationID, token string) error {
 	if !client.isConnected {
 
 		//cert, err := tls.LoadX509KeyPair("/Users/ankit/Developer/deployment/certs-test/client.crt", "/Users/ankit/Developer/deployment/certs-test/client1.key")
@@ -60,6 +62,8 @@ func connect(connectionURI string) error {
 		}
 
 		client.c = c
+		client.organizationID = organizationID
+		client.token = token
 	}
 
 	return nil
@@ -67,7 +71,7 @@ func connect(connectionURI string) error {
 
 var disconnectSignal = make(chan struct{})
 
-func Connect(connectionURI string, blockTillFirstConnect bool) chan struct{} {
+func Connect(connectionURI, organizationID, token string, blockTillFirstConnect bool) chan struct{} {
 	firstTimeConnectSignal := make(chan struct{})
 	if !client.isStarted {
 		client.Lock()
@@ -83,7 +87,7 @@ func Connect(connectionURI string, blockTillFirstConnect bool) chan struct{} {
 					default:
 						isConnectedOld := client.isConnected
 						if !client.isConnected {
-							connect(connectionURI)
+							connect(connectionURI, organizationID, token)
 						}
 						if client.c != nil {
 							err := client.Ping()
