@@ -3,6 +3,8 @@ package commands
 import (
 	"bytes"
 	"fmt"
+	"github.com/deployment-io/deployment-runner-kit/builds"
+	"github.com/deployment-io/deployment-runner-kit/enums/build_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner/utils/loggers"
@@ -109,19 +111,44 @@ func (cr *CheckoutRepository) Run(parameters map[parameters_enums.Key]interface{
 			Force:      true,
 		})
 
+		//TODO check for oauth error and get new token from server
+
 		if err != nil && err != git.NoErrAlreadyUpToDate {
 			return parameters, err
 		}
 
+		referenceName := plumbing.NewRemoteReferenceName("origin", repoBranch)
+
 		err = worktree.Checkout(&git.CheckoutOptions{
-			Branch: plumbing.NewRemoteReferenceName("origin", repoBranch),
+			Branch: referenceName,
 		})
 
 		if err != nil {
 			return parameters, err
 		}
 
+		reference, err := repository.Reference(referenceName, true)
+		hash := reference.Hash()
+		commitObject, err := repository.CommitObject(hash)
+		if err != nil {
+			return parameters, err
+		}
+		commitHash := hash.String()
+		commitMessage := strings.TrimSpace(commitObject.Message)
+
 		parameters[parameters_enums.RepoDirectoryPath] = repoDirectoryPath
+
+		buildID, err := jobs.GetParameterValue[string](parameters, parameters_enums.BuildID)
+		if err != nil {
+			return parameters, err
+		}
+
+		updateBuildsPipeline.Add("updateBuilds", builds.UpdateBuildDtoV1{
+			ID:            buildID,
+			CommitHash:    commitHash,
+			CommitMessage: commitMessage,
+			Status:        build_enums.Running,
+		})
 	} else {
 		return parameters, fmt.Errorf("clone URL doesn't start with https://")
 	}
