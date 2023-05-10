@@ -6,6 +6,7 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner/utils/loggers"
+	"os"
 	"os/exec"
 	"time"
 )
@@ -13,7 +14,7 @@ import (
 type BuildStaticSite struct {
 }
 
-func (b *BuildStaticSite) executeCommand(logBuffer *bytes.Buffer, commandAndArgs []string, directoryPath string) error {
+func (b *BuildStaticSite) executeCommand(logBuffer *bytes.Buffer, envVariablesSlice []string, commandAndArgs []string, directoryPath string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 	var cmd *exec.Cmd
@@ -24,6 +25,10 @@ func (b *BuildStaticSite) executeCommand(logBuffer *bytes.Buffer, commandAndArgs
 	}
 	cmd.Dir = directoryPath
 	cmd.Stdout = logBuffer
+	if len(envVariablesSlice) > 0 {
+		cmd.Env = os.Environ()
+		cmd.Env = append(cmd.Env, envVariablesSlice...)
+	}
 	if err := cmd.Run(); err != nil {
 		return err
 	}
@@ -70,8 +75,14 @@ func (b *BuildStaticSite) Run(parameters map[parameters_enums.Key]interface{}, l
 	//	return parameters, err
 	//}
 
+	envVariables, err := jobs.GetParameterValue[string](parameters, parameters_enums.EnvironmentVariables)
+	var envVariablesSlice []string
+	if err == nil {
+		envVariablesSlice = jobs.DecodeEnvironmentVariablesToSlice(envVariables)
+	}
+
 	//install node version, npm install, and build
-	if err := b.executeCommand(logBuffer, []string{"bash", "-c", "source $HOME/.nvm/nvm.sh ; nvm install " + nodeVersion + " ; npm install ; " + buildCommand}, repoDirectoryPath); err != nil {
+	if err := b.executeCommand(logBuffer, envVariablesSlice, []string{"bash", "-c", "source $HOME/.nvm/nvm.sh ; nvm install " + nodeVersion + " ; npm install ; " + buildCommand}, repoDirectoryPath); err != nil {
 		return parameters, err
 	}
 
