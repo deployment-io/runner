@@ -35,6 +35,23 @@ func (b *BuildStaticSite) executeCommand(logBuffer *bytes.Buffer, envVariablesSl
 	return nil
 }
 
+func addFile(filePath, contents string) error {
+	//delete file. ignoring error since file may not exist
+	_ = os.Remove(filePath)
+	file, err := os.Create(filePath)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = file.Close()
+	}()
+	_, err = file.WriteString(contents)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
 func (b *BuildStaticSite) Run(parameters map[parameters_enums.Key]interface{}, logger jobs.Logger, jobContext *jobs.ContextV1) (map[parameters_enums.Key]interface{}, error) {
 	logBuffer := new(bytes.Buffer)
 	defer func() {
@@ -48,7 +65,24 @@ func (b *BuildStaticSite) Run(parameters map[parameters_enums.Key]interface{}, l
 	if err != nil {
 		return parameters, err
 	}
+
 	//TODO handle root directory - needs to be added to repo directory
+	rootDirectoryPath, err := jobs.GetParameterValue[string](parameters, parameters_enums.RootDirectory)
+	if err == nil {
+		repoDirectoryPath += rootDirectoryPath
+	}
+
+	environmentFiles, err := jobs.GetParameterValue[map[string]string](parameters, parameters_enums.EnvironmentFiles)
+	if err == nil {
+		//create and add the environment files in repoDirectoryPath
+		for name, contents := range environmentFiles {
+			filePath := repoDirectoryPath + "/" + name
+			err := addFile(filePath, contents)
+			if err != nil {
+				return parameters, err
+			}
+		}
+	}
 
 	buildCommand, err := jobs.GetParameterValue[string](parameters, parameters_enums.BuildCommand)
 	if err != nil {

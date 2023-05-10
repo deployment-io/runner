@@ -1,6 +1,7 @@
 package client
 
 import (
+	"encoding/gob"
 	"fmt"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 )
@@ -9,6 +10,7 @@ func (r *RunnerClient) GetPendingJobs() ([]jobs.PendingJobDtoV1, error) {
 	if !r.isConnected {
 		return nil, ErrConnection
 	}
+	gob.Register(map[string]string{})
 	args := jobs.PendingJobsArgsV1{}
 	args.OrganizationID = r.organizationID
 	args.Token = r.token
