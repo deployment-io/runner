@@ -7,7 +7,6 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner/client"
 	"github.com/deployment-io/deployment-runner/jobs/commands"
-	"github.com/deployment-io/deployment-runner/utils"
 	"github.com/deployment-io/deployment-runner/utils/loggers"
 	"os"
 	"sync"
@@ -53,7 +52,6 @@ func executeJobs(jobsStream <-chan jobs.PendingJobDtoV1, noOfWorkers int) <-chan
 						resultsStream <- result
 						continue
 					}
-					jobContext := utils.GetJobContext(parameters)
 					for _, commandEnum := range pendingJob.CommandEnums {
 						command, err := commands.Get(commandEnum)
 						if err != nil {
@@ -62,7 +60,7 @@ func executeJobs(jobsStream <-chan jobs.PendingJobDtoV1, noOfWorkers int) <-chan
 							//continue to next job in jobsStream
 							continue nextJob
 						}
-						parameters, err = command.Run(parameters, logger, jobContext)
+						parameters, err = command.Run(parameters, logger)
 						if err != nil {
 							result := getJobResult(pendingJob, err.Error())
 							resultsStream <- result

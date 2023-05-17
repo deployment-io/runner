@@ -8,7 +8,7 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner/utils/loggers"
-	git "gopkg.in/src-d/go-git.v4"
+	"gopkg.in/src-d/go-git.v4"
 	"gopkg.in/src-d/go-git.v4/plumbing"
 	"gopkg.in/src-d/go-git.v4/plumbing/transport/http"
 	"strings"
@@ -44,12 +44,12 @@ func (cr *CheckoutRepository) getRepositoryDirectoryPath(parameters map[paramete
 
 }
 
-func (cr *CheckoutRepository) Run(parameters map[parameters_enums.Key]interface{}, logger jobs.Logger, jobContext *jobs.ContextV1) (map[parameters_enums.Key]interface{}, error) {
+func (cr *CheckoutRepository) Run(parameters map[parameters_enums.Key]interface{}, logger jobs.Logger) (newParameters map[parameters_enums.Key]interface{}, err error) {
 	logBuffer := new(bytes.Buffer)
 	defer func() {
-		err := loggers.LogBuffer(logBuffer, logger)
+		_ = loggers.LogBuffer(logBuffer, logger)
 		if err != nil {
-			//TODO send message back
+			markBuildDone(parameters, err)
 		}
 	}()
 

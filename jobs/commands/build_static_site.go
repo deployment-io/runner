@@ -52,12 +52,13 @@ func addFile(filePath, contents string) error {
 	return nil
 }
 
-func (b *BuildStaticSite) Run(parameters map[parameters_enums.Key]interface{}, logger jobs.Logger, jobContext *jobs.ContextV1) (map[parameters_enums.Key]interface{}, error) {
+func (b *BuildStaticSite) Run(parameters map[parameters_enums.Key]interface{}, logger jobs.Logger) (newParameters map[parameters_enums.Key]interface{}, err error) {
 	logBuffer := new(bytes.Buffer)
 	defer func() {
-		err := loggers.LogBuffer(logBuffer, logger)
+		//ignore
+		_ = loggers.LogBuffer(logBuffer, logger)
 		if err != nil {
-			//TODO send message back
+			markBuildDone(parameters, err)
 		}
 	}()
 
@@ -77,7 +78,7 @@ func (b *BuildStaticSite) Run(parameters map[parameters_enums.Key]interface{}, l
 		//create and add the environment files in repoDirectoryPath
 		for name, contents := range environmentFiles {
 			filePath := repoDirectoryPath + "/" + name
-			err := addFile(filePath, contents)
+			err = addFile(filePath, contents)
 			if err != nil {
 				return parameters, err
 			}
@@ -116,9 +117,11 @@ func (b *BuildStaticSite) Run(parameters map[parameters_enums.Key]interface{}, l
 	}
 
 	//install node version, npm install, and build
-	if err := b.executeCommand(logBuffer, envVariablesSlice, []string{"bash", "-c", "source $HOME/.nvm/nvm.sh ; nvm install " + nodeVersion + " ; npm install ; " + buildCommand}, repoDirectoryPath); err != nil {
+	if err = b.executeCommand(logBuffer, envVariablesSlice, []string{"bash", "-c", "source $HOME/.nvm/nvm.sh ; nvm install " + nodeVersion + " ; npm install ; " + buildCommand}, repoDirectoryPath); err != nil {
 		return parameters, err
 	}
+
+	parameters[parameters_enums.RepoDirectoryPath] = repoDirectoryPath
 
 	return parameters, nil
 }
