@@ -10,6 +10,7 @@ import (
 	"github.com/deployment-io/deployment-runner/utils/loggers"
 	"gopkg.in/src-d/go-git.v4"
 	"gopkg.in/src-d/go-git.v4/plumbing"
+	"gopkg.in/src-d/go-git.v4/plumbing/object"
 	"gopkg.in/src-d/go-git.v4/plumbing/transport/http"
 	"strings"
 )
@@ -72,11 +73,13 @@ func (cr *CheckoutRepository) Run(parameters map[parameters_enums.Key]interface{
 	if found {
 		//TODO currently it's common for GitLab and GitHub. Might change in the future
 		repoCloneUrlWithToken := "https://oauth2:" + repoProviderToken + "@" + after
-		repoDirectoryPath, err := cr.getRepositoryDirectoryPath(parameters)
+		var repoDirectoryPath string
+		repoDirectoryPath, err = cr.getRepositoryDirectoryPath(parameters)
 		if err != nil {
 			return parameters, err
 		}
-		repository, err := git.PlainClone(repoDirectoryPath, false, &git.CloneOptions{
+		var repository *git.Repository
+		repository, err = git.PlainClone(repoDirectoryPath, false, &git.CloneOptions{
 			URL:      repoCloneUrlWithToken,
 			Progress: logBuffer,
 			Auth: &http.BasicAuth{
@@ -95,8 +98,8 @@ func (cr *CheckoutRepository) Run(parameters map[parameters_enums.Key]interface{
 				return parameters, err
 			}
 		}
-
-		worktree, err := repository.Worktree()
+		var worktree *git.Worktree
+		worktree, err = repository.Worktree()
 		if err != nil {
 			return parameters, err
 		}
@@ -116,39 +119,55 @@ func (cr *CheckoutRepository) Run(parameters map[parameters_enums.Key]interface{
 		if err != nil && err != git.NoErrAlreadyUpToDate {
 			return parameters, err
 		}
+		var commitHashFromParams string
+		commitHashFromParams, err = jobs.GetParameterValue[string](parameters, parameters_enums.CommitHash)
 
-		referenceName := plumbing.NewRemoteReferenceName("origin", repoBranch)
-
-		err = worktree.Checkout(&git.CheckoutOptions{
-			Branch: referenceName,
-		})
-
+		var buildID string
+		buildID, err = jobs.GetParameterValue[string](parameters, parameters_enums.BuildID)
 		if err != nil {
 			return parameters, err
 		}
 
-		reference, err := repository.Reference(referenceName, true)
-		hash := reference.Hash()
-		commitObject, err := repository.CommitObject(hash)
-		if err != nil {
-			return parameters, err
-		}
-		commitHash := hash.String()
-		commitMessage := strings.TrimSpace(commitObject.Message)
+		if err == nil && len(commitHashFromParams) > 0 {
+			hash := plumbing.NewHash(commitHashFromParams)
+			err = worktree.Checkout(&git.CheckoutOptions{
+				Hash: hash,
+			})
+			if err != nil {
+				return parameters, err
+			}
+			updateBuildsPipeline.Add("updateBuilds", builds.UpdateBuildDtoV1{
+				ID:     buildID,
+				Status: build_enums.Running,
+			})
+		} else {
+			referenceName := plumbing.NewRemoteReferenceName("origin", repoBranch)
+			err = worktree.Checkout(&git.CheckoutOptions{
+				Branch: referenceName,
+			})
+			if err != nil {
+				return parameters, err
+			}
+			var reference *plumbing.Reference
+			reference, err = repository.Reference(referenceName, true)
+			hash := reference.Hash()
+			var commitObject *object.Commit
+			commitObject, err = repository.CommitObject(hash)
+			if err != nil {
+				return parameters, err
+			}
+			commitHash := hash.String()
+			commitMessage := strings.TrimSpace(commitObject.Message)
 
+			updateBuildsPipeline.Add("updateBuilds", builds.UpdateBuildDtoV1{
+				ID:            buildID,
+				CommitHash:    commitHash,
+				CommitMessage: commitMessage,
+				Status:        build_enums.Running,
+			})
+		}
 		parameters[parameters_enums.RepoDirectoryPath] = repoDirectoryPath
 
-		buildID, err := jobs.GetParameterValue[string](parameters, parameters_enums.BuildID)
-		if err != nil {
-			return parameters, err
-		}
-
-		updateBuildsPipeline.Add("updateBuilds", builds.UpdateBuildDtoV1{
-			ID:            buildID,
-			CommitHash:    commitHash,
-			CommitMessage: commitMessage,
-			Status:        build_enums.Running,
-		})
 	} else {
 		return parameters, fmt.Errorf("clone URL doesn't start with https://")
 	}
