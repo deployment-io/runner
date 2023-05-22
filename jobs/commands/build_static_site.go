@@ -67,7 +67,7 @@ func (b *BuildStaticSite) Run(parameters map[parameters_enums.Key]interface{}, l
 		return parameters, err
 	}
 
-	//TODO handle root directory - needs to be added to repo directory
+	//root directory added to repo directory
 	rootDirectoryPath, err := jobs.GetParameterValue[string](parameters, parameters_enums.RootDirectory)
 	if err == nil {
 		repoDirectoryPath += rootDirectoryPath

@@ -74,6 +74,10 @@ func Get(p commands_enums.Type) (jobs.Command, error) {
 		return &BuildStaticSite{}, nil
 	case commands_enums.DeployStaticSiteAWS:
 		return &DeployStaticSiteAWS{}, nil
+	case commands_enums.BuildDockerImage:
+		return &BuildDockerImage{}, nil
+	case commands_enums.DeployWebServiceAWS:
+		return &DeployWebServiceAWS{}, nil
 	}
 	return nil, fmt.Errorf("error getting command for %s", p)
 }

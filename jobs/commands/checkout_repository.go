@@ -119,8 +119,6 @@ func (cr *CheckoutRepository) Run(parameters map[parameters_enums.Key]interface{
 		if err != nil && err != git.NoErrAlreadyUpToDate {
 			return parameters, err
 		}
-		var commitHashFromParams string
-		commitHashFromParams, err = jobs.GetParameterValue[string](parameters, parameters_enums.CommitHash)
 
 		var buildID string
 		buildID, err = jobs.GetParameterValue[string](parameters, parameters_enums.BuildID)
@@ -128,6 +126,8 @@ func (cr *CheckoutRepository) Run(parameters map[parameters_enums.Key]interface{
 			return parameters, err
 		}
 
+		var commitHashFromParams string
+		commitHashFromParams, err = jobs.GetParameterValue[string](parameters, parameters_enums.CommitHash)
 		if err == nil && len(commitHashFromParams) > 0 {
 			hash := plumbing.NewHash(commitHashFromParams)
 			err = worktree.Checkout(&git.CheckoutOptions{
@@ -165,6 +165,8 @@ func (cr *CheckoutRepository) Run(parameters map[parameters_enums.Key]interface{
 				CommitMessage: commitMessage,
 				Status:        build_enums.Running,
 			})
+
+			parameters[parameters_enums.CommitHash] = commitHash
 		}
 		parameters[parameters_enums.RepoDirectoryPath] = repoDirectoryPath
 
