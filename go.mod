@@ -14,7 +14,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/ecs v1.27.1
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.33.1
 	github.com/aws/smithy-go v1.13.5
-	github.com/deployment-io/deployment-runner-kit v0.0.0-20230530065206-f8c7d218313e
+	github.com/deployment-io/deployment-runner-kit v0.0.0-20230530133044-63994c532172
 	github.com/docker/docker v24.0.1+incompatible
 	go.mongodb.org/mongo-driver v1.11.6
 	gopkg.in/src-d/go-git.v4 v4.13.1

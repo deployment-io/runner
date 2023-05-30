@@ -9,6 +9,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3Types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/deployment-io/deployment-runner-kit/builds"
+	"github.com/deployment-io/deployment-runner-kit/clusters"
 	"github.com/deployment-io/deployment-runner-kit/deployments"
 	"github.com/deployment-io/deployment-runner-kit/enums/build_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/commands_enums"
@@ -23,6 +24,7 @@ import (
 var updateBuildsPipeline *goPipeline.Pipeline[string, builds.UpdateBuildDtoV1]
 var updateDeploymentsPipeline *goPipeline.Pipeline[string, deployments.UpdateDeploymentDtoV1]
 var upsertVpcsPipeline *goPipeline.Pipeline[string, vpcs.UpsertVpcDtoV1]
+var upsertClustersPipeline *goPipeline.Pipeline[string, clusters.UpsertClusterDtoV1]
 
 func Init() {
 	c := client.Get()
@@ -84,6 +86,25 @@ func Init() {
 		fmt.Println("waiting for vpcs upsert pipeline shutdown")
 		upsertVpcsPipeline.Shutdown()
 		fmt.Println("waiting for vpcs upsert pipeline shutdown -- done")
+	})
+	upsertClustersPipeline, _ = goPipeline.NewPipeline(5, 10*time.Second, func(vpc string, clusters []clusters.UpsertClusterDtoV1) {
+		e := true
+		for e {
+			err := c.UpsertClusters(clusters)
+			//TODO we can handle for ErrConnection
+			//will block till error
+			if err != nil {
+				fmt.Println(err)
+				time.Sleep(2 * time.Second)
+				continue
+			}
+			e = false
+		}
+	})
+	goShutdownHook.ADD(func() {
+		fmt.Println("waiting for clusters upsert pipeline shutdown")
+		upsertClustersPipeline.Shutdown()
+		fmt.Println("waiting for clusters upsert pipeline shutdown -- done")
 	})
 }
 

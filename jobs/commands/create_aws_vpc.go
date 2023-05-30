@@ -18,7 +18,7 @@ import (
 	"time"
 )
 
-const vpcUpsertKey = "upsertVpcs"
+const upsertVpcKey = "upsertVpcs"
 
 type CreateAwsVPC struct {
 }
@@ -274,7 +274,7 @@ func createVpcIfNeeded(parameters map[parameters_enums.Key]interface{}, ec2Clien
 	if err != nil {
 		return "", err
 	}
-	upsertVpcsPipeline.Add(vpcUpsertKey, vpcs.UpsertVpcDtoV1{
+	upsertVpcsPipeline.Add(upsertVpcKey, vpcs.UpsertVpcDtoV1{
 		Type:   vpc_enums.AwsVpc,
 		Region: region,
 		VpcId:  vpcId,
@@ -359,7 +359,7 @@ func createAndAttachInternetGatewayIfNeeded(parameters map[parameters_enums.Key]
 	if err != nil {
 		return "", err
 	}
-	upsertVpcsPipeline.Add(vpcUpsertKey, vpcs.UpsertVpcDtoV1{
+	upsertVpcsPipeline.Add(upsertVpcKey, vpcs.UpsertVpcDtoV1{
 		Type:              vpc_enums.AwsVpc,
 		Region:            region,
 		InternetGatewayId: aws.ToString(internetGatewayId),
@@ -498,7 +498,7 @@ func allocatePublicElasticIPIfNeeded(parameters map[parameters_enums.Key]interfa
 	if err != nil {
 		return "", err
 	}
-	upsertVpcsPipeline.Add(vpcUpsertKey, vpcs.UpsertVpcDtoV1{
+	upsertVpcsPipeline.Add(upsertVpcKey, vpcs.UpsertVpcDtoV1{
 		Type:                  vpc_enums.AwsVpc,
 		Region:                region,
 		ElasticIPAllocationId: aws.ToString(allocationID),
@@ -572,7 +572,7 @@ func createNatGatewayIfNeeded(parameters map[parameters_enums.Key]interface{}, e
 	if err != nil {
 		return "", err
 	}
-	upsertVpcsPipeline.Add(vpcUpsertKey, vpcs.UpsertVpcDtoV1{
+	upsertVpcsPipeline.Add(upsertVpcKey, vpcs.UpsertVpcDtoV1{
 		Type:         vpc_enums.AwsVpc,
 		Region:       region,
 		NatGatewayId: natGatewayId,
@@ -877,7 +877,7 @@ func (c *CreateAwsVPC) Run(parameters map[parameters_enums.Key]interface{}, logg
 		}
 
 		if shouldSyncSubnetsAll {
-			upsertVpcsPipeline.Add(vpcUpsertKey, vpcs.UpsertVpcDtoV1{
+			upsertVpcsPipeline.Add(upsertVpcKey, vpcs.UpsertVpcDtoV1{
 				Type:    vpc_enums.AwsVpc,
 				Region:  region,
 				Subnets: subnetsDto,
@@ -885,7 +885,7 @@ func (c *CreateAwsVPC) Run(parameters map[parameters_enums.Key]interface{}, logg
 		}
 
 		if shouldSyncRouteTablesAll {
-			upsertVpcsPipeline.Add(vpcUpsertKey, vpcs.UpsertVpcDtoV1{
+			upsertVpcsPipeline.Add(upsertVpcKey, vpcs.UpsertVpcDtoV1{
 				Type:        vpc_enums.AwsVpc,
 				Region:      region,
 				RouteTables: routeTablesDto,
