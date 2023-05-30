@@ -4,14 +4,17 @@ go 1.20
 
 require (
 	github.com/ankit-arora/go-utils v0.0.0-20230426122240-f74a4bcf6217
+	github.com/ankit-arora/ipnets v0.0.0-20230525113803-5d737bfe484b
 	github.com/aws/aws-sdk-go-v2 v1.18.0
 	github.com/aws/aws-sdk-go-v2/config v1.18.20
 	github.com/aws/aws-sdk-go-v2/service/acm v1.17.11
 	github.com/aws/aws-sdk-go-v2/service/cloudfront v1.26.6
 	github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs v1.20.8
+	github.com/aws/aws-sdk-go-v2/service/ec2 v1.98.0
+	github.com/aws/aws-sdk-go-v2/service/ecs v1.27.1
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.33.1
 	github.com/aws/smithy-go v1.13.5
-	github.com/deployment-io/deployment-runner-kit v0.0.0-20230522050749-4d45d634c9e6
+	github.com/deployment-io/deployment-runner-kit v0.0.0-20230530065206-f8c7d218313e
 	github.com/docker/docker v24.0.1+incompatible
 	go.mongodb.org/mongo-driver v1.11.6
 	gopkg.in/src-d/go-git.v4 v4.13.1

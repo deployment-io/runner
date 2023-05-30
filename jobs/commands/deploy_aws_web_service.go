@@ -5,7 +5,7 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 )
 
-type DeployWebServiceAWS struct {
+type DeployAwsWebService struct {
 }
 
 /**
@@ -13,6 +13,6 @@ New deployment
 1.
 */
 
-func (d *DeployWebServiceAWS) Run(parameters map[parameters_enums.Key]interface{}, logger jobs.Logger) (newParameters map[parameters_enums.Key]interface{}, err error) {
+func (d *DeployAwsWebService) Run(parameters map[parameters_enums.Key]interface{}, logger jobs.Logger) (newParameters map[parameters_enums.Key]interface{}, err error) {
 	return parameters, nil
 }

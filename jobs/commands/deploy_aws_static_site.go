@@ -15,6 +15,7 @@ import (
 	"github.com/aws/smithy-go"
 	"github.com/deployment-io/deployment-runner-kit/deployments"
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
+	"github.com/deployment-io/deployment-runner-kit/enums/region_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner/client"
 	"github.com/deployment-io/deployment-runner/utils/loggers"
@@ -23,7 +24,7 @@ import (
 	"time"
 )
 
-type DeployStaticSiteAWS struct {
+type DeployAwsStaticSite struct {
 }
 
 func createCachePolicy(cachePolicyName string, cloudFrontClient *cloudfront.Client) (*string, error) {
@@ -358,7 +359,7 @@ func attachPolicyToS3Bucket(distributionArn *string, s3BucketName, policySid, po
 	return nil
 }
 
-func (d *DeployStaticSiteAWS) Run(parameters map[parameters_enums.Key]interface{}, logger jobs.Logger) (newParameters map[parameters_enums.Key]interface{}, err error) {
+func (d *DeployAwsStaticSite) Run(parameters map[parameters_enums.Key]interface{}, logger jobs.Logger) (newParameters map[parameters_enums.Key]interface{}, err error) {
 	logBuffer := new(bytes.Buffer)
 	defer func() {
 		_ = loggers.LogBuffer(logBuffer, logger)
@@ -367,7 +368,7 @@ func (d *DeployStaticSiteAWS) Run(parameters map[parameters_enums.Key]interface{
 		}
 	}()
 	cloudfrontRegion := "us-east-1"
-	region, err := jobs.GetParameterValue[string](parameters, parameters_enums.Region)
+	region, err := jobs.GetParameterValue[region_enums.Type](parameters, parameters_enums.Region)
 	if err != nil {
 		return parameters, err
 	}
@@ -383,15 +384,15 @@ func (d *DeployStaticSiteAWS) Run(parameters map[parameters_enums.Key]interface{
 
 	cfg, err := config.LoadDefaultConfig(context.TODO())
 	if err != nil {
-		log.Fatal(err)
+		return parameters, err
 	}
 
 	// Create an Amazon S3 service client
 	s3Client := s3.NewFromConfig(cfg, func(o *s3.Options) {
-		o.Region = region
+		o.Region = region.String()
 	})
 
-	bucketLocation, isNewBucketCreated, err := createS3BucketIfNeeded(s3Client, bucketName, region)
+	bucketLocation, isNewBucketCreated, err := createS3BucketIfNeeded(s3Client, bucketName, region.String())
 	if err != nil {
 		return parameters, err
 	}
@@ -439,7 +440,7 @@ func (d *DeployStaticSiteAWS) Run(parameters map[parameters_enums.Key]interface{
 		return parameters, err
 	}
 
-	err = uploadToS3(distDirectory, region, bucketName, s3Client)
+	err = uploadToS3(distDirectory, region.String(), bucketName, s3Client)
 	if err != nil {
 		return parameters, err
 	}
@@ -479,7 +480,7 @@ func (d *DeployStaticSiteAWS) Run(parameters map[parameters_enums.Key]interface{
 		defaultCacheBehavior := createDefaultCacheBehavior(bucketLocation, cachePolicyId)
 
 		// Create distribution config
-		domainName := bucketName + ".s3." + region + ".amazonaws.com"
+		domainName := bucketName + ".s3." + region.String() + ".amazonaws.com"
 		var callerReference string
 		callerReference, err = getCallerReference(parameters)
 		if !ignoreErrorsTillCF && err != nil {

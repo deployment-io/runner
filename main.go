@@ -142,6 +142,7 @@ func main() {
 		jobsDonePipeline.Shutdown()
 		fmt.Println("waiting for jobs done pipeline shutdown -- done")
 	})
+	jobs.RegisterGobDataTypes()
 	for !shutdown {
 		select {
 		case <-shutdownSignal:

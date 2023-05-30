@@ -14,6 +14,7 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/enums/commands_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
+	"github.com/deployment-io/deployment-runner-kit/vpcs"
 	"github.com/deployment-io/deployment-runner/client"
 	"log"
 	"time"
@@ -21,6 +22,7 @@ import (
 
 var updateBuildsPipeline *goPipeline.Pipeline[string, builds.UpdateBuildDtoV1]
 var updateDeploymentsPipeline *goPipeline.Pipeline[string, deployments.UpdateDeploymentDtoV1]
+var upsertVpcsPipeline *goPipeline.Pipeline[string, vpcs.UpsertVpcDtoV1]
 
 func Init() {
 	c := client.Get()
@@ -64,6 +66,25 @@ func Init() {
 		updateDeploymentsPipeline.Shutdown()
 		fmt.Println("waiting for deployments update pipeline shutdown -- done")
 	})
+	upsertVpcsPipeline, _ = goPipeline.NewPipeline(5, 10*time.Second, func(vpc string, vpcs []vpcs.UpsertVpcDtoV1) {
+		e := true
+		for e {
+			err := c.UpsertVpcs(vpcs)
+			//TODO we can handle for ErrConnection
+			//will block till error
+			if err != nil {
+				fmt.Println(err)
+				time.Sleep(2 * time.Second)
+				continue
+			}
+			e = false
+		}
+	})
+	goShutdownHook.ADD(func() {
+		fmt.Println("waiting for vpcs upsert pipeline shutdown")
+		upsertVpcsPipeline.Shutdown()
+		fmt.Println("waiting for vpcs upsert pipeline shutdown -- done")
+	})
 }
 
 func Get(p commands_enums.Type) (jobs.Command, error) {
@@ -72,12 +93,16 @@ func Get(p commands_enums.Type) (jobs.Command, error) {
 		return &CheckoutRepository{}, nil
 	case commands_enums.BuildStaticSite:
 		return &BuildStaticSite{}, nil
-	case commands_enums.DeployStaticSiteAWS:
-		return &DeployStaticSiteAWS{}, nil
+	case commands_enums.DeployAwsStaticSite:
+		return &DeployAwsStaticSite{}, nil
 	case commands_enums.BuildDockerImage:
 		return &BuildDockerImage{}, nil
-	case commands_enums.DeployWebServiceAWS:
-		return &DeployWebServiceAWS{}, nil
+	case commands_enums.DeployAwsWebService:
+		return &DeployAwsWebService{}, nil
+	case commands_enums.CreateAwsVpc:
+		return &CreateAwsVPC{}, nil
+	case commands_enums.CreateEcsCluster:
+		return &CreateEcsCluster{}, nil
 	}
 	return nil, fmt.Errorf("error getting command for %s", p)
 }
