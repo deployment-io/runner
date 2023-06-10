@@ -12,13 +12,14 @@ import (
 	"gopkg.in/src-d/go-git.v4/plumbing"
 	"gopkg.in/src-d/go-git.v4/plumbing/object"
 	"gopkg.in/src-d/go-git.v4/plumbing/transport/http"
+	"os"
 	"strings"
 )
 
 type CheckoutRepository struct {
 }
 
-func (cr *CheckoutRepository) getRepositoryDirectoryPath(parameters map[parameters_enums.Key]interface{}) (string, error) {
+func getRepositoryDirectoryPath(parameters map[string]interface{}) (string, error) {
 	environmentID, err := jobs.GetParameterValue[string](parameters, parameters_enums.EnvironmentID)
 	if err != nil {
 		return "", err
@@ -45,7 +46,24 @@ func (cr *CheckoutRepository) getRepositoryDirectoryPath(parameters map[paramete
 
 }
 
-func (cr *CheckoutRepository) Run(parameters map[parameters_enums.Key]interface{}, logger jobs.Logger) (newParameters map[parameters_enums.Key]interface{}, err error) {
+func addFile(filePath, contents string) error {
+	//delete file. ignoring error since file may not exist
+	_ = os.Remove(filePath)
+	file, err := os.Create(filePath)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		_ = file.Close()
+	}()
+	_, err = file.WriteString(contents)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (cr *CheckoutRepository) Run(parameters map[string]interface{}, logger jobs.Logger) (newParameters map[string]interface{}, err error) {
 	logBuffer := new(bytes.Buffer)
 	defer func() {
 		_ = loggers.LogBuffer(logBuffer, logger)
@@ -74,7 +92,7 @@ func (cr *CheckoutRepository) Run(parameters map[parameters_enums.Key]interface{
 		//TODO currently it's common for GitLab and GitHub. Might change in the future
 		repoCloneUrlWithToken := "https://oauth2:" + repoProviderToken + "@" + after
 		var repoDirectoryPath string
-		repoDirectoryPath, err = cr.getRepositoryDirectoryPath(parameters)
+		repoDirectoryPath, err = getRepositoryDirectoryPath(parameters)
 		if err != nil {
 			return parameters, err
 		}
@@ -128,6 +146,7 @@ func (cr *CheckoutRepository) Run(parameters map[parameters_enums.Key]interface{
 
 		var commitHashFromParams string
 		commitHashFromParams, err = jobs.GetParameterValue[string](parameters, parameters_enums.CommitHash)
+
 		if err == nil && len(commitHashFromParams) > 0 {
 			hash := plumbing.NewHash(commitHashFromParams)
 			err = worktree.Checkout(&git.CheckoutOptions{
@@ -136,7 +155,7 @@ func (cr *CheckoutRepository) Run(parameters map[parameters_enums.Key]interface{
 			if err != nil {
 				return parameters, err
 			}
-			updateBuildsPipeline.Add("updateBuilds", builds.UpdateBuildDtoV1{
+			updateBuildsPipeline.Add(updateBuildsKey, builds.UpdateBuildDtoV1{
 				ID:     buildID,
 				Status: build_enums.Running,
 			})
@@ -159,19 +178,42 @@ func (cr *CheckoutRepository) Run(parameters map[parameters_enums.Key]interface{
 			commitHash := hash.String()
 			commitMessage := strings.TrimSpace(commitObject.Message)
 
-			updateBuildsPipeline.Add("updateBuilds", builds.UpdateBuildDtoV1{
+			updateBuildsPipeline.Add(updateBuildsKey, builds.UpdateBuildDtoV1{
 				ID:            buildID,
 				CommitHash:    commitHash,
 				CommitMessage: commitMessage,
 				Status:        build_enums.Running,
 			})
 
-			parameters[parameters_enums.CommitHash] = commitHash
+			jobs.SetParameterValue(parameters, parameters_enums.CommitHash, commitHash)
 		}
-		parameters[parameters_enums.RepoDirectoryPath] = repoDirectoryPath
+
+		//root directory added to repo directory
+		var rootDirectoryPath string
+		rootDirectoryPath, err = jobs.GetParameterValue[string](parameters, parameters_enums.RootDirectory)
+		if err == nil && len(rootDirectoryPath) > 0 {
+			repoDirectoryPath += rootDirectoryPath
+		}
+
+		//add environment files to the source code
+		var environmentFiles map[string]string
+		environmentFiles, err = jobs.GetParameterValue[map[string]string](parameters, parameters_enums.EnvironmentFiles)
+		if err == nil && len(environmentFiles) > 0 {
+			//create and add the environment files in repoDirectoryPath
+			for name, contents := range environmentFiles {
+				filePath := repoDirectoryPath + "/" + name
+				err = addFile(filePath, contents)
+				if err != nil {
+					return parameters, err
+				}
+			}
+		}
+
+		jobs.SetParameterValue[string](parameters, parameters_enums.RepoDirectoryPath, repoDirectoryPath)
 
 	} else {
-		return parameters, fmt.Errorf("clone URL doesn't start with https://")
+		err = fmt.Errorf("clone URL doesn't start with https://")
+		return parameters, err
 	}
 
 	return parameters, nil

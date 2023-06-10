@@ -1,11 +1,11 @@
 package commands
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"github.com/ankit-arora/ipnets"
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	ec2Types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
@@ -13,17 +13,20 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/enums/vpc_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner-kit/vpcs"
+	"github.com/deployment-io/deployment-runner/utils/loggers"
+	"go.mongodb.org/mongo-driver/bson/primitive"
 	"net"
 	"strconv"
+	"sync"
 	"time"
 )
 
 const upsertVpcKey = "upsertVpcs"
 
-type CreateAwsVPC struct {
+type CreateDefaultAwsVPC struct {
 }
 
-func getDefaultVpcName(parameters map[parameters_enums.Key]interface{}) (string, error) {
+func getDefaultVpcName(parameters map[string]interface{}) (string, error) {
 	//vpc-<organizationId>
 	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationID)
 	if err != nil {
@@ -32,7 +35,7 @@ func getDefaultVpcName(parameters map[parameters_enums.Key]interface{}) (string,
 	return fmt.Sprintf("vpc-%s", organizationID), nil
 }
 
-func getDefaultInternetGatewayName(parameters map[parameters_enums.Key]interface{}) (string, error) {
+func getDefaultInternetGatewayName(parameters map[string]interface{}) (string, error) {
 	//ig-<organizationId>
 	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationID)
 	if err != nil {
@@ -41,25 +44,25 @@ func getDefaultInternetGatewayName(parameters map[parameters_enums.Key]interface
 	return fmt.Sprintf("ig-%s", organizationID), nil
 }
 
-func getDefaultElasticIPName(parameters map[parameters_enums.Key]interface{}) (string, error) {
-	//elastic-ip-<organizationId>
+func getDefaultElasticIPName(parameters map[string]interface{}, az string) (string, error) {
+	//elastic-ip-<organizationId>-public-eu-west-1b
 	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationID)
 	if err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("elastic-ip-%s", organizationID), nil
+	return fmt.Sprintf("elastic-ip-%s-%s", organizationID, az), nil
 }
 
-func getDefaultNatGatewayName(parameters map[parameters_enums.Key]interface{}) (string, error) {
-	//nat-gateway-<organizationId>
+func getDefaultNatGatewayName(parameters map[string]interface{}, az string) (string, error) {
+	//nat-gateway-<organizationId>-public-eu-west-1b
 	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationID)
 	if err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("nat-gateway-%s", organizationID), nil
+	return fmt.Sprintf("nat-gateway-%s-%s", organizationID, az), nil
 }
 
-func getDefaultRouteTableName(parameters map[parameters_enums.Key]interface{}, isPrivate bool, availabilityZone string) (string, error) {
+func getDefaultRouteTableName(parameters map[string]interface{}, isPrivate bool, availabilityZone string) (string, error) {
 	//route-table-<organizationId>-public-eu-west-1b
 	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationID)
 	if err != nil {
@@ -114,7 +117,7 @@ func divideInToSubnets(cidr string, count int) ([]string, error) {
 	return subnetCidrs, nil
 }
 
-func getDefaultSubnetName(parameters map[parameters_enums.Key]interface{}, isPrivate bool, availabilityZone string) (string, error) {
+func getDefaultSubnetName(parameters map[string]interface{}, isPrivate bool, availabilityZone string) (string, error) {
 	//subnet-<organizationId>-public-eu-west-1b
 	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationID)
 	if err != nil {
@@ -135,13 +138,13 @@ type subnetInfo struct {
 	subnetId  string
 }
 
-func getSubnetData(parameters map[parameters_enums.Key]interface{}, ec2Client *ec2.Client, cidr string) ([]subnetInfo, error) {
-	region, err := jobs.GetParameterValue[region_enums.Type](parameters, parameters_enums.Region)
+func getSubnetData(parameters map[string]interface{}, ec2Client *ec2.Client, cidr string) ([]subnetInfo, error) {
+	region, err := jobs.GetParameterValue[int64](parameters, parameters_enums.Region)
 	if err != nil {
 		return nil, err
 	}
 
-	availabilityZones, err := getAvailabilityZonesFromRegion(ec2Client, region.String())
+	availabilityZones, err := getAvailabilityZonesFromRegion(ec2Client, region_enums.Type(region).String())
 	if err != nil {
 		return nil, err
 	}
@@ -175,32 +178,15 @@ func getSubnetData(parameters map[parameters_enums.Key]interface{}, ec2Client *e
 	return subnetData, nil
 }
 
+// "10.0.0.0/8",
 func getPrivateCidrBlocks() []string {
 	return []string{
-		"10.0.0.0/8",
 		"192.168.0.0/16",
 		"172.16.0.0/12",
 	}
 }
 
-func getEC2Client(parameters map[parameters_enums.Key]interface{}) (*ec2.Client, error) {
-	cfg, err := config.LoadDefaultConfig(context.TODO())
-	if err != nil {
-		return nil, err
-	}
-
-	region, err := jobs.GetParameterValue[region_enums.Type](parameters, parameters_enums.Region)
-	if err != nil {
-		return nil, err
-	}
-
-	ec2Client := ec2.NewFromConfig(cfg, func(o *ec2.Options) {
-		o.Region = region.String()
-	})
-	return ec2Client, nil
-}
-
-func createVpcIfNeeded(parameters map[parameters_enums.Key]interface{}, ec2Client *ec2.Client, cidrBlock string) (string, error) {
+func createVpcIfNeeded(parameters map[string]interface{}, ec2Client *ec2.Client, cidrBlock string) (string, error) {
 	vpcIdFromParams, err := jobs.GetParameterValue[string](parameters, parameters_enums.VpcID)
 	if err == nil && len(vpcIdFromParams) > 0 {
 		return vpcIdFromParams, nil
@@ -257,7 +243,7 @@ func createVpcIfNeeded(parameters map[parameters_enums.Key]interface{}, ec2Clien
 			return "", err
 		}
 
-		vpcId := aws.ToString(createVpcOutput.Vpc.VpcId)
+		vpcId = aws.ToString(createVpcOutput.Vpc.VpcId)
 
 		newVpcAvailableWaiter := ec2.NewVpcAvailableWaiter(ec2Client)
 		err = newVpcAvailableWaiter.Wait(context.TODO(), &ec2.DescribeVpcsInput{
@@ -270,20 +256,20 @@ func createVpcIfNeeded(parameters map[parameters_enums.Key]interface{}, ec2Clien
 	}
 
 	//sync VPC ID to server
-	region, err := jobs.GetParameterValue[region_enums.Type](parameters, parameters_enums.Region)
+	region, err := jobs.GetParameterValue[int64](parameters, parameters_enums.Region)
 	if err != nil {
 		return "", err
 	}
 	upsertVpcsPipeline.Add(upsertVpcKey, vpcs.UpsertVpcDtoV1{
 		Type:   vpc_enums.AwsVpc,
-		Region: region,
+		Region: region_enums.Type(region),
 		VpcId:  vpcId,
 	})
 
 	return vpcId, nil
 }
 
-func createAndAttachInternetGatewayIfNeeded(parameters map[parameters_enums.Key]interface{}, ec2Client *ec2.Client, vpcId string) (string, error) {
+func createAndAttachInternetGatewayIfNeeded(parameters map[string]interface{}, ec2Client *ec2.Client, vpcId string) (string, error) {
 	internetGatewayIdFromParams, err := jobs.GetParameterValue[string](parameters, parameters_enums.InternetGatewayID)
 	if err == nil && len(internetGatewayIdFromParams) > 0 {
 		return internetGatewayIdFromParams, nil
@@ -355,13 +341,13 @@ func createAndAttachInternetGatewayIfNeeded(parameters map[parameters_enums.Key]
 	}
 
 	//sync IG ID to server
-	region, err := jobs.GetParameterValue[region_enums.Type](parameters, parameters_enums.Region)
+	region, err := jobs.GetParameterValue[int64](parameters, parameters_enums.Region)
 	if err != nil {
 		return "", err
 	}
 	upsertVpcsPipeline.Add(upsertVpcKey, vpcs.UpsertVpcDtoV1{
 		Type:              vpc_enums.AwsVpc,
-		Region:            region,
+		Region:            region_enums.Type(region),
 		InternetGatewayId: aws.ToString(internetGatewayId),
 	})
 
@@ -369,7 +355,7 @@ func createAndAttachInternetGatewayIfNeeded(parameters map[parameters_enums.Key]
 
 }
 
-func createSubnetIfNeeded(parameters map[parameters_enums.Key]interface{}, ec2Client *ec2.Client, subnet subnetInfo, vpcId string) (subnetId string, shouldSync bool, err error) {
+func createSubnetIfNeeded(parameters map[string]interface{}, ec2Client *ec2.Client, subnet subnetInfo, vpcId string) (subnetId string, shouldSync bool, err error) {
 	subnetsFromParams, err := jobs.GetParameterValue[map[string]string](parameters, parameters_enums.Subnets)
 	if err == nil && len(subnetsFromParams) > 0 {
 		subnetIdFromParams, ok := subnetsFromParams[subnet.name]
@@ -393,10 +379,14 @@ func createSubnetIfNeeded(parameters map[parameters_enums.Key]interface{}, ec2Cl
 		return "", false, err
 	}
 
-	var subnetID string
-	if len(describeSubnetsOutput.Subnets) > 0 {
-		subnetID = aws.ToString(describeSubnetsOutput.Subnets[0].SubnetId)
-	} else {
+	for _, s := range describeSubnetsOutput.Subnets {
+		if s.State == ec2Types.SubnetStateAvailable {
+			subnetId = aws.ToString(describeSubnetsOutput.Subnets[0].SubnetId)
+			break
+		}
+	}
+
+	if len(subnetId) == 0 {
 		createSubnetInput := &ec2.CreateSubnetInput{
 			VpcId:            aws.String(vpcId),
 			AvailabilityZone: aws.String(subnet.az),
@@ -430,22 +420,34 @@ func createSubnetIfNeeded(parameters map[parameters_enums.Key]interface{}, ec2Cl
 			return "", false, err
 		}
 
-		subnetID = aws.ToString(createSubnetOutput.Subnet.SubnetId)
+		subnetId = aws.ToString(createSubnetOutput.Subnet.SubnetId)
 
+		subnetAvailableWaiter := ec2.NewSubnetAvailableWaiter(ec2Client)
+		err = subnetAvailableWaiter.Wait(context.TODO(), &ec2.DescribeSubnetsInput{
+			SubnetIds: []string{
+				subnetId,
+			},
+		}, 10*time.Minute)
+		if err != nil {
+			return "", false, err
+		}
 	}
 
-	return subnetID, true, nil
+	return subnetId, true, nil
 }
 
-func allocatePublicElasticIPIfNeeded(parameters map[parameters_enums.Key]interface{}, ec2Client *ec2.Client) (string, error) {
-	elasticIPIdFromParams, err := jobs.GetParameterValue[string](parameters, parameters_enums.ElasticIPAllocationID)
-	if err == nil && len(elasticIPIdFromParams) > 0 {
-		return elasticIPIdFromParams, nil
+func allocatePublicElasticIPIfNeeded(parameters map[string]interface{}, ec2Client *ec2.Client, az string) (allocationID, allocationName string, err error) {
+	defaultElasticIPName, err := getDefaultElasticIPName(parameters, az)
+	if err != nil {
+		return "", "", err
 	}
 
-	defaultElasticIPName, err := getDefaultElasticIPName(parameters)
-	if err != nil {
-		return "", err
+	elasticIPsFromParams, err := jobs.GetParameterValue[map[string]string](parameters, parameters_enums.ElasticIPAllocations)
+	if err == nil && len(elasticIPsFromParams) > 0 {
+		elasticIPIdFromParams, ok := elasticIPsFromParams[defaultElasticIPName]
+		if ok && len(elasticIPIdFromParams) > 0 {
+			return elasticIPIdFromParams, defaultElasticIPName, nil
+		}
 	}
 
 	allocationIpsOutput, err := ec2Client.DescribeAddresses(context.TODO(), &ec2.DescribeAddressesInput{
@@ -461,12 +463,11 @@ func allocatePublicElasticIPIfNeeded(parameters map[parameters_enums.Key]interfa
 	})
 
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 
-	var allocationID *string
 	if len(allocationIpsOutput.Addresses) > 0 {
-		allocationID = allocationIpsOutput.Addresses[0].AllocationId
+		allocationID = aws.ToString(allocationIpsOutput.Addresses[0].AllocationId)
 	} else {
 		allocateAddressInput := &ec2.AllocateAddressInput{
 			DryRun: aws.Bool(false),
@@ -487,38 +488,31 @@ func allocatePublicElasticIPIfNeeded(parameters map[parameters_enums.Key]interfa
 
 		allocateAddressOutput, err := ec2Client.AllocateAddress(context.TODO(), allocateAddressInput)
 		if err != nil {
-			return "", err
+			return "", "", err
 		}
 
-		allocationID = allocateAddressOutput.AllocationId
+		allocationID = aws.ToString(allocateAddressOutput.AllocationId)
 	}
 
-	//sync allocation ID to server
-	region, err := jobs.GetParameterValue[region_enums.Type](parameters, parameters_enums.Region)
-	if err != nil {
-		return "", err
-	}
-	upsertVpcsPipeline.Add(upsertVpcKey, vpcs.UpsertVpcDtoV1{
-		Type:                  vpc_enums.AwsVpc,
-		Region:                region,
-		ElasticIPAllocationId: aws.ToString(allocationID),
-	})
-
-	return aws.ToString(allocationID), nil
+	return allocationID, defaultElasticIPName, nil
 }
 
-func createNatGatewayIfNeeded(parameters map[parameters_enums.Key]interface{}, ec2Client *ec2.Client, subnetID, allocationID string) (string, error) {
-	natGatewayIdFromParams, err := jobs.GetParameterValue[string](parameters, parameters_enums.NatGatewayID)
-	if err == nil && len(natGatewayIdFromParams) > 0 {
-		return natGatewayIdFromParams, nil
-	}
+func createNatGatewayIfNeeded(parameters map[string]interface{}, ec2Client *ec2.Client, subnetID, allocationID, az string) (natGatewayId string, natGatewayName string, shouldWaitTillAvailable bool, err error) {
 
-	defaultNatGatewayName, err := getDefaultNatGatewayName(parameters)
+	defaultNatGatewayName, err := getDefaultNatGatewayName(parameters, az)
 	if err != nil {
-		return "", err
+		return "", "", false, err
 	}
 
-	natGatewaysOutput, err := ec2Client.DescribeNatGateways(context.TODO(), &ec2.DescribeNatGatewaysInput{
+	natGatewaysFromParams, err := jobs.GetParameterValue[map[string]string](parameters, parameters_enums.NatGateways)
+	if err == nil && len(natGatewaysFromParams) > 0 {
+		natGatewayIdFromParams, ok := natGatewaysFromParams[defaultNatGatewayName]
+		if ok && len(natGatewayIdFromParams) > 0 {
+			return natGatewayIdFromParams, defaultNatGatewayName, false, nil
+		}
+	}
+
+	describeNatGatewaysInput := &ec2.DescribeNatGatewaysInput{
 		DryRun: aws.Bool(false),
 		Filter: []ec2Types.Filter{
 			{
@@ -528,16 +522,22 @@ func createNatGatewayIfNeeded(parameters map[parameters_enums.Key]interface{}, e
 				},
 			},
 		},
-	})
+	}
+	natGatewaysOutput, err := ec2Client.DescribeNatGateways(context.TODO(), describeNatGatewaysInput)
 
 	if err != nil {
-		return "", err
+		return "", "", false, err
 	}
 
-	var natGatewayId string
-	if len(natGatewaysOutput.NatGateways) > 0 {
-		natGatewayId = aws.ToString(natGatewaysOutput.NatGateways[0].NatGatewayId)
-	} else {
+	for _, natGateway := range natGatewaysOutput.NatGateways {
+		if natGateway.State == ec2Types.NatGatewayStateAvailable {
+			natGatewayId = aws.ToString(natGateway.NatGatewayId)
+			shouldWaitTillAvailable = false
+			break
+		}
+	}
+
+	if len(natGatewayId) == 0 {
 		createNatGatewayInput := &ec2.CreateNatGatewayInput{
 			SubnetId:         aws.String(subnetID),
 			AllocationId:     aws.String(allocationID),
@@ -561,27 +561,36 @@ func createNatGatewayIfNeeded(parameters map[parameters_enums.Key]interface{}, e
 		createNatGatewayOutput, err := ec2Client.CreateNatGateway(context.TODO(), createNatGatewayInput)
 
 		if err != nil {
-			return "", err
+			return "", "", false, err
 		}
 
 		natGatewayId = aws.ToString(createNatGatewayOutput.NatGateway.NatGatewayId)
+
+		shouldWaitTillAvailable = true
 	}
 
-	//sync nat gateway
-	region, err := jobs.GetParameterValue[region_enums.Type](parameters, parameters_enums.Region)
-	if err != nil {
-		return "", err
-	}
-	upsertVpcsPipeline.Add(upsertVpcKey, vpcs.UpsertVpcDtoV1{
-		Type:         vpc_enums.AwsVpc,
-		Region:       region,
-		NatGatewayId: natGatewayId,
-	})
-
-	return natGatewayId, nil
+	return natGatewayId, defaultNatGatewayName, shouldWaitTillAvailable, nil
 }
 
-func createRouteTableIfNeeded(parameters map[parameters_enums.Key]interface{}, ec2Client *ec2.Client, vpcId string, isPrivate bool, availabilityZone string) (routeTableName, routeTableId string, shouldSync bool, err error) {
+func waitForNatGatewayAvailability(ec2Client *ec2.Client, natGatewayId string) error {
+	describeNatGatewaysInput := &ec2.DescribeNatGatewaysInput{
+		DryRun: aws.Bool(false),
+		NatGatewayIds: []string{
+			natGatewayId,
+		},
+	}
+
+	waiter := ec2.NewNatGatewayAvailableWaiter(ec2Client)
+	err := waiter.Wait(context.TODO(), describeNatGatewaysInput, time.Minute*10)
+
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func createRouteTableIfNeeded(parameters map[string]interface{}, ec2Client *ec2.Client, vpcId string, isPrivate bool, availabilityZone string) (routeTableName, routeTableId string, shouldSync bool, err error) {
 	routeTableName, err = getDefaultRouteTableName(parameters, isPrivate, availabilityZone)
 	if err != nil {
 		return "", "", false, err
@@ -648,7 +657,7 @@ func createRouteTableIfNeeded(parameters map[parameters_enums.Key]interface{}, e
 	return routeTableName, routeTableId, true, nil
 }
 
-func associateRouteTableToSubnetIfNeeded(parameters map[parameters_enums.Key]interface{}, ec2Client *ec2.Client, subnetId,
+func associateRouteTableToSubnetIfNeeded(parameters map[string]interface{}, ec2Client *ec2.Client, subnetId,
 	routeTableId string) error {
 
 	describeRouteTableOutput, err := ec2Client.DescribeRouteTables(context.TODO(), &ec2.DescribeRouteTablesInput{
@@ -730,21 +739,193 @@ func createRouteIfNeeded(ec2Client *ec2.Client, routeTableId, internetGatewayId,
 	return nil
 }
 
+//TODO
+//2. add ingress security rule for the VPC security group - port 8080 and source VPC CIDR
+
+func getDefaultSecurityGroupIdForVpc(parameters map[string]interface{}, ec2Client *ec2.Client, vpcId string) (securityGroupId string, err error) {
+	securityGroupsOutput, err := ec2Client.DescribeSecurityGroups(context.TODO(), &ec2.DescribeSecurityGroupsInput{
+		DryRun: aws.Bool(false),
+		Filters: []ec2Types.Filter{
+			{
+				Name: aws.String("vpc-id"),
+				Values: []string{
+					vpcId,
+				},
+			},
+			{
+				Name: aws.String("group-name"),
+				Values: []string{
+					"default",
+				},
+			},
+		},
+	})
+
+	if err != nil {
+		return "", err
+	}
+
+	for _, sg := range securityGroupsOutput.SecurityGroups {
+		if aws.ToString(sg.VpcId) == vpcId {
+			securityGroupId = aws.ToString(sg.GroupId)
+		}
+	}
+
+	if len(securityGroupId) == 0 {
+		err = fmt.Errorf("no default security group found")
+	}
+
+	return
+}
+
+func getDefaultVpcSecurityGroupIngressRuleNameForPort(parameters map[string]interface{}) (string, error) {
+	//sgin-<port>
+	port, err := jobs.GetParameterValue[int64](parameters, parameters_enums.Port)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("sgin-%d", port), nil
+}
+
+func addIngressRuleToDefaultVpcSecurityGroup(parameters map[string]interface{}, ec2Client *ec2.Client, vpcId, vpcCidr string) error {
+	//TODO create new security group
+	defaultSecurityGroupId, err := getDefaultSecurityGroupIdForVpc(parameters, ec2Client, vpcId)
+	if err != nil {
+		return err
+	}
+	defaultVpcSecurityGroupIngressRuleNameForPort, err := getDefaultVpcSecurityGroupIngressRuleNameForPort(parameters)
+	if err != nil {
+		return err
+	}
+
+	describeSecurityGroupRulesOutput, err := ec2Client.DescribeSecurityGroupRules(context.TODO(), &ec2.DescribeSecurityGroupRulesInput{
+		DryRun: aws.Bool(false),
+		Filters: []ec2Types.Filter{
+			{
+				Name: aws.String("tag:Name"),
+				Values: []string{
+					defaultVpcSecurityGroupIngressRuleNameForPort,
+				},
+			},
+			{
+				Name: aws.String("group-id"),
+				Values: []string{
+					defaultSecurityGroupId,
+				},
+			},
+		},
+	})
+
+	if err != nil {
+		return err
+	}
+
+	if len(describeSecurityGroupRulesOutput.SecurityGroupRules) == 0 {
+		port, err := jobs.GetParameterValue[int64](parameters, parameters_enums.Port)
+		if err != nil {
+			return err
+		}
+		authorizeSecurityGroupIngressInput := &ec2.AuthorizeSecurityGroupIngressInput{
+			CidrIp:     aws.String(vpcCidr),
+			DryRun:     aws.Bool(false),
+			FromPort:   aws.Int32(int32(port)),
+			GroupId:    aws.String(defaultSecurityGroupId),
+			IpProtocol: aws.String("tcp"),
+			TagSpecifications: []ec2Types.TagSpecification{{
+				ResourceType: ec2Types.ResourceTypeSecurityGroupRule,
+				Tags: []ec2Types.Tag{
+					{
+						Key:   aws.String("Name"),
+						Value: aws.String(defaultVpcSecurityGroupIngressRuleNameForPort),
+					},
+					{
+						Key:   aws.String("created by"),
+						Value: aws.String("deployment.io"),
+					},
+					{
+						Key:   aws.String("vpc-default-security-group-id"),
+						Value: aws.String(defaultSecurityGroupId),
+					},
+				},
+			}},
+			ToPort: aws.Int32(int32(port)),
+		}
+		_, err = ec2Client.AuthorizeSecurityGroupIngress(context.TODO(), authorizeSecurityGroupIngressInput)
+		if err != nil {
+			return err
+		}
+
+		describeSecurityGroupRulesOutput, err = ec2Client.DescribeSecurityGroupRules(context.TODO(), &ec2.DescribeSecurityGroupRulesInput{
+			DryRun: aws.Bool(false),
+			Filters: []ec2Types.Filter{
+				{
+					Name: aws.String("group-id"),
+					Values: []string{
+						defaultSecurityGroupId,
+					},
+				},
+			},
+		})
+
+		if err != nil {
+			return err
+		}
+
+		var ingressRules []vpcs.DefaultSecurityIngressRuleDtoV1
+		for _, securityGroupRule := range describeSecurityGroupRulesOutput.SecurityGroupRules {
+			if !*securityGroupRule.IsEgress {
+				ingressRules = append(ingressRules, vpcs.DefaultSecurityIngressRuleDtoV1{
+					ID: aws.ToString(securityGroupRule.SecurityGroupRuleId),
+				})
+			}
+		}
+
+		region, err := jobs.GetParameterValue[int64](parameters, parameters_enums.Region)
+		if err != nil {
+			return err
+		}
+
+		upsertVpcsPipeline.Add(upsertVpcKey, vpcs.UpsertVpcDtoV1{
+			Type:                        vpc_enums.AwsVpc,
+			Region:                      region_enums.Type(region),
+			DefaultSecurityIngressRules: ingressRules,
+			DefaultSecurityGroupId:      defaultSecurityGroupId,
+		})
+	}
+	return nil
+}
+
 type routeTableInfo struct {
 	routeTableId string
 	isPrivate    bool
+	az           string
 }
 
-func (c *CreateAwsVPC) Run(parameters map[parameters_enums.Key]interface{}, logger jobs.Logger) (newParameters map[parameters_enums.Key]interface{}, err error) {
+func (c *CreateDefaultAwsVPC) Run(parameters map[string]interface{}, logger jobs.Logger) (newParameters map[string]interface{}, err error) {
+	logBuffer := new(bytes.Buffer)
+	defer func() {
+		_ = loggers.LogBuffer(logBuffer, logger)
+		if err != nil {
+			markBuildDone(parameters, err)
+		}
+	}()
 	//try creating subnets for each of these cidr blocks
 	cidrBlocks := getPrivateCidrBlocks()
 	ec2Client, err := getEC2Client(parameters)
 	if err != nil {
 		return parameters, err
 	}
+	cidrBlockFromParams, _ := jobs.GetParameterValue[string](parameters, parameters_enums.VpcCidr)
 	for _, cidrBlock := range cidrBlocks {
+		if len(cidrBlockFromParams) > 0 && cidrBlockFromParams != cidrBlock {
+			continue
+		}
 		var vpcId string
 		vpcId, err = createVpcIfNeeded(parameters, ec2Client, cidrBlock)
+		if err != nil {
+			return parameters, err
+		}
+		err = addIngressRuleToDefaultVpcSecurityGroup(parameters, ec2Client, vpcId, cidrBlock)
 		if err != nil {
 			return parameters, err
 		}
@@ -761,13 +942,15 @@ func (c *CreateAwsVPC) Run(parameters map[parameters_enums.Key]interface{}, logg
 			return parameters, err
 		}
 
-		var natGatewayId string
+		natGatewaysAzMap := make(map[string]string)
 		var routeTables []routeTableInfo
 		firstPublicSubnet := true
 		shouldSyncSubnetsAll := false
 		shouldSyncRouteTablesAll := false
 		var subnetsDto []vpcs.SubnetDtoV1
 		var routeTablesDto []vpcs.RouteTableDtoV1
+		var natGatewaysDto []vpcs.NatGatewayDtoV1
+		var natGatewayIdsToWait []string
 		for _, subnet := range subnetData {
 			//create subnet
 			var subnetId string
@@ -783,16 +966,6 @@ func (c *CreateAwsVPC) Run(parameters map[parameters_enums.Key]interface{}, logg
 			if !subnet.isPrivate {
 				if firstPublicSubnet {
 					//for first subnet which is public
-					var allocationID string
-					allocationID, err = allocatePublicElasticIPIfNeeded(parameters, ec2Client)
-					if err != nil {
-						return parameters, err
-					}
-
-					natGatewayId, err = createNatGatewayIfNeeded(parameters, ec2Client, subnetId, allocationID)
-					if err != nil {
-						return parameters, err
-					}
 					var shouldSyncRouteTable bool
 					var routeTableName string
 					routeTableName, publicRouteTableId, shouldSyncRouteTable, err = createRouteTableIfNeeded(parameters, ec2Client, vpcId, subnet.isPrivate, subnet.az)
@@ -806,6 +979,7 @@ func (c *CreateAwsVPC) Run(parameters map[parameters_enums.Key]interface{}, logg
 					routeTable := routeTableInfo{
 						routeTableId: publicRouteTableId,
 						isPrivate:    false,
+						az:           subnet.az,
 					}
 					routeTables = append(routeTables, routeTable)
 
@@ -825,6 +999,32 @@ func (c *CreateAwsVPC) Run(parameters map[parameters_enums.Key]interface{}, logg
 				if err != nil {
 					return parameters, err
 				}
+
+				var allocationId, allocationName string
+				allocationId, allocationName, err = allocatePublicElasticIPIfNeeded(parameters, ec2Client, subnet.az)
+				if err != nil {
+					return parameters, err
+				}
+
+				var natGatewayId, natGatewayName string
+				var shouldWaitForNatGatewayAvailability bool
+				natGatewayId, natGatewayName, shouldWaitForNatGatewayAvailability, err = createNatGatewayIfNeeded(parameters, ec2Client, subnetId, allocationId, subnet.az)
+				if err != nil {
+					return parameters, err
+				}
+				if shouldWaitForNatGatewayAvailability {
+					natGatewayIdsToWait = append(natGatewayIdsToWait, natGatewayId)
+				}
+
+				natGatewayDtoV1 := vpcs.NatGatewayDtoV1{
+					Name:                    natGatewayName,
+					ID:                      natGatewayId,
+					ElasticIPAllocationName: allocationName,
+					ElasticIPAllocationId:   allocationId,
+				}
+				natGatewaysDto = append(natGatewaysDto, natGatewayDtoV1)
+
+				natGatewaysAzMap[subnet.az] = natGatewayId
 			} else {
 				//create route table for each private subnet
 				var routeTableId, routeTableName string
@@ -839,6 +1039,7 @@ func (c *CreateAwsVPC) Run(parameters map[parameters_enums.Key]interface{}, logg
 				routeTable := routeTableInfo{
 					routeTableId: routeTableId,
 					isPrivate:    true,
+					az:           subnet.az,
 				}
 				routeTables = append(routeTables, routeTable)
 
@@ -870,8 +1071,8 @@ func (c *CreateAwsVPC) Run(parameters map[parameters_enums.Key]interface{}, logg
 			}
 			subnetsDto = append(subnetsDto, subnetDtoV1)
 		}
-		var region region_enums.Type
-		region, err = jobs.GetParameterValue[region_enums.Type](parameters, parameters_enums.Region)
+		var region int64
+		region, err = jobs.GetParameterValue[int64](parameters, parameters_enums.Region)
 		if err != nil {
 			return parameters, err
 		}
@@ -879,7 +1080,7 @@ func (c *CreateAwsVPC) Run(parameters map[parameters_enums.Key]interface{}, logg
 		if shouldSyncSubnetsAll {
 			upsertVpcsPipeline.Add(upsertVpcKey, vpcs.UpsertVpcDtoV1{
 				Type:    vpc_enums.AwsVpc,
-				Region:  region,
+				Region:  region_enums.Type(region),
 				Subnets: subnetsDto,
 			})
 		}
@@ -887,9 +1088,38 @@ func (c *CreateAwsVPC) Run(parameters map[parameters_enums.Key]interface{}, logg
 		if shouldSyncRouteTablesAll {
 			upsertVpcsPipeline.Add(upsertVpcKey, vpcs.UpsertVpcDtoV1{
 				Type:        vpc_enums.AwsVpc,
-				Region:      region,
+				Region:      region_enums.Type(region),
 				RouteTables: routeTablesDto,
 			})
+		}
+
+		upsertVpcsPipeline.Add(upsertVpcKey, vpcs.UpsertVpcDtoV1{
+			Type:        vpc_enums.AwsVpc,
+			Region:      region_enums.Type(region),
+			NatGateways: natGatewaysDto,
+		})
+
+		upsertVpcsPipeline.Add(upsertVpcKey, vpcs.UpsertVpcDtoV1{
+			Type:    vpc_enums.AwsVpc,
+			Region:  region_enums.Type(region),
+			VpcCidr: cidrBlock,
+		})
+
+		//wait for natGateway availability
+		var wg sync.WaitGroup
+		for _, nId := range natGatewayIdsToWait {
+			wg.Add(1)
+			go func(natGatewayId string) {
+				defer wg.Done()
+				errFromWaiting := waitForNatGatewayAvailability(ec2Client, natGatewayId)
+				if errFromWaiting != nil {
+					err = errFromWaiting
+				}
+			}(nId)
+		}
+		wg.Wait()
+		if err != nil {
+			return parameters, err
 		}
 
 		for _, routeTable := range routeTables {
@@ -900,6 +1130,10 @@ func (c *CreateAwsVPC) Run(parameters map[parameters_enums.Key]interface{}, logg
 					return parameters, err
 				}
 			} else {
+				natGatewayId, ok := natGatewaysAzMap[routeTable.az]
+				if !ok {
+					return parameters, fmt.Errorf("did not find a nat gateway for az: %s", routeTable.az)
+				}
 				//create nat gateway route for private route table
 				err = createRouteIfNeeded(ec2Client, routeTable.routeTableId, "", natGatewayId)
 				if err != nil {
@@ -908,6 +1142,22 @@ func (c *CreateAwsVPC) Run(parameters map[parameters_enums.Key]interface{}, logg
 			}
 		}
 
+		jobs.SetParameterValue(parameters, parameters_enums.VpcID, vpcId)
+		jobs.SetParameterValue(parameters, parameters_enums.VpcCidr, cidrBlock)
+		jobs.SetParameterValue(parameters, parameters_enums.InternetGatewayID, internetGatewayId)
+
+		if len(natGatewaysDto) > 0 {
+			jobs.SetParameterValue[map[string]string](parameters, parameters_enums.NatGateways, vpcs.GetNatGatewaysMapFromDto(natGatewaysDto))
+			jobs.SetParameterValue[map[string]string](parameters, parameters_enums.ElasticIPAllocations, vpcs.GetAllocationsMapFromDto(natGatewaysDto))
+		}
+		if len(subnetsDto) > 0 {
+			jobs.SetParameterValue[map[string]string](parameters, parameters_enums.Subnets, vpcs.GetSubnetsMapFromDto(subnetsDto))
+			jobs.SetParameterValue[primitive.A](parameters, parameters_enums.PrivateSubnets, vpcs.GetPrivateSubnetIdsFromDto(subnetsDto))
+			jobs.SetParameterValue[primitive.A](parameters, parameters_enums.PublicSubnets, vpcs.GetPublicSubnetIdsFromDto(subnetsDto))
+		}
+		if len(routeTablesDto) > 0 {
+			jobs.SetParameterValue(parameters, parameters_enums.RouteTables, vpcs.GetRouteTablesMapFromDto(routeTablesDto))
+		}
 		return parameters, nil
 	}
 

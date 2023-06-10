@@ -3,14 +3,14 @@ package cloudwatch
 import (
 	"context"
 	"errors"
-	"fmt"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs/types"
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
+	"github.com/deployment-io/deployment-runner-kit/enums/region_enums"
 	jobTypes "github.com/deployment-io/deployment-runner-kit/jobs"
-	"log"
+	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
 	"time"
 )
 
@@ -20,34 +20,29 @@ type Logger struct {
 	logStreamName *string
 }
 
-func New(parameters map[parameters_enums.Key]interface{}) (*Logger, error) {
-	organizationID, err := jobTypes.GetParameterValue[string](parameters, parameters_enums.OrganizationID)
-	if err != nil {
-		return nil, err
-	}
+func New(parameters map[string]interface{}) (*Logger, error) {
 
-	deploymentID, err := jobTypes.GetParameterValue[string](parameters, parameters_enums.DeploymentID)
-	if err != nil {
-		return nil, err
-	}
-
-	buildIDString, err := jobTypes.GetParameterValue[string](parameters, parameters_enums.BuildID)
+	region, err := jobTypes.GetParameterValue[int64](parameters, parameters_enums.Region)
 	if err != nil {
 		return nil, err
 	}
 
 	cfg, err := config.LoadDefaultConfig(context.TODO())
 	if err != nil {
-		log.Fatal(err)
+		return nil, err
 	}
-	cloudwatchClient := cloudwatchlogs.NewFromConfig(cfg)
 
-	//log group name will be a combination of organization id and deployment id
-	logGroupName := aws.String(fmt.Sprintf("%s/%s", organizationID, deploymentID))
+	cloudwatchClient := cloudwatchlogs.NewFromConfig(cfg, func(options *cloudwatchlogs.Options) {
+		options.Region = region_enums.Type(region).String()
+	})
+
+	logGroupName, err := commandUtils.GetLogGroupName(parameters)
+	if err != nil {
+		return nil, err
+	}
+
 	createLogGroupInput := &cloudwatchlogs.CreateLogGroupInput{
-		LogGroupName: logGroupName,
-		//KmsKeyId:     nil,
-		//Tags:         nil,
+		LogGroupName: aws.String(logGroupName),
 	}
 	_, err = cloudwatchClient.CreateLogGroup(context.TODO(), createLogGroupInput)
 	if err != nil {
@@ -61,10 +56,13 @@ func New(parameters map[parameters_enums.Key]interface{}) (*Logger, error) {
 		}
 	}
 
-	logStreamName := aws.String(fmt.Sprintf("%s/%s", "build", buildIDString))
+	logStreamName, err := commandUtils.GetBuildLogStreamName(parameters)
+	if err != nil {
+		return nil, err
+	}
 	createLogStreamInput := &cloudwatchlogs.CreateLogStreamInput{
-		LogGroupName:  logGroupName,
-		LogStreamName: logStreamName,
+		LogGroupName:  aws.String(logGroupName),
+		LogStreamName: aws.String(logStreamName),
 	}
 	_, err = cloudwatchClient.CreateLogStream(context.TODO(), createLogStreamInput)
 	if err != nil {
@@ -80,8 +78,8 @@ func New(parameters map[parameters_enums.Key]interface{}) (*Logger, error) {
 
 	return &Logger{
 		client:        cloudwatchClient,
-		logGroupName:  logGroupName,
-		logStreamName: logStreamName,
+		logGroupName:  aws.String(logGroupName),
+		logStreamName: aws.String(logStreamName),
 	}, nil
 }
 
@@ -100,7 +98,6 @@ func (l *Logger) Log(messages []string) error {
 		LogEvents:     logEvents,
 		LogGroupName:  l.logGroupName,
 		LogStreamName: l.logStreamName,
-		//SequenceToken: nil,
 	}
 	_, err := l.client.PutLogEvents(context.TODO(), putLogEventsInput)
 	return err

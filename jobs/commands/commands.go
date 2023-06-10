@@ -6,6 +6,11 @@ import (
 	goPipeline "github.com/ankit-arora/go-utils/go-concurrent-pipeline/go-pipeline"
 	goShutdownHook "github.com/ankit-arora/go-utils/go-shutdown-hook"
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/ec2"
+	"github.com/aws/aws-sdk-go-v2/service/ecr"
+	"github.com/aws/aws-sdk-go-v2/service/ecs"
+	"github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3Types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/deployment-io/deployment-runner-kit/builds"
@@ -14,12 +19,16 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/enums/build_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/commands_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
+	"github.com/deployment-io/deployment-runner-kit/enums/region_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner-kit/vpcs"
 	"github.com/deployment-io/deployment-runner/client"
 	"log"
 	"time"
 )
+
+const updateDeploymentsKey = "updateDeployments"
+const updateBuildsKey = "updateBuilds"
 
 var updateBuildsPipeline *goPipeline.Pipeline[string, builds.UpdateBuildDtoV1]
 var updateDeploymentsPipeline *goPipeline.Pipeline[string, deployments.UpdateDeploymentDtoV1]
@@ -121,14 +130,16 @@ func Get(p commands_enums.Type) (jobs.Command, error) {
 	case commands_enums.DeployAwsWebService:
 		return &DeployAwsWebService{}, nil
 	case commands_enums.CreateAwsVpc:
-		return &CreateAwsVPC{}, nil
+		return &CreateDefaultAwsVPC{}, nil
 	case commands_enums.CreateEcsCluster:
 		return &CreateEcsCluster{}, nil
+	case commands_enums.UploadImageToEcr:
+		return &UploadDockerImageToEcr{}, nil
 	}
 	return nil, fmt.Errorf("error getting command for %s", p)
 }
 
-func markBuildDone(parameters map[parameters_enums.Key]interface{}, err error) {
+func markBuildDone(parameters map[string]interface{}, err error) {
 	status := build_enums.Success
 	errorMessage := ""
 	if err != nil {
@@ -140,7 +151,7 @@ func markBuildDone(parameters map[parameters_enums.Key]interface{}, err error) {
 		//Weird error. Would show up in logs. Return for now.
 		return
 	}
-	updateBuildsPipeline.Add("updateBuilds", builds.UpdateBuildDtoV1{
+	updateBuildsPipeline.Add(updateBuildsKey, builds.UpdateBuildDtoV1{
 		ID:           buildID,
 		BuildTs:      time.Now().Unix(),
 		Status:       status,
@@ -202,4 +213,110 @@ func deleteAllS3Files(s3Client *s3.Client, bucketName string) error {
 	}
 
 	return nil
+}
+
+func getS3Client(parameters map[string]interface{}) (*s3.Client, error) {
+
+	cfg, err := config.LoadDefaultConfig(context.TODO())
+	if err != nil {
+		return nil, err
+	}
+
+	region, err := jobs.GetParameterValue[int64](parameters, parameters_enums.Region)
+	if err != nil {
+		return nil, err
+	}
+
+	s3Client := s3.NewFromConfig(cfg, func(o *s3.Options) {
+		o.Region = region_enums.Type(region).String()
+	})
+
+	return s3Client, nil
+}
+
+func getEC2Client(parameters map[string]interface{}) (*ec2.Client, error) {
+	cfg, err := config.LoadDefaultConfig(context.TODO())
+	if err != nil {
+		return nil, err
+	}
+
+	region, err := jobs.GetParameterValue[int64](parameters, parameters_enums.Region)
+	if err != nil {
+		return nil, err
+	}
+
+	ec2Client := ec2.NewFromConfig(cfg, func(o *ec2.Options) {
+		o.Region = region_enums.Type(region).String()
+	})
+	return ec2Client, nil
+}
+
+func getEcsClient(parameters map[string]interface{}) (*ecs.Client, error) {
+	cfg, err := config.LoadDefaultConfig(context.TODO())
+	if err != nil {
+		return nil, err
+	}
+
+	region, err := jobs.GetParameterValue[int64](parameters, parameters_enums.Region)
+	if err != nil {
+		return nil, err
+	}
+
+	ecsClient := ecs.NewFromConfig(cfg, func(o *ecs.Options) {
+		o.Region = region_enums.Type(region).String()
+	})
+	return ecsClient, nil
+}
+
+func getElbClient(parameters map[string]interface{}) (*elasticloadbalancingv2.Client, error) {
+	cfg, err := config.LoadDefaultConfig(context.TODO())
+	if err != nil {
+		return nil, err
+	}
+
+	region, err := jobs.GetParameterValue[int64](parameters, parameters_enums.Region)
+	if err != nil {
+		return nil, err
+	}
+
+	elbClient := elasticloadbalancingv2.NewFromConfig(cfg, func(options *elasticloadbalancingv2.Options) {
+		options.Region = region_enums.Type(region).String()
+	})
+
+	return elbClient, nil
+}
+
+func getEcrClient(parameters map[string]interface{}) (*ecr.Client, error) {
+	cfg, err := config.LoadDefaultConfig(context.TODO())
+	if err != nil {
+		return nil, err
+	}
+
+	region, err := jobs.GetParameterValue[int64](parameters, parameters_enums.Region)
+	if err != nil {
+		return nil, err
+	}
+
+	ecrClient := ecr.NewFromConfig(cfg, func(options *ecr.Options) {
+		options.Region = region_enums.Type(region).String()
+	})
+
+	return ecrClient, nil
+}
+
+func getDockerImageNameAndTag(parameters map[string]interface{}) (string, error) {
+	//ex. <organizationID>-<deploymentID>:<commit-hash>
+	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationID)
+	if err != nil {
+		return "", err
+	}
+	deploymentID, err := jobs.GetParameterValue[string](parameters, parameters_enums.DeploymentID)
+	if err != nil {
+		return "", err
+	}
+	commitHashFromParams, err := jobs.GetParameterValue[string](parameters, parameters_enums.CommitHash)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%s-%s:%s", organizationID, deploymentID, commitHashFromParams), nil
 }

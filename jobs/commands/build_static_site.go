@@ -3,11 +3,13 @@ package commands
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner/utils/loggers"
 	"os"
 	"os/exec"
+	"strings"
 	"time"
 )
 
@@ -35,24 +37,24 @@ func (b *BuildStaticSite) executeCommand(logBuffer *bytes.Buffer, envVariablesSl
 	return nil
 }
 
-func addFile(filePath, contents string) error {
-	//delete file. ignoring error since file may not exist
-	_ = os.Remove(filePath)
-	file, err := os.Create(filePath)
-	if err != nil {
-		return err
+// decodes envVariables map to key=value slice
+func decodeEnvironmentVariablesToSlice(envVariables string) ([]string, error) {
+	var envVariablesSlice []string
+	variableEntries := strings.Split(envVariables, "\n")
+	for _, entry := range variableEntries {
+		if len(entry) == 0 {
+			continue
+		}
+		keyValue := strings.Split(entry, "=")
+		if len(keyValue) != 2 {
+			return nil, fmt.Errorf("env variables not in correct format")
+		}
+		envVariablesSlice = append(envVariablesSlice, fmt.Sprintf("%s=%s", keyValue[0], keyValue[1]))
 	}
-	defer func() {
-		_ = file.Close()
-	}()
-	_, err = file.WriteString(contents)
-	if err != nil {
-		return err
-	}
-	return nil
+	return envVariablesSlice, nil
 }
 
-func (b *BuildStaticSite) Run(parameters map[parameters_enums.Key]interface{}, logger jobs.Logger) (newParameters map[parameters_enums.Key]interface{}, err error) {
+func (b *BuildStaticSite) Run(parameters map[string]interface{}, logger jobs.Logger) (newParameters map[string]interface{}, err error) {
 	logBuffer := new(bytes.Buffer)
 	defer func() {
 		//ignore
@@ -65,24 +67,6 @@ func (b *BuildStaticSite) Run(parameters map[parameters_enums.Key]interface{}, l
 	repoDirectoryPath, err := jobs.GetParameterValue[string](parameters, parameters_enums.RepoDirectoryPath)
 	if err != nil {
 		return parameters, err
-	}
-
-	//root directory added to repo directory
-	rootDirectoryPath, err := jobs.GetParameterValue[string](parameters, parameters_enums.RootDirectory)
-	if err == nil {
-		repoDirectoryPath += rootDirectoryPath
-	}
-
-	environmentFiles, err := jobs.GetParameterValue[map[string]string](parameters, parameters_enums.EnvironmentFiles)
-	if err == nil {
-		//create and add the environment files in repoDirectoryPath
-		for name, contents := range environmentFiles {
-			filePath := repoDirectoryPath + "/" + name
-			err = addFile(filePath, contents)
-			if err != nil {
-				return parameters, err
-			}
-		}
 	}
 
 	buildCommand, err := jobs.GetParameterValue[string](parameters, parameters_enums.BuildCommand)
@@ -113,15 +97,16 @@ func (b *BuildStaticSite) Run(parameters map[parameters_enums.Key]interface{}, l
 	envVariables, err := jobs.GetParameterValue[string](parameters, parameters_enums.EnvironmentVariables)
 	var envVariablesSlice []string
 	if err == nil {
-		envVariablesSlice = jobs.DecodeEnvironmentVariablesToSlice(envVariables)
+		envVariablesSlice, err = decodeEnvironmentVariablesToSlice(envVariables)
+		if err != nil {
+			return parameters, err
+		}
 	}
 
 	//install node version, npm install, and build
 	if err = b.executeCommand(logBuffer, envVariablesSlice, []string{"bash", "-c", "source $HOME/.nvm/nvm.sh ; nvm install " + nodeVersion + " ; npm install ; " + buildCommand}, repoDirectoryPath); err != nil {
 		return parameters, err
 	}
-
-	parameters[parameters_enums.RepoDirectoryPath] = repoDirectoryPath
 
 	return parameters, nil
 }

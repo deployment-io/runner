@@ -10,20 +10,17 @@ import (
 	"github.com/deployment-io/deployment-runner/utils/loggers/cloudwatch"
 )
 
-func Get(parameters map[parameters_enums.Key]interface{}) (jobs.Logger, error) {
-	loggerType, ok := parameters[parameters_enums.LoggerType]
-	if !ok {
-		return nil, fmt.Errorf("logger type is missing in parameters")
+func Get(parameters map[string]interface{}) (jobs.Logger, error) {
+	loggerType, err := jobs.GetParameterValue[int64](parameters, parameters_enums.LoggerType)
+	if err != nil {
+		return nil, err
 	}
-	if lt, ok := loggerType.(int64); ok {
-		switch uint(lt) {
-		case uint(loggers_enums.Cloudwatch):
-			return cloudwatch.New(parameters)
-		}
-		return nil, fmt.Errorf("invalid logger type")
-	} else {
-		return nil, fmt.Errorf("invalid logger type")
+
+	switch uint(loggerType) {
+	case uint(loggers_enums.Cloudwatch):
+		return cloudwatch.New(parameters)
 	}
+	return nil, fmt.Errorf("invalid logger type")
 }
 
 func LogBuffer(logBuffer *bytes.Buffer, logger jobs.Logger) error {

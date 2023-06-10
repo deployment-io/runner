@@ -84,7 +84,7 @@ func createOriginAccessControl(name string, cloudFrontClient *cloudfront.Client)
 	return originAccessControlId, nil
 }
 
-func getBucketName(parameters map[parameters_enums.Key]interface{}) (string, error) {
+func getBucketName(parameters map[string]interface{}) (string, error) {
 	//bucket name = <organizationID>-<deploymentID>
 	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationID)
 	if err != nil {
@@ -97,7 +97,7 @@ func getBucketName(parameters map[parameters_enums.Key]interface{}) (string, err
 	return fmt.Sprintf("%s-%s", organizationID, deploymentID), nil
 }
 
-func getDistDirectory(parameters map[parameters_enums.Key]interface{}) (string, error) {
+func getDistDirectory(parameters map[string]interface{}) (string, error) {
 	repoDirectory, err := jobs.GetParameterValue[string](parameters, parameters_enums.RepoDirectoryPath)
 	if err != nil {
 		return "", err
@@ -163,7 +163,7 @@ func createS3BucketIfNeeded(s3Client *s3.Client, s3Bucket, s3Region string) (*st
 	return bucketLocation, true, nil
 }
 
-func getCommentForCloudfront(parameters map[parameters_enums.Key]interface{}) (string, error) {
+func getCommentForCloudfront(parameters map[string]interface{}) (string, error) {
 	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationID)
 	if err != nil {
 		return "", err
@@ -175,7 +175,7 @@ func getCommentForCloudfront(parameters map[parameters_enums.Key]interface{}) (s
 	return fmt.Sprintf("Creating cloudfront distribution for %s-%s", organizationID, deploymentID), nil
 }
 
-func getCallerReference(parameters map[parameters_enums.Key]interface{}) (string, error) {
+func getCallerReference(parameters map[string]interface{}) (string, error) {
 	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationID)
 	if err != nil {
 		return "", err
@@ -187,7 +187,7 @@ func getCallerReference(parameters map[parameters_enums.Key]interface{}) (string
 	return fmt.Sprintf("%s-%s-%d", organizationID, deploymentID, time.Now().Unix()), nil
 }
 
-func getCachePolicyName(parameters map[parameters_enums.Key]interface{}) (string, error) {
+func getCachePolicyName(parameters map[string]interface{}) (string, error) {
 	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationID)
 	if err != nil {
 		return "", err
@@ -199,7 +199,7 @@ func getCachePolicyName(parameters map[parameters_enums.Key]interface{}) (string
 	return fmt.Sprintf("%s-%s", organizationID, deploymentID), nil
 }
 
-func getOriginAccessName(parameters map[parameters_enums.Key]interface{}) (string, error) {
+func getOriginAccessName(parameters map[string]interface{}) (string, error) {
 	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationID)
 	if err != nil {
 		return "", err
@@ -285,7 +285,7 @@ type bucketPolicyDto struct {
 	Statement []bucketPolicyStatement `json:"Statement"`
 }
 
-func getBucketPolicySid(parameters map[parameters_enums.Key]interface{}) (string, error) {
+func getBucketPolicySid(parameters map[string]interface{}) (string, error) {
 	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationID)
 	if err != nil {
 		return "", err
@@ -297,7 +297,7 @@ func getBucketPolicySid(parameters map[parameters_enums.Key]interface{}) (string
 	return fmt.Sprintf("AllowCloudFrontServicePrincipal-%s-%s", organizationID, deploymentID), nil
 }
 
-func getBucketPolicyId(parameters map[parameters_enums.Key]interface{}) (string, error) {
+func getBucketPolicyId(parameters map[string]interface{}) (string, error) {
 	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationID)
 	if err != nil {
 		return "", err
@@ -359,7 +359,7 @@ func attachPolicyToS3Bucket(distributionArn *string, s3BucketName, policySid, po
 	return nil
 }
 
-func (d *DeployAwsStaticSite) Run(parameters map[parameters_enums.Key]interface{}, logger jobs.Logger) (newParameters map[parameters_enums.Key]interface{}, err error) {
+func (d *DeployAwsStaticSite) Run(parameters map[string]interface{}, logger jobs.Logger) (newParameters map[string]interface{}, err error) {
 	logBuffer := new(bytes.Buffer)
 	defer func() {
 		_ = loggers.LogBuffer(logBuffer, logger)
@@ -368,7 +368,7 @@ func (d *DeployAwsStaticSite) Run(parameters map[parameters_enums.Key]interface{
 		}
 	}()
 	cloudfrontRegion := "us-east-1"
-	region, err := jobs.GetParameterValue[region_enums.Type](parameters, parameters_enums.Region)
+	region, err := jobs.GetParameterValue[int64](parameters, parameters_enums.Region)
 	if err != nil {
 		return parameters, err
 	}
@@ -382,17 +382,12 @@ func (d *DeployAwsStaticSite) Run(parameters map[parameters_enums.Key]interface{
 		return parameters, err
 	}
 
-	cfg, err := config.LoadDefaultConfig(context.TODO())
+	s3Client, err := getS3Client(parameters)
 	if err != nil {
 		return parameters, err
 	}
 
-	// Create an Amazon S3 service client
-	s3Client := s3.NewFromConfig(cfg, func(o *s3.Options) {
-		o.Region = region.String()
-	})
-
-	bucketLocation, isNewBucketCreated, err := createS3BucketIfNeeded(s3Client, bucketName, region.String())
+	bucketLocation, isNewBucketCreated, err := createS3BucketIfNeeded(s3Client, bucketName, region_enums.Type(region).String())
 	if err != nil {
 		return parameters, err
 	}
@@ -440,9 +435,14 @@ func (d *DeployAwsStaticSite) Run(parameters map[parameters_enums.Key]interface{
 		return parameters, err
 	}
 
-	err = uploadToS3(distDirectory, region.String(), bucketName, s3Client)
+	err = uploadToS3(distDirectory, region_enums.Type(region).String(), bucketName, s3Client)
 	if err != nil {
 		return parameters, err
+	}
+
+	cfg, err := config.LoadDefaultConfig(context.TODO())
+	if err != nil {
+		return nil, err
 	}
 
 	// Create an Amazon Cloudfront service client
@@ -480,7 +480,7 @@ func (d *DeployAwsStaticSite) Run(parameters map[parameters_enums.Key]interface{
 		defaultCacheBehavior := createDefaultCacheBehavior(bucketLocation, cachePolicyId)
 
 		// Create distribution config
-		domainName := bucketName + ".s3." + region.String() + ".amazonaws.com"
+		domainName := bucketName + ".s3." + region_enums.Type(region).String() + ".amazonaws.com"
 		var callerReference string
 		callerReference, err = getCallerReference(parameters)
 		if !ignoreErrorsTillCF && err != nil {
@@ -538,7 +538,8 @@ func (d *DeployAwsStaticSite) Run(parameters map[parameters_enums.Key]interface{
 		if err != nil {
 			return parameters, err
 		}
-		updateDeploymentsPipeline.Add("updateDeployments", deployments.UpdateDeploymentDtoV1{
+
+		updateDeploymentsPipeline.Add(updateDeploymentsKey, deployments.UpdateDeploymentDtoV1{
 			ID:                               deploymentID,
 			CloudfrontDistributionID:         aws.ToString(createDistributionOutput.Distribution.Id),
 			CloudfrontDistributionArn:        aws.ToString(createDistributionOutput.Distribution.ARN),

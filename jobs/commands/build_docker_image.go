@@ -9,13 +9,12 @@ import (
 	"fmt"
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
+	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
 	"github.com/deployment-io/deployment-runner/utils/loggers"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/pkg/archive"
-	"go.mongodb.org/mongo-driver/bson/primitive"
 	"io"
-	"strings"
 	"time"
 )
 
@@ -31,17 +30,21 @@ type ErrorDetail struct {
 	Message string `json:"message"`
 }
 
-func printBody(rd io.Reader) error {
+func printBodyToLog(rd io.Reader) error {
 	var lastLine string
 
 	scanner := bufio.NewScanner(rd)
 	for scanner.Scan() {
+		//TODO handle logging
 		lastLine = scanner.Text()
 		fmt.Println(scanner.Text())
 	}
 
 	errLine := &ErrorLine{}
-	json.Unmarshal([]byte(lastLine), errLine)
+	err := json.Unmarshal([]byte(lastLine), errLine)
+	if err != nil {
+		return err
+	}
 	if errLine.Error != "" {
 		return errors.New(errLine.Error)
 	}
@@ -53,39 +56,7 @@ func printBody(rd io.Reader) error {
 	return nil
 }
 
-func convertPrimitiveAToStringSlice(a primitive.A) ([]string, error) {
-	var out []string
-	for _, s := range a {
-		sVal, ok := s.(string)
-		if !ok {
-			return nil, fmt.Errorf("error convering primitive A to string slice")
-		}
-		out = append(out, sVal)
-	}
-	return out, nil
-}
-
-func getDockerBuildArgs(parameters map[parameters_enums.Key]interface{}) (map[string]*string, error) {
-	dockerBuildArgs, err := jobs.GetParameterValue[primitive.A](parameters, parameters_enums.DockerBuildArgs)
-	if err != nil || len(dockerBuildArgs) == 0 {
-		//no docker build args
-		return nil, nil
-	}
-	var dockerBuildArgsMap = make(map[string]*string)
-	dockerBuildArgsStrings, err := convertPrimitiveAToStringSlice(dockerBuildArgs)
-	if err != nil {
-		return nil, fmt.Errorf("error getting doecker build args: %s", err)
-	}
-	for _, dockerBuildArg := range dockerBuildArgsStrings {
-		entry := strings.Split(dockerBuildArg, "=")
-		if len(entry) == 2 {
-			dockerBuildArgsMap[entry[0]] = &entry[1]
-		}
-	}
-	return dockerBuildArgsMap, nil
-}
-
-func imageBuild(parameters map[parameters_enums.Key]interface{}, dockerClient *client.Client, repoDir, dockerImageNameAndTag, dockerFile string) error {
+func imageBuild(parameters map[string]interface{}, dockerClient *client.Client, repoDir, dockerImageNameAndTag, dockerFile string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*500)
 	defer cancel()
 	tar, err := archive.TarWithOptions(repoDir, &archive.TarOptions{
@@ -95,7 +66,7 @@ func imageBuild(parameters map[parameters_enums.Key]interface{}, dockerClient *c
 		return err
 	}
 
-	buildArgs, err := getDockerBuildArgs(parameters)
+	buildArgs, err := commandUtils.GetDockerBuildArgs(parameters)
 	if err != nil {
 		return err
 	}
@@ -113,7 +84,7 @@ func imageBuild(parameters map[parameters_enums.Key]interface{}, dockerClient *c
 
 	defer res.Body.Close()
 
-	err = printBody(res.Body)
+	err = printBodyToLog(res.Body)
 	if err != nil {
 		return err
 	}
@@ -121,20 +92,7 @@ func imageBuild(parameters map[parameters_enums.Key]interface{}, dockerClient *c
 	return nil
 }
 
-func getDockerImageNameAndTag(parameters map[parameters_enums.Key]interface{}) (string, error) {
-	//ex. <repo-name>:<commit-hash>
-	repoName, err := jobs.GetParameterValue[string](parameters, parameters_enums.RepoName)
-	if err != nil {
-		return "", err
-	}
-	commitHashFromParams, err := jobs.GetParameterValue[string](parameters, parameters_enums.CommitHash)
-	if err != nil {
-		return "", err
-	}
-	return fmt.Sprintf("%s:%s", repoName, commitHashFromParams), nil
-}
-
-func (b *BuildDockerImage) Run(parameters map[parameters_enums.Key]interface{}, logger jobs.Logger) (newParameters map[parameters_enums.Key]interface{}, err error) {
+func (b *BuildDockerImage) Run(parameters map[string]interface{}, logger jobs.Logger) (newParameters map[string]interface{}, err error) {
 	logBuffer := new(bytes.Buffer)
 	defer func() {
 		_ = loggers.LogBuffer(logBuffer, logger)
@@ -150,12 +108,6 @@ func (b *BuildDockerImage) Run(parameters map[parameters_enums.Key]interface{}, 
 	repoDirectoryPath, err := jobs.GetParameterValue[string](parameters, parameters_enums.RepoDirectoryPath)
 	if err != nil {
 		return parameters, err
-	}
-
-	//root directory added to repo directory
-	rootDirectoryPath, err := jobs.GetParameterValue[string](parameters, parameters_enums.RootDirectory)
-	if err == nil {
-		repoDirectoryPath += rootDirectoryPath
 	}
 
 	//TODO support for only Dockerfile for now

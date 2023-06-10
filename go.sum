@@ -42,8 +42,12 @@ github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs v1.20.8 h1:7HUT2jmbAu47Lct6C
 github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs v1.20.8/go.mod h1:CpWhQvomfSbbrfUhq9sq/w2x4wbkQOAqGJbcPS2AINA=
 github.com/aws/aws-sdk-go-v2/service/ec2 v1.98.0 h1:WblDV33AG9dhv0zFEPEmGtD5UECSNpKMxtdENULfR8M=
 github.com/aws/aws-sdk-go-v2/service/ec2 v1.98.0/go.mod h1:L3ZT0N/vBsw77mOAawXmRnREpEjcHd2v5Hzf7AkIH8M=
+github.com/aws/aws-sdk-go-v2/service/ecr v1.18.11 h1:wlTgmb/sCmVRJrN5De3CiHj4v/bTCgL5+qpdEd0CPtw=
+github.com/aws/aws-sdk-go-v2/service/ecr v1.18.11/go.mod h1:Ce1q2jlNm8BVpjLaOnwnm5v2RClAbK6txwPljFzyW6c=
 github.com/aws/aws-sdk-go-v2/service/ecs v1.27.1 h1:54QSuWR3Pot7HqBRXd+c1yF97h2bqzDBID8qFSAkTlE=
 github.com/aws/aws-sdk-go-v2/service/ecs v1.27.1/go.mod h1:SB6YszwN1iKvyt/Qk+ICeKsfBxjd0CTEwwkmej9qoa0=
+github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2 v1.19.11 h1:IN2XMTLmhIEL5e3o+tY9JsLFSAxmjgM8gI7W2+CPrpw=
+github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2 v1.19.11/go.mod h1:oPHYtcocUcfHOE7qygtvyZMw82nedCKZSop/R9jxlAM=
 github.com/aws/aws-sdk-go-v2/service/internal/accept-encoding v1.9.11 h1:y2+VQzC6Zh2ojtV2LoC0MNwHWc6qXv/j2vrQtlftkdA=
 github.com/aws/aws-sdk-go-v2/service/internal/accept-encoding v1.9.11/go.mod h1:iV4q2hsqtNECrfmlXyord9u4zyuFEJX9eLgLpSPzWA8=
 github.com/aws/aws-sdk-go-v2/service/internal/checksum v1.1.28 h1:vGWm5vTpMr39tEZfQeDiDAMgk+5qsnvRny3FjLpnH5w=
@@ -71,8 +75,10 @@ github.com/cyphar/filepath-securejoin v0.2.3 h1:YX6ebbZCZP7VkM3scTTokDgBL2TY741X
 github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
-github.com/deployment-io/deployment-runner-kit v0.0.0-20230530133044-63994c532172 h1:rw2ASzrLJ8v2Ogq6WjO44t5t4iDNhFblQ68QUi2uAe0=
-github.com/deployment-io/deployment-runner-kit v0.0.0-20230530133044-63994c532172/go.mod h1:nsTLE2CI2RPxB3DT/waLEFJpU9eXTWNxljN4ynLW49A=
+github.com/deployment-io/deployment-runner-kit v0.0.0-20230606095931-457464f8fe25 h1:b1XxqCYpymhLnTPkuKOrTtkWKkoKu5VJznzxfV3zWH8=
+github.com/deployment-io/deployment-runner-kit v0.0.0-20230606095931-457464f8fe25/go.mod h1:nsTLE2CI2RPxB3DT/waLEFJpU9eXTWNxljN4ynLW49A=
+github.com/deployment-io/deployment-runner-kit v0.0.0-20230610070927-48f03dc46bb5 h1:jBX4Ae3+ryNRTr7YMgjJtkh1ZJwfOLiUuh/VA+D9LA0=
+github.com/deployment-io/deployment-runner-kit v0.0.0-20230610070927-48f03dc46bb5/go.mod h1:nsTLE2CI2RPxB3DT/waLEFJpU9eXTWNxljN4ynLW49A=
 github.com/docker/distribution v2.8.2+incompatible h1:T3de5rq0dB1j30rp0sA2rER+m322EBzniBPB6ZIzuh8=
 github.com/docker/distribution v2.8.2+incompatible/go.mod h1:J2gT2udsDAN96Uj4KfcMRqY0/ypR+oyYUYmja8H+y+w=
 github.com/docker/docker v24.0.1+incompatible h1:NxN81beIxDlUaVt46iUQrYHD9/W3u9EGl52r86O/IGw=
