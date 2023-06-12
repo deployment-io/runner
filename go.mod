@@ -16,7 +16,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2 v1.19.11
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.33.1
 	github.com/aws/smithy-go v1.13.5
-	github.com/deployment-io/deployment-runner-kit v0.0.0-20230610070927-48f03dc46bb5
+	github.com/deployment-io/deployment-runner-kit v0.0.0-20230612085121-aea6fdf6cc81
 	github.com/docker/docker v24.0.1+incompatible
 	go.mongodb.org/mongo-driver v1.11.6
 	gopkg.in/src-d/go-git.v4 v4.13.1

@@ -7,6 +7,8 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/enums/build_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
+	"github.com/deployment-io/deployment-runner-kit/oauth"
+	"github.com/deployment-io/deployment-runner/client"
 	"github.com/deployment-io/deployment-runner/utils/loggers"
 	"gopkg.in/src-d/go-git.v4"
 	"gopkg.in/src-d/go-git.v4/plumbing"
@@ -14,6 +16,7 @@ import (
 	"gopkg.in/src-d/go-git.v4/plumbing/transport/http"
 	"os"
 	"strings"
+	"time"
 )
 
 type CheckoutRepository struct {
@@ -63,6 +66,73 @@ func addFile(filePath, contents string) error {
 	return nil
 }
 
+func isErrorAuthenticationRequired(err error) bool {
+	if err.Error() == "authentication required" {
+		return true
+	}
+	return false
+}
+
+func cloneRepository(repoDirectoryPath, repoCloneUrlWithToken, repoProviderToken string, logBuffer *bytes.Buffer) (*git.Repository, error) {
+	var repository *git.Repository
+	repository, err := git.PlainClone(repoDirectoryPath, false, &git.CloneOptions{
+		URL:      repoCloneUrlWithToken,
+		Progress: logBuffer,
+		Auth: &http.BasicAuth{
+			Username: "oauth2",
+			Password: repoProviderToken,
+		},
+	})
+
+	if err != nil {
+		if err == git.ErrRepositoryAlreadyExists {
+			repository, err = git.PlainOpen(repoDirectoryPath)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			return nil, err
+		}
+	}
+	return repository, nil
+}
+
+func fetchRepository(repository *git.Repository, repoProviderToken string, logBuffer *bytes.Buffer) error {
+	err := repository.Fetch(&git.FetchOptions{
+		Auth: &http.BasicAuth{
+			Username: "oauth2",
+			Password: repoProviderToken,
+		},
+		RemoteName: "origin",
+		Progress:   logBuffer,
+		Force:      true,
+	})
+
+	if err != nil && err != git.NoErrAlreadyUpToDate {
+		return err
+	}
+	return nil
+}
+
+func refreshGitToken(parameters map[string]interface{}) (string, error) {
+	installationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.InstallationId)
+	if err != nil {
+		return "", err
+	}
+	token, err := client.Get().RefreshGitToken(installationID)
+	if err == nil {
+		return token, nil
+	}
+	for err == oauth.ErrRefreshInProcess {
+		time.Sleep(10 * time.Second)
+		token, err = client.Get().RefreshGitToken(installationID)
+		if err == nil {
+			return token, nil
+		}
+	}
+	return "", err
+}
+
 func (cr *CheckoutRepository) Run(parameters map[string]interface{}, logger jobs.Logger) (newParameters map[string]interface{}, err error) {
 	logBuffer := new(bytes.Buffer)
 	defer func() {
@@ -97,47 +167,46 @@ func (cr *CheckoutRepository) Run(parameters map[string]interface{}, logger jobs
 			return parameters, err
 		}
 		var repository *git.Repository
-		repository, err = git.PlainClone(repoDirectoryPath, false, &git.CloneOptions{
-			URL:      repoCloneUrlWithToken,
-			Progress: logBuffer,
-			Auth: &http.BasicAuth{
-				Username: "oauth2",
-				Password: repoProviderToken,
-			},
-		})
-
+		repository, err = cloneRepository(repoDirectoryPath, repoCloneUrlWithToken, repoProviderToken, logBuffer)
 		if err != nil {
-			if err == git.ErrRepositoryAlreadyExists {
-				repository, err = git.PlainOpen(repoDirectoryPath)
+			if isErrorAuthenticationRequired(err) {
+				repoProviderToken, err = refreshGitToken(parameters)
 				if err != nil {
-					return parameters, nil
+					return parameters, err
 				}
+				repoCloneUrlWithToken = "https://oauth2:" + repoProviderToken + "@" + after
+				repository, err = cloneRepository(repoDirectoryPath, repoCloneUrlWithToken, repoProviderToken, logBuffer)
+				if err != nil {
+					return parameters, err
+				}
+				jobs.SetParameterValue(parameters, parameters_enums.RepoProviderToken, repoProviderToken)
 			} else {
 				return parameters, err
 			}
 		}
+
 		var worktree *git.Worktree
 		worktree, err = repository.Worktree()
 		if err != nil {
 			return parameters, err
 		}
 
-		err = repository.Fetch(&git.FetchOptions{
-			Auth: &http.BasicAuth{
-				Username: "oauth2",
-				Password: repoProviderToken,
-			},
-			RemoteName: "origin",
-			Progress:   logBuffer,
-			Force:      true,
-		})
-
-		//TODO check for oauth error and get new token from server
-
-		if err != nil && err != git.NoErrAlreadyUpToDate {
-			return parameters, err
+		err = fetchRepository(repository, repoProviderToken, logBuffer)
+		if err != nil {
+			if isErrorAuthenticationRequired(err) {
+				repoProviderToken, err = refreshGitToken(parameters)
+				if err != nil {
+					return parameters, err
+				}
+				err = fetchRepository(repository, repoProviderToken, logBuffer)
+				if err != nil {
+					return parameters, err
+				}
+				jobs.SetParameterValue(parameters, parameters_enums.RepoProviderToken, repoProviderToken)
+			} else {
+				return parameters, err
+			}
 		}
-
 		var buildID string
 		buildID, err = jobs.GetParameterValue[string](parameters, parameters_enums.BuildID)
 		if err != nil {
