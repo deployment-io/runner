@@ -151,11 +151,23 @@ func markBuildDone(parameters map[string]interface{}, err error) {
 		//Weird error. Would show up in logs. Return for now.
 		return
 	}
+	nowEpoch := time.Now().Unix()
 	updateBuildsPipeline.Add(updateBuildsKey, builds.UpdateBuildDtoV1{
 		ID:           buildID,
-		BuildTs:      time.Now().Unix(),
+		BuildTs:      nowEpoch,
 		Status:       status,
 		ErrorMessage: errorMessage,
+	})
+	deploymentID, e := jobs.GetParameterValue[string](parameters, parameters_enums.DeploymentID)
+	if e != nil {
+		//Weird error. Would show up in logs. Return for now.
+		return
+	}
+	updateDeploymentsPipeline.Add(updateDeploymentsKey, deployments.UpdateDeploymentDtoV1{
+		ID:               deploymentID,
+		LastDeploymentTs: nowEpoch,
+		Status:           status,
+		ErrorMessage:     errorMessage,
 	})
 }
 
