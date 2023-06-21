@@ -6,7 +6,10 @@ import (
 )
 
 func (r *RunnerClient) Ping() error {
-	args := ping.ArgsV1{Send: "ping"}
+	args := ping.ArgsV1{}
+	args.Send = "ping"
+	args.OrganizationID = r.organizationID
+	args.Token = r.token
 	var reply ping.ReplyV1
 	err := r.c.Call("Ping.SendV1", args, &reply)
 	if err != nil {

@@ -1,0 +1,42 @@
+FROM golang:1.20.0-buster
+MAINTAINER Ankit Arora <ankit.j.arora@gmail.com>
+
+ARG branch
+
+RUN apt update
+RUN apt install git -y
+
+RUN apt-get update && apt-get install -y \
+       apt-transport-https \
+       ca-certificates \
+       curl \
+       gnupg2 \
+       software-properties-common
+RUN curl -fsSL https://download.docker.com/linux/debian/gpg | apt-key add -
+RUN apt-key fingerprint 0EBFCD88
+RUN add-apt-repository \
+       "deb [arch=arm64] https://download.docker.com/linux/debian \
+       $(lsb_release -cs) \
+       stable"
+
+RUN apt-get update && apt-get install -y docker-ce-cli
+RUN groupadd --gid 1950 docker
+
+# Change TimeZone
+RUN apt install tzdata -y
+ENV TZ=Asia/Kolkata
+
+RUN GOCACHE=OFF
+
+COPY . /go/src/github.com/deployment-io/deployment-runner
+WORKDIR /go/src/github.com/deployment-io/deployment-runner
+
+RUN go get github.com/deployment-io/deployment-runner-kit@$branch; exit 0
+
+#ldflags will be added later
+RUN go mod tidy && go install github.com/deployment-io/deployment-runner
+
+WORKDIR /
+RUN rm -rf /go/src
+
+CMD exec deployment-runner
