@@ -11,6 +11,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ecr"
 	"github.com/aws/aws-sdk-go-v2/service/ecs"
 	"github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2"
+	"github.com/aws/aws-sdk-go-v2/service/iam"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3Types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/deployment-io/deployment-runner-kit/builds"
@@ -314,6 +315,24 @@ func getEcrClient(parameters map[string]interface{}) (*ecr.Client, error) {
 	})
 
 	return ecrClient, nil
+}
+
+func getIamClient(parameters map[string]interface{}) (*iam.Client, error) {
+	cfg, err := config.LoadDefaultConfig(context.TODO())
+	if err != nil {
+		return nil, err
+	}
+
+	region, err := jobs.GetParameterValue[int64](parameters, parameters_enums.Region)
+	if err != nil {
+		return nil, err
+	}
+
+	iamClient := iam.NewFromConfig(cfg, func(options *iam.Options) {
+		options.Region = region_enums.Type(region).String()
+	})
+
+	return iamClient, nil
 }
 
 func getDockerImageNameAndTag(parameters map[string]interface{}) (string, error) {

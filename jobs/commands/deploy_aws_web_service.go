@@ -644,7 +644,7 @@ func registerTaskDefinition(parameters map[string]interface{}, ecsClient *ecs.Cl
 		return "", err
 	}
 
-	ecsTaskExecutionRoleArn, err := jobs.GetParameterValue[string](parameters, parameters_enums.EcsTaskExecutionRole)
+	ecsTaskExecutionRoleArn, err := jobs.GetParameterValue[string](parameters, parameters_enums.EcsTaskExecutionRoleArn)
 	if err != nil {
 		return "", err
 	}

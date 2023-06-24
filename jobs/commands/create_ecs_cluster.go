@@ -7,6 +7,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ecs"
 	ecsTypes "github.com/aws/aws-sdk-go-v2/service/ecs/types"
+	"github.com/aws/aws-sdk-go-v2/service/iam"
 	"github.com/deployment-io/deployment-runner-kit/clusters"
 	"github.com/deployment-io/deployment-runner-kit/enums/cluster_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
@@ -85,6 +86,49 @@ func createEcsClusterIfNeeded(ecsClient *ecs.Client, parameters map[string]inter
 	return ecsClusterArn, nil
 }
 
+func getDefaultTaskExecutionRoleName(parameters map[string]interface{}) (string, error) {
+	//ecsTaskExecutionRole-<organizationID>
+	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationID)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("ecsTaskExecutionRole-%s", organizationID), nil
+}
+
+func getEcsTaskExecutionRoleIfNeeded(iamClient *iam.Client, parameters map[string]interface{}) (ecsTaskExecutionRoleArn string, err error) {
+	ecsTaskExecutionRoleArn, err = jobs.GetParameterValue[string](parameters, parameters_enums.EcsTaskExecutionRoleArn)
+	if err == nil && len(ecsTaskExecutionRoleArn) > 0 {
+		return
+	}
+	taskExecutionRoleName, err := getDefaultTaskExecutionRoleName(parameters)
+	if err != nil {
+		return "", err
+	}
+
+	getRoleOutput, err := iamClient.GetRole(context.TODO(), &iam.GetRoleInput{RoleName: aws.String(taskExecutionRoleName)})
+	if err != nil {
+		return "", err
+	}
+
+	if getRoleOutput != nil && getRoleOutput.Role != nil && getRoleOutput.Role.Arn != nil && len(aws.ToString(getRoleOutput.Role.Arn)) > 0 {
+		ecsTaskExecutionRoleArn = aws.ToString(getRoleOutput.Role.Arn)
+		var region int64
+		region, err = jobs.GetParameterValue[int64](parameters, parameters_enums.Region)
+		if err != nil {
+			return "", err
+		}
+		upsertClustersPipeline.Add(upsertClusterKey, clusters.UpsertClusterDtoV1{
+			Type:                    cluster_enums.ECS,
+			Region:                  region_enums.Type(region),
+			EcsTaskExecutionRoleArn: ecsTaskExecutionRoleArn,
+		})
+		return
+	}
+
+	return "", fmt.Errorf("ecs task execution role not found")
+
+}
+
 func (c *CreateEcsCluster) Run(parameters map[string]interface{}, logger jobs.Logger) (newParameters map[string]interface{}, err error) {
 	logBuffer := new(bytes.Buffer)
 	defer func() {
@@ -103,7 +147,18 @@ func (c *CreateEcsCluster) Run(parameters map[string]interface{}, logger jobs.Lo
 		return parameters, err
 	}
 
+	iamClient, err := getIamClient(parameters)
+	if err != nil {
+		return parameters, err
+	}
+
+	ecsTaskExecutionRoleArn, err := getEcsTaskExecutionRoleIfNeeded(iamClient, parameters)
+	if err != nil {
+		return parameters, err
+	}
+
 	jobs.SetParameterValue(parameters, parameters_enums.EcsClusterArn, clusterArn)
+	jobs.SetParameterValue(parameters, parameters_enums.EcsTaskExecutionRoleArn, ecsTaskExecutionRoleArn)
 
 	return parameters, nil
 }

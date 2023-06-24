@@ -8,6 +8,7 @@ import (
 	"github.com/deployment-io/deployment-runner/client"
 	"github.com/deployment-io/deployment-runner/jobs/commands"
 	"github.com/deployment-io/deployment-runner/utils/loggers"
+	"github.com/joho/godotenv"
 	"os"
 	"sync"
 	"time"
@@ -104,17 +105,19 @@ func sendJobResults(resultsStream <-chan jobs.CompletingJobDtoV1,
 
 func getEnvironment() (service, organizationId, token string) {
 	//TODO load .env
-
-	//var service = "nlb-deployment-load-balancer-8240e82289b3f92e.elb.eu-west-1.amazonaws.com:443"
+	//ignoring err
+	_ = godotenv.Load()
 	organizationId = os.Getenv("OrganizationID")
 	service = os.Getenv("Service")
 	token = os.Getenv("Token")
 	return
 }
 
+var clientCertPem, clientKeyPem string
+
 func main() {
 	service, organizationId, token := getEnvironment()
-	client.Connect(service, organizationId, token, false)
+	client.Connect(service, organizationId, token, clientCertPem, clientKeyPem, false)
 	c := client.Get()
 	commands.Init()
 	shutdownSignal := make(chan struct{})
