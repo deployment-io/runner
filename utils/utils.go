@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
+	"io"
 	"strings"
 )
 
@@ -30,7 +31,7 @@ func ScanCRLF(data []byte, atEOF bool) (advance int, token []byte, err error) {
 	return 0, nil, nil
 }
 
-func GetLinesFromBuffer(logBuffer *bytes.Buffer) ([]string, error) {
+func GetLinesFromBuffer(logBuffer io.Reader) ([]string, error) {
 	var messages []string
 	scanner := bufio.NewScanner(logBuffer)
 	scanner.Split(ScanCRLF)

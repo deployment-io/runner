@@ -1,7 +1,6 @@
 package commands
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -20,6 +19,7 @@ import (
 	"github.com/deployment-io/deployment-runner/client"
 	"github.com/deployment-io/deployment-runner/utils/loggers"
 	awsS3Uploads "github.com/deployment-io/deployment-runner/utils/uploads/aws-s3"
+	"io"
 	"log"
 	"time"
 )
@@ -109,12 +109,12 @@ func getDistDirectory(parameters map[string]interface{}) (string, error) {
 	return fmt.Sprintf("%s/%s", repoDirectory, publishDirectory), nil
 }
 
-func uploadToS3(directory, s3Region, s3Bucket string, s3Client *s3.Client) error {
+func uploadToS3(directory, s3Region, s3Bucket string, s3Client *s3.Client, logsWriter io.Writer) error {
 	uploader, err := awsS3Uploads.NewUploader(s3Region, s3Bucket, s3Client)
 	if err != nil {
 		return err
 	}
-	err = uploader.UploadDirectory(directory)
+	err = uploader.UploadDirectory(directory, logsWriter)
 	if err != nil {
 		return err
 	}
@@ -156,10 +156,10 @@ func createS3BucketIfNeeded(s3Client *s3.Client, s3Bucket, s3Region string) (*st
 		return nil, false, err
 	}
 	bucketLocation := response.Location
-	log.Println("created bucket info")
-	log.Println(aws.ToString(bucketLocation))
-	log.Println(response.ResultMetadata)
-	log.Println("------------------------")
+	//log.Println("created bucket info")
+	//log.Println(aws.ToString(bucketLocation))
+	//log.Println(response.ResultMetadata)
+	//log.Println("------------------------")
 	return bucketLocation, true, nil
 }
 
@@ -172,7 +172,7 @@ func getCommentForCloudfront(parameters map[string]interface{}) (string, error) 
 	if err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("Creating cloudfront distribution for %s-%s", organizationID, deploymentID), nil
+	return fmt.Sprintf("Cloudfront distribution for %s-%s", organizationID, deploymentID), nil
 }
 
 func getCallerReference(parameters map[string]interface{}) (string, error) {
@@ -360,11 +360,14 @@ func attachPolicyToS3Bucket(distributionArn *string, s3BucketName, policySid, po
 }
 
 func (d *DeployAwsStaticSite) Run(parameters map[string]interface{}, logger jobs.Logger) (newParameters map[string]interface{}, err error) {
-	logBuffer := new(bytes.Buffer)
+	logsWriter, err := loggers.GetBuildLogsWriter(parameters, logger)
+	if err != nil {
+		return parameters, err
+	}
+	defer logsWriter.Close()
 	defer func() {
-		_ = loggers.LogBuffer(logBuffer, logger)
 		if err != nil {
-			markBuildDone(parameters, err)
+			markBuildDone(parameters, err, logsWriter)
 		}
 	}()
 	cloudfrontRegion := "us-east-1"
@@ -435,14 +438,17 @@ func (d *DeployAwsStaticSite) Run(parameters map[string]interface{}, logger jobs
 		return parameters, err
 	}
 
-	err = uploadToS3(distDirectory, region_enums.Type(region).String(), bucketName, s3Client)
+	io.WriteString(logsWriter, fmt.Sprintf("Uploading site to S3 bucket: %s\n", bucketName))
+
+	err = uploadToS3(distDirectory, region_enums.Type(region).String(), bucketName, s3Client, logsWriter)
 	if err != nil {
+		io.WriteString(logsWriter, fmt.Sprintf("Error uploading site to S3 bucket: %s\n", bucketName))
 		return parameters, err
 	}
 
 	cfg, err := config.LoadDefaultConfig(context.TODO())
 	if err != nil {
-		return nil, err
+		return parameters, err
 	}
 
 	// Create an Amazon Cloudfront service client
@@ -496,6 +502,8 @@ func (d *DeployAwsStaticSite) Run(parameters map[string]interface{}, logger jobs
 		distributionConfig := createDistributionConfigForNewCloudfront(bucketLocation, originAccessControlId,
 			callerReference, comment, domainName, defaultCacheBehavior)
 
+		io.WriteString(logsWriter, fmt.Sprintf("Creating cloudfront distribution\n"))
+
 		// Create cloudfront distribution
 		var createDistributionOutput *cloudfront.CreateDistributionOutput
 		createDistributionOutput, err = cloudfrontClient.CreateDistribution(context.TODO(), &cloudfront.CreateDistributionInput{
@@ -506,6 +514,9 @@ func (d *DeployAwsStaticSite) Run(parameters map[string]interface{}, logger jobs
 		}
 
 		distributionId := createDistributionOutput.Distribution.Id
+
+		io.WriteString(logsWriter, fmt.Sprintf("Created cloudfront distribution: %s\n", aws.ToString(distributionId)))
+
 		// Attach bucket policy
 		var bucketPolicySid string
 		bucketPolicySid, err = getBucketPolicySid(parameters)
@@ -527,6 +538,7 @@ func (d *DeployAwsStaticSite) Run(parameters map[string]interface{}, logger jobs
 
 		distributionDeployedWaiter := cloudfront.NewDistributionDeployedWaiter(cloudfrontClient)
 
+		io.WriteString(logsWriter, fmt.Sprintf("Waiting for cloudfront distribution to be deployed: %s\n", aws.ToString(distributionId)))
 		err = distributionDeployedWaiter.Wait(context.TODO(), getDistributionInput, 10*time.Minute)
 		if err != nil {
 			return parameters, err
@@ -573,6 +585,9 @@ func (d *DeployAwsStaticSite) Run(parameters map[string]interface{}, logger jobs
 
 		//Wait for invalidation to get done
 		invalidationWaiter := cloudfront.NewInvalidationCompletedWaiter(cloudfrontClient)
+
+		io.WriteString(logsWriter, fmt.Sprintf("Waiting for cloudfront distribution to be invalidated: %s\n", cloudfrontID))
+
 		err = invalidationWaiter.Wait(context.TODO(), &cloudfront.GetInvalidationInput{
 			DistributionId: aws.String(cloudfrontID),
 			Id:             createInvalidationOutput.Invalidation.Id,
@@ -584,7 +599,7 @@ func (d *DeployAwsStaticSite) Run(parameters map[string]interface{}, logger jobs
 	}
 
 	//mark build done successfully
-	markBuildDone(parameters, nil)
+	markBuildDone(parameters, nil, logsWriter)
 
 	return parameters, nil
 }

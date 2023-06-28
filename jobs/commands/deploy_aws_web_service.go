@@ -1,7 +1,6 @@
 package commands
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -19,6 +18,7 @@ import (
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
 	"github.com/deployment-io/deployment-runner/utils/loggers"
 	"go.mongodb.org/mongo-driver/bson/primitive"
+	"io"
 	"strings"
 	"time"
 )
@@ -307,7 +307,7 @@ func getAlbListenerName(parameters map[string]interface{}) (string, error) {
 }
 
 func createAlbIfNeeded(parameters map[string]interface{},
-	elbClient *elasticloadbalancingv2.Client, albSecurityGroupId string) (loadBalancerArn string, targetGroupArn string, err error) {
+	elbClient *elasticloadbalancingv2.Client, albSecurityGroupId string, logsWriter io.Writer) (loadBalancerArn string, targetGroupArn string, err error) {
 
 	loadBalancerArnFromParams, err := jobs.GetParameterValue[string](parameters, parameters_enums.LoadBalancerArn)
 	if err == nil && len(loadBalancerArnFromParams) > 0 {
@@ -384,7 +384,6 @@ func createAlbIfNeeded(parameters map[string]interface{},
 		return "", "", err
 	}
 
-	//TODO check for 400 not found error
 	describeLoadBalancersOutput, err := elbClient.DescribeLoadBalancers(context.TODO(), &elasticloadbalancingv2.DescribeLoadBalancersInput{
 		Names: []string{
 			albName,
@@ -435,6 +434,9 @@ func createAlbIfNeeded(parameters map[string]interface{},
 		describeLoadBalancersInput := &elasticloadbalancingv2.DescribeLoadBalancersInput{
 			LoadBalancerArns: []string{loadBalancerArn},
 		}
+
+		io.WriteString(logsWriter, fmt.Sprintf("Waiting for load balancer to be available: %s\n", loadBalancerArn))
+
 		err = newLoadBalancerAvailableWaiter.Wait(context.TODO(), describeLoadBalancersInput, time.Minute*10)
 		if err != nil {
 			return "", "", err
@@ -447,7 +449,6 @@ func createAlbIfNeeded(parameters map[string]interface{},
 		return "", "", err
 	}
 
-	//TODO check for 400 not found error
 	describeListenersOutput, err := elbClient.DescribeListeners(context.TODO(), &elasticloadbalancingv2.DescribeListenersInput{
 		LoadBalancerArn: aws.String(loadBalancerArn),
 	})
@@ -490,6 +491,9 @@ func createAlbIfNeeded(parameters map[string]interface{},
 	if err != nil {
 		return "", "", err
 	}
+
+	io.WriteString(logsWriter, fmt.Sprintf("Created load balancer: %s\n", loadBalancerArn))
+
 	updateDeploymentsPipeline.Add(updateDeploymentsKey, deployments.UpdateDeploymentDtoV1{
 		ID:              deploymentID,
 		TargetGroupArn:  targetGroupArn,
@@ -686,7 +690,7 @@ func registerTaskDefinition(parameters map[string]interface{}, ecsClient *ecs.Cl
 	return taskDefinitionArn, nil
 }
 
-func createEcsServiceIfNeeded(parameters map[string]interface{}, ecsClient *ecs.Client, ecsClusterArn, targetGroupArn, taskDefinitionArn string) (ecsServiceArn string, shouldUpdateService bool, err error) {
+func createEcsServiceIfNeeded(parameters map[string]interface{}, ecsClient *ecs.Client, ecsClusterArn, targetGroupArn, taskDefinitionArn string, logsWriter io.Writer) (ecsServiceArn string, shouldUpdateService bool, err error) {
 
 	ecsServiceArnFromParams, err := jobs.GetParameterValue[string](parameters, parameters_enums.EcsServiceArn)
 	if err == nil && len(ecsServiceArnFromParams) > 0 {
@@ -798,6 +802,7 @@ func createEcsServiceIfNeeded(parameters map[string]interface{}, ecsClient *ecs.
 	if err != nil {
 		return "", false, err
 	}
+	io.WriteString(logsWriter, fmt.Sprintf("Created ECS service: %s\n", ecsServiceArn))
 	updateDeploymentsPipeline.Add(updateDeploymentsKey, deployments.UpdateDeploymentDtoV1{
 		ID:            deploymentID,
 		EcsServiceArn: ecsServiceArn,
@@ -831,11 +836,14 @@ func updateEcsService(parameters map[string]interface{}, ecsClient *ecs.Client, 
 //1. add another ingress security rule for ALB security group  - port 80
 
 func (d *DeployAwsWebService) Run(parameters map[string]interface{}, logger jobs.Logger) (newParameters map[string]interface{}, err error) {
-	logBuffer := new(bytes.Buffer)
+	logsWriter, err := loggers.GetBuildLogsWriter(parameters, logger)
+	if err != nil {
+		return parameters, err
+	}
+	defer logsWriter.Close()
 	defer func() {
-		_ = loggers.LogBuffer(logBuffer, logger)
 		if err != nil {
-			markBuildDone(parameters, err)
+			markBuildDone(parameters, err, logsWriter)
 		}
 	}()
 	ec2Client, err := getEC2Client(parameters)
@@ -851,7 +859,7 @@ func (d *DeployAwsWebService) Run(parameters map[string]interface{}, logger jobs
 	if err != nil {
 		return parameters, err
 	}
-	_, targetGroupArn, err := createAlbIfNeeded(parameters, elbClient, securityGroupId)
+	_, targetGroupArn, err := createAlbIfNeeded(parameters, elbClient, securityGroupId, logsWriter)
 	if err != nil {
 		return parameters, err
 	}
@@ -867,7 +875,7 @@ func (d *DeployAwsWebService) Run(parameters map[string]interface{}, logger jobs
 	if err != nil {
 		return parameters, err
 	}
-	_, shouldUpdateService, err := createEcsServiceIfNeeded(parameters, ecsClient, ecsClusterArn, targetGroupArn, taskDefinitionArn)
+	_, shouldUpdateService, err := createEcsServiceIfNeeded(parameters, ecsClient, ecsClusterArn, targetGroupArn, taskDefinitionArn, logsWriter)
 	if err != nil {
 		return parameters, err
 	}
@@ -888,7 +896,7 @@ func (d *DeployAwsWebService) Run(parameters map[string]interface{}, logger jobs
 	})
 
 	//mark build done successfully
-	markBuildDone(parameters, nil)
+	markBuildDone(parameters, nil, logsWriter)
 
 	return parameters, nil
 }

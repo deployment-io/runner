@@ -1,7 +1,6 @@
 package commands
 
 import (
-	"bytes"
 	"fmt"
 	"github.com/deployment-io/deployment-runner-kit/builds"
 	"github.com/deployment-io/deployment-runner-kit/enums/build_enums"
@@ -14,6 +13,7 @@ import (
 	"gopkg.in/src-d/go-git.v4/plumbing"
 	"gopkg.in/src-d/go-git.v4/plumbing/object"
 	"gopkg.in/src-d/go-git.v4/plumbing/transport/http"
+	"io"
 	"os"
 	"strings"
 	"time"
@@ -73,11 +73,11 @@ func isErrorAuthenticationRequired(err error) bool {
 	return false
 }
 
-func cloneRepository(repoDirectoryPath, repoCloneUrlWithToken, repoProviderToken string, logBuffer *bytes.Buffer) (*git.Repository, error) {
+func cloneRepository(repoDirectoryPath, repoCloneUrlWithToken, repoProviderToken string, logsWriter io.Writer) (*git.Repository, error) {
 	var repository *git.Repository
 	repository, err := git.PlainClone(repoDirectoryPath, false, &git.CloneOptions{
 		URL:      repoCloneUrlWithToken,
-		Progress: logBuffer,
+		Progress: logsWriter,
 		Auth: &http.BasicAuth{
 			Username: "oauth2",
 			Password: repoProviderToken,
@@ -97,14 +97,14 @@ func cloneRepository(repoDirectoryPath, repoCloneUrlWithToken, repoProviderToken
 	return repository, nil
 }
 
-func fetchRepository(repository *git.Repository, repoProviderToken string, logBuffer *bytes.Buffer) error {
+func fetchRepository(repository *git.Repository, repoProviderToken string, logsWriter io.Writer) error {
 	err := repository.Fetch(&git.FetchOptions{
 		Auth: &http.BasicAuth{
 			Username: "oauth2",
 			Password: repoProviderToken,
 		},
 		RemoteName: "origin",
-		Progress:   logBuffer,
+		Progress:   logsWriter,
 		Force:      true,
 	})
 
@@ -134,14 +134,17 @@ func refreshGitToken(parameters map[string]interface{}) (string, error) {
 }
 
 func (cr *CheckoutRepository) Run(parameters map[string]interface{}, logger jobs.Logger) (newParameters map[string]interface{}, err error) {
-	logBuffer := new(bytes.Buffer)
+	logsWriter, err := loggers.GetBuildLogsWriter(parameters, logger)
+	if err != nil {
+		return parameters, err
+	}
+	defer logsWriter.Close()
 	defer func() {
-		_ = loggers.LogBuffer(logBuffer, logger)
+		//_ = loggers.LogBuffer(logBuffer, logger)
 		if err != nil {
-			markBuildDone(parameters, err)
+			markBuildDone(parameters, err, logsWriter)
 		}
 	}()
-
 	repoCloneUrl, err := jobs.GetParameterValue[string](parameters, parameters_enums.RepoCloneUrl)
 	if err != nil {
 		return parameters, err
@@ -159,6 +162,8 @@ func (cr *CheckoutRepository) Run(parameters map[string]interface{}, logger jobs
 
 	after, found := strings.CutPrefix(repoCloneUrl, "https://")
 	if found {
+		io.WriteString(logsWriter, fmt.Sprintf("Checking out repository from: %s\n", after))
+
 		//TODO currently it's common for GitLab and GitHub. Might change in the future
 		repoCloneUrlWithToken := "https://oauth2:" + repoProviderToken + "@" + after
 		var repoDirectoryPath string
@@ -167,7 +172,7 @@ func (cr *CheckoutRepository) Run(parameters map[string]interface{}, logger jobs
 			return parameters, err
 		}
 		var repository *git.Repository
-		repository, err = cloneRepository(repoDirectoryPath, repoCloneUrlWithToken, repoProviderToken, logBuffer)
+		repository, err = cloneRepository(repoDirectoryPath, repoCloneUrlWithToken, repoProviderToken, logsWriter)
 		if err != nil {
 			if isErrorAuthenticationRequired(err) {
 				repoProviderToken, err = refreshGitToken(parameters)
@@ -175,7 +180,7 @@ func (cr *CheckoutRepository) Run(parameters map[string]interface{}, logger jobs
 					return parameters, err
 				}
 				repoCloneUrlWithToken = "https://oauth2:" + repoProviderToken + "@" + after
-				repository, err = cloneRepository(repoDirectoryPath, repoCloneUrlWithToken, repoProviderToken, logBuffer)
+				repository, err = cloneRepository(repoDirectoryPath, repoCloneUrlWithToken, repoProviderToken, logsWriter)
 				if err != nil {
 					return parameters, err
 				}
@@ -191,14 +196,14 @@ func (cr *CheckoutRepository) Run(parameters map[string]interface{}, logger jobs
 			return parameters, err
 		}
 
-		err = fetchRepository(repository, repoProviderToken, logBuffer)
+		err = fetchRepository(repository, repoProviderToken, logsWriter)
 		if err != nil {
 			if isErrorAuthenticationRequired(err) {
 				repoProviderToken, err = refreshGitToken(parameters)
 				if err != nil {
 					return parameters, err
 				}
-				err = fetchRepository(repository, repoProviderToken, logBuffer)
+				err = fetchRepository(repository, repoProviderToken, logsWriter)
 				if err != nil {
 					return parameters, err
 				}

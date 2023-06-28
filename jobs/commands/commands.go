@@ -24,7 +24,7 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner-kit/vpcs"
 	"github.com/deployment-io/deployment-runner/client"
-	"log"
+	"io"
 	"time"
 )
 
@@ -140,7 +140,7 @@ func Get(p commands_enums.Type) (jobs.Command, error) {
 	return nil, fmt.Errorf("error getting command for %s", p)
 }
 
-func markBuildDone(parameters map[string]interface{}, err error) {
+func markBuildDone(parameters map[string]interface{}, err error, logsWriter io.Writer) {
 	status := build_enums.Success
 	errorMessage := ""
 	if err != nil {
@@ -170,6 +170,11 @@ func markBuildDone(parameters map[string]interface{}, err error) {
 		Status:           status,
 		ErrorMessage:     errorMessage,
 	})
+	if err != nil {
+		io.WriteString(logsWriter, fmt.Sprintf("Error in building - %s - %s\n", buildID, errorMessage))
+	} else {
+		io.WriteString(logsWriter, fmt.Sprintf("Successfully built - %s\n", buildID))
+	}
 }
 
 func listAllS3Objects(s3Client *s3.Client, bucketName string) ([]s3Types.Object, error) {
@@ -180,7 +185,7 @@ func listAllS3Objects(s3Client *s3.Client, bucketName string) ([]s3Types.Object,
 	listObjectsPaginator := s3.NewListObjectsV2Paginator(s3Client, params)
 
 	var i int
-	log.Println("Objects:")
+	//log.Println("Objects:")
 	var objects []s3Types.Object
 	for listObjectsPaginator.HasMorePages() {
 		i++

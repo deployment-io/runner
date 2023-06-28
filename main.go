@@ -120,6 +120,7 @@ func main() {
 	client.Connect(service, organizationId, token, clientCertPem, clientKeyPem, false)
 	c := client.Get()
 	commands.Init()
+	loggers.Init()
 	shutdownSignal := make(chan struct{})
 	goShutdownHook.ADD(func() {
 		fmt.Println("waiting for shutdown signal")

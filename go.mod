@@ -17,7 +17,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/iam v1.20.3
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.33.1
 	github.com/aws/smithy-go v1.13.5
-	github.com/deployment-io/deployment-runner-kit v0.0.0-20230624044304-4e1cd68ef94f
+	github.com/deployment-io/deployment-runner-kit v0.0.0-20230628152105-01c988e258ba
 	github.com/docker/docker v24.0.1+incompatible
 	github.com/joho/godotenv v1.5.1
 	go.mongodb.org/mongo-driver v1.11.6

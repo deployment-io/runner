@@ -1,12 +1,12 @@
 package commands
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner/utils/loggers"
+	"io"
 	"os"
 	"os/exec"
 	"strings"
@@ -16,7 +16,7 @@ import (
 type BuildStaticSite struct {
 }
 
-func (b *BuildStaticSite) executeCommand(logBuffer *bytes.Buffer, envVariablesSlice []string, commandAndArgs []string, directoryPath string) error {
+func (b *BuildStaticSite) executeCommand(logsWriter io.Writer, envVariablesSlice []string, commandAndArgs []string, directoryPath string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 	var cmd *exec.Cmd
@@ -26,7 +26,7 @@ func (b *BuildStaticSite) executeCommand(logBuffer *bytes.Buffer, envVariablesSl
 		cmd = exec.CommandContext(ctx, commandAndArgs[0], commandAndArgs[1:]...)
 	}
 	cmd.Dir = directoryPath
-	cmd.Stdout = logBuffer
+	cmd.Stdout = logsWriter
 	if len(envVariablesSlice) > 0 {
 		cmd.Env = os.Environ()
 		cmd.Env = append(cmd.Env, envVariablesSlice...)
@@ -55,15 +55,16 @@ func decodeEnvironmentVariablesToSlice(envVariables string) ([]string, error) {
 }
 
 func (b *BuildStaticSite) Run(parameters map[string]interface{}, logger jobs.Logger) (newParameters map[string]interface{}, err error) {
-	logBuffer := new(bytes.Buffer)
+	logsWriter, err := loggers.GetBuildLogsWriter(parameters, logger)
+	if err != nil {
+		return parameters, err
+	}
+	defer logsWriter.Close()
 	defer func() {
-		//ignore
-		_ = loggers.LogBuffer(logBuffer, logger)
 		if err != nil {
-			markBuildDone(parameters, err)
+			markBuildDone(parameters, err, logsWriter)
 		}
 	}()
-
 	repoDirectoryPath, err := jobs.GetParameterValue[string](parameters, parameters_enums.RepoDirectoryPath)
 	if err != nil {
 		return parameters, err
@@ -103,8 +104,10 @@ func (b *BuildStaticSite) Run(parameters map[string]interface{}, logger jobs.Log
 		}
 	}
 
+	io.WriteString(logsWriter, fmt.Sprintf("Building static site\n"))
+
 	//install node version, npm install, and build
-	if err = b.executeCommand(logBuffer, envVariablesSlice, []string{"bash", "-c", "source $HOME/.nvm/nvm.sh ; nvm install " + nodeVersion + " ; npm install ; " + buildCommand}, repoDirectoryPath); err != nil {
+	if err = b.executeCommand(logsWriter, envVariablesSlice, []string{"bash", "-c", "source $HOME/.nvm/nvm.sh ; nvm install " + nodeVersion + " ; npm install ; " + buildCommand}, repoDirectoryPath); err != nil {
 		return parameters, err
 	}
 

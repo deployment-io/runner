@@ -3,6 +3,7 @@ package aws_s3
 import (
 	"fmt"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -39,7 +40,7 @@ func isPathDirectory(directoryPath string) (bool, error) {
 }
 
 // we can assume that this function is called only for directory
-func (u *Uploader) uploadDirectory(directoryPath string) error {
+func (u *Uploader) uploadDirectory(directoryPath string, logsWriter io.Writer) error {
 	fileUploadDoneSignals := make([]<-chan uploadFileDoneDTO, 0)
 	abortUploadSignal := make(chan interface{})
 	root := directoryPath
@@ -63,6 +64,11 @@ func (u *Uploader) uploadDirectory(directoryPath string) error {
 	}
 	for _, fileUploadDoneSignal := range fileUploadDoneSignals {
 		done := <-fileUploadDoneSignal
+		if done.done {
+			io.WriteString(logsWriter, fmt.Sprintf("Successfully uploaded file: %s\n", done.objectKey))
+		} else {
+			io.WriteString(logsWriter, fmt.Sprintf("Error uploading file: %s\n", done.objectKey))
+		}
 		if done.err != nil {
 			return err
 		}
@@ -72,7 +78,7 @@ func (u *Uploader) uploadDirectory(directoryPath string) error {
 
 var DirectoryErr = fmt.Errorf("path is not a directory path")
 
-func (u *Uploader) UploadDirectory(directoryPath string) error {
+func (u *Uploader) UploadDirectory(directoryPath string, logsWriter io.Writer) error {
 	isDirectory, err := isPathDirectory(directoryPath)
 	if err != nil {
 		return err
@@ -80,7 +86,7 @@ func (u *Uploader) UploadDirectory(directoryPath string) error {
 	if !isDirectory {
 		return DirectoryErr
 	}
-	return u.uploadDirectory(directoryPath)
+	return u.uploadDirectory(directoryPath, logsWriter)
 }
 
 func (u *Uploader) UploadFile(inputFilePath, outputS3ObjectKey string, abortUploadSignal chan interface{}) (<-chan uploadFileDoneDTO, error) {

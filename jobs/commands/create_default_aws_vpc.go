@@ -1,7 +1,6 @@
 package commands
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"github.com/ankit-arora/ipnets"
@@ -15,6 +14,7 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/vpcs"
 	"github.com/deployment-io/deployment-runner/utils/loggers"
 	"go.mongodb.org/mongo-driver/bson/primitive"
+	"io"
 	"net"
 	"strconv"
 	"sync"
@@ -739,9 +739,6 @@ func createRouteIfNeeded(ec2Client *ec2.Client, routeTableId, internetGatewayId,
 	return nil
 }
 
-//TODO
-//2. add ingress security rule for the VPC security group - port 8080 and source VPC CIDR
-
 func getDefaultSecurityGroupIdForVpc(parameters map[string]interface{}, ec2Client *ec2.Client, vpcId string) (securityGroupId string, err error) {
 	securityGroupsOutput, err := ec2Client.DescribeSecurityGroups(context.TODO(), &ec2.DescribeSecurityGroupsInput{
 		DryRun: aws.Bool(false),
@@ -902,11 +899,14 @@ type routeTableInfo struct {
 }
 
 func (c *CreateDefaultAwsVPC) Run(parameters map[string]interface{}, logger jobs.Logger) (newParameters map[string]interface{}, err error) {
-	logBuffer := new(bytes.Buffer)
+	logsWriter, err := loggers.GetBuildLogsWriter(parameters, logger)
+	if err != nil {
+		return parameters, err
+	}
+	defer logsWriter.Close()
 	defer func() {
-		_ = loggers.LogBuffer(logBuffer, logger)
 		if err != nil {
-			markBuildDone(parameters, err)
+			markBuildDone(parameters, err, logsWriter)
 		}
 	}()
 	//try creating subnets for each of these cidr blocks
@@ -925,6 +925,9 @@ func (c *CreateDefaultAwsVPC) Run(parameters map[string]interface{}, logger jobs
 		if err != nil {
 			return parameters, err
 		}
+
+		io.WriteString(logsWriter, fmt.Sprintf("Created VPC - %s\n", vpcId))
+
 		err = addIngressRuleToDefaultVpcSecurityGroup(parameters, ec2Client, vpcId, cidrBlock)
 		if err != nil {
 			return parameters, err
@@ -1106,6 +1109,9 @@ func (c *CreateDefaultAwsVPC) Run(parameters map[string]interface{}, logger jobs
 		})
 
 		//wait for natGateway availability
+
+		io.WriteString(logsWriter, fmt.Sprintf("Waiting for NAT Gateways to be available: %v\n", natGatewayIdsToWait))
+
 		var wg sync.WaitGroup
 		for _, nId := range natGatewayIdsToWait {
 			wg.Add(1)

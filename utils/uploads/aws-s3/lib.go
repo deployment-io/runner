@@ -3,7 +3,6 @@ package aws_s3
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -126,7 +125,7 @@ func uploadPart(client *s3.Client, resp *s3.CreateMultipartUploadOutput, fileByt
 				//}
 				return types.CompletedPart{}, err
 			}
-			fmt.Printf("Retrying to upload part #%v\n", partNumber)
+			//fmt.Printf("Retrying to upload part #%v\n", partNumber)
 			tryNum++
 		} else {
 			//fmt.Printf("Uploaded part #%v\n", partNumber)
@@ -140,7 +139,7 @@ func uploadPart(client *s3.Client, resp *s3.CreateMultipartUploadOutput, fileByt
 }
 
 func abortMultipartUpload(client *s3.Client, resp *s3.CreateMultipartUploadOutput) error {
-	fmt.Println("Aborting multipart upload for UploadId#" + *resp.UploadId)
+	//fmt.Println("Aborting multipart upload for UploadId#" + *resp.UploadId)
 	abortInput := &s3.AbortMultipartUploadInput{
 		Bucket:   resp.Bucket,
 		Key:      resp.Key,
@@ -151,8 +150,9 @@ func abortMultipartUpload(client *s3.Client, resp *s3.CreateMultipartUploadOutpu
 }
 
 type uploadFileDoneDTO struct {
-	err  error
-	done bool
+	err       error
+	done      bool
+	objectKey string
 }
 
 func (u *Uploader) uploadByteStreamToS3(filePath, outputS3ObjectKey string, dataByteStream <-chan fileByteStreamDTO,
@@ -191,8 +191,9 @@ func (u *Uploader) uploadByteStreamToS3(filePath, outputS3ObjectKey string, data
 		resp, err := client.CreateMultipartUpload(context.TODO(), input)
 		if err != nil {
 			fileDoneStream <- uploadFileDoneDTO{
-				err:  err,
-				done: false,
+				err:       err,
+				done:      false,
+				objectKey: outputS3ObjectKey,
 			}
 			return
 		}
@@ -205,11 +206,11 @@ func (u *Uploader) uploadByteStreamToS3(filePath, outputS3ObjectKey string, data
 			}
 			completedPart, err := uploadPart(client, resp, dataBytes.data, partNumber)
 			if err != nil {
-				fmt.Println(err.Error())
-				err := abortMultipartUpload(client, resp)
+				_ = abortMultipartUpload(client, resp)
 				fileDoneStream <- uploadFileDoneDTO{
-					err:  err,
-					done: false,
+					err:       err,
+					done:      false,
+					objectKey: outputS3ObjectKey,
 				}
 				return
 			}
@@ -217,19 +218,20 @@ func (u *Uploader) uploadByteStreamToS3(filePath, outputS3ObjectKey string, data
 			completedParts = append(completedParts, completedPart)
 		}
 		if len(completedParts) > 0 {
-			completeResponse, err := completeMultipartUpload(client, resp, completedParts)
+			_, err := completeMultipartUpload(client, resp, completedParts)
 			if err != nil {
 				fileDoneStream <- uploadFileDoneDTO{
-					err:  err,
-					done: false,
+					err:       err,
+					done:      false,
+					objectKey: outputS3ObjectKey,
 				}
 				return
 			}
-			fmt.Printf("Successfully uploaded file: %s\n", aws.ToString(completeResponse.Key))
 		}
 		fileDoneStream <- uploadFileDoneDTO{
-			err:  nil,
-			done: true,
+			err:       nil,
+			done:      true,
+			objectKey: outputS3ObjectKey,
 		}
 		return
 	}()

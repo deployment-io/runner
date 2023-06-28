@@ -1,7 +1,6 @@
 package commands
 
 import (
-	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -17,7 +16,6 @@ import (
 	"github.com/docker/docker/api/types/registry"
 	"github.com/docker/docker/client"
 	"io"
-	"os"
 	"strings"
 )
 
@@ -37,7 +35,7 @@ func getEcrRepositoryName(parameters map[string]interface{}) (string, error) {
 	return fmt.Sprintf("ecr-%s-%s", organizationID, deploymentID), nil
 }
 
-func createEcrRepositoryIfNeeded(parameters map[string]interface{}, ecrClient *ecr.Client) (ecrRepositoryUri string, err error) {
+func createEcrRepositoryIfNeeded(parameters map[string]interface{}, ecrClient *ecr.Client, logsWriter io.Writer) (ecrRepositoryUri string, err error) {
 	ecrRepositoryName, err := getEcrRepositoryName(parameters)
 	if err != nil {
 		return "", err
@@ -89,6 +87,8 @@ func createEcrRepositoryIfNeeded(parameters map[string]interface{}, ecrClient *e
 	if err != nil {
 		return "", err
 	}
+
+	io.WriteString(logsWriter, fmt.Sprintf("Created ECR repository: %s\n", ecrRepositoryUri))
 	updateDeploymentsPipeline.Add(updateDeploymentsKey, deployments.UpdateDeploymentDtoV1{
 		ID:               deploymentID,
 		EcrRepositoryUri: ecrRepositoryUri,
@@ -118,7 +118,7 @@ func tagDockerImageToRepositoryUri(parameters map[string]interface{}, ecrReposit
 	return ecrRepositoryUriWithTag, nil
 }
 
-func pushDockerImageToEcr(parameters map[string]interface{}, ecrClient *ecr.Client, ecrRepositoryUriWithTag string) error {
+func pushDockerImageToEcr(parameters map[string]interface{}, ecrClient *ecr.Client, ecrRepositoryUriWithTag string, logsWriter io.Writer) error {
 	getAuthorizationTokenOutput, err := ecrClient.GetAuthorizationToken(context.TODO(), &ecr.GetAuthorizationTokenInput{})
 	if err != nil {
 		return err
@@ -162,8 +162,8 @@ func pushDockerImageToEcr(parameters map[string]interface{}, ecrClient *ecr.Clie
 	defer func() {
 		_ = push.Close()
 	}()
-	_, err = io.Copy(os.Stdout, push)
-
+	io.WriteString(logsWriter, fmt.Sprintf("Pushing docker image to ECR: %s\n", ecrRepositoryUriWithTag))
+	_, err = io.Copy(logsWriter, push)
 	if err != nil {
 		return err
 	}
@@ -172,11 +172,14 @@ func pushDockerImageToEcr(parameters map[string]interface{}, ecrClient *ecr.Clie
 }
 
 func (u *UploadDockerImageToEcr) Run(parameters map[string]interface{}, logger jobs.Logger) (newParameters map[string]interface{}, err error) {
-	logBuffer := new(bytes.Buffer)
+	logsWriter, err := loggers.GetBuildLogsWriter(parameters, logger)
+	if err != nil {
+		return parameters, err
+	}
+	defer logsWriter.Close()
 	defer func() {
-		_ = loggers.LogBuffer(logBuffer, logger)
 		if err != nil {
-			markBuildDone(parameters, err)
+			markBuildDone(parameters, err, logsWriter)
 		}
 	}()
 	ecrClient, err := getEcrClient(parameters)
@@ -184,7 +187,7 @@ func (u *UploadDockerImageToEcr) Run(parameters map[string]interface{}, logger j
 		return parameters, err
 	}
 
-	ecrRepositoryUri, err := createEcrRepositoryIfNeeded(parameters, ecrClient)
+	ecrRepositoryUri, err := createEcrRepositoryIfNeeded(parameters, ecrClient, logsWriter)
 	if err != nil {
 		return parameters, err
 	}
@@ -212,7 +215,7 @@ func (u *UploadDockerImageToEcr) Run(parameters map[string]interface{}, logger j
 	})
 
 	if describeImagesOutput == nil || len(describeImagesOutput.ImageDetails) == 0 {
-		err = pushDockerImageToEcr(parameters, ecrClient, ecrRepositoryUriWithTag)
+		err = pushDockerImageToEcr(parameters, ecrClient, ecrRepositoryUriWithTag, logsWriter)
 		if err != nil {
 			return parameters, err
 		}

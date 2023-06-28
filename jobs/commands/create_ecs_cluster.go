@@ -1,7 +1,6 @@
 package commands
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -14,6 +13,7 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/enums/region_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner/utils/loggers"
+	"io"
 )
 
 const upsertClusterKey = "upsertClusters"
@@ -130,13 +130,17 @@ func getEcsTaskExecutionRoleIfNeeded(iamClient *iam.Client, parameters map[strin
 }
 
 func (c *CreateEcsCluster) Run(parameters map[string]interface{}, logger jobs.Logger) (newParameters map[string]interface{}, err error) {
-	logBuffer := new(bytes.Buffer)
+	logsWriter, err := loggers.GetBuildLogsWriter(parameters, logger)
+	if err != nil {
+		return parameters, err
+	}
+	defer logsWriter.Close()
 	defer func() {
-		_ = loggers.LogBuffer(logBuffer, logger)
 		if err != nil {
-			markBuildDone(parameters, err)
+			markBuildDone(parameters, err, logsWriter)
 		}
 	}()
+
 	ecsClient, err := getEcsClient(parameters)
 	if err != nil {
 		return parameters, err
@@ -146,6 +150,8 @@ func (c *CreateEcsCluster) Run(parameters map[string]interface{}, logger jobs.Lo
 	if err != nil {
 		return parameters, err
 	}
+
+	io.WriteString(logsWriter, fmt.Sprintf("Created ECS cluster: %s\n", clusterArn))
 
 	iamClient, err := getIamClient(parameters)
 	if err != nil {
