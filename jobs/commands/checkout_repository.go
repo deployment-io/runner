@@ -35,18 +35,11 @@ func getRepositoryDirectoryPath(parameters map[string]interface{}) (string, erro
 	if err != nil {
 		return "", err
 	}
-	repoGitProvider, err := jobs.GetParameterValue[string](parameters, parameters_enums.RepoGitProvider)
+	buildID, err := jobs.GetParameterValue[string](parameters, parameters_enums.BuildID)
 	if err != nil {
 		return "", err
 	}
-	repoName, err := jobs.GetParameterValue[string](parameters, parameters_enums.RepoName)
-	if err != nil {
-		return "", err
-	}
-	repoName = strings.ReplaceAll(repoName, " ", "")
-
-	return fmt.Sprintf("/tmp/%s/%s/%s/%s/%s", organizationID, environmentID, deploymentID, repoGitProvider, repoName), nil
-
+	return fmt.Sprintf("/tmp/%s/%s/%s/%s", organizationID, environmentID, deploymentID, buildID), nil
 }
 
 func addFile(filePath, contents string) error {
@@ -162,7 +155,7 @@ func (cr *CheckoutRepository) Run(parameters map[string]interface{}, logger jobs
 
 	after, found := strings.CutPrefix(repoCloneUrl, "https://")
 	if found {
-		io.WriteString(logsWriter, fmt.Sprintf("Checking out repository from: %s\n", after))
+		io.WriteString(logsWriter, fmt.Sprintf("Checking out branch %s for repository: %s\n", repoBranch, after))
 
 		//TODO currently it's common for GitLab and GitHub. Might change in the future
 		repoCloneUrlWithToken := "https://oauth2:" + repoProviderToken + "@" + after

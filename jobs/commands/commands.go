@@ -25,6 +25,7 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/vpcs"
 	"github.com/deployment-io/deployment-runner/client"
 	"io"
+	"os"
 	"time"
 )
 
@@ -141,6 +142,13 @@ func Get(p commands_enums.Type) (jobs.Command, error) {
 }
 
 func markBuildDone(parameters map[string]interface{}, err error, logsWriter io.Writer) {
+	defer func() {
+		//Delete old repo directory to clean up
+		repoDirectoryPath, _ := jobs.GetParameterValue[string](parameters, parameters_enums.RepoDirectoryPath)
+		if len(repoDirectoryPath) > 0 {
+			os.RemoveAll(repoDirectoryPath)
+		}
+	}()
 	status := build_enums.Success
 	errorMessage := ""
 	if err != nil {
