@@ -5,9 +5,10 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/ping"
 )
 
-func (r *RunnerClient) Ping() error {
+func (r *RunnerClient) Ping(firstPing bool) error {
 	args := ping.ArgsV1{}
 	args.Send = "ping"
+	args.FirstPing = firstPing
 	args.OrganizationID = r.organizationID
 	args.Token = r.token
 	var reply ping.ReplyV1

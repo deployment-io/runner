@@ -3,7 +3,7 @@ module github.com/deployment-io/deployment-runner
 go 1.20
 
 require (
-	github.com/ankit-arora/go-utils v0.0.0-20230426122240-f74a4bcf6217
+	github.com/ankit-arora/go-utils v0.0.0-20230703175629-90641e500c7c
 	github.com/ankit-arora/ipnets v0.0.0-20230525113803-5d737bfe484b
 	github.com/aws/aws-sdk-go-v2 v1.18.1
 	github.com/aws/aws-sdk-go-v2/config v1.18.20
@@ -17,7 +17,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/iam v1.20.3
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.33.1
 	github.com/aws/smithy-go v1.13.5
-	github.com/deployment-io/deployment-runner-kit v0.0.0-20230628152105-01c988e258ba
+	github.com/deployment-io/deployment-runner-kit v0.0.0-20230704065734-abb5e2824588
 	github.com/docker/docker v24.0.1+incompatible
 	github.com/joho/godotenv v1.5.1
 	go.mongodb.org/mongo-driver v1.11.6

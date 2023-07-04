@@ -84,6 +84,7 @@ func Connect(service, organizationID, token, clientCertPem, clientKeyPem string,
 		defer client.Unlock()
 		if !client.isStarted {
 			go func() {
+				firstPing := true
 				for {
 					select {
 					case <-disconnectSignal:
@@ -96,7 +97,7 @@ func Connect(service, organizationID, token, clientCertPem, clientKeyPem string,
 							connect(service, organizationID, token, clientCertPem, clientKeyPem)
 						}
 						if client.c != nil {
-							err := client.Ping()
+							err := client.Ping(firstPing)
 							if err != nil {
 								client.isConnected = false
 								client.c.Close()
@@ -105,6 +106,7 @@ func Connect(service, organizationID, token, clientCertPem, clientKeyPem string,
 									//log only when connection status changes
 								}
 							} else {
+								firstPing = false
 								client.isConnected = true
 								if isConnectedOld != client.isConnected {
 									if blockTillFirstConnect {
