@@ -23,14 +23,14 @@ type CheckoutRepository struct {
 }
 
 func getRepositoryDirectoryPath(parameters map[string]interface{}) (string, error) {
-	environmentID, err := jobs.GetParameterValue[string](parameters, parameters_enums.EnvironmentID)
-	if err != nil {
-		return "", err
-	}
-	deploymentID, err := jobs.GetParameterValue[string](parameters, parameters_enums.DeploymentID)
-	if err != nil {
-		return "", err
-	}
+	//environmentID, err := jobs.GetParameterValue[string](parameters, parameters_enums.EnvironmentID)
+	//if err != nil {
+	//	return "", err
+	//}
+	//deploymentID, err := jobs.GetParameterValue[string](parameters, parameters_enums.DeploymentID)
+	//if err != nil {
+	//	return "", err
+	//}
 	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationID)
 	if err != nil {
 		return "", err
@@ -39,7 +39,8 @@ func getRepositoryDirectoryPath(parameters map[string]interface{}) (string, erro
 	if err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("/tmp/%s/%s/%s/%s", organizationID, environmentID, deploymentID, buildID), nil
+	//return fmt.Sprintf("/tmp/%s/%s/%s/%s", organizationID, environmentID, deploymentID, buildID), nil
+	return fmt.Sprintf("/tmp/%s/%s", organizationID, buildID), nil
 }
 
 func addFile(filePath, contents string) error {

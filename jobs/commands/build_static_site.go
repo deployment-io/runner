@@ -6,6 +6,10 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner/utils/loggers"
+	"github.com/docker/docker/api/types"
+	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/mount"
+	"github.com/docker/docker/client"
 	"io"
 	"os"
 	"os/exec"
@@ -54,6 +58,116 @@ func decodeEnvironmentVariablesToSlice(envVariables string) ([]string, error) {
 	return envVariablesSlice, nil
 }
 
+func execCommand(containerID, repoDir string, command []string, env []string, logsWriter io.Writer) error {
+	ctx := context.Background()
+	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		return err
+	}
+	defer cli.Close()
+
+	config := types.ExecConfig{
+		AttachStderr: true,
+		AttachStdout: true,
+		WorkingDir:   repoDir,
+		Cmd:          command,
+		Env:          env,
+	}
+
+	idResponse, err := cli.ContainerExecCreate(ctx, containerID, config)
+	if err != nil {
+		return err
+	}
+
+	execID := idResponse.ID
+
+	resp, err := cli.ContainerExecAttach(ctx, execID,
+		types.ExecStartCheck{
+			Detach: false,
+			Tty:    false,
+		},
+	)
+	defer resp.Close()
+
+	io.Copy(logsWriter, resp.Reader)
+
+	res, err := cli.ContainerExecInspect(ctx, execID)
+	if err != nil {
+		return err
+	}
+
+	if res.ExitCode != 0 {
+		return fmt.Errorf("error running command: %v", command)
+	}
+
+	return nil
+}
+
+func pullDockerImageForBuilding(imageID string) error {
+	ctx := context.Background()
+	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		return err
+	}
+	defer cli.Close()
+
+	reader, err := cli.ImagePull(ctx, fmt.Sprintf("docker.io/library/%s", imageID), types.ImagePullOptions{})
+	if err != nil {
+		return err
+	}
+
+	defer reader.Close()
+
+	return nil
+}
+
+func startBuildContainer(imageId, repoDir string) (string, error) {
+	ctx := context.Background()
+	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		return "", err
+	}
+	defer cli.Close()
+
+	resp, err := cli.ContainerCreate(ctx, &container.Config{
+		Image: imageId,
+		Cmd:   []string{"tail", "-f", "/dev/null"},
+		Tty:   false,
+	}, &container.HostConfig{
+		Mounts: []mount.Mount{{
+			Type:   mount.TypeBind,
+			Source: repoDir,
+			Target: repoDir,
+		}},
+	}, nil, nil, "")
+	if err != nil {
+		return "", err
+	}
+
+	if err = cli.ContainerStart(ctx, resp.ID, types.ContainerStartOptions{}); err != nil {
+		return "", err
+	}
+
+	return resp.ID, nil
+}
+
+func stopContainer(containerID string) error {
+	ctx := context.Background()
+	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		return err
+	}
+	defer cli.Close()
+	t := 1
+	err = cli.ContainerStop(ctx, containerID, container.StopOptions{
+		Timeout: &t,
+	})
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
 func (b *BuildStaticSite) Run(parameters map[string]interface{}, logger jobs.Logger) (newParameters map[string]interface{}, err error) {
 	logsWriter, err := loggers.GetBuildLogsWriter(parameters, logger)
 	if err != nil {
@@ -77,23 +191,15 @@ func (b *BuildStaticSite) Run(parameters map[string]interface{}, logger jobs.Log
 
 	nodeVersion, err := jobs.GetParameterValue[string](parameters, parameters_enums.NodeVersion)
 	if err != nil {
-		return parameters, nil
+		return parameters, err
 	}
 
 	//if node version is missing install and use latest lts
+	//get node docker image id according to node version
+	imageId := "node:lts-buster"
 	if len(nodeVersion) == 0 {
 		nodeVersion = "--lts"
 	}
-
-	////rm node modules - clean up after deployment
-	//if err := b.executeCommand(logBuffer, []string{"rm", "-rf", "node_modules"}, repoDirectoryPath); err != nil {
-	//	return parameters, err
-	//}
-	//
-	////rm publish folder
-	//if err := b.executeCommand(logBuffer, []string{"bash", "-c", "source $HOME/.nvm/nvm.sh ; nvm install " + nodeVersion + " l "}, repoDirectoryPath); err != nil {
-	//	return parameters, err
-	//}
 
 	envVariables, err := jobs.GetParameterValue[string](parameters, parameters_enums.EnvironmentVariables)
 	var envVariablesSlice []string
@@ -106,10 +212,30 @@ func (b *BuildStaticSite) Run(parameters map[string]interface{}, logger jobs.Log
 
 	io.WriteString(logsWriter, fmt.Sprintf("Building static site\n"))
 
-	//install node version, npm install, and build
-	if err = b.executeCommand(logsWriter, envVariablesSlice, []string{"bash", "-c", "source $HOME/.nvm/nvm.sh ; nvm install " + nodeVersion + " ; npm install ; " + buildCommand}, repoDirectoryPath); err != nil {
+	err = pullDockerImageForBuilding(imageId)
+	if err != nil {
 		return parameters, err
 	}
+
+	containerID, err := startBuildContainer(imageId, repoDirectoryPath)
+	if err != nil {
+		return parameters, err
+	}
+
+	defer func() {
+		stopContainer(containerID)
+	}()
+
+	err = execCommand(containerID, repoDirectoryPath, []string{"bash", "-c", "npm install;" + buildCommand}, envVariablesSlice, logsWriter)
+	//err = execCommand(containerID, repoDirectoryPath, []string{"bash", "-c", "npm install; npm run clean; npm run build"}, envVariablesSlice, logsWriter)
+
+	if err != nil {
+		return parameters, err
+	}
+
+	//if err = b.executeCommand(logsWriter, envVariablesSlice, []string{"bash", "-c", "source $HOME/.nvm/nvm.sh ; nvm install " + nodeVersion + " ; npm install ; " + buildCommand}, repoDirectoryPath); err != nil {
+	//	return parameters, err
+	//}
 
 	return parameters, nil
 }
