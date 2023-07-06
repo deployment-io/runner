@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -103,7 +104,11 @@ func execCommand(containerID, repoDir string, command []string, env []string, lo
 	return nil
 }
 
+var imagePullLock = sync.Mutex{}
+
 func pullDockerImageForBuilding(imageID string) error {
+	imagePullLock.Lock()
+	defer imagePullLock.Unlock()
 	ctx := context.Background()
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
@@ -117,6 +122,11 @@ func pullDockerImageForBuilding(imageID string) error {
 	}
 
 	defer reader.Close()
+
+	_, err = io.ReadAll(reader)
+	if err != nil {
+		return err
+	}
 
 	return nil
 }
