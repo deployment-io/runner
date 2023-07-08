@@ -12,6 +12,7 @@ import (
 	elbTypes "github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2/types"
 	"github.com/deployment-io/deployment-runner-kit/builds"
 	"github.com/deployment-io/deployment-runner-kit/deployments"
+	"github.com/deployment-io/deployment-runner-kit/enums/cpu_architecture_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/region_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
@@ -653,7 +654,15 @@ func registerTaskDefinition(parameters map[string]interface{}, ecsClient *ecs.Cl
 		return "", err
 	}
 
-	//TODO revisit cpu architecture type - arm64 for now
+	cpuArch := ecsTypes.CPUArchitectureX8664
+	arch, err := jobs.GetParameterValue[int64](parameters, parameters_enums.CpuArchitecture)
+	if err != nil {
+		return "", err
+	}
+	if cpu_architecture_enums.Type(arch) == cpu_architecture_enums.ARM {
+		cpuArch = ecsTypes.CPUArchitectureArm64
+	}
+
 	//TODO Linux for now
 	registerTaskDefinitionInput := &ecs.RegisterTaskDefinitionInput{
 		ContainerDefinitions: []ecsTypes.ContainerDefinition{
@@ -665,7 +674,7 @@ func registerTaskDefinition(parameters map[string]interface{}, ecsClient *ecs.Cl
 		Memory:           aws.String(memory),
 		NetworkMode:      ecsTypes.NetworkModeAwsvpc,
 		RuntimePlatform: &ecsTypes.RuntimePlatform{
-			CpuArchitecture:       ecsTypes.CPUArchitectureArm64,
+			CpuArchitecture:       cpuArch,
 			OperatingSystemFamily: ecsTypes.OSFamilyLinux,
 		},
 		Tags: []ecsTypes.Tag{

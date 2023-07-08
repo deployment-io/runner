@@ -80,8 +80,8 @@ github.com/cyphar/filepath-securejoin v0.2.3 h1:YX6ebbZCZP7VkM3scTTokDgBL2TY741X
 github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
-github.com/deployment-io/deployment-runner-kit v0.0.0-20230704065734-abb5e2824588 h1:qJPBi7NVQBEu8tzPnkkUlv46ngsbqXTLJ+974EzXScE=
-github.com/deployment-io/deployment-runner-kit v0.0.0-20230704065734-abb5e2824588/go.mod h1:nsTLE2CI2RPxB3DT/waLEFJpU9eXTWNxljN4ynLW49A=
+github.com/deployment-io/deployment-runner-kit v0.0.0-20230708080835-e6f46d541269 h1:WJVVThuqp9Xkxu0HAOxsa4Pi8a9TCzReRoQ0dnGkt5M=
+github.com/deployment-io/deployment-runner-kit v0.0.0-20230708080835-e6f46d541269/go.mod h1:nsTLE2CI2RPxB3DT/waLEFJpU9eXTWNxljN4ynLW49A=
 github.com/docker/distribution v2.8.2+incompatible h1:T3de5rq0dB1j30rp0sA2rER+m322EBzniBPB6ZIzuh8=
 github.com/docker/distribution v2.8.2+incompatible/go.mod h1:J2gT2udsDAN96Uj4KfcMRqY0/ypR+oyYUYmja8H+y+w=
 github.com/docker/docker v24.0.1+incompatible h1:NxN81beIxDlUaVt46iUQrYHD9/W3u9EGl52r86O/IGw=

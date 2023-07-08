@@ -3,12 +3,14 @@ package client
 import (
 	"fmt"
 	"github.com/deployment-io/deployment-runner-kit/ping"
+	"runtime"
 )
 
 func (r *RunnerClient) Ping(firstPing bool) error {
 	args := ping.ArgsV1{}
 	args.Send = "ping"
 	args.FirstPing = firstPing
+	args.GoArch = runtime.GOARCH
 	args.OrganizationID = r.organizationID
 	args.Token = r.token
 	var reply ping.ReplyV1
