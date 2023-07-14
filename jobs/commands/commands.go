@@ -7,6 +7,7 @@ import (
 	goShutdownHook "github.com/ankit-arora/go-utils/go-shutdown-hook"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/cloudfront"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/ecr"
 	"github.com/aws/aws-sdk-go-v2/service/ecs"
@@ -31,6 +32,8 @@ import (
 
 const updateDeploymentsKey = "updateDeployments"
 const updateBuildsKey = "updateBuilds"
+
+const cloudfrontRegion = "us-east-1"
 
 var updateBuildsPipeline *goPipeline.Pipeline[string, builds.UpdateBuildDtoV1]
 var updateDeploymentsPipeline *goPipeline.Pipeline[string, deployments.UpdateDeploymentDtoV1]
@@ -137,6 +140,8 @@ func Get(p commands_enums.Type) (jobs.Command, error) {
 		return &CreateEcsCluster{}, nil
 	case commands_enums.UploadImageToEcr:
 		return &UploadDockerImageToEcr{}, nil
+	case commands_enums.AddAwsStaticSiteResponseHeaders:
+		return &AddAwsStaticSiteResponseHeaders{}, nil
 	}
 	return nil, fmt.Errorf("error getting command for %s", p)
 }
@@ -346,6 +351,24 @@ func getIamClient(parameters map[string]interface{}) (*iam.Client, error) {
 	})
 
 	return iamClient, nil
+}
+
+func getCloudfrontClient(parameters map[string]interface{}, region string) (*cloudfront.Client, error) {
+	cfg, err := config.LoadDefaultConfig(context.TODO())
+	if err != nil {
+		return nil, err
+	}
+
+	//region, err := jobs.GetParameterValue[int64](parameters, parameters_enums.Region)
+	//if err != nil {
+	//	return nil, err
+	//}
+
+	cloudfrontClient := cloudfront.NewFromConfig(cfg, func(options *cloudfront.Options) {
+		options.Region = region
+	})
+
+	return cloudfrontClient, nil
 }
 
 func getDockerImageNameAndTag(parameters map[string]interface{}) (string, error) {

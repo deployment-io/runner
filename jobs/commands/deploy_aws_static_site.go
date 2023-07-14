@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/cloudfront"
 	cloudfrontTypes "github.com/aws/aws-sdk-go-v2/service/cloudfront/types"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -370,7 +369,7 @@ func (d *DeployAwsStaticSite) Run(parameters map[string]interface{}, logger jobs
 			markBuildDone(parameters, err, logsWriter)
 		}
 	}()
-	cloudfrontRegion := "us-east-1"
+
 	region, err := jobs.GetParameterValue[int64](parameters, parameters_enums.Region)
 	if err != nil {
 		return parameters, err
@@ -446,15 +445,11 @@ func (d *DeployAwsStaticSite) Run(parameters map[string]interface{}, logger jobs
 		return parameters, err
 	}
 
-	cfg, err := config.LoadDefaultConfig(context.TODO())
+	// Create an Amazon Cloudfront service client
+	cloudfrontClient, err := getCloudfrontClient(parameters, cloudfrontRegion)
 	if err != nil {
 		return parameters, err
 	}
-
-	// Create an Amazon Cloudfront service client
-	cloudfrontClient := cloudfront.NewFromConfig(cfg, func(o *cloudfront.Options) {
-		o.Region = cloudfrontRegion
-	})
 
 	if isNewBucketCreated {
 		//new deployment

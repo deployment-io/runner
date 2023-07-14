@@ -47,6 +47,9 @@ func executeJobs(jobsStream <-chan jobs.PendingJobDtoV1, noOfWorkers int) <-chan
 			nextJob:
 				for pendingJob := range jobsStream {
 					parameters := pendingJob.Parameters
+					//TODO logger is job level detail. Introduce a job context and add logger there
+					//pass job context in each command run.
+					//job context will be different based on job type. So job types needs to be passed from the server.
 					logger, err := loggers.Get(parameters)
 					if err != nil {
 						result := getJobResult(pendingJob, err.Error())

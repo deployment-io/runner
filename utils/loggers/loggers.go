@@ -81,7 +81,9 @@ func Init() {
 func Get(parameters map[string]interface{}) (jobs.Logger, error) {
 	loggerType, err := jobs.GetParameterValue[int64](parameters, parameters_enums.LoggerType)
 	if err != nil {
-		return nil, err
+		//loggerType is not needed for all job types.
+		//TODO We'll revisit this later
+		return nil, nil
 	}
 
 	switch uint(loggerType) {
