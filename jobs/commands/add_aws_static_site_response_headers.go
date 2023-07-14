@@ -84,6 +84,88 @@ func (a *AddAwsStaticSiteResponseHeaders) Run(parameters map[string]interface{},
 		return parameters, err
 	}
 
+	cloudfrontDistributionId, err := jobs.GetParameterValue[string](parameters, parameters_enums.CloudfrontID)
+	if err != nil {
+		return parameters, err
+	}
+
+	//assign to the cloudfront distribution
+	distributionConfigOutput, err := cloudfrontClient.GetDistributionConfig(context.TODO(), &cloudfront.GetDistributionConfigInput{
+		Id: aws.String(cloudfrontDistributionId),
+	})
+
+	if err != nil {
+		return parameters, err
+	}
+
+	distributionConfig := distributionConfigOutput.DistributionConfig
+	functionAssociations := distributionConfig.DefaultCacheBehavior.FunctionAssociations
+	items := functionAssociations.Items
+	quantity := functionAssociations.Quantity
+
+	responseHeadersA, err := jobs.GetParameterValue[primitive.A](parameters, parameters_enums.ResponseHeaders)
+	if err != nil {
+		return parameters, err
+	}
+
+	//check if headers function exists
+	describeFunctionOutput, _ := cloudfrontClient.DescribeFunction(context.TODO(), &cloudfront.DescribeFunctionInput{
+		Name: aws.String(responseHeadersFunctionName),
+		//Stage: "",
+	})
+
+	if len(responseHeadersA) == 0 {
+		if describeFunctionOutput == nil {
+			return parameters, nil
+		}
+		//no headers so delete function and disassociate
+		newArn := aws.ToString(describeFunctionOutput.FunctionSummary.FunctionMetadata.FunctionARN)
+		var newItems []cloudfront_types.FunctionAssociation
+		var q int32 = 0
+		disAssociate := false
+		for _, item := range items {
+			//check if already associated
+			associatedArn := aws.ToString(item.FunctionARN)
+			if (associatedArn == newArn) && (item.EventType == cloudfront_types.EventTypeViewerResponse) {
+				disAssociate = true
+			} else {
+				newItems = append(newItems, item)
+				q++
+			}
+		}
+		if disAssociate {
+			functionAssociations = &cloudfront_types.FunctionAssociations{
+				Quantity: aws.Int32(q),
+				Items:    newItems,
+			}
+			distributionConfig.DefaultCacheBehavior.FunctionAssociations = functionAssociations
+			_, err = cloudfrontClient.UpdateDistribution(context.TODO(), &cloudfront.UpdateDistributionInput{
+				DistributionConfig: distributionConfig,
+				Id:                 aws.String(cloudfrontDistributionId),
+				IfMatch:            distributionConfigOutput.ETag,
+			})
+
+			if err != nil {
+				return parameters, err
+			}
+
+			err := invalidateCloudfrontDistribution(parameters, cloudfrontClient, cloudfrontDistributionId)
+			if err != nil {
+				return parameters, err
+			}
+		}
+
+		_, err = cloudfrontClient.DeleteFunction(context.TODO(), &cloudfront.DeleteFunctionInput{
+			IfMatch: describeFunctionOutput.ETag,
+			Name:    aws.String(responseHeadersFunctionName),
+		})
+		if err != nil {
+			return parameters, err
+		}
+
+		return parameters, nil
+	}
+
 	cloudfrontFunctionComment, err := getResponseHeadersFunctionComment(parameters)
 	if err != nil {
 		return parameters, err
@@ -94,12 +176,6 @@ func (a *AddAwsStaticSiteResponseHeaders) Run(parameters map[string]interface{},
 		return parameters, err
 	}
 
-	//check if headers function exists
-	describeFunctionOutput, err := cloudfrontClient.DescribeFunction(context.TODO(), &cloudfront.DescribeFunctionInput{
-		Name: aws.String(responseHeadersFunctionName),
-		//Stage: "",
-	})
-
 	config := &cloudfront_types.FunctionConfig{
 		Comment: aws.String(cloudfrontFunctionComment),
 		Runtime: cloudfront_types.FunctionRuntimeCloudfrontJs10,
@@ -107,7 +183,7 @@ func (a *AddAwsStaticSiteResponseHeaders) Run(parameters map[string]interface{},
 
 	var functionARN, etag *string
 
-	if describeFunctionOutput != nil && err == nil {
+	if describeFunctionOutput != nil {
 		//function exists
 		//TODO logic can be better and we can specifically check for NoSuchFunctionExists: The specified function does not exist
 		//if exists
@@ -149,24 +225,6 @@ func (a *AddAwsStaticSiteResponseHeaders) Run(parameters map[string]interface{},
 		return parameters, err
 	}
 
-	cloudfrontDistributionId, err := jobs.GetParameterValue[string](parameters, parameters_enums.CloudfrontID)
-	if err != nil {
-		return parameters, err
-	}
-
-	//assign to the cloudfront distribution
-	distributionConfigOutput, err := cloudfrontClient.GetDistributionConfig(context.TODO(), &cloudfront.GetDistributionConfigInput{
-		Id: aws.String(cloudfrontDistributionId),
-	})
-
-	if err != nil {
-		return parameters, err
-	}
-
-	distributionConfig := distributionConfigOutput.DistributionConfig
-	functionAssociations := distributionConfig.DefaultCacheBehavior.FunctionAssociations
-	items := functionAssociations.Items
-	quantity := functionAssociations.Quantity
 	associate := true
 	for _, item := range items {
 		//check if already associated
@@ -205,10 +263,18 @@ func (a *AddAwsStaticSiteResponseHeaders) Run(parameters map[string]interface{},
 		}
 	}
 
-	var callerReference string
-	callerReference, err = getCallerReference(parameters)
+	err = invalidateCloudfrontDistribution(parameters, cloudfrontClient, cloudfrontDistributionId)
 	if err != nil {
 		return parameters, err
+	}
+
+	return parameters, err
+}
+
+func invalidateCloudfrontDistribution(parameters map[string]interface{}, cloudfrontClient *cloudfront.Client, cloudfrontDistributionId string) error {
+	callerReference, err := getCallerReference(parameters)
+	if err != nil {
+		return err
 	}
 
 	var createInvalidationOutput *cloudfront.CreateInvalidationOutput
@@ -226,7 +292,7 @@ func (a *AddAwsStaticSiteResponseHeaders) Run(parameters map[string]interface{},
 	})
 
 	if err != nil {
-		return parameters, err
+		return err
 	}
 
 	//Wait for invalidation to get done
@@ -238,8 +304,7 @@ func (a *AddAwsStaticSiteResponseHeaders) Run(parameters map[string]interface{},
 	}, 10*time.Minute)
 
 	if err != nil {
-		return parameters, err
+		return err
 	}
-
-	return parameters, err
+	return nil
 }
