@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 type Uploader struct {
@@ -44,6 +45,9 @@ func (u *Uploader) uploadDirectory(directoryPath string, logsWriter io.Writer) e
 	fileUploadDoneSignals := make([]<-chan uploadFileDoneDTO, 0)
 	abortUploadSignal := make(chan interface{})
 	root := directoryPath
+	//10 concurrent uploads sleep for 10 seconds after 10 requests for now
+	//TODO fix later
+	i := 0
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -51,11 +55,12 @@ func (u *Uploader) uploadDirectory(directoryPath string, logsWriter io.Writer) e
 		if !d.IsDir() {
 			//	upload if it's not directory
 			outputS3ObjectKey := strings.TrimPrefix(path, directoryPath+"/")
-			fileUploadDoneSignal, fileUploadErr := u.UploadFile(path, outputS3ObjectKey, abortUploadSignal)
-			if fileUploadErr != nil {
-				return fileUploadErr
-			}
+			fileUploadDoneSignal := u.UploadFile(path, outputS3ObjectKey, abortUploadSignal)
 			fileUploadDoneSignals = append(fileUploadDoneSignals, fileUploadDoneSignal)
+			i++
+			if i%10 == 0 {
+				time.Sleep(10 * time.Second)
+			}
 		}
 		return err
 	})
@@ -89,8 +94,8 @@ func (u *Uploader) UploadDirectory(directoryPath string, logsWriter io.Writer) e
 	return u.uploadDirectory(directoryPath, logsWriter)
 }
 
-func (u *Uploader) UploadFile(inputFilePath, outputS3ObjectKey string, abortUploadSignal chan interface{}) (<-chan uploadFileDoneDTO, error) {
+func (u *Uploader) UploadFile(inputFilePath, outputS3ObjectKey string, abortUploadSignal chan interface{}) <-chan uploadFileDoneDTO {
 	fileBytesStream := u.fileByteStreamGenerator(inputFilePath, abortUploadSignal)
 	fileUploadDoneSignal := u.uploadByteStreamToS3(inputFilePath, outputS3ObjectKey, fileBytesStream, abortUploadSignal)
-	return fileUploadDoneSignal, nil
+	return fileUploadDoneSignal
 }
