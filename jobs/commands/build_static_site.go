@@ -194,6 +194,18 @@ func (b *BuildStaticSite) Run(parameters map[string]interface{}, logger jobs.Log
 		return parameters, err
 	}
 
+	io.WriteString(logsWriter, fmt.Sprintf("Building static site\n"))
+
+	//checking if package.json file exists
+	if _, err = os.Stat(repoDirectoryPath + "/package.json"); err != nil {
+		if os.IsNotExist(err) {
+			io.WriteString(logsWriter, fmt.Sprintf("package.json file doesn't exists in root directory\n"))
+			return parameters, err
+		} else {
+			return parameters, err
+		}
+	}
+
 	buildCommand, err := jobs.GetParameterValue[string](parameters, parameters_enums.BuildCommand)
 	if err != nil {
 		return parameters, err
@@ -219,8 +231,6 @@ func (b *BuildStaticSite) Run(parameters map[string]interface{}, logger jobs.Log
 			return parameters, err
 		}
 	}
-
-	io.WriteString(logsWriter, fmt.Sprintf("Building static site\n"))
 
 	err = pullDockerImageForBuilding(imageId)
 	if err != nil {

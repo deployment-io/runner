@@ -149,7 +149,7 @@ func Get(p commands_enums.Type) (jobs.Command, error) {
 func markBuildDone(parameters map[string]interface{}, err error, logsWriter io.Writer) {
 	defer func() {
 		//Delete old repo directory to clean up
-		repoDirectoryPath, _ := jobs.GetParameterValue[string](parameters, parameters_enums.RepoDirectoryPath)
+		repoDirectoryPath, _ := getRepositoryDirectoryPath(parameters)
 		if len(repoDirectoryPath) > 0 {
 			os.RemoveAll(repoDirectoryPath)
 		}

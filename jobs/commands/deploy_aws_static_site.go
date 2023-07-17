@@ -20,6 +20,7 @@ import (
 	awsS3Uploads "github.com/deployment-io/deployment-runner/utils/uploads/aws-s3"
 	"io"
 	"log"
+	"strings"
 	"time"
 )
 
@@ -104,6 +105,13 @@ func getDistDirectory(parameters map[string]interface{}) (string, error) {
 	publishDirectory, err := jobs.GetParameterValue[string](parameters, parameters_enums.PublishDirectory)
 	if err != nil {
 		return "", err
+	}
+	//remove . and /
+	publishDirectory = strings.TrimPrefix(publishDirectory, ".")
+	publishDirectory = strings.TrimPrefix(publishDirectory, "/")
+	publishDirectory = strings.TrimSuffix(publishDirectory, "/")
+	if len(publishDirectory) == 0 {
+		return "", fmt.Errorf("publish directory path is same as the root directory")
 	}
 	return fmt.Sprintf("%s/%s", repoDirectory, publishDirectory), nil
 }

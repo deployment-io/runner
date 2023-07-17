@@ -127,6 +127,21 @@ func refreshGitToken(parameters map[string]interface{}) (string, error) {
 	return "", err
 }
 
+func addRootDirectory(parameters map[string]interface{}, repoDirectoryPath string) string {
+	var rootDirectoryPath string
+	rootDirectoryPath, err := jobs.GetParameterValue[string](parameters, parameters_enums.RootDirectory)
+	if err == nil && len(rootDirectoryPath) > 0 {
+		//remove . and/or / from the beginning and / from the end
+		rootDirectoryPath = strings.TrimPrefix(rootDirectoryPath, ".")
+		rootDirectoryPath = strings.TrimPrefix(rootDirectoryPath, "/")
+		rootDirectoryPath = strings.TrimSuffix(rootDirectoryPath, "/")
+		if len(rootDirectoryPath) > 0 {
+			repoDirectoryPath = fmt.Sprintf("%s/%s", repoDirectoryPath, rootDirectoryPath)
+		}
+	}
+	return repoDirectoryPath
+}
+
 func (cr *CheckoutRepository) Run(parameters map[string]interface{}, logger jobs.Logger) (newParameters map[string]interface{}, err error) {
 	logsWriter, err := loggers.GetBuildLogsWriter(parameters, logger)
 	if err != nil {
@@ -257,11 +272,7 @@ func (cr *CheckoutRepository) Run(parameters map[string]interface{}, logger jobs
 		}
 
 		//root directory added to repo directory
-		var rootDirectoryPath string
-		rootDirectoryPath, err = jobs.GetParameterValue[string](parameters, parameters_enums.RootDirectory)
-		if err == nil && len(rootDirectoryPath) > 0 {
-			repoDirectoryPath += rootDirectoryPath
-		}
+		repoDirectoryPath = addRootDirectory(parameters, repoDirectoryPath)
 
 		//add environment files to the source code
 		var environmentFiles map[string]string
