@@ -101,7 +101,6 @@ func (a *AddAwsStaticSiteResponseHeaders) Run(parameters map[string]interface{},
 	distributionConfig := distributionConfigOutput.DistributionConfig
 	functionAssociations := distributionConfig.DefaultCacheBehavior.FunctionAssociations
 	items := functionAssociations.Items
-	quantity := functionAssociations.Quantity
 
 	responseHeadersA, err := jobs.GetParameterValue[primitive.A](parameters, parameters_enums.ResponseHeaders)
 	if err != nil {
@@ -225,33 +224,8 @@ func (a *AddAwsStaticSiteResponseHeaders) Run(parameters map[string]interface{},
 		return parameters, err
 	}
 
-	associate := true
-	for _, item := range items {
-		//check if already associated
-		associatedArn := aws.ToString(item.FunctionARN)
-		newArn := aws.ToString(functionARN)
-		if (associatedArn == newArn) && (item.EventType == cloudfront_types.EventTypeViewerResponse) {
-			associate = false
-		}
-	}
+	associate := associateFunctionToCloudfrontDistribution(distributionConfig, functionARN, cloudfront_types.EventTypeViewerResponse)
 	if associate {
-		var q int32
-		if quantity == nil {
-			q = 0
-		} else {
-			q = aws.ToInt32(quantity)
-		}
-		q++
-		quantity = aws.Int32(q)
-		items = append(items, cloudfront_types.FunctionAssociation{
-			EventType:   cloudfront_types.EventTypeViewerResponse,
-			FunctionARN: functionARN,
-		})
-		functionAssociations = &cloudfront_types.FunctionAssociations{
-			Quantity: quantity,
-			Items:    items,
-		}
-		distributionConfig.DefaultCacheBehavior.FunctionAssociations = functionAssociations
 		_, err = cloudfrontClient.UpdateDistribution(context.TODO(), &cloudfront.UpdateDistributionInput{
 			DistributionConfig: distributionConfig,
 			Id:                 aws.String(cloudfrontDistributionId),

@@ -298,13 +298,13 @@ func getAlbName(parameters map[string]interface{}) (string, error) {
 	return fmt.Sprintf("alb-%s", deploymentID), nil
 }
 
-func getAlbListenerName(parameters map[string]interface{}) (string, error) {
-	//lstr-<deploymentID>
+func getAlbListenerName(parameters map[string]interface{}, port int32) (string, error) {
+	//lstr-<port>-<deploymentID>
 	deploymentID, err := jobs.GetParameterValue[string](parameters, parameters_enums.DeploymentID)
 	if err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("lstr-%s", deploymentID), nil
+	return fmt.Sprintf("lstr-%d-%s", port, deploymentID), nil
 }
 
 func createAlbIfNeeded(parameters map[string]interface{},
@@ -445,7 +445,8 @@ func createAlbIfNeeded(parameters map[string]interface{},
 		loadBalancerDns = aws.ToString(createLoadBalancerOutput.LoadBalancers[0].DNSName)
 	}
 
-	albListenerName, err := getAlbListenerName(parameters)
+	var listenerPort int32 = 80
+	albListenerName, err := getAlbListenerName(parameters, listenerPort)
 	if err != nil {
 		return "", "", err
 	}
@@ -467,7 +468,7 @@ func createAlbIfNeeded(parameters map[string]interface{},
 				TargetGroupArn: aws.String(targetGroupArn),
 			}},
 			LoadBalancerArn: aws.String(loadBalancerArn),
-			Port:            aws.Int32(80),
+			Port:            aws.Int32(listenerPort),
 			Protocol:        elbTypes.ProtocolEnumHttp,
 			Tags: []elbTypes.Tag{
 				{
@@ -496,11 +497,11 @@ func createAlbIfNeeded(parameters map[string]interface{},
 	io.WriteString(logsWriter, fmt.Sprintf("Created load balancer: %s\n", loadBalancerArn))
 
 	updateDeploymentsPipeline.Add(updateDeploymentsKey, deployments.UpdateDeploymentDtoV1{
-		ID:              deploymentID,
-		TargetGroupArn:  targetGroupArn,
-		ListenerArn:     listenerArn,
-		LoadBalancerArn: loadBalancerArn,
-		LoadBalancerDns: loadBalancerDns,
+		ID:                deploymentID,
+		TargetGroupArn:    targetGroupArn,
+		ListenerArnPort80: listenerArn,
+		LoadBalancerArn:   loadBalancerArn,
+		LoadBalancerDns:   loadBalancerDns,
 	})
 
 	return

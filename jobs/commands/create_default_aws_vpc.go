@@ -11,6 +11,7 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/enums/region_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/vpc_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
+	"github.com/deployment-io/deployment-runner-kit/types"
 	"github.com/deployment-io/deployment-runner-kit/vpcs"
 	"github.com/deployment-io/deployment-runner/utils/loggers"
 	"go.mongodb.org/mongo-driver/bson/primitive"
@@ -989,7 +990,7 @@ func (c *CreateDefaultAwsVPC) Run(parameters map[string]interface{}, logger jobs
 					routeTableDtoV1 := vpcs.RouteTableDtoV1{
 						Name:      routeTableName,
 						ID:        publicRouteTableId,
-						IsPrivate: vpcs.False,
+						IsPrivate: types.False,
 					}
 
 					routeTablesDto = append(routeTablesDto, routeTableDtoV1)
@@ -1055,15 +1056,15 @@ func (c *CreateDefaultAwsVPC) Run(parameters map[string]interface{}, logger jobs
 				routeTableDtoV1 := vpcs.RouteTableDtoV1{
 					Name:      routeTableName,
 					ID:        routeTableId,
-					IsPrivate: vpcs.True,
+					IsPrivate: types.True,
 				}
 
 				routeTablesDto = append(routeTablesDto, routeTableDtoV1)
 			}
 
-			isPrivate := vpcs.False
+			isPrivate := types.False
 			if subnet.isPrivate {
-				isPrivate = vpcs.True
+				isPrivate = types.True
 			}
 			subnetDtoV1 := vpcs.SubnetDtoV1{
 				Name:      subnet.name,

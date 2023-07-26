@@ -7,6 +7,7 @@ import (
 	goShutdownHook "github.com/ankit-arora/go-utils/go-shutdown-hook"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/acm"
 	"github.com/aws/aws-sdk-go-v2/service/cloudfront"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/ecr"
@@ -16,6 +17,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3Types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/deployment-io/deployment-runner-kit/builds"
+	"github.com/deployment-io/deployment-runner-kit/certificates"
 	"github.com/deployment-io/deployment-runner-kit/clusters"
 	"github.com/deployment-io/deployment-runner-kit/deployments"
 	"github.com/deployment-io/deployment-runner-kit/enums/build_enums"
@@ -32,6 +34,7 @@ import (
 
 const updateDeploymentsKey = "updateDeployments"
 const updateBuildsKey = "updateBuilds"
+const updateCertificatesKey = "updateCertificates"
 
 const cloudfrontRegion = "us-east-1"
 
@@ -39,6 +42,7 @@ var updateBuildsPipeline *goPipeline.Pipeline[string, builds.UpdateBuildDtoV1]
 var updateDeploymentsPipeline *goPipeline.Pipeline[string, deployments.UpdateDeploymentDtoV1]
 var upsertVpcsPipeline *goPipeline.Pipeline[string, vpcs.UpsertVpcDtoV1]
 var upsertClustersPipeline *goPipeline.Pipeline[string, clusters.UpsertClusterDtoV1]
+var updateCertificatesPipeline *goPipeline.Pipeline[string, certificates.UpdateCertificateDtoV1]
 
 func Init() {
 	c := client.Get()
@@ -120,6 +124,26 @@ func Init() {
 		upsertClustersPipeline.Shutdown()
 		fmt.Println("waiting for clusters upsert pipeline shutdown -- done")
 	})
+	updateCertificatesPipeline, _ = goPipeline.NewPipeline(5, 2*time.Second,
+		func(certificate string, certificates []certificates.UpdateCertificateDtoV1) {
+			e := true
+			for e {
+				err := c.UpdateCertificates(certificates)
+				//TODO we can handle for ErrConnection
+				//will block till error
+				if err != nil {
+					fmt.Println(err)
+					time.Sleep(2 * time.Second)
+					continue
+				}
+				e = false
+			}
+		})
+	goShutdownHook.ADD(func() {
+		fmt.Println("waiting for certificates update pipeline shutdown")
+		updateCertificatesPipeline.Shutdown()
+		fmt.Println("waiting for certificates update pipeline shutdown -- done")
+	})
 }
 
 func Get(p commands_enums.Type) (jobs.Command, error) {
@@ -142,6 +166,16 @@ func Get(p commands_enums.Type) (jobs.Command, error) {
 		return &UploadDockerImageToEcr{}, nil
 	case commands_enums.AddAwsStaticSiteResponseHeaders:
 		return &AddAwsStaticSiteResponseHeaders{}, nil
+	case commands_enums.AddAwsStaticSiteDomains:
+		return &AddAwsStaticSiteDomains{}, nil
+	case commands_enums.DeployAwsCloudfrontViewerRequestFunction:
+		return &DeployAwsCloudfrontViewerRequestFunction{}, nil
+	case commands_enums.CreateAcmCertificate:
+		return &CreateAcmCertificate{}, nil
+	case commands_enums.AddAwsWebServiceDomain:
+		return &AddAwsWebServiceDomain{}, nil
+	case commands_enums.VerifyAcmCertificate:
+		return &VerifyAcmCertificate{}, nil
 	}
 	return nil, fmt.Errorf("error getting command for %s", p)
 }
@@ -369,6 +403,24 @@ func getCloudfrontClient(parameters map[string]interface{}, region string) (*clo
 	})
 
 	return cloudfrontClient, nil
+}
+
+func getAcmClient(parameters map[string]interface{}) (*acm.Client, error) {
+	cfg, err := config.LoadDefaultConfig(context.TODO())
+	if err != nil {
+		return nil, err
+	}
+
+	region, err := jobs.GetParameterValue[int64](parameters, parameters_enums.CertificateRegion)
+	if err != nil {
+		return nil, err
+	}
+
+	acmClient := acm.NewFromConfig(cfg, func(options *acm.Options) {
+		options.Region = region_enums.Type(region).String()
+	})
+
+	return acmClient, nil
 }
 
 func getDockerImageNameAndTag(parameters map[string]interface{}) (string, error) {
