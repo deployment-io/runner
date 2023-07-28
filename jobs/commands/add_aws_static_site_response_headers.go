@@ -17,8 +17,9 @@ import (
 type AddAwsStaticSiteResponseHeaders struct {
 }
 
-func getResponseHeadersFunctionName(parameters map[string]interface{}) (string, error) {
+func getViewerResponseFunctionName(parameters map[string]interface{}) (string, error) {
 	//response-headers-<deploymentID>
+	//TODO change name to viewer-response-<deploymentID>
 	deploymentID, err := jobs.GetParameterValue[string](parameters, parameters_enums.DeploymentID)
 	if err != nil {
 		return "", err
@@ -79,7 +80,7 @@ func (a *AddAwsStaticSiteResponseHeaders) Run(parameters map[string]interface{},
 		return parameters, err
 	}
 
-	responseHeadersFunctionName, err := getResponseHeadersFunctionName(parameters)
+	responseHeadersFunctionName, err := getViewerResponseFunctionName(parameters)
 	if err != nil {
 		return parameters, err
 	}

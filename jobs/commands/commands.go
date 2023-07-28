@@ -176,6 +176,8 @@ func Get(p commands_enums.Type) (jobs.Command, error) {
 		return &AddAwsWebServiceDomain{}, nil
 	case commands_enums.VerifyAcmCertificate:
 		return &VerifyAcmCertificate{}, nil
+	case commands_enums.DeleteAwsStaticSite:
+		return &DeleteAwsStaticSite{}, nil
 	}
 	return nil, fmt.Errorf("error getting command for %s", p)
 }
