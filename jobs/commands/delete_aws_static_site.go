@@ -68,13 +68,10 @@ func (d *DeleteAwsStaticSite) Run(parameters map[string]interface{}, logger jobs
 	if err != nil {
 		return parameters, err
 	}
-	_, err = cloudfrontClient.DeleteCachePolicy(context.TODO(), &cloudfront.DeleteCachePolicyInput{
+	_, _ = cloudfrontClient.DeleteCachePolicy(context.TODO(), &cloudfront.DeleteCachePolicyInput{
 		Id:      cachePolicyId,
 		IfMatch: getCachePolicyOutput.ETag,
 	})
-	if err != nil {
-		return parameters, err
-	}
 
 	//delete cf functions if needed
 	err = deleteCloudfrontFunctions(parameters, cloudfrontClient)
@@ -86,10 +83,7 @@ func (d *DeleteAwsStaticSite) Run(parameters map[string]interface{}, logger jobs
 	if distributionConfig.Origins != nil {
 		for _, origin := range distributionConfig.Origins.Items {
 			if origin.OriginAccessControlId != nil {
-				err = deleteOriginAccessControl(origin.OriginAccessControlId, cloudfrontClient)
-				if err != nil {
-					return parameters, err
-				}
+				_ = deleteOriginAccessControl(origin.OriginAccessControlId, cloudfrontClient)
 			}
 		}
 	}
