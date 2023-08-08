@@ -106,6 +106,9 @@ func (d *DeleteAwsWebService) Run(parameters map[string]interface{}, logger jobs
 		return parameters, err
 	}
 
+	//sleep after alb is deleted else AWS might give an error
+	time.Sleep(1 * time.Minute)
+
 	//delete target group
 	targetGroupArn, err := jobs.GetParameterValue[string](parameters, parameters_enums.TargetGroupArn)
 	if err != nil {

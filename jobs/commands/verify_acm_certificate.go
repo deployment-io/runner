@@ -41,5 +41,8 @@ func (v *VerifyAcmCertificate) Run(parameters map[string]interface{}, logger job
 		Verified: types.True,
 	})
 
+	//wait for a minute after the certificate is verified or AWS gives an error
+	time.Sleep(1 * time.Minute)
+
 	return parameters, err
 }
