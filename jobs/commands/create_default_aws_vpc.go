@@ -917,6 +917,7 @@ func (c *CreateDefaultAwsVPC) Run(parameters map[string]interface{}, logger jobs
 		return parameters, err
 	}
 	cidrBlockFromParams, _ := jobs.GetParameterValue[string](parameters, parameters_enums.VpcCidr)
+	var masterNatID string
 	for _, cidrBlock := range cidrBlocks {
 		if len(cidrBlockFromParams) > 0 && cidrBlockFromParams != cidrBlock {
 			continue
@@ -1004,31 +1005,39 @@ func (c *CreateDefaultAwsVPC) Run(parameters map[string]interface{}, logger jobs
 					return parameters, err
 				}
 
-				var allocationId, allocationName string
-				allocationId, allocationName, err = allocatePublicElasticIPIfNeeded(parameters, ec2Client, subnet.az)
-				if err != nil {
-					return parameters, err
-				}
-
-				var natGatewayId, natGatewayName string
 				var shouldWaitForNatGatewayAvailability bool
-				natGatewayId, natGatewayName, shouldWaitForNatGatewayAvailability, err = createNatGatewayIfNeeded(parameters, ec2Client, subnetId, allocationId, subnet.az)
+				//get createMultipleNats bool from parameters - false by default
+				createMultipleNats := false
+				createMultipleNats, err = jobs.GetParameterValue[bool](parameters, parameters_enums.CreateMultipleNats)
 				if err != nil {
-					return parameters, err
+					createMultipleNats = false
 				}
-				if shouldWaitForNatGatewayAvailability {
-					natGatewayIdsToWait = append(natGatewayIdsToWait, natGatewayId)
-				}
+				if createMultipleNats || len(natGatewaysDto) < 1 {
+					var allocationId, allocationName string
+					allocationId, allocationName, err = allocatePublicElasticIPIfNeeded(parameters, ec2Client, subnet.az)
+					if err != nil {
+						return parameters, err
+					}
+					var natGatewayId, natGatewayName string
+					natGatewayId, natGatewayName, shouldWaitForNatGatewayAvailability, err = createNatGatewayIfNeeded(parameters, ec2Client, subnetId, allocationId, subnet.az)
+					if err != nil {
+						return parameters, err
+					}
+					if shouldWaitForNatGatewayAvailability {
+						natGatewayIdsToWait = append(natGatewayIdsToWait, natGatewayId)
+					}
 
-				natGatewayDtoV1 := vpcs.NatGatewayDtoV1{
-					Name:                    natGatewayName,
-					ID:                      natGatewayId,
-					ElasticIPAllocationName: allocationName,
-					ElasticIPAllocationId:   allocationId,
-				}
-				natGatewaysDto = append(natGatewaysDto, natGatewayDtoV1)
+					natGatewayDtoV1 := vpcs.NatGatewayDtoV1{
+						Name:                    natGatewayName,
+						ID:                      natGatewayId,
+						ElasticIPAllocationName: allocationName,
+						ElasticIPAllocationId:   allocationId,
+					}
+					natGatewaysDto = append(natGatewaysDto, natGatewayDtoV1)
 
-				natGatewaysAzMap[subnet.az] = natGatewayId
+					natGatewaysAzMap[subnet.az] = natGatewayId
+					masterNatID = natGatewayId
+				}
 			} else {
 				//create route table for each private subnet
 				var routeTableId, routeTableName string
@@ -1139,7 +1148,7 @@ func (c *CreateDefaultAwsVPC) Run(parameters map[string]interface{}, logger jobs
 			} else {
 				natGatewayId, ok := natGatewaysAzMap[routeTable.az]
 				if !ok {
-					return parameters, fmt.Errorf("did not find a nat gateway for az: %s", routeTable.az)
+					natGatewayId = masterNatID
 				}
 				//create nat gateway route for private route table
 				err = createRouteIfNeeded(ec2Client, routeTable.routeTableId, "", natGatewayId)
