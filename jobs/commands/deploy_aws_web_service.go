@@ -777,7 +777,7 @@ func createEcsServiceIfNeeded(parameters map[string]interface{}, ecsClient *ecs.
 				TargetGroupArn: aws.String(targetGroupArn),
 			}},
 			NetworkConfiguration: networkConfiguration,
-			PropagateTags:        ecsTypes.PropagateTagsNone,
+			PropagateTags:        ecsTypes.PropagateTagsTaskDefinition,
 			SchedulingStrategy:   ecsTypes.SchedulingStrategyReplica,
 			Tags: []ecsTypes.Tag{
 				{
@@ -832,6 +832,7 @@ func updateEcsService(parameters map[string]interface{}, ecsClient *ecs.Client, 
 		Cluster:        aws.String(ecsClusterArn),
 		DesiredCount:   aws.Int32(1),
 		TaskDefinition: aws.String(taskDefinitionArn),
+		PropagateTags:  ecsTypes.PropagateTagsTaskDefinition,
 	}
 	_, err = ecsClient.UpdateService(context.TODO(), updateServiceInput)
 
