@@ -7,6 +7,7 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner/client"
 	"github.com/deployment-io/deployment-runner/jobs/commands"
+	"github.com/deployment-io/deployment-runner/utils"
 	"github.com/deployment-io/deployment-runner/utils/loggers"
 	"github.com/joho/godotenv"
 	"os"
@@ -106,21 +107,28 @@ func sendJobResults(resultsStream <-chan jobs.CompletingJobDtoV1,
 	return done
 }
 
-func getEnvironment() (service, organizationId, token string) {
+func getEnvironment() (service, organizationId, token, region, dockerImage, cpuStr, memory, taskExecutionRoleArn, taskRoleArn string) {
 	//TODO load .env
 	//ignoring err
 	_ = godotenv.Load()
 	organizationId = os.Getenv("OrganizationID")
 	service = os.Getenv("Service")
 	token = os.Getenv("Token")
+	region = os.Getenv("Region")
+	dockerImage = os.Getenv("DockerImage")
+	cpuStr = os.Getenv("CpuArch")
+	memory = os.Getenv("Memory")
+	taskExecutionRoleArn = os.Getenv("ExecutionRoleArn")
+	taskRoleArn = os.Getenv("TaskRoleArn")
+
 	return
 }
 
 var clientCertPem, clientKeyPem string
 
 func main() {
-	service, organizationId, token := getEnvironment()
-	client.Connect(service, organizationId, token, clientCertPem, clientKeyPem, false)
+	service, organizationId, token, region, dockerImage, cpuStr, memory, taskExecutionRoleArn, taskRoleArn := getEnvironment()
+	client.Connect(service, organizationId, token, clientCertPem, clientKeyPem, dockerImage, false)
 	c := client.Get()
 	commands.Init()
 	loggers.Init()
@@ -157,6 +165,14 @@ func main() {
 		default:
 			pendingJobs, err := c.GetPendingJobs()
 			if err != nil {
+				//no pending jobs - check for upgrading
+				now := time.Now().Unix()
+				if now > c.UpgradeFromTs && now < c.UpgradeToTs {
+					if len(c.DockerUpgradeImage) > 0 && dockerImage != c.DockerUpgradeImage {
+						//upgrade deployment runner to upgraded image
+						_ = utils.UpgradeDeploymentRunner(service, organizationId, token, region, c.DockerUpgradeImage, cpuStr, memory, taskExecutionRoleArn, taskRoleArn)
+					}
+				}
 				time.Sleep(10 * time.Second)
 				continue
 			}
