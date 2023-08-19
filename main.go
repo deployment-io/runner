@@ -167,10 +167,16 @@ func main() {
 			if err != nil {
 				//no pending jobs - check for upgrading
 				now := time.Now().Unix()
+				fmt.Println("from upgrade time: ", c.UpgradeFromTs)
+				fmt.Println("to upgrade time: ", c.UpgradeToTs)
+				fmt.Println("upgrade image: ", c.DockerUpgradeImage)
 				if now > c.UpgradeFromTs && now < c.UpgradeToTs {
 					if len(c.DockerUpgradeImage) > 0 && dockerImage != c.DockerUpgradeImage {
 						//upgrade deployment runner to upgraded image
-						_ = utils.UpgradeDeploymentRunner(service, organizationId, token, region, c.DockerUpgradeImage, cpuStr, memory, taskExecutionRoleArn, taskRoleArn)
+						err := utils.UpgradeDeploymentRunner(service, organizationId, token, region, c.DockerUpgradeImage, cpuStr, memory, taskExecutionRoleArn, taskRoleArn)
+						if err != nil {
+							fmt.Println(err.Error())
+						}
 					}
 				}
 				time.Sleep(10 * time.Second)
