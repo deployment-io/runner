@@ -202,13 +202,7 @@ func updateDeploymentRunnerService(ecsClient *ecs.Client, organizationId, cpuStr
 
 func UpgradeDeploymentRunner(service, organizationId, token, region, dockerImage, cpuStr, memory, taskExecutionRoleArn, taskRoleArn string) error {
 	dockerUpgradeImage, upgradeFromTs, upgradeToTs := UpgradeData.Get()
-
-	fmt.Println("from upgrade time: ", upgradeFromTs)
-	fmt.Println("to upgrade time: ", upgradeToTs)
-	fmt.Println("upgrade image: ", dockerUpgradeImage)
-
 	now := time.Now().Unix()
-
 	if now > upgradeFromTs && now < upgradeToTs {
 		if len(dockerUpgradeImage) > 0 && dockerImage != dockerUpgradeImage {
 			//upgrade deployment runner to upgraded image
