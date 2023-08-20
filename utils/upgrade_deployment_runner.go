@@ -8,7 +8,35 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ecs"
 	ecsTypes "github.com/aws/aws-sdk-go-v2/service/ecs/types"
 	"strings"
+	"sync"
+	"time"
 )
+
+type UpgradeDataType struct {
+	sync.Mutex
+	DockerUpgradeImage string
+	UpgradeFromTs      int64
+	UpgradeToTs        int64
+}
+
+func (u *UpgradeDataType) Set(dockerUpgradeImage string, upgradeFromTs, upgradeToTs int64) {
+	u.Lock()
+	defer u.Unlock()
+	u.UpgradeFromTs = upgradeFromTs
+	u.UpgradeToTs = upgradeToTs
+	u.DockerUpgradeImage = dockerUpgradeImage
+}
+
+func (u *UpgradeDataType) Get() (dockerUpgradeImage string, upgradeFromTs, upgradeToTs int64) {
+	u.Lock()
+	defer u.Unlock()
+	dockerUpgradeImage = u.DockerUpgradeImage
+	upgradeFromTs = u.UpgradeFromTs
+	upgradeToTs = u.UpgradeToTs
+	return
+}
+
+var UpgradeData = UpgradeDataType{}
 
 func registerDeploymentRunnerTaskDefinition(ecsClient *ecs.Client, service, organizationId, token, region, dockerImage, cpuStr, memory, taskExecutionRoleArn, taskRoleArn string) (taskDefinitionArn string, err error) {
 
@@ -149,7 +177,7 @@ func registerDeploymentRunnerTaskDefinition(ecsClient *ecs.Client, service, orga
 
 func updateDeploymentRunnerService(ecsClient *ecs.Client, organizationId, cpuStr, taskDefinitionArn string) error {
 	ccName := fmt.Sprintf("deployment-runner-capacity-provider-%s", cpuStr)
-	ecsClusterName := fmt.Sprintf("ecs-%s-%s", cpuStr, organizationId)
+	ecsClusterName := fmt.Sprintf("deployment-runner-%s-%s", cpuStr, organizationId)
 	ecsServiceName := fmt.Sprintf("deployment-runner-%s", cpuStr)
 	updateServiceInput := &ecs.UpdateServiceInput{
 		CapacityProviderStrategy: []ecsTypes.CapacityProviderStrategyItem{{
@@ -173,22 +201,36 @@ func updateDeploymentRunnerService(ecsClient *ecs.Client, organizationId, cpuStr
 }
 
 func UpgradeDeploymentRunner(service, organizationId, token, region, dockerImage, cpuStr, memory, taskExecutionRoleArn, taskRoleArn string) error {
-	cfg, err := config.LoadDefaultConfig(context.TODO())
-	if err != nil {
-		return err
+	dockerUpgradeImage, upgradeFromTs, upgradeToTs := UpgradeData.Get()
+
+	fmt.Println("from upgrade time: ", upgradeFromTs)
+	fmt.Println("to upgrade time: ", upgradeToTs)
+	fmt.Println("upgrade image: ", dockerUpgradeImage)
+
+	now := time.Now().Unix()
+
+	if now > upgradeFromTs && now < upgradeToTs {
+		if len(dockerUpgradeImage) > 0 && dockerImage != dockerUpgradeImage {
+			//upgrade deployment runner to upgraded image
+			cfg, err := config.LoadDefaultConfig(context.TODO())
+			if err != nil {
+				return err
+			}
+			ecsClient := ecs.NewFromConfig(cfg, func(o *ecs.Options) {
+				o.Region = region
+			})
+
+			//register new task definition
+			taskDefinitionArn, err := registerDeploymentRunnerTaskDefinition(ecsClient, service, organizationId, token, region, dockerUpgradeImage, cpuStr, memory, taskExecutionRoleArn, taskRoleArn)
+			if err != nil {
+				return err
+			}
+
+			//update service
+			err = updateDeploymentRunnerService(ecsClient, organizationId, cpuStr, taskDefinitionArn)
+
+			return err
+		}
 	}
-	ecsClient := ecs.NewFromConfig(cfg, func(o *ecs.Options) {
-		o.Region = region
-	})
-
-	//register new task definition
-	taskDefinitionArn, err := registerDeploymentRunnerTaskDefinition(ecsClient, service, organizationId, token, region, dockerImage, cpuStr, memory, taskExecutionRoleArn, taskRoleArn)
-	if err != nil {
-		return err
-	}
-
-	//update service
-	err = updateDeploymentRunnerService(ecsClient, organizationId, cpuStr, taskDefinitionArn)
-
-	return err
+	return nil
 }

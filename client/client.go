@@ -4,6 +4,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"github.com/deployment-io/deployment-runner/utils"
 	"log"
 	"net/rpc"
 	"strings"
@@ -19,9 +20,6 @@ type RunnerClient struct {
 	organizationID     string
 	token              string
 	currentDockerImage string
-	DockerUpgradeImage string
-	UpgradeFromTs      int64
-	UpgradeToTs        int64
 }
 
 func getTlsClient(service, clientCertPem, clientKeyPem string) (*rpc.Client, error) {
@@ -113,15 +111,14 @@ func Connect(service, organizationID, token, clientCertPem, clientKeyPem, docker
 							} else {
 								firstPing = false
 								client.isConnected = true
-								client.DockerUpgradeImage = dockerUpgradeImage
-								client.UpgradeFromTs = upgradeFromTs
-								client.UpgradeToTs = upgradeToTs
 								if isConnectedOld != client.isConnected {
 									if blockTillFirstConnect {
 										<-firstTimeConnectSignal
 										blockTillFirstConnect = false
 									}
 								}
+								//set upgrade data
+								utils.UpgradeData.Set(dockerUpgradeImage, upgradeFromTs, upgradeToTs)
 							}
 						} else {
 							client.isConnected = false

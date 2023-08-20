@@ -165,26 +165,19 @@ func main() {
 		default:
 			pendingJobs, err := c.GetPendingJobs()
 			if err != nil {
-				//no pending jobs - check for upgrading
-				now := time.Now().Unix()
-				fmt.Println("from upgrade time: ", c.UpgradeFromTs)
-				fmt.Println("to upgrade time: ", c.UpgradeToTs)
-				fmt.Println("upgrade image: ", c.DockerUpgradeImage)
-				if now > c.UpgradeFromTs && now < c.UpgradeToTs {
-					if len(c.DockerUpgradeImage) > 0 && dockerImage != c.DockerUpgradeImage {
-						//upgrade deployment runner to upgraded image
-						err := utils.UpgradeDeploymentRunner(service, organizationId, token, region, c.DockerUpgradeImage, cpuStr, memory, taskExecutionRoleArn, taskRoleArn)
-						if err != nil {
-							fmt.Println(err.Error())
-						}
-					}
-				}
 				time.Sleep(10 * time.Second)
 				continue
 			}
 			jobsStream := allocateJobs(pendingJobs)
 			resultsStream := executeJobs(jobsStream, 5)
 			<-sendJobResults(resultsStream, 5, jobsDonePipeline)
+			if len(pendingJobs) == 0 {
+				//no pending jobs - upgrade deployment runner to upgraded image
+				err = utils.UpgradeDeploymentRunner(service, organizationId, token, region, dockerImage, cpuStr, memory, taskExecutionRoleArn, taskRoleArn)
+				if err != nil {
+					fmt.Println(err.Error())
+				}
+			}
 			time.Sleep(10 * time.Second)
 		}
 	}
