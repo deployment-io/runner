@@ -16,10 +16,13 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/enums/region_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner/client"
+	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
 	"github.com/deployment-io/deployment-runner/utils/loggers"
 	awsS3Uploads "github.com/deployment-io/deployment-runner/utils/uploads/aws-s3"
+	"go.mongodb.org/mongo-driver/bson/primitive"
 	"io"
 	"log"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -236,9 +239,9 @@ func createDefaultCacheBehavior(bucketLocation, cachePolicyId *string) *cloudfro
 	return defaultCacheBehavior
 }
 
-func createDistributionConfigForNewCloudfront(bucketLocation, originAccessControlId *string, callerReference, comment,
+func createDistributionConfigForNewCloudfront(parameters map[string]interface{}, bucketLocation, originAccessControlId *string, callerReference, comment,
 	domainName string,
-	defaultCacheBehavior *cloudfrontTypes.DefaultCacheBehavior) *cloudfrontTypes.DistributionConfig {
+	defaultCacheBehavior *cloudfrontTypes.DefaultCacheBehavior) (*cloudfrontTypes.DistributionConfig, error) {
 	origin := cloudfrontTypes.Origin{
 		Id:                    bucketLocation,
 		DomainName:            aws.String(domainName),
@@ -255,20 +258,49 @@ func createDistributionConfigForNewCloudfront(bucketLocation, originAccessContro
 		Quantity: aws.Int32(1),
 	}
 
+	errorPagesA, err := jobs.GetParameterValue[primitive.A](parameters, parameters_enums.ErrorPages)
+	if err != nil {
+		return nil, err
+	}
+	errorPages, err := commandUtils.ConvertPrimitiveAToTwoDStringSlice(errorPagesA)
+	if err != nil {
+		return nil, err
+	}
+
+	var customErrorResponses []cloudfrontTypes.CustomErrorResponse
+	var q int32 = 0
+	for _, errorPageRow := range errorPages {
+		if len(errorPageRow) == 3 {
+			i, err := strconv.ParseInt(errorPageRow[0], 10, 64)
+			if err == nil {
+				customErrorResponse := cloudfrontTypes.CustomErrorResponse{
+					ErrorCode:        aws.Int32(int32(i)),
+					ResponsePagePath: aws.String(errorPageRow[1]),
+					ResponseCode:     aws.String(errorPageRow[2]),
+				}
+				customErrorResponses = append(customErrorResponses, customErrorResponse)
+				q++
+			}
+		}
+	}
+
 	distributionConfig := &cloudfrontTypes.DistributionConfig{
 		CallerReference:      aws.String(callerReference),
 		Comment:              aws.String(comment),
 		DefaultCacheBehavior: defaultCacheBehavior,
 		Enabled:              aws.Bool(true),
 		Origins:              origins,
-		CustomErrorResponses: nil,
-		DefaultRootObject:    aws.String("index.html"),
-		PriceClass:           cloudfrontTypes.PriceClassPriceClassAll,
-		ViewerCertificate:    nil,
-		WebACLId:             nil,
+		CustomErrorResponses: &cloudfrontTypes.CustomErrorResponses{
+			Quantity: aws.Int32(q),
+			Items:    customErrorResponses,
+		},
+		DefaultRootObject: aws.String("index.html"),
+		PriceClass:        cloudfrontTypes.PriceClassPriceClassAll,
+		ViewerCertificate: nil,
+		WebACLId:          nil,
 	}
 
-	return distributionConfig
+	return distributionConfig, nil
 }
 
 type bucketPolicyStatement struct {
@@ -502,8 +534,13 @@ func (d *DeployAwsStaticSite) Run(parameters map[string]interface{}, logger jobs
 			return parameters, err
 		}
 
-		distributionConfig := createDistributionConfigForNewCloudfront(bucketLocation, originAccessControlId,
+		var distributionConfig *cloudfrontTypes.DistributionConfig
+		distributionConfig, err = createDistributionConfigForNewCloudfront(parameters, bucketLocation, originAccessControlId,
 			callerReference, comment, domainName, defaultCacheBehavior)
+
+		if err != nil {
+			return parameters, err
+		}
 
 		io.WriteString(logsWriter, fmt.Sprintf("Creating cloudfront distribution\n"))
 
@@ -560,6 +597,8 @@ func (d *DeployAwsStaticSite) Run(parameters map[string]interface{}, logger jobs
 			CloudfrontDistributionArn:        aws.ToString(createDistributionOutput.Distribution.ARN),
 			CloudfrontDistributionDomainName: aws.ToString(createDistributionOutput.Distribution.DomainName),
 		})
+
+		jobs.SetParameterValue(parameters, parameters_enums.CloudfrontID, aws.ToString(createDistributionOutput.Distribution.Id))
 	} else {
 		//new build
 		//Invalidate cloudfront
@@ -599,6 +638,8 @@ func (d *DeployAwsStaticSite) Run(parameters map[string]interface{}, logger jobs
 		if err != nil {
 			return parameters, err
 		}
+
+		jobs.SetParameterValue(parameters, parameters_enums.CloudfrontID, cloudfrontID)
 	}
 
 	//mark build done successfully

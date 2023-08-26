@@ -60,10 +60,10 @@ func getViewerRequestFunctionCode(parameters map[string]interface{}) (string, er
 		}
 	}
 
-	domainsA, err := jobs.GetParameterValue[primitive.A](parameters, parameters_enums.Domains)
-	if err != nil {
-		return "", err
-	}
+	domainsA, _ := jobs.GetParameterValue[primitive.A](parameters, parameters_enums.Domains)
+	//if err != nil {
+	//	return "", err
+	//}
 	var domains []string
 	domainHttpsStatement := ""
 	if len(domainsA) > 0 {
@@ -88,12 +88,19 @@ func getViewerRequestFunctionCode(parameters map[string]interface{}) (string, er
 
 	}
 
+	subdirectoryIndexStatement := `if (request.uri.endsWith('/')) {
+        request.uri += 'index.html';
+     } else if (!request.uri.includes('.')) {
+        request.uri += '/index.html';
+     }`
+
 	cloudfrontFunction := fmt.Sprintf(`function handler(event) {
     var request = event.request;
     %s
     %s
+    %s
     return request;
-}`, domainRedirectStatement, domainHttpsStatement)
+}`, domainRedirectStatement, domainHttpsStatement, subdirectoryIndexStatement)
 	return cloudfrontFunction, nil
 }
 
