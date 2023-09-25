@@ -29,7 +29,7 @@ var addBuildLogsPipeline *goPipeline.Pipeline[string, BuildLog]
 
 func Init() {
 	c := client.Get()
-	addBuildLogsPipeline, _ = goPipeline.NewPipeline(20, 10*time.Second,
+	addBuildLogsPipeline, _ = goPipeline.NewPipeline(20, 5*time.Second,
 		func(buildId string, buildLogs []BuildLog) {
 			var logger jobs.Logger
 			if len(buildLogs) > 0 {

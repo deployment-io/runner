@@ -579,11 +579,6 @@ func (d *DeployAwsStaticSite) Run(parameters map[string]interface{}, logger jobs
 		distributionDeployedWaiter := cloudfront.NewDistributionDeployedWaiter(cloudfrontClient)
 
 		io.WriteString(logsWriter, fmt.Sprintf("Waiting for cloudfront distribution to be deployed: %s\n", aws.ToString(distributionId)))
-		err = distributionDeployedWaiter.Wait(context.TODO(), getDistributionInput, 10*time.Minute)
-		if err != nil {
-			return parameters, err
-		}
-
 		//send data back to save for deployment
 		var deploymentID string
 		deploymentID, err = jobs.GetParameterValue[string](parameters, parameters_enums.DeploymentID)
@@ -597,6 +592,10 @@ func (d *DeployAwsStaticSite) Run(parameters map[string]interface{}, logger jobs
 			CloudfrontDistributionArn:        aws.ToString(createDistributionOutput.Distribution.ARN),
 			CloudfrontDistributionDomainName: aws.ToString(createDistributionOutput.Distribution.DomainName),
 		})
+		err = distributionDeployedWaiter.Wait(context.TODO(), getDistributionInput, 20*time.Minute)
+		if err != nil {
+			return parameters, err
+		}
 
 		jobs.SetParameterValue(parameters, parameters_enums.CloudfrontID, aws.ToString(createDistributionOutput.Distribution.Id))
 	} else {
@@ -633,7 +632,7 @@ func (d *DeployAwsStaticSite) Run(parameters map[string]interface{}, logger jobs
 		err = invalidationWaiter.Wait(context.TODO(), &cloudfront.GetInvalidationInput{
 			DistributionId: aws.String(cloudfrontID),
 			Id:             createInvalidationOutput.Invalidation.Id,
-		}, 10*time.Minute)
+		}, 20*time.Minute)
 
 		if err != nil {
 			return parameters, err
