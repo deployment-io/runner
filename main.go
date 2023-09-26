@@ -7,7 +7,6 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner/client"
 	"github.com/deployment-io/deployment-runner/jobs/commands"
-	"github.com/deployment-io/deployment-runner/utils"
 	"github.com/deployment-io/deployment-runner/utils/loggers"
 	"github.com/joho/godotenv"
 	"os"
@@ -127,7 +126,7 @@ func getEnvironment() (service, organizationId, token, region, dockerImage, cpuS
 var clientCertPem, clientKeyPem string
 
 func main() {
-	service, organizationId, token, region, dockerImage, cpuStr, memory, taskExecutionRoleArn, taskRoleArn := getEnvironment()
+	service, organizationId, token, _, dockerImage, _, _, _, _ := getEnvironment()
 	client.Connect(service, organizationId, token, clientCertPem, clientKeyPem, dockerImage, false)
 	c := client.Get()
 	commands.Init()
@@ -171,13 +170,6 @@ func main() {
 			jobsStream := allocateJobs(pendingJobs)
 			resultsStream := executeJobs(jobsStream, 5)
 			<-sendJobResults(resultsStream, 5, jobsDonePipeline)
-			if len(pendingJobs) == 0 {
-				//no pending jobs - upgrade deployment runner to upgraded image
-				err = utils.UpgradeDeploymentRunner(service, organizationId, token, region, dockerImage, cpuStr, memory, taskExecutionRoleArn, taskRoleArn)
-				if err != nil {
-					fmt.Println(err.Error())
-				}
-			}
 			time.Sleep(10 * time.Second)
 		}
 	}

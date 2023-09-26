@@ -6,7 +6,7 @@ import (
 	"runtime"
 )
 
-func (r *RunnerClient) Ping(firstPing bool) (string, int64, int64, error) {
+func (r *RunnerClient) Ping(firstPing bool) error {
 	args := ping.ArgsV1{}
 	args.Send = "ping"
 	args.FirstPing = firstPing
@@ -17,11 +17,11 @@ func (r *RunnerClient) Ping(firstPing bool) (string, int64, int64, error) {
 	var reply ping.ReplyV1
 	err := r.c.Call("Ping.SendV1", args, &reply)
 	if err != nil {
-		return "", 0, 0, err
+		return err
 	}
 	if reply.Send != "pong" {
-		return "", 0, 0, fmt.Errorf("error receiving pong from the server")
+		return fmt.Errorf("error receiving pong from the server")
 	}
 
-	return reply.DockerUpgradeImage, reply.UpgradeFromTs, reply.UpgradeToTs, nil
+	return nil
 }

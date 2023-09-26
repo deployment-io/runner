@@ -4,7 +4,6 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
-	"github.com/deployment-io/deployment-runner/utils"
 	"log"
 	"net/rpc"
 	"strings"
@@ -100,7 +99,7 @@ func Connect(service, organizationID, token, clientCertPem, clientKeyPem, docker
 							connect(service, organizationID, token, clientCertPem, clientKeyPem, dockerImage)
 						}
 						if client.c != nil {
-							dockerUpgradeImage, upgradeFromTs, upgradeToTs, err := client.Ping(firstPing)
+							err := client.Ping(firstPing)
 							if err != nil {
 								client.isConnected = false
 								client.c.Close()
@@ -117,8 +116,6 @@ func Connect(service, organizationID, token, clientCertPem, clientKeyPem, docker
 										blockTillFirstConnect = false
 									}
 								}
-								//set upgrade data
-								utils.UpgradeData.Set(dockerUpgradeImage, upgradeFromTs, upgradeToTs)
 							}
 						} else {
 							client.isConnected = false
