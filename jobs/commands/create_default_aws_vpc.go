@@ -13,7 +13,6 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner-kit/types"
 	"github.com/deployment-io/deployment-runner-kit/vpcs"
-	"github.com/deployment-io/deployment-runner/utils/loggers"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"io"
 	"net"
@@ -899,12 +898,7 @@ type routeTableInfo struct {
 	az           string
 }
 
-func (c *CreateDefaultAwsVPC) Run(parameters map[string]interface{}, logger jobs.Logger) (newParameters map[string]interface{}, err error) {
-	logsWriter, err := loggers.GetBuildLogsWriter(parameters, logger)
-	if err != nil {
-		return parameters, err
-	}
-	defer logsWriter.Close()
+func (c *CreateDefaultAwsVPC) Run(parameters map[string]interface{}, logsWriter io.Writer) (newParameters map[string]interface{}, err error) {
 	defer func() {
 		if err != nil {
 			markBuildDone(parameters, err, logsWriter)

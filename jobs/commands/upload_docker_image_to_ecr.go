@@ -11,7 +11,6 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/deployments"
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
-	"github.com/deployment-io/deployment-runner/utils/loggers"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/registry"
 	"github.com/docker/docker/client"
@@ -171,12 +170,7 @@ func pushDockerImageToEcr(parameters map[string]interface{}, ecrClient *ecr.Clie
 	return nil
 }
 
-func (u *UploadDockerImageToEcr) Run(parameters map[string]interface{}, logger jobs.Logger) (newParameters map[string]interface{}, err error) {
-	logsWriter, err := loggers.GetBuildLogsWriter(parameters, logger)
-	if err != nil {
-		return parameters, err
-	}
-	defer logsWriter.Close()
+func (u *UploadDockerImageToEcr) Run(parameters map[string]interface{}, logsWriter io.Writer) (newParameters map[string]interface{}, err error) {
 	defer func() {
 		if err != nil {
 			markBuildDone(parameters, err, logsWriter)

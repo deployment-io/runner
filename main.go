@@ -9,6 +9,7 @@ import (
 	"github.com/deployment-io/deployment-runner/jobs/commands"
 	"github.com/deployment-io/deployment-runner/utils/loggers"
 	"github.com/joho/godotenv"
+	"io"
 	"os"
 	"sync"
 	"time"
@@ -32,6 +33,14 @@ func getJobResult(job jobs.PendingJobDtoV1, error string) jobs.CompletingJobDtoV
 	}
 }
 
+func handleLogEnd(err error, jobID string, logsWriter io.Writer) {
+	if err != nil {
+		io.WriteString(logsWriter, fmt.Sprintf("Error in executing - %s - %s\n", jobID, err.Error()))
+	} else {
+		io.WriteString(logsWriter, fmt.Sprintf("Successfully executed - %s\n", jobID))
+	}
+}
+
 func executeJobs(jobsStream <-chan jobs.PendingJobDtoV1, noOfWorkers int) <-chan jobs.CompletingJobDtoV1 {
 	resultsStream := make(chan jobs.CompletingJobDtoV1)
 	go func() {
@@ -44,36 +53,48 @@ func executeJobs(jobsStream <-chan jobs.PendingJobDtoV1, noOfWorkers int) <-chan
 				defer func() {
 					wg.Done()
 				}()
-			nextJob:
 				for pendingJob := range jobsStream {
-					parameters := pendingJob.Parameters
-					//TODO logger is job level detail. Introduce a job context and add logger there
-					//pass job context in each command run.
-					//job context will be different based on job type. So job types needs to be passed from the server.
-					logger, err := loggers.Get(parameters)
-					if err != nil {
-						result := getJobResult(pendingJob, err.Error())
+					func(pendingJob jobs.PendingJobDtoV1) {
+						parameters := pendingJob.Parameters
+						//TODO logger is job level detail. Introduce a job context and add logger there
+						//pass job context in each command run.
+						//job context will be different based on job type. So job types needs to be passed from the server.
+						logger, err := loggers.Get(parameters)
+						if err != nil {
+							result := getJobResult(pendingJob, err.Error())
+							resultsStream <- result
+							return
+						}
+						logsWriter, err := loggers.GetJobLogsWriter(pendingJob.JobID, logger)
+						if err != nil {
+							result := getJobResult(pendingJob, err.Error())
+							resultsStream <- result
+							return
+						}
+						defer logsWriter.Close()
+						for _, commandEnum := range pendingJob.CommandEnums {
+							command, err := commands.Get(commandEnum)
+							errorMessage := err.Error()
+							if err != nil {
+								handleLogEnd(err, pendingJob.JobID, logsWriter)
+								result := getJobResult(pendingJob, errorMessage)
+								resultsStream <- result
+								//continue to next job in jobsStream
+								return
+							}
+							parameters, err = command.Run(parameters, logsWriter)
+							if err != nil {
+								handleLogEnd(err, pendingJob.JobID, logsWriter)
+								result := getJobResult(pendingJob, errorMessage)
+								resultsStream <- result
+								//continue to next job in jobsStream
+								return
+							}
+						}
+						handleLogEnd(nil, pendingJob.JobID, logsWriter)
+						result := getJobResult(pendingJob, "")
 						resultsStream <- result
-						continue
-					}
-					for _, commandEnum := range pendingJob.CommandEnums {
-						command, err := commands.Get(commandEnum)
-						if err != nil {
-							result := getJobResult(pendingJob, err.Error())
-							resultsStream <- result
-							//continue to next job in jobsStream
-							continue nextJob
-						}
-						parameters, err = command.Run(parameters, logger)
-						if err != nil {
-							result := getJobResult(pendingJob, err.Error())
-							resultsStream <- result
-							//continue to next job in jobsStream
-							continue nextJob
-						}
-					}
-					result := getJobResult(pendingJob, "")
-					resultsStream <- result
+					}(pendingJob)
 				}
 			}()
 		}

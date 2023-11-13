@@ -17,7 +17,6 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner/client"
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
-	"github.com/deployment-io/deployment-runner/utils/loggers"
 	awsS3Uploads "github.com/deployment-io/deployment-runner/utils/uploads/aws-s3"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"io"
@@ -398,12 +397,7 @@ func attachPolicyToS3Bucket(distributionArn *string, s3BucketName, policySid, po
 	return nil
 }
 
-func (d *DeployAwsStaticSite) Run(parameters map[string]interface{}, logger jobs.Logger) (newParameters map[string]interface{}, err error) {
-	logsWriter, err := loggers.GetBuildLogsWriter(parameters, logger)
-	if err != nil {
-		return parameters, err
-	}
-	defer logsWriter.Close()
+func (d *DeployAwsStaticSite) Run(parameters map[string]interface{}, logsWriter io.Writer) (newParameters map[string]interface{}, err error) {
 	defer func() {
 		if err != nil {
 			markBuildDone(parameters, err, logsWriter)

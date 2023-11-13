@@ -11,13 +11,14 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/enums/deployment_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
+	"io"
 	"time"
 )
 
 type DeleteAwsWebService struct {
 }
 
-func (d *DeleteAwsWebService) Run(parameters map[string]interface{}, logger jobs.Logger) (newParameters map[string]interface{}, err error) {
+func (d *DeleteAwsWebService) Run(parameters map[string]interface{}, logsWriter io.Writer) (newParameters map[string]interface{}, err error) {
 	//stop service //delete service
 	clusterArn, err := jobs.GetParameterValue[string](parameters, parameters_enums.EcsClusterArn)
 	if err != nil {
@@ -63,9 +64,22 @@ func (d *DeleteAwsWebService) Run(parameters map[string]interface{}, logger jobs
 			return parameters, err
 		}
 	}
-	_, err = ecsClient.DeleteTaskDefinitions(context.TODO(), &ecs.DeleteTaskDefinitionsInput{TaskDefinitions: taskDefinitionArns})
-	if err != nil {
-		return parameters, err
+	var taskDefinitionArnsSet []string
+	for _, taskDefinitionArn := range taskDefinitionArns {
+		taskDefinitionArnsSet = append(taskDefinitionArnsSet, taskDefinitionArn)
+		if len(taskDefinitionArnsSet) == 8 {
+			_, err = ecsClient.DeleteTaskDefinitions(context.TODO(), &ecs.DeleteTaskDefinitionsInput{TaskDefinitions: taskDefinitionArnsSet})
+			if err != nil {
+				return parameters, err
+			}
+			taskDefinitionArnsSet = nil
+		}
+	}
+	if len(taskDefinitionArnsSet) > 0 {
+		_, err = ecsClient.DeleteTaskDefinitions(context.TODO(), &ecs.DeleteTaskDefinitionsInput{TaskDefinitions: taskDefinitionArnsSet})
+		if err != nil {
+			return parameters, err
+		}
 	}
 
 	//delete ecr repository if necessary

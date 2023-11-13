@@ -222,11 +222,11 @@ func markBuildDone(parameters map[string]interface{}, err error, logsWriter io.W
 		Status:           status,
 		ErrorMessage:     errorMessage,
 	})
-	if err != nil {
-		io.WriteString(logsWriter, fmt.Sprintf("Error in building - %s - %s\n", buildID, errorMessage))
-	} else {
-		io.WriteString(logsWriter, fmt.Sprintf("Successfully built - %s\n", buildID))
-	}
+	//if err != nil {
+	//	io.WriteString(logsWriter, fmt.Sprintf("Error in executing - %s - %s\n", buildID, errorMessage))
+	//} else {
+	//	io.WriteString(logsWriter, fmt.Sprintf("Successfully executed - %s\n", buildID))
+	//}
 }
 
 func listAllS3Objects(s3Client *s3.Client, bucketName string) ([]s3Types.Object, error) {

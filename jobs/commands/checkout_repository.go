@@ -8,7 +8,6 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner-kit/oauth"
 	"github.com/deployment-io/deployment-runner/client"
-	"github.com/deployment-io/deployment-runner/utils/loggers"
 	"gopkg.in/src-d/go-git.v4"
 	"gopkg.in/src-d/go-git.v4/plumbing"
 	"gopkg.in/src-d/go-git.v4/plumbing/object"
@@ -142,12 +141,7 @@ func addRootDirectory(parameters map[string]interface{}, repoDirectoryPath strin
 	return repoDirectoryPath
 }
 
-func (cr *CheckoutRepository) Run(parameters map[string]interface{}, logger jobs.Logger) (newParameters map[string]interface{}, err error) {
-	logsWriter, err := loggers.GetBuildLogsWriter(parameters, logger)
-	if err != nil {
-		return parameters, err
-	}
-	defer logsWriter.Close()
+func (cr *CheckoutRepository) Run(parameters map[string]interface{}, logsWriter io.Writer) (newParameters map[string]interface{}, err error) {
 	defer func() {
 		//_ = loggers.LogBuffer(logBuffer, logger)
 		if err != nil {

@@ -18,36 +18,36 @@ import (
 	"time"
 )
 
-type BuildLog struct {
+type JobLog struct {
 	logger       jobs.Logger
 	message      string
 	errorMessage string
 	ts           int64
 }
 
-var addBuildLogsPipeline *goPipeline.Pipeline[string, BuildLog]
+var addJobLogsPipeline *goPipeline.Pipeline[string, JobLog]
 
 func Init() {
 	c := client.Get()
-	addBuildLogsPipeline, _ = goPipeline.NewPipeline(20, 5*time.Second,
-		func(buildId string, buildLogs []BuildLog) {
+	addJobLogsPipeline, _ = goPipeline.NewPipeline(20, 5*time.Second,
+		func(jobId string, jobLogs []JobLog) {
 			var logger jobs.Logger
-			if len(buildLogs) > 0 {
-				logger = buildLogs[0].logger
+			if len(jobLogs) > 0 {
+				logger = jobLogs[0].logger
 			}
 			var messages []string
-			var buildLogsDto []logs.AddBuildLogDtoV1
-			for _, buildLog := range buildLogs {
-				message := buildLog.message
-				if len(buildLog.errorMessage) > 0 {
-					message = buildLog.errorMessage
+			var jobLogsDto []logs.AddJobLogDtoV1
+			for _, jobLog := range jobLogs {
+				message := jobLog.message
+				if len(jobLog.errorMessage) > 0 {
+					message = jobLog.errorMessage
 				}
 				messages = append(messages, message)
-				buildLogsDto = append(buildLogsDto, logs.AddBuildLogDtoV1{
-					ID:           buildId,
-					Message:      buildLog.message,
-					ErrorMessage: buildLog.errorMessage,
-					Ts:           buildLog.ts,
+				jobLogsDto = append(jobLogsDto, logs.AddJobLogDtoV1{
+					ID:           jobId,
+					Message:      jobLog.message,
+					ErrorMessage: jobLog.errorMessage,
+					Ts:           jobLog.ts,
 				})
 			}
 			if logger != nil {
@@ -59,7 +59,7 @@ func Init() {
 
 			e := true
 			for e {
-				err := c.AddBuildLogs(buildLogsDto)
+				err := c.AddJobLogs(jobLogsDto)
 				//TODO we can handle for ErrConnection
 				//will block till error
 				if err != nil {
@@ -72,7 +72,7 @@ func Init() {
 		})
 	goShutdownHook.ADD(func() {
 		fmt.Println("waiting for logs add pipeline shutdown")
-		addBuildLogsPipeline.Shutdown()
+		addJobLogsPipeline.Shutdown()
 		fmt.Println("waiting for logs add pipeline shutdown -- done")
 	})
 
@@ -105,11 +105,7 @@ func LogBuffer(logBuffer *bytes.Buffer, logger jobs.Logger) error {
 	return logger.Log(messages)
 }
 
-func GetBuildLogsWriter(parameters map[string]interface{}, logger jobs.Logger) (*io.PipeWriter, error) {
-	buildId, err := jobs.GetParameterValue[string](parameters, parameters_enums.BuildID)
-	if err != nil {
-		return nil, err
-	}
+func GetJobLogsWriter(jobId string, logger jobs.Logger) (*io.PipeWriter, error) {
 	reader, writer := io.Pipe()
 	go func() {
 		defer reader.Close()
@@ -120,7 +116,7 @@ func GetBuildLogsWriter(parameters map[string]interface{}, logger jobs.Logger) (
 			s := scanner.Text()
 			s = strings.Trim(s, " \n \r")
 			if len(s) > 0 {
-				addBuildLogsPipeline.Add(buildId, BuildLog{
+				addJobLogsPipeline.Add(jobId, JobLog{
 					logger:  logger,
 					message: s,
 					ts:      time.Now().Unix(),
@@ -128,7 +124,7 @@ func GetBuildLogsWriter(parameters map[string]interface{}, logger jobs.Logger) (
 			}
 		}
 		if err := scanner.Err(); err != nil {
-			addBuildLogsPipeline.Add(buildId, BuildLog{
+			addJobLogsPipeline.Add(jobId, JobLog{
 				logger:       logger,
 				errorMessage: err.Error(),
 				ts:           time.Now().Unix(),

@@ -10,13 +10,14 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/enums/deployment_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
+	"io"
 	"time"
 )
 
 type DeleteAwsStaticSite struct {
 }
 
-func (d *DeleteAwsStaticSite) Run(parameters map[string]interface{}, logger jobs.Logger) (newParameters map[string]interface{}, err error) {
+func (d *DeleteAwsStaticSite) Run(parameters map[string]interface{}, logsWriter io.Writer) (newParameters map[string]interface{}, err error) {
 	//For static site
 
 	//delete cloudfront distribution
