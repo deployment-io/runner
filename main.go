@@ -74,10 +74,9 @@ func executeJobs(jobsStream <-chan jobs.PendingJobDtoV1, noOfWorkers int) <-chan
 						defer logsWriter.Close()
 						for _, commandEnum := range pendingJob.CommandEnums {
 							command, err := commands.Get(commandEnum)
-							errorMessage := err.Error()
 							if err != nil {
 								handleLogEnd(err, pendingJob.JobID, logsWriter)
-								result := getJobResult(pendingJob, errorMessage)
+								result := getJobResult(pendingJob, err.Error())
 								resultsStream <- result
 								//continue to next job in jobsStream
 								return
@@ -85,7 +84,7 @@ func executeJobs(jobsStream <-chan jobs.PendingJobDtoV1, noOfWorkers int) <-chan
 							parameters, err = command.Run(parameters, logsWriter)
 							if err != nil {
 								handleLogEnd(err, pendingJob.JobID, logsWriter)
-								result := getJobResult(pendingJob, errorMessage)
+								result := getJobResult(pendingJob, err.Error())
 								resultsStream <- result
 								//continue to next job in jobsStream
 								return

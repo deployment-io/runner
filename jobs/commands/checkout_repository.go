@@ -7,6 +7,7 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner-kit/oauth"
+	"github.com/deployment-io/deployment-runner-kit/previews"
 	"github.com/deployment-io/deployment-runner/client"
 	"gopkg.in/src-d/go-git.v4"
 	"gopkg.in/src-d/go-git.v4/plumbing"
@@ -22,14 +23,6 @@ type CheckoutRepository struct {
 }
 
 func getRepositoryDirectoryPath(parameters map[string]interface{}) (string, error) {
-	//environmentID, err := jobs.GetParameterValue[string](parameters, parameters_enums.EnvironmentID)
-	//if err != nil {
-	//	return "", err
-	//}
-	//deploymentID, err := jobs.GetParameterValue[string](parameters, parameters_enums.DeploymentID)
-	//if err != nil {
-	//	return "", err
-	//}
 	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationID)
 	if err != nil {
 		return "", err
@@ -38,7 +31,6 @@ func getRepositoryDirectoryPath(parameters map[string]interface{}) (string, erro
 	if err != nil {
 		return "", err
 	}
-	//return fmt.Sprintf("/tmp/%s/%s/%s/%s", organizationID, environmentID, deploymentID, buildID), nil
 	return fmt.Sprintf("/tmp/%s/%s", organizationID, buildID), nil
 }
 
@@ -215,10 +207,20 @@ func (cr *CheckoutRepository) Run(parameters map[string]interface{}, logsWriter 
 				return parameters, err
 			}
 		}
-		var buildID string
-		buildID, err = jobs.GetParameterValue[string](parameters, parameters_enums.BuildID)
-		if err != nil {
-			return parameters, err
+		isPreview := isPreview(parameters)
+		var buildOrPreviewID string
+		if !isPreview {
+			//get buildID
+			buildOrPreviewID, err = jobs.GetParameterValue[string](parameters, parameters_enums.BuildID)
+			if err != nil {
+				return parameters, err
+			}
+		} else {
+			//get previewID
+			buildOrPreviewID, err = jobs.GetParameterValue[string](parameters, parameters_enums.PreviewID)
+			if err != nil {
+				return parameters, err
+			}
 		}
 
 		var commitHashFromParams string
@@ -232,10 +234,19 @@ func (cr *CheckoutRepository) Run(parameters map[string]interface{}, logsWriter 
 			if err != nil {
 				return parameters, err
 			}
-			updateBuildsPipeline.Add(updateBuildsKey, builds.UpdateBuildDtoV1{
-				ID:     buildID,
-				Status: build_enums.Running,
-			})
+			if !isPreview {
+				//update build
+				updateBuildsPipeline.Add(updateBuildsKey, builds.UpdateBuildDtoV1{
+					ID:     buildOrPreviewID,
+					Status: build_enums.Running,
+				})
+			} else {
+				//update preview
+				updatePreviewsPipeline.Add(updatePreviewsKey, previews.UpdatePreviewDtoV1{
+					ID:     buildOrPreviewID,
+					Status: build_enums.Running,
+				})
+			}
 		} else {
 			referenceName := plumbing.NewRemoteReferenceName("origin", repoBranch)
 			err = worktree.Checkout(&git.CheckoutOptions{
@@ -255,12 +266,21 @@ func (cr *CheckoutRepository) Run(parameters map[string]interface{}, logsWriter 
 			commitHash := hash.String()
 			commitMessage := strings.TrimSpace(commitObject.Message)
 
-			updateBuildsPipeline.Add(updateBuildsKey, builds.UpdateBuildDtoV1{
-				ID:            buildID,
-				CommitHash:    commitHash,
-				CommitMessage: commitMessage,
-				Status:        build_enums.Running,
-			})
+			if !isPreview {
+				updateBuildsPipeline.Add(updateBuildsKey, builds.UpdateBuildDtoV1{
+					ID:            buildOrPreviewID,
+					CommitHash:    commitHash,
+					CommitMessage: commitMessage,
+					Status:        build_enums.Running,
+				})
+			} else {
+				updatePreviewsPipeline.Add(updatePreviewsKey, previews.UpdatePreviewDtoV1{
+					ID:            buildOrPreviewID,
+					CommitHash:    commitHash,
+					CommitMessage: commitMessage,
+					Status:        build_enums.Running,
+				})
+			}
 
 			jobs.SetParameterValue(parameters, parameters_enums.CommitHash, commitHash)
 		}

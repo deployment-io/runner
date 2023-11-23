@@ -11,6 +11,7 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/deployments"
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
+	"github.com/deployment-io/deployment-runner-kit/previews"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/registry"
 	"github.com/docker/docker/client"
@@ -81,17 +82,27 @@ func createEcrRepositoryIfNeeded(parameters map[string]interface{}, ecrClient *e
 		ecrRepositoryUri = aws.ToString(createRepositoryOutput.Repository.RepositoryUri)
 	}
 
+	io.WriteString(logsWriter, fmt.Sprintf("Created ECR repository: %s\n", ecrRepositoryUri))
+
 	var deploymentID string
 	deploymentID, err = jobs.GetParameterValue[string](parameters, parameters_enums.DeploymentID)
 	if err != nil {
 		return "", err
 	}
 
-	io.WriteString(logsWriter, fmt.Sprintf("Created ECR repository: %s\n", ecrRepositoryUri))
-	updateDeploymentsPipeline.Add(updateDeploymentsKey, deployments.UpdateDeploymentDtoV1{
-		ID:               deploymentID,
-		EcrRepositoryUri: ecrRepositoryUri,
-	})
+	if !isPreview(parameters) {
+		updateDeploymentsPipeline.Add(updateDeploymentsKey, deployments.UpdateDeploymentDtoV1{
+			ID:               deploymentID,
+			EcrRepositoryUri: ecrRepositoryUri,
+		})
+	} else {
+		//for preview
+		previewID := deploymentID
+		updatePreviewsPipeline.Add(updatePreviewsKey, previews.UpdatePreviewDtoV1{
+			ID:               previewID,
+			EcrRepositoryUri: ecrRepositoryUri,
+		})
+	}
 
 	return ecrRepositoryUri, nil
 }

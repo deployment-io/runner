@@ -161,6 +161,7 @@ func associateFunctionToCloudfrontDistribution(distributionConfig *cloudfront_ty
 }
 
 func (d *DeployAwsCloudfrontViewerRequestFunction) Run(parameters map[string]interface{}, logsWriter io.Writer) (newParameters map[string]interface{}, err error) {
+	// TODO support for preview
 	cloudfrontClient, err := getCloudfrontClient(parameters, cloudfrontRegion)
 	if err != nil {
 		return parameters, err

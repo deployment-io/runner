@@ -25,6 +25,7 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/region_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
+	"github.com/deployment-io/deployment-runner-kit/previews"
 	"github.com/deployment-io/deployment-runner-kit/vpcs"
 	"github.com/deployment-io/deployment-runner/client"
 	"io"
@@ -34,11 +35,13 @@ import (
 
 const updateDeploymentsKey = "updateDeployments"
 const updateBuildsKey = "updateBuilds"
+const updatePreviewsKey = "updatePreviews"
 const updateCertificatesKey = "updateCertificates"
 
 const cloudfrontRegion = "us-east-1"
 
 var updateBuildsPipeline *goPipeline.Pipeline[string, builds.UpdateBuildDtoV1]
+var updatePreviewsPipeline *goPipeline.Pipeline[string, previews.UpdatePreviewDtoV1]
 var updateDeploymentsPipeline *goPipeline.Pipeline[string, deployments.UpdateDeploymentDtoV1]
 var upsertVpcsPipeline *goPipeline.Pipeline[string, vpcs.UpsertVpcDtoV1]
 var upsertClustersPipeline *goPipeline.Pipeline[string, clusters.UpsertClusterDtoV1]
@@ -65,6 +68,26 @@ func Init() {
 		fmt.Println("waiting for builds update pipeline shutdown")
 		updateBuildsPipeline.Shutdown()
 		fmt.Println("waiting for builds update pipeline shutdown -- done")
+	})
+	updatePreviewsPipeline, _ = goPipeline.NewPipeline(5, 10*time.Second,
+		func(preview string, previews []previews.UpdatePreviewDtoV1) {
+			e := true
+			for e {
+				err := c.UpdatePreviews(previews)
+				//TODO we can handle for ErrConnection
+				//will block till error
+				if err != nil {
+					fmt.Println(err)
+					time.Sleep(2 * time.Second)
+					continue
+				}
+				e = false
+			}
+		})
+	goShutdownHook.ADD(func() {
+		fmt.Println("waiting for previews update pipeline shutdown")
+		updatePreviewsPipeline.Shutdown()
+		fmt.Println("waiting for previews update pipeline shutdown -- done")
 	})
 	updateDeploymentsPipeline, _ = goPipeline.NewPipeline(5, 10*time.Second,
 		func(deployment string, deployments []deployments.UpdateDeploymentDtoV1) {
@@ -185,6 +208,14 @@ func Get(p commands_enums.Type) (jobs.Command, error) {
 	return nil, fmt.Errorf("error getting command for %s", p)
 }
 
+func isPreview(parameters map[string]interface{}) bool {
+	p, err := jobs.GetParameterValue[bool](parameters, parameters_enums.IsPreview)
+	if err != nil {
+		p = false
+	}
+	return p
+}
+
 func markBuildDone(parameters map[string]interface{}, err error, logsWriter io.Writer) {
 	defer func() {
 		//Delete old repo directory to clean up
@@ -199,12 +230,28 @@ func markBuildDone(parameters map[string]interface{}, err error, logsWriter io.W
 		status = build_enums.Error
 		errorMessage = err.Error()
 	}
+	nowEpoch := time.Now().Unix()
+	if isPreview(parameters) {
+		//update preview and return
+		previewID, e := jobs.GetParameterValue[string](parameters, parameters_enums.PreviewID)
+		if e != nil {
+			//Weird error. Would show up in logs. Return for now.
+			return
+		}
+		updatePreviewsPipeline.Add(updatePreviewsKey, previews.UpdatePreviewDtoV1{
+			ID:           previewID,
+			BuildTs:      nowEpoch,
+			Status:       status,
+			ErrorMessage: errorMessage,
+		})
+		return
+	}
+
 	buildID, e := jobs.GetParameterValue[string](parameters, parameters_enums.BuildID)
 	if e != nil {
 		//Weird error. Would show up in logs. Return for now.
 		return
 	}
-	nowEpoch := time.Now().Unix()
 	updateBuildsPipeline.Add(updateBuildsKey, builds.UpdateBuildDtoV1{
 		ID:           buildID,
 		BuildTs:      nowEpoch,
