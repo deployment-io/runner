@@ -25,6 +25,7 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/region_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
+	"github.com/deployment-io/deployment-runner-kit/notifications"
 	"github.com/deployment-io/deployment-runner-kit/previews"
 	"github.com/deployment-io/deployment-runner-kit/vpcs"
 	"github.com/deployment-io/deployment-runner/client"
@@ -37,11 +38,13 @@ const updateDeploymentsKey = "updateDeployments"
 const updateBuildsKey = "updateBuilds"
 const updatePreviewsKey = "updatePreviews"
 const updateCertificatesKey = "updateCertificates"
+const sendNotificationsKey = "sendNotifications"
 
 const cloudfrontRegion = "us-east-1"
 
 var updateBuildsPipeline *goPipeline.Pipeline[string, builds.UpdateBuildDtoV1]
 var updatePreviewsPipeline *goPipeline.Pipeline[string, previews.UpdatePreviewDtoV1]
+var sendNotificationPipeline *goPipeline.Pipeline[string, notifications.SendNotificationDtoV1]
 var updateDeploymentsPipeline *goPipeline.Pipeline[string, deployments.UpdateDeploymentDtoV1]
 var upsertVpcsPipeline *goPipeline.Pipeline[string, vpcs.UpsertVpcDtoV1]
 var upsertClustersPipeline *goPipeline.Pipeline[string, clusters.UpsertClusterDtoV1]
@@ -166,6 +169,26 @@ func Init() {
 		fmt.Println("waiting for certificates update pipeline shutdown")
 		updateCertificatesPipeline.Shutdown()
 		fmt.Println("waiting for certificates update pipeline shutdown -- done")
+	})
+	sendNotificationPipeline, _ = goPipeline.NewPipeline(5, 10*time.Second,
+		func(notification string, notifications []notifications.SendNotificationDtoV1) {
+			e := true
+			for e {
+				err := c.SendNotifications(notifications)
+				//TODO we can handle for ErrConnection
+				//will block till error
+				if err != nil {
+					fmt.Println(err)
+					time.Sleep(2 * time.Second)
+					continue
+				}
+				e = false
+			}
+		})
+	goShutdownHook.ADD(func() {
+		fmt.Println("waiting for notifications send pipeline shutdown")
+		sendNotificationPipeline.Shutdown()
+		fmt.Println("waiting for notifications send pipeline shutdown -- done")
 	})
 }
 

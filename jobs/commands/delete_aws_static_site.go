@@ -10,6 +10,7 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/enums/deployment_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
+	"github.com/deployment-io/deployment-runner-kit/previews"
 	"io"
 	"time"
 )
@@ -109,15 +110,24 @@ func (d *DeleteAwsStaticSite) Run(parameters map[string]interface{}, logsWriter 
 		return parameters, err
 	}
 
-	//update deployment to deleted and delete domain
 	deploymentID, err := jobs.GetParameterValue[string](parameters, parameters_enums.DeploymentID)
 	if err != nil {
 		return parameters, err
 	}
-	updateDeploymentsPipeline.Add(updateDeploymentsKey, deployments.UpdateDeploymentDtoV1{
-		ID:            deploymentID,
-		DeletionState: deployment_enums.DeletionDone,
-	})
+	if !isPreview(parameters) {
+		//update deployment to deleted and delete domain
+		updateDeploymentsPipeline.Add(updateDeploymentsKey, deployments.UpdateDeploymentDtoV1{
+			ID:            deploymentID,
+			DeletionState: deployment_enums.DeletionDone,
+		})
+	} else {
+		previewID := deploymentID
+		updatePreviewsPipeline.Add(updatePreviewsKey, previews.UpdatePreviewDtoV1{
+			ID:            previewID,
+			DeletionState: deployment_enums.DeletionDone,
+		})
+	}
+
 	return parameters, err
 }
 
