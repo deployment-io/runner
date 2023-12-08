@@ -10,6 +10,7 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
 	"go.mongodb.org/mongo-driver/bson/primitive"
+	"io"
 )
 
 type DeployAwsCloudfrontViewerRequestFunction struct {
@@ -159,7 +160,8 @@ func associateFunctionToCloudfrontDistribution(distributionConfig *cloudfront_ty
 	return true
 }
 
-func (d *DeployAwsCloudfrontViewerRequestFunction) Run(parameters map[string]interface{}, logger jobs.Logger) (newParameters map[string]interface{}, err error) {
+func (d *DeployAwsCloudfrontViewerRequestFunction) Run(parameters map[string]interface{}, logsWriter io.Writer) (newParameters map[string]interface{}, err error) {
+	// TODO support for preview
 	cloudfrontClient, err := getCloudfrontClient(parameters, cloudfrontRegion)
 	if err != nil {
 		return parameters, err

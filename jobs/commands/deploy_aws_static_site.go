@@ -15,13 +15,14 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/region_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
+	"github.com/deployment-io/deployment-runner-kit/previews"
 	"github.com/deployment-io/deployment-runner/client"
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
-	"github.com/deployment-io/deployment-runner/utils/loggers"
 	awsS3Uploads "github.com/deployment-io/deployment-runner/utils/uploads/aws-s3"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"io"
 	"log"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -398,12 +399,7 @@ func attachPolicyToS3Bucket(distributionArn *string, s3BucketName, policySid, po
 	return nil
 }
 
-func (d *DeployAwsStaticSite) Run(parameters map[string]interface{}, logger jobs.Logger) (newParameters map[string]interface{}, err error) {
-	logsWriter, err := loggers.GetBuildLogsWriter(parameters, logger)
-	if err != nil {
-		return parameters, err
-	}
-	defer logsWriter.Close()
+func (d *DeployAwsStaticSite) Run(parameters map[string]interface{}, logsWriter io.Writer) (newParameters map[string]interface{}, err error) {
 	defer func() {
 		if err != nil {
 			markBuildDone(parameters, err, logsWriter)
@@ -422,6 +418,16 @@ func (d *DeployAwsStaticSite) Run(parameters map[string]interface{}, logger jobs
 	distDirectory, err := getDistDirectory(parameters)
 	if err != nil {
 		return parameters, err
+	}
+
+	//checking if index.html file exists
+	if _, err = os.Stat(distDirectory + "/index.html"); err != nil {
+		if os.IsNotExist(err) {
+			io.WriteString(logsWriter, fmt.Sprintf("index.html file doesn't exists in build directory\n"))
+			return parameters, err
+		} else {
+			return parameters, err
+		}
 	}
 
 	s3Client, err := getS3Client(parameters)
@@ -447,25 +453,46 @@ func (d *DeployAwsStaticSite) Run(parameters map[string]interface{}, logger jobs
 			}
 			c := client.Get()
 			e := false
-			var deploymentData []deployments.GetDeploymentDtoV1
-			for !e {
-				deploymentData, err = c.GetDeploymentData([]string{deploymentID})
-				if err == client.ErrConnection {
-					time.Sleep(time.Second * 20)
-					continue
+			//TODO put this in a function and add support for preview
+			if !isPreview(parameters) {
+				var deploymentData []deployments.GetDeploymentDtoV1
+				for !e {
+					deploymentData, err = c.GetDeploymentData([]string{deploymentID})
+					if err == client.ErrConnection {
+						time.Sleep(time.Second * 20)
+						continue
+					}
+					if err != nil {
+						return parameters, err
+					}
+					if len(deploymentData) < 1 {
+						return parameters, fmt.Errorf("error getting deployment data for %s", deploymentID)
+					}
+					e = true
 				}
-				if err != nil {
-					return parameters, err
+				cloudfrontID = deploymentData[0].CloudfrontDistributionID
+			} else {
+				var previewData []previews.GetPreviewDtoV1
+				//preview id is deployment id in case of preview
+				previewID := deploymentID
+				for !e {
+					previewData, err = c.GetPreviewData([]string{previewID})
+					if err == client.ErrConnection {
+						time.Sleep(time.Second * 20)
+						continue
+					}
+					if err != nil {
+						return parameters, err
+					}
+					if len(previewData) < 1 {
+						return parameters, fmt.Errorf("error getting preview data for %s", previewID)
+					}
+					e = true
 				}
-				if len(deploymentData) < 1 {
-					return parameters, fmt.Errorf("error getting deployment data for %s", deploymentID)
-				}
-				e = true
+				cloudfrontID = previewData[0].CloudfrontDistributionID
 			}
-			cloudfrontID = deploymentData[0].CloudfrontDistributionID
+
 			if len(cloudfrontID) == 0 {
-				//return parameters, fmt.Errorf("cloudfront distribution id shouldn't be empty if S3 bucket exists. "+
-				//	"deployment id: %s", deploymentID)
 				isNewBucketCreated = true
 				ignoreErrorsTillCF = true
 			}
@@ -579,19 +606,32 @@ func (d *DeployAwsStaticSite) Run(parameters map[string]interface{}, logger jobs
 		distributionDeployedWaiter := cloudfront.NewDistributionDeployedWaiter(cloudfrontClient)
 
 		io.WriteString(logsWriter, fmt.Sprintf("Waiting for cloudfront distribution to be deployed: %s\n", aws.ToString(distributionId)))
-		//send data back to save for deployment
+
 		var deploymentID string
 		deploymentID, err = jobs.GetParameterValue[string](parameters, parameters_enums.DeploymentID)
 		if err != nil {
 			return parameters, err
 		}
+		if !isPreview(parameters) {
+			//send data back to save for deployment
+			updateDeploymentsPipeline.Add(updateDeploymentsKey, deployments.UpdateDeploymentDtoV1{
+				ID:                               deploymentID,
+				CloudfrontDistributionID:         aws.ToString(createDistributionOutput.Distribution.Id),
+				CloudfrontDistributionArn:        aws.ToString(createDistributionOutput.Distribution.ARN),
+				CloudfrontDistributionDomainName: aws.ToString(createDistributionOutput.Distribution.DomainName),
+			})
+		} else {
+			//deployment id is preview id in case of preview
+			previewID := deploymentID
+			//send data back to save for preview
+			updatePreviewsPipeline.Add(updatePreviewsKey, previews.UpdatePreviewDtoV1{
+				ID:                               previewID,
+				CloudfrontDistributionID:         aws.ToString(createDistributionOutput.Distribution.Id),
+				CloudfrontDistributionArn:        aws.ToString(createDistributionOutput.Distribution.ARN),
+				CloudfrontDistributionDomainName: aws.ToString(createDistributionOutput.Distribution.DomainName),
+			})
+		}
 
-		updateDeploymentsPipeline.Add(updateDeploymentsKey, deployments.UpdateDeploymentDtoV1{
-			ID:                               deploymentID,
-			CloudfrontDistributionID:         aws.ToString(createDistributionOutput.Distribution.Id),
-			CloudfrontDistributionArn:        aws.ToString(createDistributionOutput.Distribution.ARN),
-			CloudfrontDistributionDomainName: aws.ToString(createDistributionOutput.Distribution.DomainName),
-		})
 		err = distributionDeployedWaiter.Wait(context.TODO(), getDistributionInput, 20*time.Minute)
 		if err != nil {
 			return parameters, err

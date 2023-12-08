@@ -9,8 +9,6 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
-	"github.com/deployment-io/deployment-runner/utils"
-	"github.com/deployment-io/deployment-runner/utils/loggers"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/pkg/archive"
@@ -39,13 +37,13 @@ func printBodyToLog(rd io.Reader, logsWriter io.Writer) error {
 	//ignoring all errors while sending logs
 	var lastLine string
 	scanner := bufio.NewScanner(rd)
-	scanner.Split(utils.ScanCRLF)
+	//scanner.Split(utils.ScanCRLF)
 	for scanner.Scan() {
 		lastLine = strings.Trim(scanner.Text(), " \n \r")
-		stream := &Stream{}
-		_ = json.Unmarshal([]byte(lastLine), stream)
+		//stream := &Stream{}
+		//_ = json.Unmarshal([]byte(lastLine), stream)
 		//fmt.Print(stream.Stream)
-		_, _ = io.WriteString(logsWriter, stream.Stream)
+		_, _ = io.WriteString(logsWriter, lastLine)
 	}
 
 	errLine := &ErrorLine{}
@@ -98,12 +96,7 @@ func imageBuild(parameters map[string]interface{}, dockerClient *client.Client, 
 	return nil
 }
 
-func (b *BuildDockerImage) Run(parameters map[string]interface{}, logger jobs.Logger) (newParameters map[string]interface{}, err error) {
-	logsWriter, err := loggers.GetBuildLogsWriter(parameters, logger)
-	if err != nil {
-		return parameters, err
-	}
-	defer logsWriter.Close()
+func (b *BuildDockerImage) Run(parameters map[string]interface{}, logsWriter io.Writer) (newParameters map[string]interface{}, err error) {
 	defer func() {
 		if err != nil {
 			markBuildDone(parameters, err, logsWriter)

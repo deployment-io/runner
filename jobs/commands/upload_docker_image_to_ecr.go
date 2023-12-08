@@ -11,7 +11,7 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/deployments"
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
-	"github.com/deployment-io/deployment-runner/utils/loggers"
+	"github.com/deployment-io/deployment-runner-kit/previews"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/registry"
 	"github.com/docker/docker/client"
@@ -82,17 +82,27 @@ func createEcrRepositoryIfNeeded(parameters map[string]interface{}, ecrClient *e
 		ecrRepositoryUri = aws.ToString(createRepositoryOutput.Repository.RepositoryUri)
 	}
 
+	io.WriteString(logsWriter, fmt.Sprintf("Created ECR repository: %s\n", ecrRepositoryUri))
+
 	var deploymentID string
 	deploymentID, err = jobs.GetParameterValue[string](parameters, parameters_enums.DeploymentID)
 	if err != nil {
 		return "", err
 	}
 
-	io.WriteString(logsWriter, fmt.Sprintf("Created ECR repository: %s\n", ecrRepositoryUri))
-	updateDeploymentsPipeline.Add(updateDeploymentsKey, deployments.UpdateDeploymentDtoV1{
-		ID:               deploymentID,
-		EcrRepositoryUri: ecrRepositoryUri,
-	})
+	if !isPreview(parameters) {
+		updateDeploymentsPipeline.Add(updateDeploymentsKey, deployments.UpdateDeploymentDtoV1{
+			ID:               deploymentID,
+			EcrRepositoryUri: ecrRepositoryUri,
+		})
+	} else {
+		//for preview
+		previewID := deploymentID
+		updatePreviewsPipeline.Add(updatePreviewsKey, previews.UpdatePreviewDtoV1{
+			ID:               previewID,
+			EcrRepositoryUri: ecrRepositoryUri,
+		})
+	}
 
 	return ecrRepositoryUri, nil
 }
@@ -171,12 +181,7 @@ func pushDockerImageToEcr(parameters map[string]interface{}, ecrClient *ecr.Clie
 	return nil
 }
 
-func (u *UploadDockerImageToEcr) Run(parameters map[string]interface{}, logger jobs.Logger) (newParameters map[string]interface{}, err error) {
-	logsWriter, err := loggers.GetBuildLogsWriter(parameters, logger)
-	if err != nil {
-		return parameters, err
-	}
-	defer logsWriter.Close()
+func (u *UploadDockerImageToEcr) Run(parameters map[string]interface{}, logsWriter io.Writer) (newParameters map[string]interface{}, err error) {
 	defer func() {
 		if err != nil {
 			markBuildDone(parameters, err, logsWriter)

@@ -16,8 +16,8 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/region_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
+	"github.com/deployment-io/deployment-runner-kit/previews"
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
-	"github.com/deployment-io/deployment-runner/utils/loggers"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"io"
 	"strings"
@@ -265,17 +265,27 @@ func createAlbSecurityGroupIfNeeded(parameters map[string]interface{}, ec2Client
 		albSecurityGroupEgressRuleId = aws.ToString(authorizeSecurityGroupEgressOutput.SecurityGroupRules[0].SecurityGroupRuleId)
 	}
 
+	//TODO can sync both sg ingress ids later
 	deploymentID, err := jobs.GetParameterValue[string](parameters, parameters_enums.DeploymentID)
 	if err != nil {
 		return "", err
 	}
-	//TODO can sync both sg ingress ids later
-	updateDeploymentsPipeline.Add(updateDeploymentsKey, deployments.UpdateDeploymentDtoV1{
-		ID:                       deploymentID,
-		AlbSecurityGroupId:       albSecurityGroupId,
-		AlbSecurityIngressRuleId: albSecurityGroupIngressRuleId,
-		AlbSecurityEgressRuleId:  albSecurityGroupEgressRuleId,
-	})
+	if !isPreview(parameters) {
+		updateDeploymentsPipeline.Add(updateDeploymentsKey, deployments.UpdateDeploymentDtoV1{
+			ID:                       deploymentID,
+			AlbSecurityGroupId:       albSecurityGroupId,
+			AlbSecurityIngressRuleId: albSecurityGroupIngressRuleId,
+			AlbSecurityEgressRuleId:  albSecurityGroupEgressRuleId,
+		})
+	} else {
+		previewID := deploymentID
+		updatePreviewsPipeline.Add(updatePreviewsKey, previews.UpdatePreviewDtoV1{
+			ID:                       previewID,
+			AlbSecurityGroupId:       albSecurityGroupId,
+			AlbSecurityIngressRuleId: albSecurityGroupIngressRuleId,
+			AlbSecurityEgressRuleId:  albSecurityGroupEgressRuleId,
+		})
+	}
 
 	return albSecurityGroupId, nil
 }
@@ -489,20 +499,31 @@ func createAlbIfNeeded(parameters map[string]interface{},
 		listenerArn = aws.ToString(createListenerOutput.Listeners[0].ListenerArn)
 	}
 
+	io.WriteString(logsWriter, fmt.Sprintf("Created load balancer: %s\n", loadBalancerArn))
+
 	deploymentID, err := jobs.GetParameterValue[string](parameters, parameters_enums.DeploymentID)
 	if err != nil {
 		return "", "", err
 	}
 
-	io.WriteString(logsWriter, fmt.Sprintf("Created load balancer: %s\n", loadBalancerArn))
-
-	updateDeploymentsPipeline.Add(updateDeploymentsKey, deployments.UpdateDeploymentDtoV1{
-		ID:                deploymentID,
-		TargetGroupArn:    targetGroupArn,
-		ListenerArnPort80: listenerArn,
-		LoadBalancerArn:   loadBalancerArn,
-		LoadBalancerDns:   loadBalancerDns,
-	})
+	if !isPreview(parameters) {
+		updateDeploymentsPipeline.Add(updateDeploymentsKey, deployments.UpdateDeploymentDtoV1{
+			ID:                deploymentID,
+			TargetGroupArn:    targetGroupArn,
+			ListenerArnPort80: listenerArn,
+			LoadBalancerArn:   loadBalancerArn,
+			LoadBalancerDns:   loadBalancerDns,
+		})
+	} else {
+		previewID := deploymentID
+		updatePreviewsPipeline.Add(updatePreviewsKey, previews.UpdatePreviewDtoV1{
+			ID:                previewID,
+			TargetGroupArn:    targetGroupArn,
+			ListenerArnPort80: listenerArn,
+			LoadBalancerArn:   loadBalancerArn,
+			LoadBalancerDns:   loadBalancerDns,
+		})
+	}
 
 	return
 }
@@ -808,15 +829,25 @@ func createEcsServiceIfNeeded(parameters map[string]interface{}, ecsClient *ecs.
 		}
 	}
 
+	io.WriteString(logsWriter, fmt.Sprintf("Created ECS service: %s\n", ecsServiceArn))
+
 	deploymentID, err := jobs.GetParameterValue[string](parameters, parameters_enums.DeploymentID)
 	if err != nil {
 		return "", false, err
 	}
-	io.WriteString(logsWriter, fmt.Sprintf("Created ECS service: %s\n", ecsServiceArn))
-	updateDeploymentsPipeline.Add(updateDeploymentsKey, deployments.UpdateDeploymentDtoV1{
-		ID:            deploymentID,
-		EcsServiceArn: ecsServiceArn,
-	})
+
+	if !isPreview(parameters) {
+		updateDeploymentsPipeline.Add(updateDeploymentsKey, deployments.UpdateDeploymentDtoV1{
+			ID:            deploymentID,
+			EcsServiceArn: ecsServiceArn,
+		})
+	} else {
+		previewID := deploymentID
+		updatePreviewsPipeline.Add(updatePreviewsKey, previews.UpdatePreviewDtoV1{
+			ID:            previewID,
+			EcsServiceArn: ecsServiceArn,
+		})
+	}
 
 	return
 }
@@ -846,12 +877,7 @@ func updateEcsService(parameters map[string]interface{}, ecsClient *ecs.Client, 
 //TODO
 //1. add another ingress security rule for ALB security group  - port 80
 
-func (d *DeployAwsWebService) Run(parameters map[string]interface{}, logger jobs.Logger) (newParameters map[string]interface{}, err error) {
-	logsWriter, err := loggers.GetBuildLogsWriter(parameters, logger)
-	if err != nil {
-		return parameters, err
-	}
-	defer logsWriter.Close()
+func (d *DeployAwsWebService) Run(parameters map[string]interface{}, logsWriter io.Writer) (newParameters map[string]interface{}, err error) {
 	defer func() {
 		if err != nil {
 			markBuildDone(parameters, err, logsWriter)
@@ -901,10 +927,20 @@ func (d *DeployAwsWebService) Run(parameters map[string]interface{}, logger jobs
 	if err != nil {
 		return parameters, err
 	}
-	updateBuildsPipeline.Add(updateBuildsKey, builds.UpdateBuildDtoV1{
-		ID:                buildID,
-		TaskDefinitionArn: taskDefinitionArn,
-	})
+
+	if !isPreview(parameters) {
+		updateBuildsPipeline.Add(updateBuildsKey, builds.UpdateBuildDtoV1{
+			ID:                buildID,
+			TaskDefinitionArn: taskDefinitionArn,
+		})
+	} else {
+		//build id is preview id
+		previewID := buildID
+		updatePreviewsPipeline.Add(updateBuildsKey, previews.UpdatePreviewDtoV1{
+			ID:                previewID,
+			TaskDefinitionArn: taskDefinitionArn,
+		})
+	}
 
 	//mark build done successfully
 	markBuildDone(parameters, nil, logsWriter)

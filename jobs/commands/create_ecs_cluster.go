@@ -13,7 +13,6 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/region_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
-	"github.com/deployment-io/deployment-runner/utils/loggers"
 	"io"
 )
 
@@ -138,12 +137,7 @@ func getEcsTaskExecutionRoleIfNeeded(iamClient *iam.Client, parameters map[strin
 
 }
 
-func (c *CreateEcsCluster) Run(parameters map[string]interface{}, logger jobs.Logger) (newParameters map[string]interface{}, err error) {
-	logsWriter, err := loggers.GetBuildLogsWriter(parameters, logger)
-	if err != nil {
-		return parameters, err
-	}
-	defer logsWriter.Close()
+func (c *CreateEcsCluster) Run(parameters map[string]interface{}, logsWriter io.Writer) (newParameters map[string]interface{}, err error) {
 	defer func() {
 		if err != nil {
 			markBuildDone(parameters, err, logsWriter)

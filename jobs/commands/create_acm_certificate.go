@@ -8,13 +8,14 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/certificates"
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
+	"io"
 	"time"
 )
 
 type CreateAcmCertificate struct {
 }
 
-func (c *CreateAcmCertificate) Run(parameters map[string]interface{}, logger jobs.Logger) (newParameters map[string]interface{}, err error) {
+func (c *CreateAcmCertificate) Run(parameters map[string]interface{}, logsWriter io.Writer) (newParameters map[string]interface{}, err error) {
 	acmClient, err := getAcmClient(parameters)
 	if err != nil {
 		return parameters, err
