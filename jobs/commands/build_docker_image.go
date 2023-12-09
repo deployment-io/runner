@@ -44,12 +44,14 @@ func printBodyToLog(rd io.Reader, logsWriter io.Writer) error {
 		//_ = json.Unmarshal([]byte(lastLine), stream)
 		//fmt.Print(stream.Stream)
 		_, _ = io.WriteString(logsWriter, lastLine)
+		_, _ = io.WriteString(logsWriter, "\n")
 	}
 
 	errLine := &ErrorLine{}
 	_ = json.Unmarshal([]byte(lastLine), errLine)
 	if len(errLine.Error) > 0 {
 		_, _ = io.WriteString(logsWriter, errLine.Error)
+		_, _ = io.WriteString(logsWriter, "\n")
 		return errors.New(errLine.Error)
 	}
 
