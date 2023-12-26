@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"errors"
 	"fmt"
 	"github.com/deployment-io/deployment-runner-kit/builds"
 	"github.com/deployment-io/deployment-runner-kit/enums/build_enums"
@@ -108,7 +109,7 @@ func refreshGitToken(parameters map[string]interface{}) (string, error) {
 	if err == nil {
 		return token, nil
 	}
-	for err == oauth.ErrRefreshInProcess {
+	for errors.Is(err, oauth.ErrRefreshInProcess) {
 		time.Sleep(10 * time.Second)
 		token, err = client.Get().RefreshGitToken(installationID)
 		if err == nil {
