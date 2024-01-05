@@ -212,13 +212,13 @@ func Get(p commands_enums.Type) (jobs.Command, error) {
 		return &UploadDockerImageToEcr{}, nil
 	case commands_enums.AddAwsStaticSiteResponseHeaders:
 		return &AddAwsStaticSiteResponseHeaders{}, nil
-	case commands_enums.AddAwsStaticSiteDomains:
-		return &AddAwsStaticSiteDomains{}, nil
+	case commands_enums.UpdateAwsStaticSiteDomains:
+		return &UpdateAwsStaticSiteDomains{}, nil
 	case commands_enums.DeployAwsCloudfrontViewerRequestFunction:
 		return &DeployAwsCloudfrontViewerRequestFunction{}, nil
 	case commands_enums.CreateAcmCertificate:
 		return &CreateAcmCertificate{}, nil
-	case commands_enums.AddAwsWebServiceDomain:
+	case commands_enums.UpdateAwsWebServiceDomain:
 		return &AddAwsWebServiceDomain{}, nil
 	case commands_enums.VerifyAcmCertificate:
 		return &VerifyAcmCertificate{}, nil

@@ -12,10 +12,35 @@ import (
 	"io"
 )
 
-type AddAwsStaticSiteDomains struct {
+type UpdateAwsStaticSiteDomains struct {
 }
 
-func (a *AddAwsStaticSiteDomains) Run(parameters map[string]interface{}, logsWriter io.Writer) (newParameters map[string]interface{}, err error) {
+func deleteDomainsFromCloudfront(cloudfrontClient *cloudfront.Client, distributionConfigOutput *cloudfront.GetDistributionConfigOutput,
+	cloudfrontDistributionId string) error {
+	distributionConfig := distributionConfigOutput.DistributionConfig
+
+	//distributionConfig.ViewerCertificate = &cloudfront_types.ViewerCertificate{
+	//	ACMCertificateArn:            nil,
+	//	CloudFrontDefaultCertificate: nil,
+	//}
+
+	distributionConfig.Aliases = &cloudfront_types.Aliases{
+		Quantity: aws.Int32(0),
+		Items:    []string{},
+	}
+
+	_, err := cloudfrontClient.UpdateDistribution(context.TODO(), &cloudfront.UpdateDistributionInput{
+		DistributionConfig: distributionConfig,
+		Id:                 aws.String(cloudfrontDistributionId),
+		IfMatch:            distributionConfigOutput.ETag,
+	})
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (u *UpdateAwsStaticSiteDomains) Run(parameters map[string]interface{}, logsWriter io.Writer) (newParameters map[string]interface{}, err error) {
 
 	cloudfrontClient, err := getCloudfrontClient(parameters, cloudfrontRegion)
 	if err != nil {
@@ -40,17 +65,26 @@ func (a *AddAwsStaticSiteDomains) Run(parameters map[string]interface{}, logsWri
 		return parameters, err
 	}
 
+	var domains []string
+	if len(domainsA) == 0 {
+		//delete domains from deployment
+		err = deleteDomainsFromCloudfront(cloudfrontClient, distributionConfigOutput, cloudfrontDistributionId)
+		if err != nil {
+			return parameters, err
+		}
+		err = invalidateCloudfrontDistribution(parameters, cloudfrontClient, cloudfrontDistributionId)
+		if err != nil {
+			return parameters, err
+		}
+		return parameters, nil
+	}
+
 	certificateArn, err := jobs.GetParameterValue[string](parameters, parameters_enums.AcmCertificateArn)
 	if err != nil {
 		return parameters, err
 	}
 
-	if len(domainsA) == 0 {
-		//TODO delete domains and cleanup function
-		return parameters, nil
-	}
-
-	domains, err := commandUtils.ConvertPrimitiveAToStringSlice(domainsA)
+	domains, err = commandUtils.ConvertPrimitiveAToStringSlice(domainsA)
 	if err != nil {
 		return parameters, err
 	}
