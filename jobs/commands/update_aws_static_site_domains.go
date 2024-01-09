@@ -2,6 +2,7 @@ package commands
 
 import (
 	"context"
+	"fmt"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/cloudfront"
 	cloudfront_types "github.com/aws/aws-sdk-go-v2/service/cloudfront/types"
@@ -16,7 +17,7 @@ type UpdateAwsStaticSiteDomains struct {
 }
 
 func deleteDomainsFromCloudfront(cloudfrontClient *cloudfront.Client, distributionConfigOutput *cloudfront.GetDistributionConfigOutput,
-	cloudfrontDistributionId string) error {
+	cloudfrontDistributionId string, logsWriter io.Writer) error {
 	distributionConfig := distributionConfigOutput.DistributionConfig
 
 	//distributionConfig.ViewerCertificate = &cloudfront_types.ViewerCertificate{
@@ -37,6 +38,7 @@ func deleteDomainsFromCloudfront(cloudfrontClient *cloudfront.Client, distributi
 	if err != nil {
 		return err
 	}
+	io.WriteString(logsWriter, fmt.Sprintf("Deleted alias from cloudfront distribution: %s\n", cloudfrontDistributionId))
 	return nil
 }
 
@@ -68,16 +70,19 @@ func (u *UpdateAwsStaticSiteDomains) Run(parameters map[string]interface{}, logs
 	var domains []string
 	if len(domainsA) == 0 {
 		//delete domains from deployment
-		err = deleteDomainsFromCloudfront(cloudfrontClient, distributionConfigOutput, cloudfrontDistributionId)
+		io.WriteString(logsWriter, fmt.Sprintf("Deleting domains for static site\n"))
+		err = deleteDomainsFromCloudfront(cloudfrontClient, distributionConfigOutput, cloudfrontDistributionId, logsWriter)
 		if err != nil {
 			return parameters, err
 		}
-		err = invalidateCloudfrontDistribution(parameters, cloudfrontClient, cloudfrontDistributionId)
+		err = invalidateCloudfrontDistribution(parameters, cloudfrontClient, cloudfrontDistributionId, logsWriter)
 		if err != nil {
 			return parameters, err
 		}
 		return parameters, nil
 	}
+
+	io.WriteString(logsWriter, fmt.Sprintf("Updating domains for static site\n"))
 
 	certificateArn, err := jobs.GetParameterValue[string](parameters, parameters_enums.AcmCertificateArn)
 	if err != nil {
@@ -103,6 +108,8 @@ func (u *UpdateAwsStaticSiteDomains) Run(parameters map[string]interface{}, logs
 		Items:    domains,
 	}
 
+	io.WriteString(logsWriter, fmt.Sprintf("Updating alias and certificate for cloudfront distribution: %s\n", cloudfrontDistributionId))
+
 	_, err = cloudfrontClient.UpdateDistribution(context.TODO(), &cloudfront.UpdateDistributionInput{
 		DistributionConfig: distributionConfig,
 		Id:                 aws.String(cloudfrontDistributionId),
@@ -113,7 +120,7 @@ func (u *UpdateAwsStaticSiteDomains) Run(parameters map[string]interface{}, logs
 		return parameters, err
 	}
 
-	err = invalidateCloudfrontDistribution(parameters, cloudfrontClient, cloudfrontDistributionId)
+	err = invalidateCloudfrontDistribution(parameters, cloudfrontClient, cloudfrontDistributionId, logsWriter)
 	if err != nil {
 		return parameters, err
 	}

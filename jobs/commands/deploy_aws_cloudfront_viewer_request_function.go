@@ -161,7 +161,7 @@ func associateFunctionToCloudfrontDistribution(distributionConfig *cloudfront_ty
 }
 
 func (d *DeployAwsCloudfrontViewerRequestFunction) Run(parameters map[string]interface{}, logsWriter io.Writer) (newParameters map[string]interface{}, err error) {
-	// TODO support for preview
+
 	cloudfrontClient, err := getCloudfrontClient(parameters, cloudfrontRegion)
 	if err != nil {
 		return parameters, err
@@ -207,6 +207,7 @@ func (d *DeployAwsCloudfrontViewerRequestFunction) Run(parameters map[string]int
 		Runtime: cloudfront_types.FunctionRuntimeCloudfrontJs10,
 	}
 	if functionExists {
+		io.WriteString(logsWriter, fmt.Sprintf("Updating cloudfront function %s for adding redirects\n", viewerRequestsFunctionName))
 		//if function exists update existing function
 		var updateFunctionOutput *cloudfront.UpdateFunctionOutput
 		updateFunctionOutput, err = cloudfrontClient.UpdateFunction(context.TODO(), &cloudfront.UpdateFunctionInput{
@@ -221,6 +222,7 @@ func (d *DeployAwsCloudfrontViewerRequestFunction) Run(parameters map[string]int
 		functionARN = updateFunctionOutput.FunctionSummary.FunctionMetadata.FunctionARN
 		etag = updateFunctionOutput.ETag
 	} else {
+		io.WriteString(logsWriter, fmt.Sprintf("Creating cloudfront function %s for adding redirects\n", viewerRequestsFunctionName))
 		//create function
 		var createFunctionOutput *cloudfront.CreateFunctionOutput
 		createFunctionOutput, err = cloudfrontClient.CreateFunction(context.TODO(), &cloudfront.CreateFunctionInput{
@@ -234,6 +236,7 @@ func (d *DeployAwsCloudfrontViewerRequestFunction) Run(parameters map[string]int
 		functionARN = createFunctionOutput.FunctionSummary.FunctionMetadata.FunctionARN
 		etag = createFunctionOutput.ETag
 	}
+	io.WriteString(logsWriter, fmt.Sprintf("Publishing cloudfront function: %s\n", viewerRequestsFunctionName))
 	//publish function
 	_, err = cloudfrontClient.PublishFunction(context.TODO(), &cloudfront.PublishFunctionInput{
 		IfMatch: etag,
@@ -245,6 +248,8 @@ func (d *DeployAwsCloudfrontViewerRequestFunction) Run(parameters map[string]int
 	//associate function to distribution config
 	associate := associateFunctionToCloudfrontDistribution(distributionConfig, functionARN, cloudfront_types.EventTypeViewerRequest)
 	if associate {
+		io.WriteString(logsWriter, fmt.Sprintf("Associating cloudfront function %s to cloudfront distribution: %s\n",
+			viewerRequestsFunctionName, cloudfrontDistributionId))
 		_, err = cloudfrontClient.UpdateDistribution(context.TODO(), &cloudfront.UpdateDistributionInput{
 			DistributionConfig: distributionConfig,
 			Id:                 aws.String(cloudfrontDistributionId),
@@ -256,7 +261,7 @@ func (d *DeployAwsCloudfrontViewerRequestFunction) Run(parameters map[string]int
 		}
 	}
 
-	err = invalidateCloudfrontDistribution(parameters, cloudfrontClient, cloudfrontDistributionId)
+	err = invalidateCloudfrontDistribution(parameters, cloudfrontClient, cloudfrontDistributionId, logsWriter)
 	if err != nil {
 		return parameters, err
 	}

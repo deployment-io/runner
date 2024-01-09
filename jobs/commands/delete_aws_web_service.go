@@ -2,6 +2,7 @@ package commands
 
 import (
 	"context"
+	"fmt"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/ecr"
@@ -21,6 +22,7 @@ type DeleteAwsWebService struct {
 
 func (d *DeleteAwsWebService) Run(parameters map[string]interface{}, logsWriter io.Writer) (newParameters map[string]interface{}, err error) {
 	//stop service //delete service
+	io.WriteString(logsWriter, fmt.Sprintf("Deleting web service\n"))
 	clusterArn, err := jobs.GetParameterValue[string](parameters, parameters_enums.EcsClusterArn)
 	if err != nil {
 		return parameters, err
@@ -30,6 +32,7 @@ func (d *DeleteAwsWebService) Run(parameters map[string]interface{}, logsWriter 
 		return parameters, err
 	}
 	ecsClient, err := getEcsClient(parameters)
+	io.WriteString(logsWriter, fmt.Sprintf("Deleting ECS service: %s in cluster: %s\n", ecsServiceName, clusterArn))
 	_, err = ecsClient.DeleteService(context.TODO(), &ecs.DeleteServiceInput{
 		Service: aws.String(ecsServiceName),
 		Cluster: aws.String(clusterArn),
@@ -60,6 +63,7 @@ func (d *DeleteAwsWebService) Run(parameters map[string]interface{}, logsWriter 
 	}
 	taskDefinitionArns := listTaskDefinitionsOutput.TaskDefinitionArns
 	for _, taskDefinitionArn := range taskDefinitionArns {
+		io.WriteString(logsWriter, fmt.Sprintf("Deleting task definition: %s\n", taskDefinitionArn))
 		_, err = ecsClient.DeregisterTaskDefinition(context.TODO(), &ecs.DeregisterTaskDefinitionInput{TaskDefinition: aws.String(taskDefinitionArn)})
 		if err != nil {
 			return parameters, err
@@ -92,6 +96,7 @@ func (d *DeleteAwsWebService) Run(parameters map[string]interface{}, logsWriter 
 	if err != nil {
 		return parameters, err
 	}
+	io.WriteString(logsWriter, fmt.Sprintf("Deleting ECR repository: %s\n", ecrRepositoryName))
 	_, err = ecrClient.DeleteRepository(context.TODO(), &ecr.DeleteRepositoryInput{
 		RepositoryName: aws.String(ecrRepositoryName),
 		Force:          true,
@@ -107,6 +112,7 @@ func (d *DeleteAwsWebService) Run(parameters map[string]interface{}, logsWriter 
 	if err != nil {
 		return parameters, err
 	}
+	io.WriteString(logsWriter, fmt.Sprintf("Deleting load balancer: %s\n", loadBalancerArn))
 	_, err = elbClient.DeleteLoadBalancer(context.TODO(), &elasticloadbalancingv2.DeleteLoadBalancerInput{LoadBalancerArn: aws.String(loadBalancerArn)})
 	if err != nil {
 		return parameters, err
@@ -129,6 +135,7 @@ func (d *DeleteAwsWebService) Run(parameters map[string]interface{}, logsWriter 
 	if err != nil {
 		return parameters, err
 	}
+	io.WriteString(logsWriter, fmt.Sprintf("Deleting target group: %s\n", targetGroupArn))
 	_, err = elbClient.DeleteTargetGroup(context.TODO(), &elasticloadbalancingv2.DeleteTargetGroupInput{TargetGroupArn: aws.String(targetGroupArn)})
 	if err != nil {
 		return parameters, err
@@ -143,6 +150,8 @@ func (d *DeleteAwsWebService) Run(parameters map[string]interface{}, logsWriter 
 	if err != nil {
 		return parameters, err
 	}
+
+	io.WriteString(logsWriter, fmt.Sprintf("Deleting security group: %s\n", albSecurityGroupID))
 	_, err = ec2Client.DeleteSecurityGroup(context.TODO(), &ec2.DeleteSecurityGroupInput{
 		DryRun:  aws.Bool(false),
 		GroupId: aws.String(albSecurityGroupID),

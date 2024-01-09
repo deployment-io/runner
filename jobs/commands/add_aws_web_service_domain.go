@@ -2,6 +2,7 @@ package commands
 
 import (
 	"context"
+	"fmt"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2"
 	elbTypes "github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2/types"
@@ -58,6 +59,7 @@ func (a *AddAwsWebServiceDomain) Run(parameters map[string]interface{}, logsWrit
 
 	if len(listenerArn) > 0 {
 		//update
+		io.WriteString(logsWriter, fmt.Sprintf("Adding certificate %s for alb https listener: %s\n", certificateArn, listenerArn))
 		_, err := elbClient.ModifyListener(context.TODO(), &elasticloadbalancingv2.ModifyListenerInput{
 			ListenerArn: aws.String(listenerArn),
 			Certificates: []elbTypes.Certificate{{
@@ -70,6 +72,7 @@ func (a *AddAwsWebServiceDomain) Run(parameters map[string]interface{}, logsWrit
 		}
 	} else {
 		//create
+		io.WriteString(logsWriter, fmt.Sprintf("Creating new https alb listener with certificate: %s\n", certificateArn))
 		createListenerInput := &elasticloadbalancingv2.CreateListenerInput{
 			DefaultActions: []elbTypes.Action{{
 				Type:           elbTypes.ActionTypeEnumForward,
@@ -99,6 +102,7 @@ func (a *AddAwsWebServiceDomain) Run(parameters map[string]interface{}, logsWrit
 			return parameters, err
 		}
 		listenerArn = aws.ToString(createListenerOutput.Listeners[0].ListenerArn)
+		io.WriteString(logsWriter, fmt.Sprintf("New alb https listener created: %s\n", listenerArn))
 	}
 
 	deploymentID, err := jobs.GetParameterValue[string](parameters, parameters_enums.DeploymentID)

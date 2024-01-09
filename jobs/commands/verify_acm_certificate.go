@@ -2,6 +2,7 @@ package commands
 
 import (
 	"context"
+	"fmt"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/acm"
 	"github.com/deployment-io/deployment-runner-kit/certificates"
@@ -24,6 +25,7 @@ func (v *VerifyAcmCertificate) Run(parameters map[string]interface{}, logsWriter
 	if err != nil {
 		return parameters, err
 	}
+	io.WriteString(logsWriter, fmt.Sprintf("Verifying and validating certificate from ACM: %s\n", certificateArn))
 	//TODO handle - If a certificate shows status FAILED or VALIDATION_TIMED_OUT, delete the request
 	//This can happen if the user doesn't validate certificate DNS in 72 hours
 	newCertificateValidatedWaiter := acm.NewCertificateValidatedWaiter(acmClient)
@@ -44,6 +46,8 @@ func (v *VerifyAcmCertificate) Run(parameters map[string]interface{}, logsWriter
 
 	//wait for a minute after the certificate is verified or AWS gives an error
 	time.Sleep(1 * time.Minute)
+
+	io.WriteString(logsWriter, fmt.Sprintf("Certificate verified from ACM: %s\n", certificateArn))
 
 	return parameters, err
 }

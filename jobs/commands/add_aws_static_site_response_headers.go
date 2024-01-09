@@ -75,6 +75,8 @@ func getResponseHeadersFunctionCode(parameters map[string]interface{}) (string, 
 
 func (a *AddAwsStaticSiteResponseHeaders) Run(parameters map[string]interface{}, logsWriter io.Writer) (newParameters map[string]interface{}, err error) {
 
+	io.WriteString(logsWriter, fmt.Sprintf("Updating response headers for static site deployment\n"))
+
 	// Create an Amazon Cloudfront service client
 	cloudfrontClient, err := getCloudfrontClient(parameters, cloudfrontRegion)
 	if err != nil {
@@ -120,6 +122,7 @@ func (a *AddAwsStaticSiteResponseHeaders) Run(parameters map[string]interface{},
 			return parameters, nil
 		}
 		//no headers so delete function and disassociate
+		io.WriteString(logsWriter, fmt.Sprintf("Deleting response headers\n"))
 		newArn := aws.ToString(describeFunctionOutput.FunctionSummary.FunctionMetadata.FunctionARN)
 		var newItems []cloudfront_types.FunctionAssociation
 		var q int32 = 0
@@ -135,6 +138,7 @@ func (a *AddAwsStaticSiteResponseHeaders) Run(parameters map[string]interface{},
 			}
 		}
 		if disAssociate {
+			io.WriteString(logsWriter, fmt.Sprintf("Disassociating cloudfront function %s from cloudfront distribution %s\n", responseHeadersFunctionName, cloudfrontDistributionId))
 			functionAssociations = &cloudfront_types.FunctionAssociations{
 				Quantity: aws.Int32(q),
 				Items:    newItems,
@@ -150,11 +154,13 @@ func (a *AddAwsStaticSiteResponseHeaders) Run(parameters map[string]interface{},
 				return parameters, err
 			}
 
-			err := invalidateCloudfrontDistribution(parameters, cloudfrontClient, cloudfrontDistributionId)
+			err := invalidateCloudfrontDistribution(parameters, cloudfrontClient, cloudfrontDistributionId, logsWriter)
 			if err != nil {
 				return parameters, err
 			}
 		}
+
+		io.WriteString(logsWriter, fmt.Sprintf("Deleting cloudfront function %s\n", responseHeadersFunctionName))
 
 		_, err = cloudfrontClient.DeleteFunction(context.TODO(), &cloudfront.DeleteFunctionInput{
 			IfMatch: describeFunctionOutput.ETag,
@@ -189,6 +195,7 @@ func (a *AddAwsStaticSiteResponseHeaders) Run(parameters map[string]interface{},
 		//TODO logic can be better and we can specifically check for NoSuchFunctionExists: The specified function does not exist
 		//if exists
 		//update to add the new headers
+		io.WriteString(logsWriter, fmt.Sprintf("Updating cloudfront function %s to add new response headers\n", responseHeadersFunctionName))
 		var updateFunctionOutput *cloudfront.UpdateFunctionOutput
 		updateFunctionOutput, err = cloudfrontClient.UpdateFunction(context.TODO(), &cloudfront.UpdateFunctionInput{
 			FunctionCode:   []byte(cloudfrontFunction),
@@ -202,6 +209,7 @@ func (a *AddAwsStaticSiteResponseHeaders) Run(parameters map[string]interface{},
 		functionARN = updateFunctionOutput.FunctionSummary.FunctionMetadata.FunctionARN
 		etag = updateFunctionOutput.ETag
 	} else {
+		io.WriteString(logsWriter, fmt.Sprintf("Creating cloudfront function %s to add new response headers\n", responseHeadersFunctionName))
 		//else create a new function
 		var createFunctionOutput *cloudfront.CreateFunctionOutput
 		createFunctionOutput, err = cloudfrontClient.CreateFunction(context.TODO(), &cloudfront.CreateFunctionInput{
@@ -216,6 +224,7 @@ func (a *AddAwsStaticSiteResponseHeaders) Run(parameters map[string]interface{},
 		etag = createFunctionOutput.ETag
 	}
 
+	io.WriteString(logsWriter, fmt.Sprintf("Publishing cloudfront function %s\n", responseHeadersFunctionName))
 	//publish function
 	_, err = cloudfrontClient.PublishFunction(context.TODO(), &cloudfront.PublishFunctionInput{
 		IfMatch: etag,
@@ -228,6 +237,7 @@ func (a *AddAwsStaticSiteResponseHeaders) Run(parameters map[string]interface{},
 
 	associate := associateFunctionToCloudfrontDistribution(distributionConfig, functionARN, cloudfront_types.EventTypeViewerResponse)
 	if associate {
+		io.WriteString(logsWriter, fmt.Sprintf("Associating cloudfront function %s to distribution %s\n", responseHeadersFunctionName, cloudfrontDistributionId))
 		_, err = cloudfrontClient.UpdateDistribution(context.TODO(), &cloudfront.UpdateDistributionInput{
 			DistributionConfig: distributionConfig,
 			Id:                 aws.String(cloudfrontDistributionId),
@@ -239,7 +249,7 @@ func (a *AddAwsStaticSiteResponseHeaders) Run(parameters map[string]interface{},
 		}
 	}
 
-	err = invalidateCloudfrontDistribution(parameters, cloudfrontClient, cloudfrontDistributionId)
+	err = invalidateCloudfrontDistribution(parameters, cloudfrontClient, cloudfrontDistributionId, logsWriter)
 	if err != nil {
 		return parameters, err
 	}
@@ -247,7 +257,8 @@ func (a *AddAwsStaticSiteResponseHeaders) Run(parameters map[string]interface{},
 	return parameters, err
 }
 
-func invalidateCloudfrontDistribution(parameters map[string]interface{}, cloudfrontClient *cloudfront.Client, cloudfrontDistributionId string) error {
+func invalidateCloudfrontDistribution(parameters map[string]interface{}, cloudfrontClient *cloudfront.Client,
+	cloudfrontDistributionId string, logsWriter io.Writer) error {
 	callerReference, err := getCallerReference(parameters)
 	if err != nil {
 		return err
@@ -270,6 +281,8 @@ func invalidateCloudfrontDistribution(parameters map[string]interface{}, cloudfr
 	if err != nil {
 		return err
 	}
+
+	io.WriteString(logsWriter, fmt.Sprintf("Waiting for cloudfront distribution to be invalidated: %s\n", cloudfrontDistributionId))
 
 	//Wait for invalidation to get done
 	invalidationWaiter := cloudfront.NewInvalidationCompletedWaiter(cloudfrontClient)

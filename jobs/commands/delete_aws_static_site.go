@@ -20,7 +20,7 @@ type DeleteAwsStaticSite struct {
 
 func (d *DeleteAwsStaticSite) Run(parameters map[string]interface{}, logsWriter io.Writer) (newParameters map[string]interface{}, err error) {
 	//For static site
-
+	io.WriteString(logsWriter, fmt.Sprintf("Deleting static site on AWS\n"))
 	//delete cloudfront distribution
 	cloudfrontDistributionId, err := jobs.GetParameterValue[string](parameters, parameters_enums.CloudfrontID)
 	if err != nil {
@@ -43,6 +43,7 @@ func (d *DeleteAwsStaticSite) Run(parameters map[string]interface{}, logsWriter 
 	distributionConfig := distributionConfigOutput.DistributionConfig
 	distributionConfig.Enabled = aws.Bool(false)
 	//disable distribution
+	io.WriteString(logsWriter, fmt.Sprintf("Disabling cloudfront distribution: %s\n", cloudfrontDistributionId))
 	updateDistributionOutput, err := cloudfrontClient.UpdateDistribution(context.TODO(), &cloudfront.UpdateDistributionInput{
 		DistributionConfig: distributionConfig,
 		Id:                 aws.String(cloudfrontDistributionId),
@@ -56,6 +57,7 @@ func (d *DeleteAwsStaticSite) Run(parameters map[string]interface{}, logsWriter 
 	if err != nil {
 		return parameters, err
 	}
+	io.WriteString(logsWriter, fmt.Sprintf("Deleting cloudfront distribution: %s\n", cloudfrontDistributionId))
 	_, err = cloudfrontClient.DeleteDistribution(context.TODO(), &cloudfront.DeleteDistributionInput{
 		Id:      aws.String(cloudfrontDistributionId),
 		IfMatch: updateDistributionOutput.ETag,
@@ -70,13 +72,14 @@ func (d *DeleteAwsStaticSite) Run(parameters map[string]interface{}, logsWriter 
 	if err != nil {
 		return parameters, err
 	}
+	io.WriteString(logsWriter, fmt.Sprintf("Deleting cache policy: %s\n", aws.ToString(cachePolicyId)))
 	_, _ = cloudfrontClient.DeleteCachePolicy(context.TODO(), &cloudfront.DeleteCachePolicyInput{
 		Id:      cachePolicyId,
 		IfMatch: getCachePolicyOutput.ETag,
 	})
 
 	//delete cf functions if needed
-	err = deleteCloudfrontFunctions(parameters, cloudfrontClient)
+	err = deleteCloudfrontFunctions(parameters, cloudfrontClient, logsWriter)
 	if err != nil {
 		return parameters, err
 	}
@@ -85,7 +88,7 @@ func (d *DeleteAwsStaticSite) Run(parameters map[string]interface{}, logsWriter 
 	if distributionConfig.Origins != nil {
 		for _, origin := range distributionConfig.Origins.Items {
 			if origin.OriginAccessControlId != nil {
-				_ = deleteOriginAccessControl(origin.OriginAccessControlId, cloudfrontClient)
+				_ = deleteOriginAccessControl(origin.OriginAccessControlId, cloudfrontClient, logsWriter)
 			}
 		}
 	}
@@ -99,10 +102,13 @@ func (d *DeleteAwsStaticSite) Run(parameters map[string]interface{}, logsWriter 
 	if err != nil {
 		return parameters, err
 	}
+
+	io.WriteString(logsWriter, fmt.Sprintf("Deleting all files in S3 bucket: %s\n", bucketName))
 	err = deleteAllS3Files(s3Client, bucketName)
 	if err != nil {
 		return parameters, err
 	}
+	io.WriteString(logsWriter, fmt.Sprintf("Deleting S3 bucket: %s\n", bucketName))
 	_, err = s3Client.DeleteBucket(context.TODO(), &s3.DeleteBucketInput{
 		Bucket: aws.String(bucketName),
 	})
@@ -131,7 +137,8 @@ func (d *DeleteAwsStaticSite) Run(parameters map[string]interface{}, logsWriter 
 	return parameters, err
 }
 
-func deleteOriginAccessControl(originAccessControlId *string, cloudFrontClient *cloudfront.Client) error {
+func deleteOriginAccessControl(originAccessControlId *string, cloudFrontClient *cloudfront.Client, logsWriter io.Writer) error {
+	io.WriteString(logsWriter, fmt.Sprintf("Deleting origin access control: %s\n", aws.ToString(originAccessControlId)))
 	getOriginAccessControlOutput, err := cloudFrontClient.GetOriginAccessControl(context.TODO(), &cloudfront.GetOriginAccessControlInput{Id: originAccessControlId})
 	if err != nil {
 		return err
@@ -148,11 +155,12 @@ func deleteOriginAccessControl(originAccessControlId *string, cloudFrontClient *
 	return nil
 }
 
-func deleteCloudfrontFunctions(parameters map[string]interface{}, cloudfrontClient *cloudfront.Client) error {
+func deleteCloudfrontFunctions(parameters map[string]interface{}, cloudfrontClient *cloudfront.Client, logsWriter io.Writer) error {
 	viewerResponseFunctionName, err := getViewerResponseFunctionName(parameters)
 	if err != nil {
 		return err
 	}
+	io.WriteString(logsWriter, fmt.Sprintf("Deleting cloudfront function: %s\n", viewerResponseFunctionName))
 	err = deleteCloudfrontFunction(cloudfrontClient, viewerResponseFunctionName)
 	if err != nil {
 		return err
@@ -161,6 +169,7 @@ func deleteCloudfrontFunctions(parameters map[string]interface{}, cloudfrontClie
 	if err != nil {
 		return err
 	}
+	io.WriteString(logsWriter, fmt.Sprintf("Deleting cloudfront function: %s\n", viewerRequestFunctionName))
 	err = deleteCloudfrontFunction(cloudfrontClient, viewerRequestFunctionName)
 	if err != nil {
 		return err

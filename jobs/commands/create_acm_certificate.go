@@ -2,6 +2,7 @@ package commands
 
 import (
 	"context"
+	"fmt"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/acm"
 	acm_types "github.com/aws/aws-sdk-go-v2/service/acm/types"
@@ -32,6 +33,7 @@ func (c *CreateAcmCertificate) Run(parameters map[string]interface{}, logsWriter
 	if err != nil {
 		return parameters, err
 	}
+	io.WriteString(logsWriter, fmt.Sprintf("Requesting certificate from ACM for domain: %s\n", certificateDomain))
 	requestCertificateOutput, err := acmClient.RequestCertificate(context.TODO(), &acm.RequestCertificateInput{
 		DomainName:       aws.String(certificateDomain),
 		IdempotencyToken: aws.String(certificateID), //will be unique for each creation request
@@ -79,6 +81,7 @@ func (c *CreateAcmCertificate) Run(parameters map[string]interface{}, logsWriter
 		}
 	}()
 
+	io.WriteString(logsWriter, fmt.Sprintf("Got certificate from ACM: %s\n", aws.ToString(certificateArn)))
 	updateCertificatesPipeline.Add(updateCertificatesKey, certificates.UpdateCertificateDtoV1{
 		ID:             certificateID,
 		CertificateArn: aws.ToString(certificateArn),
