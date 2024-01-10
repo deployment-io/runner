@@ -202,29 +202,29 @@ func (u *UploadDockerImageToEcr) Run(parameters map[string]interface{}, logsWrit
 		return parameters, err
 	}
 
-	ecrRepositoryName, err := getEcrRepositoryName(parameters)
-	if err != nil {
-		return parameters, err
-	}
-	commitHash, err := jobs.GetParameterValue[string](parameters, parameters_enums.CommitHash)
-	if err != nil {
-		return parameters, err
-	}
-	describeImagesOutput, _ := ecrClient.DescribeImages(context.TODO(), &ecr.DescribeImagesInput{
-		RepositoryName: aws.String(ecrRepositoryName),
-		ImageIds: []ecrTypes.ImageIdentifier{
-			{
-				ImageTag: aws.String(commitHash),
-			},
-		},
-	})
+	//ecrRepositoryName, err := getEcrRepositoryName(parameters)
+	//if err != nil {
+	//	return parameters, err
+	//}
+	//commitHash, err := jobs.GetParameterValue[string](parameters, parameters_enums.CommitHash)
+	//if err != nil {
+	//	return parameters, err
+	//}
+	//describeImagesOutput, _ := ecrClient.DescribeImages(context.TODO(), &ecr.DescribeImagesInput{
+	//	RepositoryName: aws.String(ecrRepositoryName),
+	//	ImageIds: []ecrTypes.ImageIdentifier{
+	//		{
+	//			ImageTag: aws.String(commitHash),
+	//		},
+	//	},
+	//})
 
-	if describeImagesOutput == nil || len(describeImagesOutput.ImageDetails) == 0 {
-		err = pushDockerImageToEcr(parameters, ecrClient, ecrRepositoryUriWithTag, logsWriter)
-		if err != nil {
-			return parameters, err
-		}
+	//if describeImagesOutput == nil || len(describeImagesOutput.ImageDetails) == 0 {
+	err = pushDockerImageToEcr(parameters, ecrClient, ecrRepositoryUriWithTag, logsWriter)
+	if err != nil {
+		return parameters, err
 	}
+	//}
 
 	jobs.SetParameterValue(parameters, parameters_enums.EcrRepositoryUri, ecrRepositoryUri)
 	jobs.SetParameterValue(parameters, parameters_enums.EcrRepositoryUriWithTag, ecrRepositoryUriWithTag)
