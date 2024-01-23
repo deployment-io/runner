@@ -16,6 +16,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/iam"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3Types "github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/deployment-io/deployment-runner-kit/builds"
 	"github.com/deployment-io/deployment-runner-kit/certificates"
 	"github.com/deployment-io/deployment-runner-kit/clusters"
@@ -131,7 +132,7 @@ func Init() {
 		upsertVpcsPipeline.Shutdown()
 		fmt.Println("waiting for vpcs upsert pipeline shutdown -- done")
 	})
-	upsertClustersPipeline, _ = goPipeline.NewPipeline(5, 10*time.Second, func(vpc string, clusters []clusters.UpsertClusterDtoV1) {
+	upsertClustersPipeline, _ = goPipeline.NewPipeline(5, 10*time.Second, func(cluster string, clusters []clusters.UpsertClusterDtoV1) {
 		e := true
 		for e {
 			err := c.UpsertClusters(clusters)
@@ -496,6 +497,19 @@ func getAcmClient(parameters map[string]interface{}) (*acm.Client, error) {
 	})
 
 	return acmClient, nil
+}
+
+func GetStsClient(region string) (*sts.Client, error) {
+	cfg, err := config.LoadDefaultConfig(context.TODO())
+	if err != nil {
+		return nil, err
+	}
+
+	stsClient := sts.NewFromConfig(cfg, func(options *sts.Options) {
+		options.Region = region
+	})
+
+	return stsClient, nil
 }
 
 func getDockerImageNameAndTag(parameters map[string]interface{}) (string, error) {

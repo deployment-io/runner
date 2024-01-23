@@ -9,12 +9,13 @@ func (r *RunnerClient) UpsertClusters(upsertClusters []clusters.UpsertClusterDto
 	if !r.isConnected {
 		return ErrConnection
 	}
-	args := clusters.UpsertClustersArgsV1{}
+	args := clusters.UpsertClustersArgsV2{}
 	args.OrganizationID = r.organizationID
 	args.Token = r.token
+	args.CloudAccountID = r.cloudAccountID
 	args.Clusters = upsertClusters
 	var reply clusters.UpsertClustersReplyV1
-	err := r.c.Call("Clusters.UpsertV1", args, &reply)
+	err := r.c.Call("Clusters.UpsertV2", args, &reply)
 	if err != nil {
 		return err
 	}
