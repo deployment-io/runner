@@ -1,16 +1,25 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	goPipeline "github.com/ankit-arora/go-utils/go-concurrent-pipeline/go-pipeline"
 	goShutdownHook "github.com/ankit-arora/go-utils/go-shutdown-hook"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
+	"github.com/deployment-io/deployment-runner-kit/enums/cpu_architecture_enums"
+	"github.com/deployment-io/deployment-runner-kit/enums/os_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner/client"
 	"github.com/deployment-io/deployment-runner/jobs/commands"
+	"github.com/deployment-io/deployment-runner/utils"
 	"github.com/deployment-io/deployment-runner/utils/loggers"
 	"github.com/joho/godotenv"
 	"io"
+	"log"
 	"os"
+	"runtime"
+	"strings"
 	"sync"
 	"time"
 )
@@ -126,7 +135,8 @@ func sendJobResults(resultsStream <-chan jobs.CompletingJobDtoV1,
 	return done
 }
 
-func getEnvironment() (service, organizationId, token, region, dockerImage, cpuStr, memory, taskExecutionRoleArn, taskRoleArn string) {
+func getEnvironment() (service, organizationId, token, region, dockerImage, memory, taskExecutionRoleArn,
+	taskRoleArn, awsAccountID string) {
 	//TODO load .env
 	//ignoring err
 	_ = godotenv.Load()
@@ -135,22 +145,46 @@ func getEnvironment() (service, organizationId, token, region, dockerImage, cpuS
 	token = os.Getenv("Token")
 	region = os.Getenv("Region")
 	dockerImage = os.Getenv("DockerImage")
-	cpuStr = os.Getenv("CpuArch")
 	memory = os.Getenv("Memory")
 	taskExecutionRoleArn = os.Getenv("ExecutionRoleArn")
 	taskRoleArn = os.Getenv("TaskRoleArn")
-
+	awsAccountID = os.Getenv("AWSAccountID")
 	return
 }
 
 var clientCertPem, clientKeyPem string
 
 func main() {
-	service, organizationId, token, _, dockerImage, _, _, _, _ := getEnvironment()
-	client.Connect(service, organizationId, token, clientCertPem, clientKeyPem, dockerImage, false)
+	service, organizationId, token, region, dockerImage, _, _, _, awsAccountID := getEnvironment()
+	stsClient, err := commands.GetStsClient(region)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if len(awsAccountID) > 0 {
+		//aws case - check account validity
+		getCallerIdentityOutput, err := stsClient.GetCallerIdentity(context.TODO(), &sts.GetCallerIdentityInput{})
+		if err != nil {
+			log.Fatal(err)
+		}
+		if awsAccountID != aws.ToString(getCallerIdentityOutput.Account) {
+			log.Fatalf("Invalid AWS account ID")
+		}
+	}
+	client.Connect(service, organizationId, token, clientCertPem, clientKeyPem, dockerImage, region, awsAccountID, false)
 	c := client.Get()
 	commands.Init()
 	loggers.Init()
+	goarch := runtime.GOARCH
+	archEnum := cpu_architecture_enums.AMD
+	if strings.HasPrefix(goarch, "arm") {
+		archEnum = cpu_architecture_enums.ARM
+	}
+	goos := runtime.GOOS
+	osType := os_enums.LINUX
+	if strings.HasPrefix(goos, "windows") {
+		osType = os_enums.WINDOWS
+	}
+	utils.RunnerData.Set(region, awsAccountID, archEnum, osType)
 	shutdownSignal := make(chan struct{})
 	goShutdownHook.ADD(func() {
 		fmt.Println("waiting for shutdown signal")

@@ -3,17 +3,22 @@ package client
 import (
 	"fmt"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
+	"runtime"
 )
 
 func (r *RunnerClient) GetPendingJobs() ([]jobs.PendingJobDtoV1, error) {
 	if !r.isConnected {
 		return nil, ErrConnection
 	}
-	args := jobs.PendingJobsArgsV1{}
+	args := jobs.PendingJobsArgsV2{}
 	args.OrganizationID = r.organizationID
 	args.Token = r.token
+	args.CloudAccountID = r.cloudAccountID
+	args.RunnerRegion = r.runnerRegion
+	args.GoArch = runtime.GOARCH
+	args.GoOS = runtime.GOOS
 	var jobsDto jobs.PendingJobsDtoV1
-	err := r.c.Call("Jobs.GetPendingV1", args, &jobsDto)
+	err := r.c.Call("Jobs.GetPendingV2", args, &jobsDto)
 	if err != nil {
 		return nil, err
 	}

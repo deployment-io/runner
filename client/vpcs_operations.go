@@ -9,12 +9,13 @@ func (r *RunnerClient) UpsertVpcs(upsertVpcs []vpcs.UpsertVpcDtoV1) error {
 	if !r.isConnected {
 		return ErrConnection
 	}
-	args := vpcs.UpsertVpcsArgsV1{}
+	args := vpcs.UpsertVpcsArgsV2{}
 	args.OrganizationID = r.organizationID
 	args.Token = r.token
+	args.CloudAccountID = r.cloudAccountID
 	args.Vpcs = upsertVpcs
 	var reply vpcs.UpsertVpcsReplyV1
-	err := r.c.Call("Vpcs.UpsertV1", args, &reply)
+	err := r.c.Call("Vpcs.UpsertV2", args, &reply)
 	if err != nil {
 		return err
 	}

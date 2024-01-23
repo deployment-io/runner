@@ -19,6 +19,8 @@ type RunnerClient struct {
 	organizationID     string
 	token              string
 	currentDockerImage string
+	runnerRegion       string
+	cloudAccountID     string
 }
 
 func getTlsClient(service, clientCertPem, clientKeyPem string) (*rpc.Client, error) {
@@ -52,7 +54,7 @@ func getTlsClient(service, clientCertPem, clientKeyPem string) (*rpc.Client, err
 
 var client = RunnerClient{}
 
-func connect(service, organizationID, token, clientCertPem, clientKeyPem, dockerImage string) (err error) {
+func connect(service, organizationID, token, clientCertPem, clientKeyPem, dockerImage, region, awsAccountID string) (err error) {
 	var c *rpc.Client
 	if !client.isConnected {
 		if len(clientCertPem) > 0 && len(clientKeyPem) > 0 {
@@ -72,6 +74,8 @@ func connect(service, organizationID, token, clientCertPem, clientKeyPem, docker
 		client.organizationID = organizationID
 		client.token = token
 		client.currentDockerImage = dockerImage
+		client.runnerRegion = region
+		client.cloudAccountID = awsAccountID
 	}
 
 	return nil
@@ -79,7 +83,7 @@ func connect(service, organizationID, token, clientCertPem, clientKeyPem, docker
 
 var disconnectSignal = make(chan struct{})
 
-func Connect(service, organizationID, token, clientCertPem, clientKeyPem, dockerImage string, blockTillFirstConnect bool) chan struct{} {
+func Connect(service, organizationID, token, clientCertPem, clientKeyPem, dockerImage, region, awsAccountID string, blockTillFirstConnect bool) chan struct{} {
 	firstTimeConnectSignal := make(chan struct{})
 	if !client.isStarted {
 		client.Lock()
@@ -96,7 +100,8 @@ func Connect(service, organizationID, token, clientCertPem, clientKeyPem, docker
 					default:
 						isConnectedOld := client.isConnected
 						if !client.isConnected {
-							connect(service, organizationID, token, clientCertPem, clientKeyPem, dockerImage)
+							connect(service, organizationID, token, clientCertPem, clientKeyPem, dockerImage,
+								region, awsAccountID)
 						}
 						if client.c != nil {
 							err := client.Ping(firstPing)

@@ -13,11 +13,13 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/builds"
 	"github.com/deployment-io/deployment-runner-kit/deployments"
 	"github.com/deployment-io/deployment-runner-kit/enums/cpu_architecture_enums"
+	"github.com/deployment-io/deployment-runner-kit/enums/os_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/region_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner-kit/previews"
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
+	"github.com/deployment-io/deployment-runner/utils"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"io"
 	"strings"
@@ -676,16 +678,17 @@ func registerTaskDefinition(parameters map[string]interface{}, ecsClient *ecs.Cl
 		return "", err
 	}
 
+	_, _, cpuArchEnum, osType := utils.RunnerData.Get()
 	cpuArch := ecsTypes.CPUArchitectureX8664
-	arch, err := jobs.GetParameterValue[int64](parameters, parameters_enums.CpuArchitecture)
-	if err != nil {
-		return "", err
-	}
-	if cpu_architecture_enums.Type(arch) == cpu_architecture_enums.ARM {
+	if cpuArchEnum == cpu_architecture_enums.ARM {
 		cpuArch = ecsTypes.CPUArchitectureArm64
 	}
 
-	//TODO Linux for now
+	osFamily := ecsTypes.OSFamilyLinux
+	if osType == os_enums.WINDOWS {
+		osFamily = ecsTypes.OSFamilyWindowsServer2022Core
+	}
+
 	registerTaskDefinitionInput := &ecs.RegisterTaskDefinitionInput{
 		ContainerDefinitions: []ecsTypes.ContainerDefinition{
 			containerDefinition,
@@ -697,7 +700,7 @@ func registerTaskDefinition(parameters map[string]interface{}, ecsClient *ecs.Cl
 		NetworkMode:      ecsTypes.NetworkModeAwsvpc,
 		RuntimePlatform: &ecsTypes.RuntimePlatform{
 			CpuArchitecture:       cpuArch,
-			OperatingSystemFamily: ecsTypes.OSFamilyLinux,
+			OperatingSystemFamily: osFamily,
 		},
 		Tags: []ecsTypes.Tag{
 			{

@@ -7,15 +7,18 @@ import (
 )
 
 func (r *RunnerClient) Ping(firstPing bool) error {
-	args := ping.ArgsV1{}
+	args := ping.ArgsV2{}
 	args.Send = "ping"
 	args.FirstPing = firstPing
 	args.GoArch = runtime.GOARCH
 	args.OrganizationID = r.organizationID
 	args.Token = r.token
+	args.GoOS = runtime.GOOS
+	args.RunnerRegion = r.runnerRegion
+	args.CloudAccountID = r.cloudAccountID
 	args.DockerImage = r.currentDockerImage
 	var reply ping.ReplyV1
-	err := r.c.Call("Ping.SendV1", args, &reply)
+	err := r.c.Call("Ping.SendV2", args, &reply)
 	if err != nil {
 		return err
 	}

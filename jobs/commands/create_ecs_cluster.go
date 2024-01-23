@@ -9,10 +9,10 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/iam"
 	"github.com/deployment-io/deployment-runner-kit/clusters"
 	"github.com/deployment-io/deployment-runner-kit/enums/cluster_enums"
-	"github.com/deployment-io/deployment-runner-kit/enums/cpu_architecture_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/region_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
+	"github.com/deployment-io/deployment-runner/utils"
 	"io"
 )
 
@@ -26,11 +26,7 @@ func getDefaultEcsClusterName(parameters map[string]interface{}) (string, error)
 	if err != nil {
 		return "", err
 	}
-	arch, err := jobs.GetParameterValue[int64](parameters, parameters_enums.CpuArchitecture)
-	if err != nil {
-		return "", err
-	}
-	return fmt.Sprintf("ecs-%s-%s", cpu_architecture_enums.Type(arch).String(), organizationID), nil
+	return fmt.Sprintf("ecs-%s", organizationID), nil
 }
 
 func createEcsClusterIfNeeded(ecsClient *ecs.Client, parameters map[string]interface{}) (ecsClusterArn string, err error) {
@@ -91,16 +87,13 @@ func createEcsClusterIfNeeded(ecsClient *ecs.Client, parameters map[string]inter
 }
 
 func getDefaultTaskExecutionRoleName(parameters map[string]interface{}) (string, error) {
-	//ecsTaskExecutionRole-<cpuArch>-<organizationID>
+	//eTERole-<os>-<cpuArch>-<organizationID>-<runner region>
+	runnerRegion, _, cpuArch, osType := utils.RunnerData.Get()
 	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationID)
 	if err != nil {
 		return "", err
 	}
-	arch, err := jobs.GetParameterValue[int64](parameters, parameters_enums.CpuArchitecture)
-	if err != nil {
-		return "", err
-	}
-	return fmt.Sprintf("ecsTaskExecutionRole-%s-%s", cpu_architecture_enums.Type(arch).String(), organizationID), nil
+	return fmt.Sprintf("eTERole-%s-%s-%s-%s", osType.String(), cpuArch.String(), organizationID, runnerRegion), nil
 }
 
 func getEcsTaskExecutionRoleIfNeeded(iamClient *iam.Client, parameters map[string]interface{}) (ecsTaskExecutionRoleArn string, err error) {
