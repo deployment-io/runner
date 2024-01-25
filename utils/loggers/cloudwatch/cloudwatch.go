@@ -3,6 +3,7 @@ package cloudwatch
 import (
 	"context"
 	"errors"
+	"fmt"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
@@ -29,7 +30,7 @@ func New(parameters map[string]interface{}) (*Logger, error) {
 
 	cfg, err := config.LoadDefaultConfig(context.TODO())
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("error loading config for cloudwatch client: %s", err)
 	}
 
 	cloudwatchClient := cloudwatchlogs.NewFromConfig(cfg, func(options *cloudwatchlogs.Options) {
@@ -52,7 +53,7 @@ func New(parameters map[string]interface{}) (*Logger, error) {
 			logGroupAlreadyExists = true
 		}
 		if !logGroupAlreadyExists {
-			return nil, err
+			return nil, fmt.Errorf("error creating loggroup: %s", err)
 		}
 	}
 
@@ -72,7 +73,7 @@ func New(parameters map[string]interface{}) (*Logger, error) {
 			logStreamAlreadyExists = true
 		}
 		if !logStreamAlreadyExists {
-			return nil, err
+			return nil, fmt.Errorf("error creating logstream: %s", err)
 		}
 	}
 

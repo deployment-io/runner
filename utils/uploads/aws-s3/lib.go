@@ -107,13 +107,16 @@ func completeMultipartUpload(client *s3.Client, resp *s3.CreateMultipartUploadOu
 
 func uploadPart(client *s3.Client, resp *s3.CreateMultipartUploadOutput, fileBytes []byte, partNumber int) (types.CompletedPart, error) {
 	tryNum := 1
+
+	partNumberPointer := int32(partNumber)
+	contentLength := int64(len(fileBytes))
 	uploadPartInput := &s3.UploadPartInput{
 		Body:          bytes.NewReader(fileBytes),
 		Bucket:        resp.Bucket,
 		Key:           resp.Key,
-		PartNumber:    int32(partNumber),
+		PartNumber:    &partNumberPointer,
 		UploadId:      resp.UploadId,
-		ContentLength: int64(len(fileBytes)),
+		ContentLength: &contentLength,
 	}
 
 	for tryNum <= maxRetries {
@@ -131,7 +134,7 @@ func uploadPart(client *s3.Client, resp *s3.CreateMultipartUploadOutput, fileByt
 			//fmt.Printf("Uploaded part #%v\n", partNumber)
 			return types.CompletedPart{
 				ETag:       uploadResult.ETag,
-				PartNumber: int32(partNumber),
+				PartNumber: &partNumberPointer,
 			}, nil
 		}
 	}
