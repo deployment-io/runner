@@ -538,12 +538,26 @@ func decodeEnvironmentVariablesToKeyValueSlice(envVariables string) ([]ecsTypes.
 			continue
 		}
 		keyValue := strings.Split(envEntry, "=")
-		if len(keyValue) != 2 {
+		if len(keyValue) < 2 {
 			return nil, fmt.Errorf("environment variables in incorrect format")
 		}
+		value := ""
+		if len(keyValue) == 2 {
+			value = keyValue[1]
+		} else {
+			for i, s := range keyValue {
+				if i > 0 {
+					value += s
+					if i != (len(keyValue) - 1) {
+						value += "="
+					}
+				}
+			}
+		}
+
 		kv := ecsTypes.KeyValuePair{
 			Name:  aws.String(keyValue[0]),
-			Value: aws.String(keyValue[1]),
+			Value: aws.String(value),
 		}
 		envVariablesSlice = append(envVariablesSlice, kv)
 	}

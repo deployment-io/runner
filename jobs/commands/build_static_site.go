@@ -50,10 +50,24 @@ func decodeEnvironmentVariablesToSlice(envVariables string) ([]string, error) {
 			continue
 		}
 		keyValue := strings.Split(entry, "=")
-		if len(keyValue) != 2 {
+		if len(keyValue) < 2 {
 			return nil, fmt.Errorf("env variables not in correct format")
 		}
-		envVariablesSlice = append(envVariablesSlice, fmt.Sprintf("%s=%s", keyValue[0], keyValue[1]))
+		value := ""
+		if len(keyValue) == 2 {
+			value = keyValue[1]
+		} else {
+			for i, s := range keyValue {
+				if i > 0 {
+					value += s
+					if i != (len(keyValue) - 1) {
+						value += "="
+					}
+				}
+			}
+		}
+
+		envVariablesSlice = append(envVariablesSlice, fmt.Sprintf("%s=%s", keyValue[0], value))
 	}
 	return envVariablesSlice, nil
 }
