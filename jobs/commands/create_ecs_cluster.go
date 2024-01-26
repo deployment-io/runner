@@ -93,7 +93,7 @@ func getDefaultTaskExecutionRoleName(parameters map[string]interface{}) (string,
 	if err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("eTERole-%s-%s-%s-%s", osType.String(), cpuArch.String(), organizationID, runnerRegion), nil
+	return fmt.Sprintf("eTERole-%s%s-%s-%s", osType.String(), cpuArch.String(), organizationID, runnerRegion), nil
 }
 
 func getEcsTaskExecutionRoleIfNeeded(iamClient *iam.Client, parameters map[string]interface{}) (ecsTaskExecutionRoleArn string, err error) {
