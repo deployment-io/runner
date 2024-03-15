@@ -839,6 +839,8 @@ func createEcsServiceIfNeeded(parameters map[string]interface{}, ecsClient *ecs.
 
 		newServicesStableWaiter := ecs.NewServicesStableWaiter(ecsClient)
 
+		io.WriteString(logsWriter, fmt.Sprintf("Waiting for ECS service to be stable: %s\n", ecsServiceArn))
+
 		err = newServicesStableWaiter.Wait(context.TODO(), describeServicesInput, time.Minute*10)
 
 		if err != nil {
