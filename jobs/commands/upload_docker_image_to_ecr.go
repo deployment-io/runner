@@ -8,10 +8,14 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ecr"
 	ecrTypes "github.com/aws/aws-sdk-go-v2/service/ecr/types"
+	"github.com/deployment-io/deployment-runner-kit/cloud_api_clients"
 	"github.com/deployment-io/deployment-runner-kit/deployments"
+	"github.com/deployment-io/deployment-runner-kit/enums/iam_policy_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
+	"github.com/deployment-io/deployment-runner-kit/iam_policies"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner-kit/previews"
+	"github.com/deployment-io/deployment-runner/utils"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/registry"
 	"github.com/docker/docker/client"
@@ -187,7 +191,19 @@ func (u *UploadDockerImageToEcr) Run(parameters map[string]interface{}, logsWrit
 			markBuildDone(parameters, err, logsWriter)
 		}
 	}()
-	ecrClient, err := getEcrClient(parameters)
+
+	//check and add policy for AWS ECR upload
+	runnerRegion, _, cpuArchEnum, osType := utils.RunnerData.Get()
+	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationID)
+	if err != nil {
+		return parameters, err
+	}
+	err = iam_policies.AddAwsPolicyForDeploymentRunner(iam_policy_enums.AwsEcrUpload, osType.String(), cpuArchEnum.String(), organizationID, runnerRegion)
+	if err != nil {
+		return parameters, err
+	}
+
+	ecrClient, err := cloud_api_clients.GetEcrClient(parameters)
 	if err != nil {
 		return parameters, err
 	}

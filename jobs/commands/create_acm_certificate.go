@@ -7,8 +7,12 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/acm"
 	acm_types "github.com/aws/aws-sdk-go-v2/service/acm/types"
 	"github.com/deployment-io/deployment-runner-kit/certificates"
+	"github.com/deployment-io/deployment-runner-kit/cloud_api_clients"
+	"github.com/deployment-io/deployment-runner-kit/enums/iam_policy_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
+	"github.com/deployment-io/deployment-runner-kit/iam_policies"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
+	"github.com/deployment-io/deployment-runner/utils"
 	"io"
 	"time"
 )
@@ -17,7 +21,19 @@ type CreateAcmCertificate struct {
 }
 
 func (c *CreateAcmCertificate) Run(parameters map[string]interface{}, logsWriter io.Writer) (newParameters map[string]interface{}, err error) {
-	acmClient, err := getAcmClient(parameters)
+
+	//check and add policy for AWS ACM certificate creation
+	runnerRegion, _, cpuArchEnum, osType := utils.RunnerData.Get()
+	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationID)
+	if err != nil {
+		return parameters, err
+	}
+	err = iam_policies.AddAwsPolicyForDeploymentRunner(iam_policy_enums.AwsCertificateManager, osType.String(), cpuArchEnum.String(), organizationID, runnerRegion)
+	if err != nil {
+		return parameters, err
+	}
+
+	acmClient, err := cloud_api_clients.GetAcmClient(parameters)
 	if err != nil {
 		return parameters, err
 	}

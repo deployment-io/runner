@@ -7,8 +7,11 @@ import (
 	goShutdownHook "github.com/ankit-arora/go-utils/go-shutdown-hook"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
+	"github.com/deployment-io/deployment-runner-kit/cloud_api_clients"
 	"github.com/deployment-io/deployment-runner-kit/enums/cpu_architecture_enums"
+	"github.com/deployment-io/deployment-runner-kit/enums/iam_policy_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/os_enums"
+	"github.com/deployment-io/deployment-runner-kit/iam_policies"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner/client"
 	"github.com/deployment-io/deployment-runner/jobs/commands"
@@ -156,10 +159,11 @@ var clientCertPem, clientKeyPem string
 
 func main() {
 	service, organizationId, token, region, dockerImage, _, _, _, awsAccountID := getEnvironment()
-	stsClient, err := commands.GetStsClient(region)
+	stsClient, err := cloud_api_clients.GetStsClient(region)
 	if err != nil {
 		log.Fatal(err)
 	}
+	//TODO handle based on when target is AWS, then AWS account id won't be needed in env
 	if len(awsAccountID) > 0 {
 		//aws case - check account validity
 		getCallerIdentityOutput, err := stsClient.GetCallerIdentity(context.TODO(), &sts.GetCallerIdentityInput{})
@@ -185,6 +189,14 @@ func main() {
 		osType = os_enums.WINDOWS
 	}
 	utils.RunnerData.Set(region, awsAccountID, archEnum, osType)
+	//TODO handle based on when target is AWS, then AWS account id won't be needed in env
+	if len(awsAccountID) > 0 {
+		//add permissions for sending logs to cloudwatch
+		err = iam_policies.AddAwsPolicyForDeploymentRunner(iam_policy_enums.AwsLogs, osType.String(), archEnum.String(), organizationId, region)
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
 	shutdownSignal := make(chan struct{})
 	goShutdownHook.ADD(func() {
 		fmt.Println("waiting for shutdown signal")

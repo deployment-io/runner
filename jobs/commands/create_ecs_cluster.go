@@ -7,6 +7,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ecs"
 	ecsTypes "github.com/aws/aws-sdk-go-v2/service/ecs/types"
 	"github.com/aws/aws-sdk-go-v2/service/iam"
+	"github.com/deployment-io/deployment-runner-kit/cloud_api_clients"
 	"github.com/deployment-io/deployment-runner-kit/clusters"
 	"github.com/deployment-io/deployment-runner-kit/enums/cluster_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
@@ -137,7 +138,7 @@ func (c *CreateEcsCluster) Run(parameters map[string]interface{}, logsWriter io.
 		}
 	}()
 
-	ecsClient, err := getEcsClient(parameters)
+	ecsClient, err := cloud_api_clients.GetEcsClient(parameters)
 	if err != nil {
 		return parameters, err
 	}
@@ -149,7 +150,7 @@ func (c *CreateEcsCluster) Run(parameters map[string]interface{}, logsWriter io.
 
 	io.WriteString(logsWriter, fmt.Sprintf("Created ECS cluster: %s\n", clusterArn))
 
-	iamClient, err := getIamClient(parameters)
+	iamClient, err := cloud_api_clients.GetIamClient(parameters)
 	if err != nil {
 		return parameters, err
 	}

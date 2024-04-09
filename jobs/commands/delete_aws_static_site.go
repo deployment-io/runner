@@ -6,6 +6,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/cloudfront"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/deployment-io/deployment-runner-kit/cloud_api_clients"
 	"github.com/deployment-io/deployment-runner-kit/deployments"
 	"github.com/deployment-io/deployment-runner-kit/enums/deployment_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
@@ -26,7 +27,7 @@ func (d *DeleteAwsStaticSite) Run(parameters map[string]interface{}, logsWriter 
 	if err != nil {
 		return parameters, err
 	}
-	cloudfrontClient, err := getCloudfrontClient(parameters, cloudfrontRegion)
+	cloudfrontClient, err := cloud_api_clients.GetCloudfrontClient(parameters, cloudfrontRegion)
 	if err != nil {
 		return parameters, err
 	}
@@ -94,7 +95,7 @@ func (d *DeleteAwsStaticSite) Run(parameters map[string]interface{}, logsWriter 
 	}
 
 	//delete S3 bucket
-	s3Client, err := getS3Client(parameters)
+	s3Client, err := cloud_api_clients.GetS3Client(parameters)
 	if err != nil {
 		return parameters, err
 	}
