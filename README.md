@@ -1,7 +1,14 @@
 
 # Deployment Runner
 
-The deployment runner is the application that gets installed on your cloud environment and automates various DevOps and infrastructure tasks.
+Runner is the application that gets installed on cloud environments and automates various DevOps and infrastructure tasks.
+
+Some of its responsibilities are:
+1. checking out source code.
+2. building and deploying code.
+3. CI/CD.
+4. creating previews. 
+5. deleting deployments and freeing cloud resources.
 
 ## Get Started
 
