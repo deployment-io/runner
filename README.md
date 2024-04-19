@@ -1,7 +1,7 @@
 
 # Deployment Runner
 
-Runner is the application that gets installed on cloud environments and automates various DevOps and infrastructure tasks.
+Runner is an application that gets installed on cloud environments and automates various DevOps and infrastructure tasks.
 
 Some of its responsibilities are:
 1. checking out source code.
