@@ -11,13 +11,17 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3Types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
+	"github.com/deployment-io/deployment-runner-kit/cloud_api_clients"
 	"github.com/deployment-io/deployment-runner-kit/deployments"
+	"github.com/deployment-io/deployment-runner-kit/enums/iam_policy_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/region_enums"
+	"github.com/deployment-io/deployment-runner-kit/iam_policies"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner-kit/previews"
 	"github.com/deployment-io/deployment-runner/client"
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
+	"github.com/deployment-io/deployment-runner/utils"
 	awsS3Uploads "github.com/deployment-io/deployment-runner/utils/uploads/aws-s3"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"io"
@@ -152,12 +156,18 @@ func createS3BucketIfNeeded(s3Client *s3.Client, s3Bucket, s3Region string) (*st
 	}
 
 	// Create S3 bucket
-	response, err := s3Client.CreateBucket(context.TODO(), &s3.CreateBucketInput{
+	createBucketInput := &s3.CreateBucketInput{
 		Bucket: aws.String(s3Bucket),
-		CreateBucketConfiguration: &s3Types.CreateBucketConfiguration{
+	}
+	if s3Region != "us-east-1" {
+		//weird AWS gives error with location constraint for us-east-1
+		createBucketConfiguration := &s3Types.CreateBucketConfiguration{
 			LocationConstraint: s3Types.BucketLocationConstraint(s3Region),
-		},
-	})
+		}
+		createBucketInput.CreateBucketConfiguration = createBucketConfiguration
+	}
+
+	response, err := s3Client.CreateBucket(context.TODO(), createBucketInput)
 	if err != nil {
 		//var bne *types.BucketAlreadyExists
 		var ae smithy.APIError
@@ -411,6 +421,17 @@ func (d *DeployAwsStaticSite) Run(parameters map[string]interface{}, logsWriter 
 		return parameters, err
 	}
 
+	//check and add policy for AWS static site deployment
+	runnerRegion, _, cpuArchEnum, osType := utils.RunnerData.Get()
+	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationID)
+	if err != nil {
+		return parameters, err
+	}
+	err = iam_policies.AddAwsPolicyForDeploymentRunner(iam_policy_enums.AwsStaticSiteDeployment, osType.String(), cpuArchEnum.String(), organizationID, runnerRegion)
+	if err != nil {
+		return parameters, err
+	}
+
 	bucketName, err := getBucketName(parameters)
 	if err != nil {
 		return parameters, err
@@ -430,7 +451,7 @@ func (d *DeployAwsStaticSite) Run(parameters map[string]interface{}, logsWriter 
 		}
 	}
 
-	s3Client, err := getS3Client(parameters)
+	s3Client, err := cloud_api_clients.GetS3Client(parameters)
 	if err != nil {
 		return parameters, err
 	}
@@ -513,7 +534,7 @@ func (d *DeployAwsStaticSite) Run(parameters map[string]interface{}, logsWriter 
 	}
 
 	// Create an Amazon Cloudfront service client
-	cloudfrontClient, err := getCloudfrontClient(parameters, cloudfrontRegion)
+	cloudfrontClient, err := cloud_api_clients.GetCloudfrontClient(parameters, cloudfrontRegion)
 	if err != nil {
 		return parameters, err
 	}

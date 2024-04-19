@@ -6,6 +6,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/acm"
 	"github.com/deployment-io/deployment-runner-kit/certificates"
+	"github.com/deployment-io/deployment-runner-kit/cloud_api_clients"
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner-kit/types"
@@ -17,7 +18,7 @@ type VerifyAcmCertificate struct {
 }
 
 func (v *VerifyAcmCertificate) Run(parameters map[string]interface{}, logsWriter io.Writer) (newParameters map[string]interface{}, err error) {
-	acmClient, err := getAcmClient(parameters)
+	acmClient, err := cloud_api_clients.GetAcmClient(parameters)
 	if err != nil {
 		return parameters, err
 	}

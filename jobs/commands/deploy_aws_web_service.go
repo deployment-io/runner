@@ -11,11 +11,14 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2"
 	elbTypes "github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2/types"
 	"github.com/deployment-io/deployment-runner-kit/builds"
+	"github.com/deployment-io/deployment-runner-kit/cloud_api_clients"
 	"github.com/deployment-io/deployment-runner-kit/deployments"
 	"github.com/deployment-io/deployment-runner-kit/enums/cpu_architecture_enums"
+	"github.com/deployment-io/deployment-runner-kit/enums/iam_policy_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/os_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/region_enums"
+	"github.com/deployment-io/deployment-runner-kit/iam_policies"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner-kit/previews"
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
@@ -902,7 +905,19 @@ func (d *DeployAwsWebService) Run(parameters map[string]interface{}, logsWriter 
 			markBuildDone(parameters, err, logsWriter)
 		}
 	}()
-	ec2Client, err := getEC2Client(parameters)
+
+	//check and add policy for AWS web service deployment
+	runnerRegion, _, cpuArchEnum, osType := utils.RunnerData.Get()
+	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationID)
+	if err != nil {
+		return parameters, err
+	}
+	err = iam_policies.AddAwsPolicyForDeploymentRunner(iam_policy_enums.AwsWebServiceDeployment, osType.String(), cpuArchEnum.String(), organizationID, runnerRegion)
+	if err != nil {
+		return parameters, err
+	}
+
+	ec2Client, err := cloud_api_clients.GetEC2Client(parameters)
 	if err != nil {
 		return parameters, err
 	}
@@ -911,7 +926,7 @@ func (d *DeployAwsWebService) Run(parameters map[string]interface{}, logsWriter 
 	if err != nil {
 		return parameters, err
 	}
-	elbClient, err := getElbClient(parameters)
+	elbClient, err := cloud_api_clients.GetElbClient(parameters)
 	if err != nil {
 		return parameters, err
 	}
@@ -919,7 +934,7 @@ func (d *DeployAwsWebService) Run(parameters map[string]interface{}, logsWriter 
 	if err != nil {
 		return parameters, err
 	}
-	ecsClient, err := getEcsClient(parameters)
+	ecsClient, err := cloud_api_clients.GetEcsClient(parameters)
 	if err != nil {
 		return parameters, err
 	}

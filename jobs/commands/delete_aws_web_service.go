@@ -8,6 +8,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ecr"
 	"github.com/aws/aws-sdk-go-v2/service/ecs"
 	"github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2"
+	"github.com/deployment-io/deployment-runner-kit/cloud_api_clients"
 	"github.com/deployment-io/deployment-runner-kit/deployments"
 	"github.com/deployment-io/deployment-runner-kit/enums/deployment_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
@@ -31,7 +32,7 @@ func (d *DeleteAwsWebService) Run(parameters map[string]interface{}, logsWriter 
 	if err != nil {
 		return parameters, err
 	}
-	ecsClient, err := getEcsClient(parameters)
+	ecsClient, err := cloud_api_clients.GetEcsClient(parameters)
 	io.WriteString(logsWriter, fmt.Sprintf("Deleting ECS service: %s in cluster: %s\n", ecsServiceName, clusterArn))
 	_, err = ecsClient.DeleteService(context.TODO(), &ecs.DeleteServiceInput{
 		Service: aws.String(ecsServiceName),
@@ -88,7 +89,7 @@ func (d *DeleteAwsWebService) Run(parameters map[string]interface{}, logsWriter 
 	}
 
 	//delete ecr repository if necessary
-	ecrClient, err := getEcrClient(parameters)
+	ecrClient, err := cloud_api_clients.GetEcrClient(parameters)
 	if err != nil {
 		return parameters, err
 	}
@@ -108,7 +109,7 @@ func (d *DeleteAwsWebService) Run(parameters map[string]interface{}, logsWriter 
 	//delete listeners
 	//delete lb
 	loadBalancerArn, err := jobs.GetParameterValue[string](parameters, parameters_enums.LoadBalancerArn)
-	elbClient, err := getElbClient(parameters)
+	elbClient, err := cloud_api_clients.GetElbClient(parameters)
 	if err != nil {
 		return parameters, err
 	}
@@ -142,7 +143,7 @@ func (d *DeleteAwsWebService) Run(parameters map[string]interface{}, logsWriter 
 	}
 
 	//delete alb security group
-	ec2Client, err := getEC2Client(parameters)
+	ec2Client, err := cloud_api_clients.GetEC2Client(parameters)
 	if err != nil {
 		return parameters, err
 	}

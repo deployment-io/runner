@@ -6,17 +6,8 @@ import (
 	goPipeline "github.com/ankit-arora/go-utils/go-concurrent-pipeline/go-pipeline"
 	goShutdownHook "github.com/ankit-arora/go-utils/go-shutdown-hook"
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/service/acm"
-	"github.com/aws/aws-sdk-go-v2/service/cloudfront"
-	"github.com/aws/aws-sdk-go-v2/service/ec2"
-	"github.com/aws/aws-sdk-go-v2/service/ecr"
-	"github.com/aws/aws-sdk-go-v2/service/ecs"
-	"github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2"
-	"github.com/aws/aws-sdk-go-v2/service/iam"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3Types "github.com/aws/aws-sdk-go-v2/service/s3/types"
-	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/deployment-io/deployment-runner-kit/builds"
 	"github.com/deployment-io/deployment-runner-kit/certificates"
 	"github.com/deployment-io/deployment-runner-kit/clusters"
@@ -24,7 +15,6 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/enums/build_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/commands_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
-	"github.com/deployment-io/deployment-runner-kit/enums/region_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner-kit/notifications"
 	"github.com/deployment-io/deployment-runner-kit/previews"
@@ -354,162 +344,6 @@ func deleteAllS3Files(s3Client *s3.Client, bucketName string) error {
 	}
 
 	return nil
-}
-
-func getS3Client(parameters map[string]interface{}) (*s3.Client, error) {
-
-	cfg, err := config.LoadDefaultConfig(context.TODO())
-	if err != nil {
-		return nil, err
-	}
-
-	region, err := jobs.GetParameterValue[int64](parameters, parameters_enums.Region)
-	if err != nil {
-		return nil, err
-	}
-
-	s3Client := s3.NewFromConfig(cfg, func(o *s3.Options) {
-		o.Region = region_enums.Type(region).String()
-	})
-
-	return s3Client, nil
-}
-
-func getEC2Client(parameters map[string]interface{}) (*ec2.Client, error) {
-	cfg, err := config.LoadDefaultConfig(context.TODO())
-	if err != nil {
-		return nil, err
-	}
-
-	region, err := jobs.GetParameterValue[int64](parameters, parameters_enums.Region)
-	if err != nil {
-		return nil, err
-	}
-
-	ec2Client := ec2.NewFromConfig(cfg, func(o *ec2.Options) {
-		o.Region = region_enums.Type(region).String()
-	})
-	return ec2Client, nil
-}
-
-func getEcsClient(parameters map[string]interface{}) (*ecs.Client, error) {
-	cfg, err := config.LoadDefaultConfig(context.TODO())
-	if err != nil {
-		return nil, err
-	}
-
-	region, err := jobs.GetParameterValue[int64](parameters, parameters_enums.Region)
-	if err != nil {
-		return nil, err
-	}
-
-	ecsClient := ecs.NewFromConfig(cfg, func(o *ecs.Options) {
-		o.Region = region_enums.Type(region).String()
-	})
-	return ecsClient, nil
-}
-
-func getElbClient(parameters map[string]interface{}) (*elasticloadbalancingv2.Client, error) {
-	cfg, err := config.LoadDefaultConfig(context.TODO())
-	if err != nil {
-		return nil, err
-	}
-
-	region, err := jobs.GetParameterValue[int64](parameters, parameters_enums.Region)
-	if err != nil {
-		return nil, err
-	}
-
-	elbClient := elasticloadbalancingv2.NewFromConfig(cfg, func(options *elasticloadbalancingv2.Options) {
-		options.Region = region_enums.Type(region).String()
-	})
-
-	return elbClient, nil
-}
-
-func getEcrClient(parameters map[string]interface{}) (*ecr.Client, error) {
-	cfg, err := config.LoadDefaultConfig(context.TODO())
-	if err != nil {
-		return nil, err
-	}
-
-	region, err := jobs.GetParameterValue[int64](parameters, parameters_enums.Region)
-	if err != nil {
-		return nil, err
-	}
-
-	ecrClient := ecr.NewFromConfig(cfg, func(options *ecr.Options) {
-		options.Region = region_enums.Type(region).String()
-	})
-
-	return ecrClient, nil
-}
-
-func getIamClient(parameters map[string]interface{}) (*iam.Client, error) {
-	cfg, err := config.LoadDefaultConfig(context.TODO())
-	if err != nil {
-		return nil, err
-	}
-
-	region, err := jobs.GetParameterValue[int64](parameters, parameters_enums.Region)
-	if err != nil {
-		return nil, err
-	}
-
-	iamClient := iam.NewFromConfig(cfg, func(options *iam.Options) {
-		options.Region = region_enums.Type(region).String()
-	})
-
-	return iamClient, nil
-}
-
-func getCloudfrontClient(parameters map[string]interface{}, region string) (*cloudfront.Client, error) {
-	cfg, err := config.LoadDefaultConfig(context.TODO())
-	if err != nil {
-		return nil, err
-	}
-
-	//region, err := jobs.GetParameterValue[int64](parameters, parameters_enums.Region)
-	//if err != nil {
-	//	return nil, err
-	//}
-
-	cloudfrontClient := cloudfront.NewFromConfig(cfg, func(options *cloudfront.Options) {
-		options.Region = region
-	})
-
-	return cloudfrontClient, nil
-}
-
-func getAcmClient(parameters map[string]interface{}) (*acm.Client, error) {
-	cfg, err := config.LoadDefaultConfig(context.TODO())
-	if err != nil {
-		return nil, err
-	}
-
-	region, err := jobs.GetParameterValue[int64](parameters, parameters_enums.CertificateRegion)
-	if err != nil {
-		return nil, err
-	}
-
-	acmClient := acm.NewFromConfig(cfg, func(options *acm.Options) {
-		options.Region = region_enums.Type(region).String()
-	})
-
-	return acmClient, nil
-}
-
-func GetStsClient(region string) (*sts.Client, error) {
-	cfg, err := config.LoadDefaultConfig(context.TODO())
-	if err != nil {
-		return nil, err
-	}
-
-	stsClient := sts.NewFromConfig(cfg, func(options *sts.Options) {
-		options.Region = region
-	})
-
-	return stsClient, nil
 }
 
 func getDockerImageNameAndTag(parameters map[string]interface{}) (string, error) {
