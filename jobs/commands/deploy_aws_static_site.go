@@ -156,12 +156,18 @@ func createS3BucketIfNeeded(s3Client *s3.Client, s3Bucket, s3Region string) (*st
 	}
 
 	// Create S3 bucket
-	response, err := s3Client.CreateBucket(context.TODO(), &s3.CreateBucketInput{
+	createBucketInput := &s3.CreateBucketInput{
 		Bucket: aws.String(s3Bucket),
-		CreateBucketConfiguration: &s3Types.CreateBucketConfiguration{
+	}
+	if s3Region != "us-east-1" {
+		//weird AWS gives error with location constraint for us-east-1
+		createBucketConfiguration := &s3Types.CreateBucketConfiguration{
 			LocationConstraint: s3Types.BucketLocationConstraint(s3Region),
-		},
-	})
+		}
+		createBucketInput.CreateBucketConfiguration = createBucketConfiguration
+	}
+
+	response, err := s3Client.CreateBucket(context.TODO(), createBucketInput)
 	if err != nil {
 		//var bne *types.BucketAlreadyExists
 		var ae smithy.APIError
