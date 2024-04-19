@@ -24,7 +24,11 @@ All data communication between the runner and control plane is encrypted and hap
 
 ### Modularity
 
-Command design pattern is used extensively to make sure it's easy to add new tasks without modifying existing tasks. Complex tasks can be created by chaining simpler tasks.   
+Command design pattern is used extensively to make sure it's easy to add new tasks without modifying existing tasks. 
+
+### Composability
+
+Complex tasks can be created by chaining simpler tasks.
 
 ## Contribute
 
