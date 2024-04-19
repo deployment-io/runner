@@ -7,6 +7,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	ec2Types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
+	"github.com/deployment-io/deployment-runner-kit/cloud_api_clients"
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/region_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/vpc_enums"
@@ -906,7 +907,7 @@ func (c *CreateDefaultAwsVPC) Run(parameters map[string]interface{}, logsWriter 
 	}()
 	//try creating subnets for each of these cidr blocks
 	cidrBlocks := getPrivateCidrBlocks()
-	ec2Client, err := getEC2Client(parameters)
+	ec2Client, err := cloud_api_clients.GetEC2Client(parameters)
 	if err != nil {
 		return parameters, err
 	}

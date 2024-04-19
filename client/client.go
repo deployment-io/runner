@@ -25,11 +25,9 @@ type RunnerClient struct {
 
 func getTlsClient(service, clientCertPem, clientKeyPem string) (*rpc.Client, error) {
 	cert, err := tls.X509KeyPair([]byte(clientCertPem), []byte(clientKeyPem))
-	//cert, err := tls.LoadX509KeyPair("/Users/ankit/Developer/deployment/certs-test/localhost/client-out.crt", "/Users/ankit/Developer/deployment/certs-test/localhost/client.key")
 	if err != nil {
 		log.Fatalf("client: loadkeys: %s", err)
 	}
-	//fmt.Println(len(cert.Certificate))
 	if len(cert.Certificate) != 2 {
 		log.Fatal("client.crt should have 2 concatenated certificates: client + CA")
 	}

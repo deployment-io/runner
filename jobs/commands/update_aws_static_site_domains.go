@@ -6,6 +6,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/cloudfront"
 	cloudfront_types "github.com/aws/aws-sdk-go-v2/service/cloudfront/types"
+	"github.com/deployment-io/deployment-runner-kit/cloud_api_clients"
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
@@ -44,7 +45,7 @@ func deleteDomainsFromCloudfront(cloudfrontClient *cloudfront.Client, distributi
 
 func (u *UpdateAwsStaticSiteDomains) Run(parameters map[string]interface{}, logsWriter io.Writer) (newParameters map[string]interface{}, err error) {
 
-	cloudfrontClient, err := getCloudfrontClient(parameters, cloudfrontRegion)
+	cloudfrontClient, err := cloud_api_clients.GetCloudfrontClient(parameters, cloudfrontRegion)
 	if err != nil {
 		return parameters, err
 	}
