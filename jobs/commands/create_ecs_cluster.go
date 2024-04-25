@@ -89,12 +89,12 @@ func createEcsClusterIfNeeded(ecsClient *ecs.Client, parameters map[string]inter
 
 func getDefaultTaskExecutionRoleName(parameters map[string]interface{}) (string, error) {
 	//eTERole-<os>-<cpuArch>-<organizationID>-<runner region>
-	runnerRegion, _, cpuArch, osType := utils.RunnerData.Get()
+	runnerData := utils.RunnerData.Get()
 	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationID)
 	if err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("eTERole-%s%s-%s-%s", osType.String(), cpuArch.String(), organizationID, runnerRegion), nil
+	return fmt.Sprintf("eTERole-%s%s-%s-%s", runnerData.OsType.String(), runnerData.CpuArchEnum.String(), organizationID, runnerData.RunnerRegion), nil
 }
 
 func getEcsTaskExecutionRoleIfNeeded(iamClient *iam.Client, parameters map[string]interface{}) (ecsTaskExecutionRoleArn string, err error) {

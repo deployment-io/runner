@@ -8,12 +8,14 @@ import (
 	goShutdownHook "github.com/ankit-arora/go-utils/go-shutdown-hook"
 	"github.com/deployment-io/deployment-runner-kit/enums/loggers_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
+	"github.com/deployment-io/deployment-runner-kit/enums/runner_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner-kit/logs"
 	"github.com/deployment-io/deployment-runner/client"
 	"github.com/deployment-io/deployment-runner/utils"
 	"github.com/deployment-io/deployment-runner/utils/loggers/cloudwatch"
 	"io"
+	"log"
 	"strings"
 	"time"
 )
@@ -63,7 +65,7 @@ func Init() {
 				//TODO we can handle for ErrConnection
 				//will block till error
 				if err != nil {
-					fmt.Println(err)
+					log.Println(err)
 					time.Sleep(2 * time.Second)
 					continue
 				}
@@ -71,9 +73,9 @@ func Init() {
 			}
 		})
 	goShutdownHook.ADD(func() {
-		fmt.Println("waiting for logs add pipeline shutdown")
+		//fmt.Println("waiting for logs add pipeline shutdown")
 		addJobLogsPipeline.Shutdown()
-		fmt.Println("waiting for logs add pipeline shutdown -- done")
+		//fmt.Println("waiting for logs add pipeline shutdown -- done")
 	})
 
 }
@@ -105,7 +107,7 @@ func LogBuffer(logBuffer *bytes.Buffer, logger jobs.Logger) error {
 	return logger.Log(messages)
 }
 
-func GetJobLogsWriter(jobId string, logger jobs.Logger) (*io.PipeWriter, error) {
+func GetJobLogsWriter(jobId string, logger jobs.Logger, mode runner_enums.Mode) (*io.PipeWriter, error) {
 	reader, writer := io.Pipe()
 	go func() {
 		defer reader.Close()
@@ -121,6 +123,9 @@ func GetJobLogsWriter(jobId string, logger jobs.Logger) (*io.PipeWriter, error) 
 					message: s,
 					ts:      time.Now().Unix(),
 				})
+				if mode == runner_enums.LOCAL {
+					log.Println(s)
+				}
 			}
 		}
 		if err := scanner.Err(); err != nil {
@@ -129,6 +134,9 @@ func GetJobLogsWriter(jobId string, logger jobs.Logger) (*io.PipeWriter, error) 
 				errorMessage: err.Error(),
 				ts:           time.Now().Unix(),
 			})
+			if mode == runner_enums.LOCAL {
+				log.Println(err.Error())
+			}
 		}
 	}()
 	return writer, nil

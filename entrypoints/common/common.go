@@ -1,26 +1,18 @@
-package main
+package common
 
 import (
-	"context"
 	"fmt"
 	goPipeline "github.com/ankit-arora/go-utils/go-concurrent-pipeline/go-pipeline"
 	goShutdownHook "github.com/ankit-arora/go-utils/go-shutdown-hook"
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/service/sts"
-	"github.com/deployment-io/deployment-runner-kit/cloud_api_clients"
 	"github.com/deployment-io/deployment-runner-kit/enums/cpu_architecture_enums"
-	"github.com/deployment-io/deployment-runner-kit/enums/iam_policy_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/os_enums"
-	"github.com/deployment-io/deployment-runner-kit/iam_policies"
+	"github.com/deployment-io/deployment-runner-kit/enums/runner_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner/client"
 	"github.com/deployment-io/deployment-runner/jobs/commands"
-	"github.com/deployment-io/deployment-runner/utils"
 	"github.com/deployment-io/deployment-runner/utils/loggers"
-	"github.com/joho/godotenv"
 	"io"
 	"log"
-	"os"
 	"runtime"
 	"strings"
 	"sync"
@@ -53,7 +45,7 @@ func handleLogEnd(err error, jobID string, logsWriter io.Writer) {
 	}
 }
 
-func executeJobs(jobsStream <-chan jobs.PendingJobDtoV1, noOfWorkers int) <-chan jobs.CompletingJobDtoV1 {
+func executeJobs(jobsStream <-chan jobs.PendingJobDtoV1, noOfWorkers int, mode runner_enums.Mode) <-chan jobs.CompletingJobDtoV1 {
 	resultsStream := make(chan jobs.CompletingJobDtoV1)
 	go func() {
 		defer close(resultsStream)
@@ -77,7 +69,7 @@ func executeJobs(jobsStream <-chan jobs.PendingJobDtoV1, noOfWorkers int) <-chan
 							resultsStream <- result
 							return
 						}
-						logsWriter, err := loggers.GetJobLogsWriter(pendingJob.JobID, logger)
+						logsWriter, err := loggers.GetJobLogsWriter(pendingJob.JobID, logger, mode)
 						if err != nil {
 							result := getJobResult(pendingJob, err.Error())
 							resultsStream <- result
@@ -138,46 +130,13 @@ func sendJobResults(resultsStream <-chan jobs.CompletingJobDtoV1,
 	return done
 }
 
-func getEnvironment() (service, organizationId, token, region, dockerImage, memory, taskExecutionRoleArn,
-	taskRoleArn, awsAccountID string) {
-	//TODO load .env
-	//ignoring err
-	_ = godotenv.Load()
-	organizationId = os.Getenv("OrganizationID")
-	service = os.Getenv("Service")
-	token = os.Getenv("Token")
-	region = os.Getenv("Region")
-	dockerImage = os.Getenv("DockerImage")
-	memory = os.Getenv("Memory")
-	taskExecutionRoleArn = os.Getenv("ExecutionRoleArn")
-	taskRoleArn = os.Getenv("TaskRoleArn")
-	awsAccountID = os.Getenv("AWSAccountID")
-	return
-}
-
-var clientCertPem, clientKeyPem string
-
-func main() {
-	service, organizationId, token, region, dockerImage, _, _, _, awsAccountID := getEnvironment()
-	stsClient, err := cloud_api_clients.GetStsClient(region)
-	if err != nil {
-		log.Fatal(err)
-	}
-	//TODO handle based on when target is AWS, then AWS account id won't be needed in env
-	if len(awsAccountID) > 0 {
-		//aws case - check account validity
-		getCallerIdentityOutput, err := stsClient.GetCallerIdentity(context.TODO(), &sts.GetCallerIdentityInput{})
-		if err != nil {
-			log.Fatal(err)
-		}
-		if awsAccountID != aws.ToString(getCallerIdentityOutput.Account) {
-			log.Fatalf("Invalid AWS account ID")
-		}
-	}
-	client.Connect(service, organizationId, token, clientCertPem, clientKeyPem, dockerImage, region, awsAccountID, false)
-	c := client.Get()
+func Init() {
 	commands.Init()
 	loggers.Init()
+	jobs.RegisterGobDataTypes()
+}
+
+func GetRuntimeEnvironment() (cpu_architecture_enums.Type, os_enums.Type) {
 	goarch := runtime.GOARCH
 	archEnum := cpu_architecture_enums.AMD
 	if strings.HasPrefix(goarch, "arm") {
@@ -188,18 +147,13 @@ func main() {
 	if strings.HasPrefix(goos, "windows") {
 		osType = os_enums.WINDOWS
 	}
-	utils.RunnerData.Set(region, awsAccountID, archEnum, osType)
-	//TODO handle based on when target is AWS, then AWS account id won't be needed in env
-	if len(awsAccountID) > 0 {
-		//add permissions for sending logs to cloudwatch
-		err = iam_policies.AddAwsPolicyForDeploymentRunner(iam_policy_enums.AwsLogs, osType.String(), archEnum.String(), organizationId, region)
-		if err != nil {
-			log.Fatal(err)
-		}
-	}
+	return archEnum, osType
+}
+
+func GetAndRunJobs(c *client.RunnerClient, mode runner_enums.Mode) {
 	shutdownSignal := make(chan struct{})
 	goShutdownHook.ADD(func() {
-		fmt.Println("waiting for shutdown signal")
+		log.Println("Waiting for pending deployment jobs to complete......Please wait.")
 		shutdownSignal <- struct{}{}
 		close(shutdownSignal)
 	})
@@ -218,27 +172,36 @@ func main() {
 		}
 	})
 	goShutdownHook.ADD(func() {
-		fmt.Println("waiting for jobs done pipeline shutdown")
+		//fmt.Println("waiting for jobs done pipeline shutdown")
 		jobsDonePipeline.Shutdown()
-		fmt.Println("waiting for jobs done pipeline shutdown -- done")
+		//fmt.Println("waiting for jobs done pipeline shutdown -- done")
 	})
-	jobs.RegisterGobDataTypes()
+	printPendingJobsMessage := true
 	for !shutdown {
 		select {
 		case <-shutdownSignal:
 			shutdown = true
 		default:
 			pendingJobs, err := c.GetPendingJobs()
-			if err != nil {
-				time.Sleep(10 * time.Second)
-				continue
+			if len(pendingJobs) == 0 {
+				if printPendingJobsMessage {
+					log.Println("Waiting for new deployment jobs. You can create them at https://app.deployment.io ......")
+					printPendingJobsMessage = false
+				}
+				if err != nil {
+					time.Sleep(10 * time.Second)
+					continue
+				}
+			} else {
+				jobsStream := allocateJobs(pendingJobs)
+				resultsStream := executeJobs(jobsStream, 5, mode)
+				<-sendJobResults(resultsStream, 5, jobsDonePipeline)
+				printPendingJobsMessage = true
 			}
-			jobsStream := allocateJobs(pendingJobs)
-			resultsStream := executeJobs(jobsStream, 5)
-			<-sendJobResults(resultsStream, 5, jobsDonePipeline)
 			time.Sleep(10 * time.Second)
 		}
 	}
-	fmt.Println("waiting for shutdown.wait")
+	//log.Println("waiting for pending jobs to complete......")
 	goShutdownHook.Wait()
+	log.Println("No pending deployment jobs left - exiting now.")
 }

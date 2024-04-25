@@ -694,15 +694,14 @@ func registerTaskDefinition(parameters map[string]interface{}, ecsClient *ecs.Cl
 	if err != nil {
 		return "", err
 	}
-
-	_, _, cpuArchEnum, osType := utils.RunnerData.Get()
+	runnerData := utils.RunnerData.Get()
 	cpuArch := ecsTypes.CPUArchitectureX8664
-	if cpuArchEnum == cpu_architecture_enums.ARM {
+	if runnerData.CpuArchEnum == cpu_architecture_enums.ARM {
 		cpuArch = ecsTypes.CPUArchitectureArm64
 	}
 
 	osFamily := ecsTypes.OSFamilyLinux
-	if osType == os_enums.WINDOWS {
+	if runnerData.OsType == os_enums.WINDOWS {
 		osFamily = ecsTypes.OSFamilyWindowsServer2022Core
 	}
 
@@ -907,12 +906,13 @@ func (d *DeployAwsWebService) Run(parameters map[string]interface{}, logsWriter 
 	}()
 
 	//check and add policy for AWS web service deployment
-	runnerRegion, _, cpuArchEnum, osType := utils.RunnerData.Get()
+	runnerData := utils.RunnerData.Get()
 	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationID)
 	if err != nil {
 		return parameters, err
 	}
-	err = iam_policies.AddAwsPolicyForDeploymentRunner(iam_policy_enums.AwsWebServiceDeployment, osType.String(), cpuArchEnum.String(), organizationID, runnerRegion)
+	err = iam_policies.AddAwsPolicyForDeploymentRunner(iam_policy_enums.AwsWebServiceDeployment,
+		runnerData.OsType.String(), runnerData.CpuArchEnum.String(), organizationID, runnerData.RunnerRegion, runnerData.Mode, runnerData.TargetCloud)
 	if err != nil {
 		return parameters, err
 	}

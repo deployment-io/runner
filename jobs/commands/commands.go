@@ -59,9 +59,9 @@ func Init() {
 			}
 		})
 	goShutdownHook.ADD(func() {
-		fmt.Println("waiting for builds update pipeline shutdown")
+		//fmt.Println("waiting for builds update pipeline shutdown")
 		updateBuildsPipeline.Shutdown()
-		fmt.Println("waiting for builds update pipeline shutdown -- done")
+		//fmt.Println("waiting for builds update pipeline shutdown -- done")
 	})
 	updatePreviewsPipeline, _ = goPipeline.NewPipeline(5, 10*time.Second,
 		func(preview string, previews []previews.UpdatePreviewDtoV1) {
@@ -79,9 +79,9 @@ func Init() {
 			}
 		})
 	goShutdownHook.ADD(func() {
-		fmt.Println("waiting for previews update pipeline shutdown")
+		//fmt.Println("waiting for previews update pipeline shutdown")
 		updatePreviewsPipeline.Shutdown()
-		fmt.Println("waiting for previews update pipeline shutdown -- done")
+		//fmt.Println("waiting for previews update pipeline shutdown -- done")
 	})
 	updateDeploymentsPipeline, _ = goPipeline.NewPipeline(5, 10*time.Second,
 		func(deployment string, deployments []deployments.UpdateDeploymentDtoV1) {
@@ -99,9 +99,9 @@ func Init() {
 			}
 		})
 	goShutdownHook.ADD(func() {
-		fmt.Println("waiting for deployments update pipeline shutdown")
+		//fmt.Println("waiting for deployments update pipeline shutdown")
 		updateDeploymentsPipeline.Shutdown()
-		fmt.Println("waiting for deployments update pipeline shutdown -- done")
+		//fmt.Println("waiting for deployments update pipeline shutdown -- done")
 	})
 	upsertVpcsPipeline, _ = goPipeline.NewPipeline(5, 10*time.Second, func(vpc string, vpcs []vpcs.UpsertVpcDtoV1) {
 		e := true
@@ -118,9 +118,9 @@ func Init() {
 		}
 	})
 	goShutdownHook.ADD(func() {
-		fmt.Println("waiting for vpcs upsert pipeline shutdown")
+		//fmt.Println("waiting for vpcs upsert pipeline shutdown")
 		upsertVpcsPipeline.Shutdown()
-		fmt.Println("waiting for vpcs upsert pipeline shutdown -- done")
+		//fmt.Println("waiting for vpcs upsert pipeline shutdown -- done")
 	})
 	upsertClustersPipeline, _ = goPipeline.NewPipeline(5, 10*time.Second, func(cluster string, clusters []clusters.UpsertClusterDtoV1) {
 		e := true
@@ -137,9 +137,9 @@ func Init() {
 		}
 	})
 	goShutdownHook.ADD(func() {
-		fmt.Println("waiting for clusters upsert pipeline shutdown")
+		//fmt.Println("waiting for clusters upsert pipeline shutdown")
 		upsertClustersPipeline.Shutdown()
-		fmt.Println("waiting for clusters upsert pipeline shutdown -- done")
+		//fmt.Println("waiting for clusters upsert pipeline shutdown -- done")
 	})
 	updateCertificatesPipeline, _ = goPipeline.NewPipeline(5, 2*time.Second,
 		func(certificate string, certificates []certificates.UpdateCertificateDtoV1) {
@@ -157,9 +157,9 @@ func Init() {
 			}
 		})
 	goShutdownHook.ADD(func() {
-		fmt.Println("waiting for certificates update pipeline shutdown")
+		//fmt.Println("waiting for certificates update pipeline shutdown")
 		updateCertificatesPipeline.Shutdown()
-		fmt.Println("waiting for certificates update pipeline shutdown -- done")
+		//fmt.Println("waiting for certificates update pipeline shutdown -- done")
 	})
 	sendNotificationPipeline, _ = goPipeline.NewPipeline(5, 10*time.Second,
 		func(notification string, notifications []notifications.SendNotificationDtoV1) {
@@ -177,9 +177,9 @@ func Init() {
 			}
 		})
 	goShutdownHook.ADD(func() {
-		fmt.Println("waiting for notifications send pipeline shutdown")
+		//fmt.Println("waiting for notifications send pipeline shutdown")
 		sendNotificationPipeline.Shutdown()
-		fmt.Println("waiting for notifications send pipeline shutdown -- done")
+		//fmt.Println("waiting for notifications send pipeline shutdown -- done")
 	})
 }
 

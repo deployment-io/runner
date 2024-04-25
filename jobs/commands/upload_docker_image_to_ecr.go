@@ -193,12 +193,13 @@ func (u *UploadDockerImageToEcr) Run(parameters map[string]interface{}, logsWrit
 	}()
 
 	//check and add policy for AWS ECR upload
-	runnerRegion, _, cpuArchEnum, osType := utils.RunnerData.Get()
+	runnerData := utils.RunnerData.Get()
 	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationID)
 	if err != nil {
 		return parameters, err
 	}
-	err = iam_policies.AddAwsPolicyForDeploymentRunner(iam_policy_enums.AwsEcrUpload, osType.String(), cpuArchEnum.String(), organizationID, runnerRegion)
+	err = iam_policies.AddAwsPolicyForDeploymentRunner(iam_policy_enums.AwsEcrUpload, runnerData.OsType.String(),
+		runnerData.CpuArchEnum.String(), organizationID, runnerData.RunnerRegion, runnerData.Mode, runnerData.TargetCloud)
 	if err != nil {
 		return parameters, err
 	}
