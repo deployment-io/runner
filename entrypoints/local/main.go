@@ -32,14 +32,21 @@ func main() {
 			return
 		}
 		region = cfg.Region
+		if len(region) == 0 {
+			log.Println("error getting AWS account info. It seems that AWS API credentials are not configured. " +
+				"For more information about installing the runner locally, see https://deployment.io/docs/runner-installation/local-setup/")
+			return
+		}
 		stsClient, err := cloud_api_clients.GetStsClient(region)
 		if err != nil {
-			log.Fatal(err)
+			log.Println(err)
 		}
 
 		getCallerIdentityOutput, err := stsClient.GetCallerIdentity(context.TODO(), &sts.GetCallerIdentityInput{})
 		if err != nil {
 			log.Println(err)
+			log.Println("error getting AWS account info. It seems that AWS API credentials are not configured correctly. " +
+				"For more information about installing the runner locally, see https://deployment.io/docs/runner-installation/local-setup/")
 			return
 		}
 		cloudAccountID = aws.ToString(getCallerIdentityOutput.Account)
