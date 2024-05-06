@@ -69,6 +69,7 @@ func (d *DeleteAwsWebService) Run(parameters map[string]interface{}, logsWriter 
 		if err != nil {
 			return parameters, err
 		}
+		time.Sleep(time.Second)
 	}
 	var taskDefinitionArnsSet []string
 	for _, taskDefinitionArn := range taskDefinitionArns {

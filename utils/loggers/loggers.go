@@ -21,35 +21,35 @@ import (
 )
 
 type JobLog struct {
-	logger       jobs.Logger
-	message      string
-	errorMessage string
-	ts           int64
+	Logger       jobs.Logger
+	Message      string
+	ErrorMessage string
+	Ts           int64
 }
 
-var addJobLogsPipeline *goPipeline.Pipeline[string, JobLog]
+var AddJobLogsPipeline *goPipeline.Pipeline[string, JobLog]
 
 func Init() {
 	c := client.Get()
-	addJobLogsPipeline, _ = goPipeline.NewPipeline(20, 5*time.Second,
+	AddJobLogsPipeline, _ = goPipeline.NewPipeline(20, 5*time.Second,
 		func(jobId string, jobLogs []JobLog) {
 			var logger jobs.Logger
 			if len(jobLogs) > 0 {
-				logger = jobLogs[0].logger
+				logger = jobLogs[0].Logger
 			}
 			var messages []string
 			var jobLogsDto []logs.AddJobLogDtoV1
 			for _, jobLog := range jobLogs {
-				message := jobLog.message
-				if len(jobLog.errorMessage) > 0 {
-					message = jobLog.errorMessage
+				message := jobLog.Message
+				if len(jobLog.ErrorMessage) > 0 {
+					message = jobLog.ErrorMessage
 				}
 				messages = append(messages, message)
 				jobLogsDto = append(jobLogsDto, logs.AddJobLogDtoV1{
 					ID:           jobId,
-					Message:      jobLog.message,
-					ErrorMessage: jobLog.errorMessage,
-					Ts:           jobLog.ts,
+					Message:      jobLog.Message,
+					ErrorMessage: jobLog.ErrorMessage,
+					Ts:           jobLog.Ts,
 				})
 			}
 			if logger != nil {
@@ -74,7 +74,7 @@ func Init() {
 		})
 	goShutdownHook.ADD(func() {
 		//fmt.Println("waiting for logs add pipeline shutdown")
-		addJobLogsPipeline.Shutdown()
+		//AddJobLogsPipeline.Shutdown()
 		//fmt.Println("waiting for logs add pipeline shutdown -- done")
 	})
 
@@ -118,10 +118,10 @@ func GetJobLogsWriter(jobId string, logger jobs.Logger, mode runner_enums.Mode) 
 			s := scanner.Text()
 			s = strings.Trim(s, " \n \r")
 			if len(s) > 0 {
-				addJobLogsPipeline.Add(jobId, JobLog{
-					logger:  logger,
-					message: s,
-					ts:      time.Now().Unix(),
+				AddJobLogsPipeline.Add(jobId, JobLog{
+					Logger:  logger,
+					Message: s,
+					Ts:      time.Now().Unix(),
 				})
 				if mode == runner_enums.LOCAL {
 					log.Println(s)
@@ -129,10 +129,10 @@ func GetJobLogsWriter(jobId string, logger jobs.Logger, mode runner_enums.Mode) 
 			}
 		}
 		if err := scanner.Err(); err != nil {
-			addJobLogsPipeline.Add(jobId, JobLog{
-				logger:       logger,
-				errorMessage: err.Error(),
-				ts:           time.Now().Unix(),
+			AddJobLogsPipeline.Add(jobId, JobLog{
+				Logger:       logger,
+				ErrorMessage: err.Error(),
+				Ts:           time.Now().Unix(),
 			})
 			if mode == runner_enums.LOCAL {
 				log.Println(err.Error())
@@ -140,4 +140,8 @@ func GetJobLogsWriter(jobId string, logger jobs.Logger, mode runner_enums.Mode) 
 		}
 	}()
 	return writer, nil
+}
+
+func Shutdown() {
+	AddJobLogsPipeline.Shutdown()
 }

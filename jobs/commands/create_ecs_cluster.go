@@ -7,11 +7,13 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ecs"
 	ecsTypes "github.com/aws/aws-sdk-go-v2/service/ecs/types"
 	"github.com/aws/aws-sdk-go-v2/service/iam"
+	iamTypes "github.com/aws/aws-sdk-go-v2/service/iam/types"
 	"github.com/deployment-io/deployment-runner-kit/cloud_api_clients"
 	"github.com/deployment-io/deployment-runner-kit/clusters"
 	"github.com/deployment-io/deployment-runner-kit/enums/cluster_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/region_enums"
+	"github.com/deployment-io/deployment-runner-kit/enums/runner_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner/utils"
 	"io"
@@ -46,10 +48,12 @@ func createEcsClusterIfNeeded(ecsClient *ecs.Client, parameters map[string]inter
 		},
 	})
 
-	for _, cluster := range describeClustersOutput.Clusters {
-		status := aws.ToString(cluster.Status)
-		if ecsClusterName == aws.ToString(cluster.ClusterName) && status != "INACTIVE" {
-			ecsClusterArn = aws.ToString(cluster.ClusterArn)
+	if describeClustersOutput != nil {
+		for _, cluster := range describeClustersOutput.Clusters {
+			status := aws.ToString(cluster.Status)
+			if ecsClusterName == aws.ToString(cluster.ClusterName) && status != "INACTIVE" {
+				ecsClusterArn = aws.ToString(cluster.ClusterArn)
+			}
 		}
 	}
 
@@ -97,6 +101,55 @@ func getDefaultTaskExecutionRoleName(parameters map[string]interface{}) (string,
 	return fmt.Sprintf("eTERole-%s%s-%s-%s", runnerData.OsType.String(), runnerData.CpuArchEnum.String(), organizationID, runnerData.RunnerRegion), nil
 }
 
+func getEcsTaskTrustPolicyForTaskExecutionRole() string {
+	ecsTasksTrustPolicy := `{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "",
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "ecs-tasks.amazonaws.com"
+      },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}`
+	return ecsTasksTrustPolicy
+}
+
+func createEcsTaskExecutionRole(iamClient *iam.Client, taskExecutionRoleName string) (ecsTaskExecutionRoleArn string, err error) {
+	createRoleOutput, err := iamClient.CreateRole(context.TODO(), &iam.CreateRoleInput{
+		AssumeRolePolicyDocument: aws.String(getEcsTaskTrustPolicyForTaskExecutionRole()),
+		RoleName:                 aws.String(taskExecutionRoleName),
+		Tags: []iamTypes.Tag{{
+			Key:   aws.String("created by"),
+			Value: aws.String("deployment.io"),
+		}},
+	})
+	if err != nil {
+		return "", err
+	}
+	_, err = iamClient.AttachRolePolicy(context.TODO(), &iam.AttachRolePolicyInput{
+		PolicyArn: aws.String("arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"),
+		RoleName:  createRoleOutput.Role.RoleName,
+	})
+
+	if err != nil {
+		return "", err
+	}
+
+	_, err = iamClient.AttachRolePolicy(context.TODO(), &iam.AttachRolePolicyInput{
+		PolicyArn: aws.String("arn:aws:iam::aws:policy/CloudWatchFullAccess"),
+		RoleName:  createRoleOutput.Role.RoleName,
+	})
+
+	if err != nil {
+		return "", err
+	}
+	return aws.ToString(createRoleOutput.Role.Arn), nil
+}
+
 func getEcsTaskExecutionRoleIfNeeded(iamClient *iam.Client, parameters map[string]interface{}) (ecsTaskExecutionRoleArn string, err error) {
 	ecsTaskExecutionRoleArn, err = jobs.GetParameterValue[string](parameters, parameters_enums.EcsTaskExecutionRoleArn)
 	if err == nil && len(ecsTaskExecutionRoleArn) > 0 {
@@ -108,8 +161,13 @@ func getEcsTaskExecutionRoleIfNeeded(iamClient *iam.Client, parameters map[strin
 	}
 
 	getRoleOutput, err := iamClient.GetRole(context.TODO(), &iam.GetRoleInput{RoleName: aws.String(taskExecutionRoleName)})
+
 	if err != nil {
-		return "", err
+		runnerData := utils.RunnerData.Get()
+		if runnerData.Mode != runner_enums.LOCAL {
+			return "", err
+		}
+		err = nil
 	}
 
 	if getRoleOutput != nil && getRoleOutput.Role != nil && getRoleOutput.Role.Arn != nil && len(aws.ToString(getRoleOutput.Role.Arn)) > 0 {
@@ -125,16 +183,17 @@ func getEcsTaskExecutionRoleIfNeeded(iamClient *iam.Client, parameters map[strin
 			EcsTaskExecutionRoleArn: ecsTaskExecutionRoleArn,
 		})
 		return
+	} else {
+		//create new task execution role
+		return createEcsTaskExecutionRole(iamClient, taskExecutionRoleName)
 	}
-
-	return "", fmt.Errorf("ecs task execution role not found")
-
+	//return "", fmt.Errorf("ecs task execution role not found")
 }
 
 func (c *CreateEcsCluster) Run(parameters map[string]interface{}, logsWriter io.Writer) (newParameters map[string]interface{}, err error) {
 	defer func() {
 		if err != nil {
-			markBuildDone(parameters, err, logsWriter)
+			<-MarkBuildDone(parameters, err)
 		}
 	}()
 

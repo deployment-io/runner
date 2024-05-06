@@ -902,7 +902,7 @@ type routeTableInfo struct {
 func (c *CreateDefaultAwsVPC) Run(parameters map[string]interface{}, logsWriter io.Writer) (newParameters map[string]interface{}, err error) {
 	defer func() {
 		if err != nil {
-			markBuildDone(parameters, err, logsWriter)
+			<-MarkBuildDone(parameters, err)
 		}
 	}()
 	//try creating subnets for each of these cidr blocks

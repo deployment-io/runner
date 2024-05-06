@@ -13,7 +13,7 @@ import (
 	"log"
 )
 
-var clientCertPem, clientKeyPem, localRunnerDockerImage string
+var clientCertPem, clientKeyPem, version, serviceFromBuild string
 
 func main() {
 	userId, organizationId, token, service, targetCloud, err := getEnvironmentForLocal()
@@ -64,7 +64,7 @@ func main() {
 		Token:                 token,
 		ClientCertPem:         clientCertPem,
 		ClientKeyPem:          clientKeyPem,
-		DockerImage:           localRunnerDockerImage,
+		DockerImage:           version,
 		Region:                region,
 		CloudAccountID:        cloudAccountID,
 		BlockTillFirstConnect: false,

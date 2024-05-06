@@ -10,7 +10,7 @@ func (r *RunnerClient) UpdateBuilds(updateBuilds []builds.UpdateBuildDtoV1) erro
 		return ErrConnection
 	}
 	args := builds.UpdateBuildsArgsV1{}
-	args.OrganizationID = r.organizationID
+	args.OrganizationID = r.GetComputedOrganizationID()
 	args.Token = r.token
 	args.Builds = updateBuilds
 	var reply builds.UpdateBuildsReplyV1

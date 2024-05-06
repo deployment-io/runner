@@ -10,7 +10,7 @@ func (r *RunnerClient) UpsertClusters(upsertClusters []clusters.UpsertClusterDto
 		return ErrConnection
 	}
 	args := clusters.UpsertClustersArgsV2{}
-	args.OrganizationID = r.organizationID
+	args.OrganizationID = r.GetComputedOrganizationID()
 	args.Token = r.token
 	args.CloudAccountID = r.cloudAccountID
 	args.Clusters = upsertClusters

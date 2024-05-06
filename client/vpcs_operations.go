@@ -10,7 +10,7 @@ func (r *RunnerClient) UpsertVpcs(upsertVpcs []vpcs.UpsertVpcDtoV1) error {
 		return ErrConnection
 	}
 	args := vpcs.UpsertVpcsArgsV2{}
-	args.OrganizationID = r.organizationID
+	args.OrganizationID = r.GetComputedOrganizationID()
 	args.Token = r.token
 	args.CloudAccountID = r.cloudAccountID
 	args.Vpcs = upsertVpcs

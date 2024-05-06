@@ -8,8 +8,6 @@ import (
 	"strings"
 )
 
-var serviceFromBuild string
-
 func getEnvironmentForLocal() (userId, organizationId, token, service string, targetCloud runner_enums.TargetCloud, err error) {
 	//ignoring err
 	_ = godotenv.Load()

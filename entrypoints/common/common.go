@@ -8,6 +8,7 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/enums/os_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/runner_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
+	"github.com/deployment-io/deployment-runner-kit/types"
 	"github.com/deployment-io/deployment-runner/client"
 	"github.com/deployment-io/deployment-runner/jobs/commands"
 	"github.com/deployment-io/deployment-runner/utils/loggers"
@@ -45,7 +46,7 @@ func handleLogEnd(err error, jobID string, logsWriter io.Writer) {
 	}
 }
 
-func executeJobs(jobsStream <-chan jobs.PendingJobDtoV1, noOfWorkers int, mode runner_enums.Mode) <-chan jobs.CompletingJobDtoV1 {
+func executeJobs(jobsStream <-chan jobs.PendingJobDtoV1, noOfWorkers int, mode runner_enums.Mode, c *client.RunnerClient) <-chan jobs.CompletingJobDtoV1 {
 	resultsStream := make(chan jobs.CompletingJobDtoV1)
 	go func() {
 		defer close(resultsStream)
@@ -60,13 +61,17 @@ func executeJobs(jobsStream <-chan jobs.PendingJobDtoV1, noOfWorkers int, mode r
 				for pendingJob := range jobsStream {
 					func(pendingJob jobs.PendingJobDtoV1) {
 						parameters := pendingJob.Parameters
-						//TODO logger is job level detail. Introduce a job context and add logger there
-						//pass job context in each command run.
-						//job context will be different based on job type. So job types needs to be passed from the server.
 						logger, err := loggers.Get(parameters)
 						if err != nil {
 							result := getJobResult(pendingJob, err.Error())
 							resultsStream <- result
+							loggers.AddJobLogsPipeline.Add(pendingJob.JobID, loggers.JobLog{
+								Logger:  nil,
+								Message: fmt.Sprintf("Error in executing - %s - %s\n", pendingJob.JobID, err.Error()),
+								Ts:      time.Now().Unix(),
+							})
+							//if job is a build type it will be marked done
+							<-commands.MarkBuildDone(parameters, err)
 							return
 						}
 						logsWriter, err := loggers.GetJobLogsWriter(pendingJob.JobID, logger, mode)
@@ -76,22 +81,34 @@ func executeJobs(jobsStream <-chan jobs.PendingJobDtoV1, noOfWorkers int, mode r
 							return
 						}
 						defer logsWriter.Close()
+						jobDoneSignal := make(chan struct{})
+						defer close(jobDoneSignal)
+						stopJobSignal := getJobStopSignal(pendingJob, jobDoneSignal, c)
 						for _, commandEnum := range pendingJob.CommandEnums {
-							command, err := commands.Get(commandEnum)
-							if err != nil {
-								handleLogEnd(err, pendingJob.JobID, logsWriter)
-								result := getJobResult(pendingJob, err.Error())
+							select {
+							case <-stopJobSignal:
+								errStoppedByUser := types.ErrJobStoppedByUser
+								handleLogEnd(errStoppedByUser, pendingJob.JobID, logsWriter)
+								result := getJobResult(pendingJob, errStoppedByUser.Error())
 								resultsStream <- result
-								//continue to next job in jobsStream
+								//if job is a build type it will be marked done
+								<-commands.MarkBuildDone(parameters, errStoppedByUser)
 								return
-							}
-							parameters, err = command.Run(parameters, logsWriter)
-							if err != nil {
-								handleLogEnd(err, pendingJob.JobID, logsWriter)
-								result := getJobResult(pendingJob, err.Error())
-								resultsStream <- result
-								//continue to next job in jobsStream
-								return
+							default:
+								command, err := commands.Get(commandEnum)
+								if err != nil {
+									handleLogEnd(err, pendingJob.JobID, logsWriter)
+									result := getJobResult(pendingJob, err.Error())
+									resultsStream <- result
+									return
+								}
+								parameters, err = command.Run(parameters, logsWriter)
+								if err != nil {
+									handleLogEnd(err, pendingJob.JobID, logsWriter)
+									result := getJobResult(pendingJob, err.Error())
+									resultsStream <- result
+									return
+								}
 							}
 						}
 						handleLogEnd(nil, pendingJob.JobID, logsWriter)
@@ -104,6 +121,28 @@ func executeJobs(jobsStream <-chan jobs.PendingJobDtoV1, noOfWorkers int, mode r
 		wg.Wait()
 	}()
 	return resultsStream
+}
+
+func getJobStopSignal(job jobs.PendingJobDtoV1, jobDoneSignal <-chan struct{}, c *client.RunnerClient) <-chan struct{} {
+	jobStopSignal := make(chan struct{})
+	go func() {
+		defer close(jobStopSignal)
+		for {
+			select {
+			case <-jobDoneSignal:
+				return
+			default:
+				//ignoring error in client
+				isStopping, _ := c.UpsertJobHeartbeat(job.JobID)
+				if isStopping {
+					jobStopSignal <- struct{}{}
+					return
+				}
+			}
+			time.Sleep(5 * time.Second)
+		}
+	}()
+	return jobStopSignal
 }
 
 func sendJobResults(resultsStream <-chan jobs.CompletingJobDtoV1,
@@ -158,10 +197,10 @@ func GetAndRunJobs(c *client.RunnerClient, mode runner_enums.Mode) {
 		close(shutdownSignal)
 	})
 	shutdown := false
-	jobsDonePipeline, _ := goPipeline.NewPipeline(10, time.Second*10, func(s string, i []jobs.CompletingJobDtoV1) {
+	jobsDonePipeline, _ := goPipeline.NewPipeline(10, time.Second*10, func(s string, completingJobs []jobs.CompletingJobDtoV1) {
 		e := true
 		for e {
-			err := c.MarkJobsComplete(i)
+			err := c.MarkJobsComplete(completingJobs)
 			//TODO we can handle for ErrConnection
 			if err != nil {
 				fmt.Println(err)
@@ -169,6 +208,13 @@ func GetAndRunJobs(c *client.RunnerClient, mode runner_enums.Mode) {
 				continue
 			}
 			e = false
+		}
+		if mode == runner_enums.LOCAL {
+			for _, completingJob := range completingJobs {
+				if len(completingJob.Error) > 0 {
+					log.Println("Error executing deployment job: ", completingJob.Error)
+				}
+			}
 		}
 	})
 	goShutdownHook.ADD(func() {
@@ -194,7 +240,7 @@ func GetAndRunJobs(c *client.RunnerClient, mode runner_enums.Mode) {
 				}
 			} else {
 				jobsStream := allocateJobs(pendingJobs)
-				resultsStream := executeJobs(jobsStream, 5, mode)
+				resultsStream := executeJobs(jobsStream, 5, mode, c)
 				<-sendJobResults(resultsStream, 5, jobsDonePipeline)
 				printPendingJobsMessage = true
 			}
@@ -202,6 +248,8 @@ func GetAndRunJobs(c *client.RunnerClient, mode runner_enums.Mode) {
 		}
 	}
 	//log.Println("waiting for pending jobs to complete......")
+	commands.Shutdown()
+	loggers.Shutdown()
 	goShutdownHook.Wait()
 	log.Println("No pending deployment jobs left - exiting now.")
 }

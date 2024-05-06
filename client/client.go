@@ -5,6 +5,7 @@ import (
 	"crypto/x509"
 	"fmt"
 	"github.com/deployment-io/deployment-runner-kit/enums/runner_enums"
+	"github.com/deployment-io/deployment-runner-kit/types"
 	"log"
 	"net/rpc"
 	"strings"
@@ -125,6 +126,9 @@ func Connect(options Options) chan struct{} {
 						if client.c != nil {
 							err := client.Ping(firstPing)
 							if err != nil {
+								if types.ErrInvalidUserKeySecret.Error() == err.Error() && options.RunnerMode == runner_enums.LOCAL {
+									log.Fatal(err)
+								}
 								client.isConnected = false
 								client.c.Close()
 								client.c = nil

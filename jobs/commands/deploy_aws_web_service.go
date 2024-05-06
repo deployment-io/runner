@@ -901,7 +901,7 @@ func updateEcsService(parameters map[string]interface{}, ecsClient *ecs.Client, 
 func (d *DeployAwsWebService) Run(parameters map[string]interface{}, logsWriter io.Writer) (newParameters map[string]interface{}, err error) {
 	defer func() {
 		if err != nil {
-			markBuildDone(parameters, err, logsWriter)
+			<-MarkBuildDone(parameters, err)
 		}
 	}()
 
@@ -977,7 +977,7 @@ func (d *DeployAwsWebService) Run(parameters map[string]interface{}, logsWriter 
 	}
 
 	//mark build done successfully
-	markBuildDone(parameters, nil, logsWriter)
+	<-MarkBuildDone(parameters, nil)
 
 	return parameters, nil
 }

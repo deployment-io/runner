@@ -20,7 +20,6 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/previews"
 	"github.com/deployment-io/deployment-runner-kit/vpcs"
 	"github.com/deployment-io/deployment-runner/client"
-	"io"
 	"os"
 	"time"
 )
@@ -41,6 +40,16 @@ var upsertVpcsPipeline *goPipeline.Pipeline[string, vpcs.UpsertVpcDtoV1]
 var upsertClustersPipeline *goPipeline.Pipeline[string, clusters.UpsertClusterDtoV1]
 var updateCertificatesPipeline *goPipeline.Pipeline[string, certificates.UpdateCertificateDtoV1]
 
+func Shutdown() {
+	updateBuildsPipeline.Shutdown()
+	updatePreviewsPipeline.Shutdown()
+	updateDeploymentsPipeline.Shutdown()
+	upsertVpcsPipeline.Shutdown()
+	upsertClustersPipeline.Shutdown()
+	updateCertificatesPipeline.Shutdown()
+	sendNotificationPipeline.Shutdown()
+}
+
 func Init() {
 	c := client.Get()
 	updateBuildsPipeline, _ = goPipeline.NewPipeline(5, 10*time.Second,
@@ -60,7 +69,7 @@ func Init() {
 		})
 	goShutdownHook.ADD(func() {
 		//fmt.Println("waiting for builds update pipeline shutdown")
-		updateBuildsPipeline.Shutdown()
+		//updateBuildsPipeline.Shutdown()
 		//fmt.Println("waiting for builds update pipeline shutdown -- done")
 	})
 	updatePreviewsPipeline, _ = goPipeline.NewPipeline(5, 10*time.Second,
@@ -80,7 +89,7 @@ func Init() {
 		})
 	goShutdownHook.ADD(func() {
 		//fmt.Println("waiting for previews update pipeline shutdown")
-		updatePreviewsPipeline.Shutdown()
+		//updatePreviewsPipeline.Shutdown()
 		//fmt.Println("waiting for previews update pipeline shutdown -- done")
 	})
 	updateDeploymentsPipeline, _ = goPipeline.NewPipeline(5, 10*time.Second,
@@ -100,7 +109,7 @@ func Init() {
 		})
 	goShutdownHook.ADD(func() {
 		//fmt.Println("waiting for deployments update pipeline shutdown")
-		updateDeploymentsPipeline.Shutdown()
+		//updateDeploymentsPipeline.Shutdown()
 		//fmt.Println("waiting for deployments update pipeline shutdown -- done")
 	})
 	upsertVpcsPipeline, _ = goPipeline.NewPipeline(5, 10*time.Second, func(vpc string, vpcs []vpcs.UpsertVpcDtoV1) {
@@ -119,7 +128,7 @@ func Init() {
 	})
 	goShutdownHook.ADD(func() {
 		//fmt.Println("waiting for vpcs upsert pipeline shutdown")
-		upsertVpcsPipeline.Shutdown()
+		//upsertVpcsPipeline.Shutdown()
 		//fmt.Println("waiting for vpcs upsert pipeline shutdown -- done")
 	})
 	upsertClustersPipeline, _ = goPipeline.NewPipeline(5, 10*time.Second, func(cluster string, clusters []clusters.UpsertClusterDtoV1) {
@@ -138,7 +147,7 @@ func Init() {
 	})
 	goShutdownHook.ADD(func() {
 		//fmt.Println("waiting for clusters upsert pipeline shutdown")
-		upsertClustersPipeline.Shutdown()
+		//upsertClustersPipeline.Shutdown()
 		//fmt.Println("waiting for clusters upsert pipeline shutdown -- done")
 	})
 	updateCertificatesPipeline, _ = goPipeline.NewPipeline(5, 2*time.Second,
@@ -158,7 +167,7 @@ func Init() {
 		})
 	goShutdownHook.ADD(func() {
 		//fmt.Println("waiting for certificates update pipeline shutdown")
-		updateCertificatesPipeline.Shutdown()
+		//updateCertificatesPipeline.Shutdown()
 		//fmt.Println("waiting for certificates update pipeline shutdown -- done")
 	})
 	sendNotificationPipeline, _ = goPipeline.NewPipeline(5, 10*time.Second,
@@ -178,7 +187,7 @@ func Init() {
 		})
 	goShutdownHook.ADD(func() {
 		//fmt.Println("waiting for notifications send pipeline shutdown")
-		sendNotificationPipeline.Shutdown()
+		//sendNotificationPipeline.Shutdown()
 		//fmt.Println("waiting for notifications send pipeline shutdown -- done")
 	})
 }
@@ -230,64 +239,64 @@ func isPreview(parameters map[string]interface{}) bool {
 	return p
 }
 
-func markBuildDone(parameters map[string]interface{}, err error, logsWriter io.Writer) {
-	defer func() {
-		//Delete old repo directory to clean up
-		repoDirectoryPath, _ := getRepositoryDirectoryPath(parameters)
-		if len(repoDirectoryPath) > 0 {
-			os.RemoveAll(repoDirectoryPath)
+func MarkBuildDone(parameters map[string]interface{}, err error) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer func() {
+			//Delete old repo directory to clean up
+			repoDirectoryPath, _ := getRepositoryDirectoryPath(parameters)
+			if len(repoDirectoryPath) > 0 {
+				os.RemoveAll(repoDirectoryPath)
+			}
+			close(done)
+		}()
+		status := build_enums.Success
+		errorMessage := ""
+		if err != nil {
+			status = build_enums.Error
+			errorMessage = err.Error()
 		}
-	}()
-	status := build_enums.Success
-	errorMessage := ""
-	if err != nil {
-		status = build_enums.Error
-		errorMessage = err.Error()
-	}
-	nowEpoch := time.Now().Unix()
-	if isPreview(parameters) {
-		//update preview and return
-		previewID, e := jobs.GetParameterValue[string](parameters, parameters_enums.PreviewID)
+		nowEpoch := time.Now().Unix()
+		if isPreview(parameters) {
+			//update preview and return
+			previewID, e := jobs.GetParameterValue[string](parameters, parameters_enums.PreviewID)
+			if e != nil {
+				//Weird error. Would show up in logs. Return for now.
+				return
+			}
+			updatePreviewsPipeline.Add(updatePreviewsKey, previews.UpdatePreviewDtoV1{
+				ID:           previewID,
+				BuildTs:      nowEpoch,
+				Status:       status,
+				ErrorMessage: errorMessage,
+			})
+			return
+		}
+
+		buildID, e := jobs.GetParameterValue[string](parameters, parameters_enums.BuildID)
 		if e != nil {
 			//Weird error. Would show up in logs. Return for now.
 			return
 		}
-		updatePreviewsPipeline.Add(updatePreviewsKey, previews.UpdatePreviewDtoV1{
-			ID:           previewID,
+		updateBuildsPipeline.Add(updateBuildsKey, builds.UpdateBuildDtoV1{
+			ID:           buildID,
 			BuildTs:      nowEpoch,
 			Status:       status,
 			ErrorMessage: errorMessage,
 		})
-		return
-	}
-
-	buildID, e := jobs.GetParameterValue[string](parameters, parameters_enums.BuildID)
-	if e != nil {
-		//Weird error. Would show up in logs. Return for now.
-		return
-	}
-	updateBuildsPipeline.Add(updateBuildsKey, builds.UpdateBuildDtoV1{
-		ID:           buildID,
-		BuildTs:      nowEpoch,
-		Status:       status,
-		ErrorMessage: errorMessage,
-	})
-	deploymentID, e := jobs.GetParameterValue[string](parameters, parameters_enums.DeploymentID)
-	if e != nil {
-		//Weird error. Would show up in logs. Return for now.
-		return
-	}
-	updateDeploymentsPipeline.Add(updateDeploymentsKey, deployments.UpdateDeploymentDtoV1{
-		ID:               deploymentID,
-		LastDeploymentTs: nowEpoch,
-		Status:           status,
-		ErrorMessage:     errorMessage,
-	})
-	//if err != nil {
-	//	io.WriteString(logsWriter, fmt.Sprintf("Error in executing - %s - %s\n", buildID, errorMessage))
-	//} else {
-	//	io.WriteString(logsWriter, fmt.Sprintf("Successfully executed - %s\n", buildID))
-	//}
+		deploymentID, e := jobs.GetParameterValue[string](parameters, parameters_enums.DeploymentID)
+		if e != nil {
+			//Weird error. Would show up in logs. Return for now.
+			return
+		}
+		updateDeploymentsPipeline.Add(updateDeploymentsKey, deployments.UpdateDeploymentDtoV1{
+			ID:               deploymentID,
+			LastDeploymentTs: nowEpoch,
+			Status:           status,
+			ErrorMessage:     errorMessage,
+		})
+	}()
+	return done
 }
 
 func listAllS3Objects(s3Client *s3.Client, bucketName string) ([]s3Types.Object, error) {

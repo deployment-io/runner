@@ -10,7 +10,7 @@ func (r *RunnerClient) UpdateDeployments(updateDeployments []deployments.UpdateD
 		return ErrConnection
 	}
 	args := deployments.UpdateDeploymentsArgsV1{}
-	args.OrganizationID = r.organizationID
+	args.OrganizationID = r.GetComputedOrganizationID()
 	args.Token = r.token
 	args.Deployments = updateDeployments
 	var reply deployments.UpdateDeploymentsReplyV1
@@ -29,7 +29,7 @@ func (r *RunnerClient) GetDeploymentData(deploymentIDs []string) ([]deployments.
 		return nil, ErrConnection
 	}
 	args := deployments.GetDeploymentsArgsV1{}
-	args.OrganizationID = r.organizationID
+	args.OrganizationID = r.GetComputedOrganizationID()
 	args.Token = r.token
 	args.IDs = deploymentIDs
 	var reply deployments.GetDeploymentsReplyV1
