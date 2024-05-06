@@ -16,6 +16,8 @@ import (
 var clientCertPem, clientKeyPem, version, serviceFromBuild string
 
 func main() {
+	//TODO remove this log
+	log.Println(clientCertPem, clientKeyPem, version, serviceFromBuild)
 	userId, organizationId, token, service, targetCloud, err := getEnvironmentForLocal()
 	if err != nil {
 		log.Println(err)

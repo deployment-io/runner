@@ -18,8 +18,8 @@ builds:
     main: ./entrypoints/local
     ldflags:
       - -s -w -X main.version={{.Version}}
-      - '-X "main.clientCertPem={{.Env.TLS_CERT}}"'
-      - '-X "main.clientKeyPem={{.Env.TLS_KEY}}"'
+      - '-s -w -X "main.clientCertPem={{.Env.TLS_CERT}}"'
+      - '-s -w -X "main.clientKeyPem={{.Env.TLS_KEY}}"'
       - -s -w -X main.serviceFromBuild={{.Env.SERVICE}}
 
 archives:
