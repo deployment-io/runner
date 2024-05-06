@@ -15,7 +15,7 @@ builds:
       - arm64
     binary: deployment-runner
     id: deployment-runner
-    main: ./entrypoints/local/main.go
+    main: ./entrypoints/local
     ldflags:
       - -s -w -X main.version={{.Version}}
       - -s -w -X main.clientCertPem={{.Env.TLS_CERT}}
