@@ -23,12 +23,13 @@ type CreateAcmCertificate struct {
 func (c *CreateAcmCertificate) Run(parameters map[string]interface{}, logsWriter io.Writer) (newParameters map[string]interface{}, err error) {
 
 	//check and add policy for AWS ACM certificate creation
-	runnerRegion, _, cpuArchEnum, osType := utils.RunnerData.Get()
+	runnerData := utils.RunnerData.Get()
 	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationID)
 	if err != nil {
 		return parameters, err
 	}
-	err = iam_policies.AddAwsPolicyForDeploymentRunner(iam_policy_enums.AwsCertificateManager, osType.String(), cpuArchEnum.String(), organizationID, runnerRegion)
+	err = iam_policies.AddAwsPolicyForDeploymentRunner(iam_policy_enums.AwsCertificateManager,
+		runnerData.OsType.String(), runnerData.CpuArchEnum.String(), organizationID, runnerData.RunnerRegion, runnerData.Mode, runnerData.TargetCloud)
 	if err != nil {
 		return parameters, err
 	}
@@ -78,10 +79,6 @@ func (c *CreateAcmCertificate) Run(parameters map[string]interface{}, logsWriter
 					describeCertificateOutput.Certificate.DomainValidationOptions[0].ResourceRecord.Value != nil &&
 					len(aws.ToString(describeCertificateOutput.Certificate.DomainValidationOptions[0].ResourceRecord.Name)) > 0 &&
 					len(aws.ToString(describeCertificateOutput.Certificate.DomainValidationOptions[0].ResourceRecord.Value)) > 0 {
-					////save certificate cname info
-					//
-					//fmt.Println(aws.ToString(describeCertificateOutput.Certificate.DomainValidationOptions[0].ResourceRecord.Name))
-					//fmt.Println(aws.ToString(describeCertificateOutput.Certificate.DomainValidationOptions[0].ResourceRecord.Value))
 
 					updateCertificatesPipeline.Add(updateCertificatesKey, certificates.UpdateCertificateDtoV1{
 						ID:         certificateID,

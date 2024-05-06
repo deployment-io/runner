@@ -1,0 +1,38 @@
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+
+version: 1
+
+before:
+  hooks:
+    - go mod tidy
+    - go generate ./...
+
+builds:
+  - env:
+      - CGO_ENABLED=0
+    goarch:
+      - amd64
+      - arm64
+    binary: deployment-runner
+    id: deployment-runner
+    main: ./entrypoints/local/main.go
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+      - -s -w -X main.clientCertPem={{.Env.TLS_CERT}}
+      - -s -w -X main.clientKeyPem={{.Env.TLS_KEY}}
+      - -s -w -X main.serviceFromBuild={{.Env.SERVICE}}
+
+archives:
+  - format: tar.gz
+    name_template: "deployment-runner_{{ .Os }}_{{ .Arch }}"
+    # use zip for windows archives
+    format_overrides:
+      - goos: windows
+        format: zip
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"

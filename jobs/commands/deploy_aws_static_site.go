@@ -412,7 +412,7 @@ func attachPolicyToS3Bucket(distributionArn *string, s3BucketName, policySid, po
 func (d *DeployAwsStaticSite) Run(parameters map[string]interface{}, logsWriter io.Writer) (newParameters map[string]interface{}, err error) {
 	defer func() {
 		if err != nil {
-			markBuildDone(parameters, err, logsWriter)
+			<-MarkBuildDone(parameters, err)
 		}
 	}()
 
@@ -422,12 +422,13 @@ func (d *DeployAwsStaticSite) Run(parameters map[string]interface{}, logsWriter 
 	}
 
 	//check and add policy for AWS static site deployment
-	runnerRegion, _, cpuArchEnum, osType := utils.RunnerData.Get()
+	runnerData := utils.RunnerData.Get()
 	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationID)
 	if err != nil {
 		return parameters, err
 	}
-	err = iam_policies.AddAwsPolicyForDeploymentRunner(iam_policy_enums.AwsStaticSiteDeployment, osType.String(), cpuArchEnum.String(), organizationID, runnerRegion)
+	err = iam_policies.AddAwsPolicyForDeploymentRunner(iam_policy_enums.AwsStaticSiteDeployment,
+		runnerData.OsType.String(), runnerData.CpuArchEnum.String(), organizationID, runnerData.RunnerRegion, runnerData.Mode, runnerData.TargetCloud)
 	if err != nil {
 		return parameters, err
 	}
@@ -703,7 +704,7 @@ func (d *DeployAwsStaticSite) Run(parameters map[string]interface{}, logsWriter 
 	}
 
 	//mark build done successfully
-	markBuildDone(parameters, nil, logsWriter)
+	<-MarkBuildDone(parameters, nil)
 
 	return parameters, nil
 }

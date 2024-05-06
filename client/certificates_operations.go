@@ -10,7 +10,7 @@ func (r *RunnerClient) UpdateCertificates(updateCertificates []certificates.Upda
 		return ErrConnection
 	}
 	args := certificates.UpdateCertificatesArgsV1{}
-	args.OrganizationID = r.organizationID
+	args.OrganizationID = r.GetComputedOrganizationID()
 	args.Token = r.token
 	args.Certificates = updateCertificates
 	var reply certificates.UpdateCertificatesReplyV1

@@ -10,7 +10,7 @@ func (r *RunnerClient) SendNotifications(sendNotifications []notifications.SendN
 		return ErrConnection
 	}
 	args := notifications.SendNotificationsArgsV1{}
-	args.OrganizationID = r.organizationID
+	args.OrganizationID = r.GetComputedOrganizationID()
 	args.Token = r.token
 	args.Notifications = sendNotifications
 	var reply notifications.SendNotificationsReplyV1

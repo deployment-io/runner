@@ -11,7 +11,7 @@ func (r *RunnerClient) GetPendingJobs() ([]jobs.PendingJobDtoV1, error) {
 		return nil, ErrConnection
 	}
 	args := jobs.PendingJobsArgsV2{}
-	args.OrganizationID = r.organizationID
+	args.OrganizationID = r.GetComputedOrganizationID()
 	args.Token = r.token
 	args.CloudAccountID = r.cloudAccountID
 	args.RunnerRegion = r.runnerRegion
@@ -30,7 +30,7 @@ func (r *RunnerClient) MarkJobsComplete(completingJobs []jobs.CompletingJobDtoV1
 		return ErrConnection
 	}
 	args := jobs.CompletingJobsArgsV1{}
-	args.OrganizationID = r.organizationID
+	args.OrganizationID = r.GetComputedOrganizationID()
 	args.Token = r.token
 	args.Jobs = completingJobs
 	var reply jobs.CompletingJobsReplyV1
@@ -42,4 +42,20 @@ func (r *RunnerClient) MarkJobsComplete(completingJobs []jobs.CompletingJobDtoV1
 		return fmt.Errorf("error receiving done from the server")
 	}
 	return nil
+}
+
+func (r *RunnerClient) UpsertJobHeartbeat(jobID string) (bool, error) {
+	if !r.isConnected {
+		return false, ErrConnection
+	}
+	args := jobs.UpsertJobHeartbeatArgsV1{}
+	args.OrganizationID = r.GetComputedOrganizationID()
+	args.Token = r.token
+	args.JobID = jobID
+	var reply jobs.UpsertJobHeartbeatReplyV1
+	err := r.c.Call("Jobs.UpsertHeartbeatV1", args, &reply)
+	if err != nil {
+		return false, err
+	}
+	return reply.Stopping, nil
 }

@@ -179,7 +179,7 @@ func (cr *CheckoutRepository) Run(parameters map[string]interface{}, logsWriter 
 	defer func() {
 		//_ = loggers.LogBuffer(logBuffer, logger)
 		if err != nil {
-			markBuildDone(parameters, err, logsWriter)
+			<-MarkBuildDone(parameters, err)
 		}
 	}()
 	repoCloneUrl, err := jobs.GetParameterValue[string](parameters, parameters_enums.RepoCloneUrl)

@@ -4,6 +4,8 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"github.com/deployment-io/deployment-runner-kit/enums/runner_enums"
+	"github.com/deployment-io/deployment-runner-kit/types"
 	"log"
 	"net/rpc"
 	"strings"
@@ -21,6 +23,9 @@ type RunnerClient struct {
 	currentDockerImage string
 	runnerRegion       string
 	cloudAccountID     string
+	runnerMode         runner_enums.Mode
+	targetCloud        runner_enums.TargetCloud
+	userID             string
 }
 
 func getTlsClient(service, clientCertPem, clientKeyPem string) (*rpc.Client, error) {
@@ -52,15 +57,15 @@ func getTlsClient(service, clientCertPem, clientKeyPem string) (*rpc.Client, err
 
 var client = RunnerClient{}
 
-func connect(service, organizationID, token, clientCertPem, clientKeyPem, dockerImage, region, awsAccountID string) (err error) {
+func connect(options Options) (err error) {
 	var c *rpc.Client
 	if !client.isConnected {
-		if len(clientCertPem) > 0 && len(clientKeyPem) > 0 {
-			clientCertPem = strings.Replace(clientCertPem, "\\n", "\n", -1)
-			clientKeyPem = strings.Replace(clientKeyPem, "\\n", "\n", -1)
-			c, err = getTlsClient(service, clientCertPem, clientKeyPem)
+		if len(options.ClientCertPem) > 0 && len(options.ClientKeyPem) > 0 {
+			options.ClientCertPem = strings.Replace(options.ClientCertPem, "\\n", "\n", -1)
+			options.ClientKeyPem = strings.Replace(options.ClientKeyPem, "\\n", "\n", -1)
+			c, err = getTlsClient(options.Service, options.ClientCertPem, options.ClientKeyPem)
 		} else {
-			c, err = rpc.Dial("tcp", service)
+			c, err = rpc.Dial("tcp", options.Service)
 		}
 
 		if err != nil {
@@ -69,11 +74,14 @@ func connect(service, organizationID, token, clientCertPem, clientKeyPem, docker
 		}
 
 		client.c = c
-		client.organizationID = organizationID
-		client.token = token
-		client.currentDockerImage = dockerImage
-		client.runnerRegion = region
-		client.cloudAccountID = awsAccountID
+		client.organizationID = options.OrganizationID
+		client.userID = options.UserID
+		client.token = options.Token
+		client.currentDockerImage = options.DockerImage
+		client.runnerRegion = options.Region
+		client.cloudAccountID = options.CloudAccountID
+		client.runnerMode = options.RunnerMode
+		client.targetCloud = options.TargetCloud
 	}
 
 	return nil
@@ -81,7 +89,22 @@ func connect(service, organizationID, token, clientCertPem, clientKeyPem, docker
 
 var disconnectSignal = make(chan struct{})
 
-func Connect(service, organizationID, token, clientCertPem, clientKeyPem, dockerImage, region, awsAccountID string, blockTillFirstConnect bool) chan struct{} {
+type Options struct {
+	Service               string
+	OrganizationID        string
+	UserID                string
+	Token                 string
+	ClientCertPem         string
+	ClientKeyPem          string
+	DockerImage           string
+	Region                string
+	CloudAccountID        string
+	BlockTillFirstConnect bool
+	RunnerMode            runner_enums.Mode
+	TargetCloud           runner_enums.TargetCloud
+}
+
+func Connect(options Options) chan struct{} {
 	firstTimeConnectSignal := make(chan struct{})
 	if !client.isStarted {
 		client.Lock()
@@ -98,12 +121,14 @@ func Connect(service, organizationID, token, clientCertPem, clientKeyPem, docker
 					default:
 						isConnectedOld := client.isConnected
 						if !client.isConnected {
-							connect(service, organizationID, token, clientCertPem, clientKeyPem, dockerImage,
-								region, awsAccountID)
+							connect(options)
 						}
 						if client.c != nil {
 							err := client.Ping(firstPing)
 							if err != nil {
+								if types.ErrInvalidUserKeySecret.Error() == err.Error() && options.RunnerMode == runner_enums.LOCAL {
+									log.Fatal(err)
+								}
 								client.isConnected = false
 								client.c.Close()
 								client.c = nil
@@ -114,9 +139,9 @@ func Connect(service, organizationID, token, clientCertPem, clientKeyPem, docker
 								firstPing = false
 								client.isConnected = true
 								if isConnectedOld != client.isConnected {
-									if blockTillFirstConnect {
+									if options.BlockTillFirstConnect {
 										<-firstTimeConnectSignal
-										blockTillFirstConnect = false
+										options.BlockTillFirstConnect = false
 									}
 								}
 							}

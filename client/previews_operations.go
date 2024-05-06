@@ -10,7 +10,7 @@ func (r *RunnerClient) UpdatePreviews(updatePreviews []previews.UpdatePreviewDto
 		return ErrConnection
 	}
 	args := previews.UpdatePreviewsArgsV1{}
-	args.OrganizationID = r.organizationID
+	args.OrganizationID = r.GetComputedOrganizationID()
 	args.Token = r.token
 	args.Previews = updatePreviews
 	var reply previews.UpdatePreviewsReplyV1
@@ -29,7 +29,7 @@ func (r *RunnerClient) GetPreviewData(previewIDs []string) ([]previews.GetPrevie
 		return nil, ErrConnection
 	}
 	args := previews.GetPreviewsArgsV1{}
-	args.OrganizationID = r.organizationID
+	args.OrganizationID = r.GetComputedOrganizationID()
 	args.Token = r.token
 	args.IDs = previewIDs
 	var reply previews.GetPreviewsReplyV1

@@ -9,7 +9,7 @@ func (r *RunnerClient) RefreshGitToken(installationID string) (string, error) {
 		return "", ErrConnection
 	}
 	args := oauth.RefreshGitProviderTokenArgsV1{}
-	args.OrganizationID = r.organizationID
+	args.OrganizationID = r.GetComputedOrganizationID()
 	args.Token = r.token
 	args.InstallationID = installationID
 	var refreshTokenDto oauth.RefreshGitProviderTokenDtoV1

@@ -27,8 +27,9 @@ func (v *VerifyAcmCertificate) Run(parameters map[string]interface{}, logsWriter
 		return parameters, err
 	}
 	io.WriteString(logsWriter, fmt.Sprintf("Verifying and validating certificate from ACM: %s\n", certificateArn))
-	//TODO handle - If a certificate shows status FAILED or VALIDATION_TIMED_OUT, delete the request
+	//TODO handle - If a certificate shows status FAILED or VALIDATION_TIMED_OUT, delete the certificate
 	//This can happen if the user doesn't validate certificate DNS in 72 hours
+	io.WriteString(logsWriter, fmt.Sprintf("Waiting for certificate to be validated.....Please wait.\n"))
 	newCertificateValidatedWaiter := acm.NewCertificateValidatedWaiter(acmClient)
 	err = newCertificateValidatedWaiter.Wait(context.TODO(), &acm.DescribeCertificateInput{CertificateArn: aws.String(certificateArn)},
 		10*time.Minute)

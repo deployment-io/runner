@@ -10,7 +10,7 @@ func (r *RunnerClient) AddJobLogs(addBuildLogs []logs.AddJobLogDtoV1) error {
 		return ErrConnection
 	}
 	args := logs.AddJobLogsArgsV1{}
-	args.OrganizationID = r.organizationID
+	args.OrganizationID = r.GetComputedOrganizationID()
 	args.Token = r.token
 	args.JobLogs = addBuildLogs
 	var reply logs.AddJobLogsReplyV1
