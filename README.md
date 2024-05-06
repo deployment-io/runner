@@ -10,11 +10,29 @@ Some of its responsibilities are:
 4. creating previews. 
 5. deleting deployments and freeing cloud resources.
 
-## Get Started
+## Install locally on your device
+
+### Linux and MacOS
+
+```console
+curl -O https://raw.githubusercontent.com/deployment-io/runner/master/install-deployment-runner.sh && source install-deployment-runner.sh
+```
+
+### Windows
+
+Download and unzip the binary from releases.
+
+### Usage
+
+```console
+deployment-runner
+```
+
+[//]: # (For more information about installing and using the runner locally, see [Installing runner locally]&#40;https://deployment.io/docs/runner-installation/local-setup/&#41;)
+
+## Install on AWS
 
 For more information about installing the runner on AWS, see [Installing runner on AWS](https://deployment.io/docs/runner-installation/aws-setup/)
-
-Runner CLI coming soon!
 
 ## Design Principles
 
