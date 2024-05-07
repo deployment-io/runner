@@ -25,7 +25,7 @@ Download and unzip the binary from releases.
 ### Usage
 
 ```console
-deployment-runner
+TargetCloud=aws UserSecret=<your user secret> UserKey=<your user key> deployment-runner
 ```
 
 [//]: # (For more information about installing and using the runner locally, see [Installing runner locally]&#40;https://deployment.io/docs/runner-installation/local-setup/&#41;)
