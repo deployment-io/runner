@@ -1,14 +1,15 @@
 
 # Deployment Runner
 
-Runner is an application that can be installed on cloud environments to automate various DevOps and infrastructure tasks.
+Runner is an application that can be installed locally or on cloud environments to automate various DevOps and infrastructure tasks.
 
-Some of its responsibilities are:
+Some of its use cases are:
 1. checking out source code.
 2. building and deploying code.
-3. CI/CD.
-4. creating previews. 
-5. deleting deployments and freeing cloud resources.
+3. creating and managing cloud dev environments.
+4. CI/CD.
+5. creating previews. 
+6. deleting deployments and freeing cloud resources.
 
 ## Install locally on your device
 
@@ -20,12 +21,12 @@ curl -O https://raw.githubusercontent.com/deployment-io/runner/master/install-de
 
 ### Windows
 
-Download and unzip the binary from releases.
+Download and unzip the latest binary from releases.
 
 ### Usage
 
 ```console
-TargetCloud=aws UserSecret=<your user secret> UserKey=<your user key> deployment-runner
+TargetCloud=aws UserSecret=yourUserSecret UserKey=yourUserKey deployment-runner
 ```
 
 [//]: # (For more information about installing and using the runner locally, see [Installing runner locally]&#40;https://deployment.io/docs/runner-installation/local-setup/&#41;)
