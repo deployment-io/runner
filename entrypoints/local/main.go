@@ -16,7 +16,7 @@ import (
 var clientCertPem, clientKeyPem, version, serviceFromBuild string
 
 func main() {
-	userId, organizationId, token, service, targetCloud, err := getEnvironmentForLocal()
+	userId, token, service, targetCloud, err := getEnvironmentForLocal()
 	if err != nil {
 		log.Println(err)
 		return
@@ -60,7 +60,6 @@ func main() {
 	runnerMode := runner_enums.LOCAL
 	client.Connect(client.Options{
 		Service:               service,
-		OrganizationID:        organizationId,
 		Token:                 token,
 		ClientCertPem:         clientCertPem,
 		ClientKeyPem:          clientKeyPem,

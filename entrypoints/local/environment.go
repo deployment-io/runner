@@ -8,31 +8,29 @@ import (
 	"strings"
 )
 
-func getEnvironmentForLocal() (userId, organizationId, token, service string, targetCloud runner_enums.TargetCloud, err error) {
+func getEnvironmentForLocal() (userId, token, service string, targetCloud runner_enums.TargetCloud, err error) {
 	//ignoring err
 	_ = godotenv.Load()
 	userKey := os.Getenv("UserKey")
-	userKeySplit := strings.Split(userKey, ":")
-	if len(userKeySplit) != 2 {
-		err = fmt.Errorf("invalid user key")
+	userId, found := strings.CutPrefix(userKey, "du_")
+	if !found {
+		err = fmt.Errorf("invalid user key. Please get a valid user key from https://app.deployment.io")
 		return
 	}
-	userId = userKeySplit[0]
-	organizationId = userKeySplit[1]
+	token = os.Getenv("UserSecret")
+	if len(token) == 0 {
+		err = fmt.Errorf("invalid user secret. Please get a valid user secret from https://app.deployment.io")
+		return
+	}
 	targetCloudStr := os.Getenv("TargetCloud")
 	targetCloud, err = runner_enums.GetTargetCloudFromString(targetCloudStr)
 	if err != nil {
 		return
 	}
-	token = os.Getenv("UserSecret")
-	if len(token) == 0 {
-		err = fmt.Errorf("invalid token")
-		return
-	}
-	if len(serviceFromBuild) > 0 {
-		service = serviceFromBuild
-	} else {
+	if len(os.Getenv("Service")) > 0 {
 		service = os.Getenv("Service")
+	} else {
+		service = serviceFromBuild
 	}
 	if len(service) == 0 {
 		err = fmt.Errorf("invalid service")

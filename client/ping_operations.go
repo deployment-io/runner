@@ -8,7 +8,7 @@ import (
 
 func (r *RunnerClient) GetComputedOrganizationID() string {
 	if len(r.userID) > 0 {
-		return fmt.Sprintf("%s:%s", r.userID, r.organizationID)
+		return fmt.Sprintf("du_%s", r.userID)
 	} else {
 		return r.organizationID
 	}
