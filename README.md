@@ -29,7 +29,7 @@ Download and unzip the latest binary from releases.
 TargetCloud=aws UserSecret=yourUserSecret UserKey=yourUserKey deployment-runner
 ```
 
-[//]: # (For more information about installing and using the runner locally, see [Installing runner locally]&#40;https://deployment.io/docs/runner-installation/local-setup/&#41;)
+For more information about installing and using the runner locally, see [Installing runner locally](https://deployment.io/docs/runner-installation/local-setup/)
 
 ## Install on AWS
 
