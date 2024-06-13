@@ -38,6 +38,7 @@ func (v *VerifyAcmCertificate) Run(parameters map[string]interface{}, logsWriter
 		return parameters, err
 	}
 	if describeCertificateOutput.Certificate != nil {
+		io.WriteString(logsWriter, fmt.Sprintf("Current status of certificate: %s\n", describeCertificateOutput.Certificate.Status))
 		if describeCertificateOutput.Certificate.Status == acm_types.CertificateStatusIssued {
 			//certificate is already issued
 			//sync verified status
