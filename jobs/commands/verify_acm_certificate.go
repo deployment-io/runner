@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/acm"
+	acm_types "github.com/aws/aws-sdk-go-v2/service/acm/types"
 	"github.com/deployment-io/deployment-runner-kit/certificates"
 	"github.com/deployment-io/deployment-runner-kit/cloud_api_clients"
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
@@ -27,16 +28,36 @@ func (v *VerifyAcmCertificate) Run(parameters map[string]interface{}, logsWriter
 		return parameters, err
 	}
 	io.WriteString(logsWriter, fmt.Sprintf("Verifying and validating certificate from ACM: %s\n", certificateArn))
-	//TODO handle - If a certificate shows status FAILED or VALIDATION_TIMED_OUT, delete the certificate
-	//This can happen if the user doesn't validate certificate DNS in 72 hours
+	certificateID, err := jobs.GetParameterValue[string](parameters, parameters_enums.CertificateID)
+	if err != nil {
+		return parameters, err
+	}
+	//get status of certificate
+	describeCertificateOutput, err := acmClient.DescribeCertificate(context.TODO(), &acm.DescribeCertificateInput{CertificateArn: aws.String(certificateArn)})
+	if err != nil {
+		return parameters, err
+	}
+	if describeCertificateOutput.Certificate != nil {
+		if describeCertificateOutput.Certificate.Status == acm_types.CertificateStatusIssued {
+			//certificate is already issued
+			//sync verified status
+			updateCertificatesPipeline.Add(updateCertificatesKey, certificates.UpdateCertificateDtoV1{
+				ID:       certificateID,
+				Verified: types.True,
+			})
+			io.WriteString(logsWriter, fmt.Sprintf("Certificate verified from ACM: %s\n", certificateArn))
+			return parameters, err
+		}
+		if describeCertificateOutput.Certificate.Status == acm_types.CertificateStatusFailed || describeCertificateOutput.Certificate.Status == acm_types.CertificateStatusValidationTimedOut {
+			//TODO handle - If a certificate shows status FAILED or VALIDATION_TIMED_OUT, delete the certificate
+			//This can happen if the user doesn't validate certificate DNS in 72 hours
+		}
+	}
+
 	io.WriteString(logsWriter, fmt.Sprintf("Waiting for certificate to be validated.....Please wait.\n"))
 	newCertificateValidatedWaiter := acm.NewCertificateValidatedWaiter(acmClient)
 	err = newCertificateValidatedWaiter.Wait(context.TODO(), &acm.DescribeCertificateInput{CertificateArn: aws.String(certificateArn)},
 		10*time.Minute)
-	if err != nil {
-		return parameters, err
-	}
-	certificateID, err := jobs.GetParameterValue[string](parameters, parameters_enums.CertificateID)
 	if err != nil {
 		return parameters, err
 	}
