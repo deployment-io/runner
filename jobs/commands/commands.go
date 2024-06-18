@@ -29,6 +29,7 @@ const updateBuildsKey = "updateBuilds"
 const updatePreviewsKey = "updatePreviews"
 const updateCertificatesKey = "updateCertificates"
 const sendNotificationsKey = "sendNotifications"
+const updateJobOutputsKey = "updateJobOutputs"
 
 const cloudfrontRegion = "us-east-1"
 
@@ -39,6 +40,7 @@ var updateDeploymentsPipeline *goPipeline.Pipeline[string, deployments.UpdateDep
 var upsertVpcsPipeline *goPipeline.Pipeline[string, vpcs.UpsertVpcDtoV1]
 var upsertClustersPipeline *goPipeline.Pipeline[string, clusters.UpsertClusterDtoV1]
 var updateCertificatesPipeline *goPipeline.Pipeline[string, certificates.UpdateCertificateDtoV1]
+var updateJobOutputPipeline *goPipeline.Pipeline[string, jobs.UpdateJobOutputDtoV1]
 
 func Shutdown() {
 	updateBuildsPipeline.Shutdown()
@@ -48,6 +50,7 @@ func Shutdown() {
 	upsertClustersPipeline.Shutdown()
 	updateCertificatesPipeline.Shutdown()
 	sendNotificationPipeline.Shutdown()
+	updateJobOutputPipeline.Shutdown()
 }
 
 func Init() {
@@ -190,6 +193,21 @@ func Init() {
 		//sendNotificationPipeline.Shutdown()
 		//fmt.Println("waiting for notifications send pipeline shutdown -- done")
 	})
+	updateJobOutputPipeline, _ = goPipeline.NewPipeline(5, 10*time.Second,
+		func(job string, jobOutputs []jobs.UpdateJobOutputDtoV1) {
+			e := true
+			for e {
+				err := c.UpdateJobOutputs(jobOutputs)
+				//TODO we can handle for ErrConnection
+				//will block till error
+				if err != nil {
+					fmt.Println(err)
+					time.Sleep(2 * time.Second)
+					continue
+				}
+				e = false
+			}
+		})
 }
 
 func Get(p commands_enums.Type) (jobs.Command, error) {
@@ -226,7 +244,8 @@ func Get(p commands_enums.Type) (jobs.Command, error) {
 		return &DeleteAwsStaticSite{}, nil
 	case commands_enums.DeleteAwsWebService:
 		return &DeleteAwsWebService{}, nil
-
+	case commands_enums.ListCloudWatchMetricsAwsEcsWebService:
+		return &ListCloudWatchMetricsAwsEcsWebService{}, nil
 	}
 	return nil, fmt.Errorf("error getting command for %s", p)
 }

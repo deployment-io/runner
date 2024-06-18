@@ -59,3 +59,22 @@ func (r *RunnerClient) UpsertJobHeartbeat(jobID string) (bool, error) {
 	}
 	return reply.Stopping, nil
 }
+
+func (r *RunnerClient) UpdateJobOutputs(jobOutputs []jobs.UpdateJobOutputDtoV1) error {
+	if !r.isConnected {
+		return ErrConnection
+	}
+	args := jobs.UpdateJobOutputArgsV1{}
+	args.OrganizationID = r.GetComputedOrganizationID()
+	args.Token = r.token
+	args.Jobs = jobOutputs
+	var reply jobs.UpdateJobOutputReplyV1
+	err := r.c.Call("Jobs.UpdateOutputV1", args, &reply)
+	if err != nil {
+		return err
+	}
+	if !reply.Done {
+		return fmt.Errorf("error receiving done from the server")
+	}
+	return nil
+}

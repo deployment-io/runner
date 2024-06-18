@@ -6,6 +6,7 @@ import (
 	goShutdownHook "github.com/ankit-arora/go-utils/go-shutdown-hook"
 	"github.com/deployment-io/deployment-runner-kit/enums/cpu_architecture_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/os_enums"
+	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/runner_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner-kit/types"
@@ -61,6 +62,8 @@ func executeJobs(jobsStream <-chan jobs.PendingJobDtoV1, noOfWorkers int, mode r
 				for pendingJob := range jobsStream {
 					func(pendingJob jobs.PendingJobDtoV1) {
 						parameters := pendingJob.Parameters
+						//add job id in parameters
+						_ = jobs.SetParameterValue(parameters, parameters_enums.JobID, pendingJob.JobID)
 						logger, err := loggers.Get(parameters)
 						if err != nil {
 							result := getJobResult(pendingJob, err.Error())
