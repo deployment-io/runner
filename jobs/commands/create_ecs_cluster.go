@@ -147,6 +147,16 @@ func createEcsTaskExecutionRole(iamClient *iam.Client, taskExecutionRoleName str
 	if err != nil {
 		return "", err
 	}
+
+	_, err = iamClient.AttachRolePolicy(context.TODO(), &iam.AttachRolePolicyInput{
+		PolicyArn: aws.String("arn:aws:iam::aws:policy/SecretsManagerReadWrite"),
+		RoleName:  createRoleOutput.Role.RoleName,
+	})
+
+	if err != nil {
+		return "", err
+	}
+
 	return aws.ToString(createRoleOutput.Role.Arn), nil
 }
 

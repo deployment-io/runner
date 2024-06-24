@@ -617,7 +617,7 @@ func registerTaskDefinition(parameters map[string]interface{}, ecsClient *ecs.Cl
 		Protocol:      ecsTypes.TransportProtocolTcp,
 	}
 
-	ecrRepositoryUriWithTag, err := jobs.GetParameterValue[string](parameters, parameters_enums.EcrRepositoryUriWithTag)
+	ecrRepositoryUriWithTag, err := jobs.GetParameterValue[string](parameters, parameters_enums.DockerRepositoryUriWithTag)
 	if err != nil {
 		return "", err
 	}
@@ -673,6 +673,15 @@ func registerTaskDefinition(parameters map[string]interface{}, ecsClient *ecs.Cl
 		Privileged:             aws.Bool(false),
 		PseudoTerminal:         aws.Bool(false),
 		ReadonlyRootFilesystem: aws.Bool(false),
+	}
+
+	isPrivateRepository, _ := jobs.GetParameterValue[bool](parameters, parameters_enums.IsPrivateRegistry)
+	if isPrivateRepository {
+		secretName, err := jobs.GetParameterValue[string](parameters, parameters_enums.SecretName)
+		if err != nil {
+			return "", err
+		}
+		containerDefinition.RepositoryCredentials = &ecsTypes.RepositoryCredentials{CredentialsParameter: aws.String(secretName)}
 	}
 
 	taskDefinitionFamilyName, err := getTaskDefinitionFamilyName(parameters)
@@ -873,7 +882,8 @@ func createEcsServiceIfNeeded(parameters map[string]interface{}, ecsClient *ecs.
 	return
 }
 
-func updateEcsService(parameters map[string]interface{}, ecsClient *ecs.Client, ecsClusterArn string, taskDefinitionArn string) error {
+func updateEcsService(parameters map[string]interface{}, ecsClient *ecs.Client, ecsClusterArn string,
+	taskDefinitionArn string, logsWriter io.Writer) error {
 	//TODO desired count is 1 for now.
 	ecsServiceName, err := getEcsServiceName(parameters)
 	if err != nil {
@@ -887,6 +897,30 @@ func updateEcsService(parameters map[string]interface{}, ecsClient *ecs.Client, 
 		PropagateTags:  ecsTypes.PropagateTagsTaskDefinition,
 	}
 	_, err = ecsClient.UpdateService(context.TODO(), updateServiceInput)
+
+	if err != nil {
+		return err
+	}
+
+	describeServicesInput := &ecs.DescribeServicesInput{
+		Services: []string{
+			ecsServiceName,
+		},
+		Cluster: aws.String(ecsClusterArn),
+	}
+
+	describeServicesOutput, err := ecsClient.DescribeServices(context.TODO(), describeServicesInput)
+	if err != nil {
+		return err
+	}
+
+	ecsServiceArn := aws.ToString(describeServicesOutput.Services[0].ServiceArn)
+
+	newServicesStableWaiter := ecs.NewServicesStableWaiter(ecsClient)
+
+	io.WriteString(logsWriter, fmt.Sprintf("Waiting for ECS service to be stable: %s\n", ecsServiceArn))
+
+	err = newServicesStableWaiter.Wait(context.TODO(), describeServicesInput, time.Minute*10)
 
 	if err != nil {
 		return err
@@ -951,7 +985,7 @@ func (d *DeployAwsWebService) Run(parameters map[string]interface{}, logsWriter 
 		return parameters, err
 	}
 	if shouldUpdateService {
-		err = updateEcsService(parameters, ecsClient, ecsClusterArn, taskDefinitionArn)
+		err = updateEcsService(parameters, ecsClient, ecsClusterArn, taskDefinitionArn, logsWriter)
 		if err != nil {
 			return parameters, err
 		}

@@ -244,7 +244,7 @@ func (u *UploadDockerImageToEcr) Run(parameters map[string]interface{}, logsWrit
 	//}
 
 	jobs.SetParameterValue(parameters, parameters_enums.EcrRepositoryUri, ecrRepositoryUri)
-	jobs.SetParameterValue(parameters, parameters_enums.EcrRepositoryUriWithTag, ecrRepositoryUriWithTag)
+	jobs.SetParameterValue(parameters, parameters_enums.DockerRepositoryUriWithTag, ecrRepositoryUriWithTag)
 
 	return parameters, err
 }

@@ -89,22 +89,25 @@ func (d *DeleteAwsWebService) Run(parameters map[string]interface{}, logsWriter 
 		}
 	}
 
-	//delete ecr repository if necessary
-	ecrClient, err := cloud_api_clients.GetEcrClient(parameters)
-	if err != nil {
-		return parameters, err
-	}
-	ecrRepositoryName, err := getEcrRepositoryName(parameters)
-	if err != nil {
-		return parameters, err
-	}
-	io.WriteString(logsWriter, fmt.Sprintf("Deleting ECR repository: %s\n", ecrRepositoryName))
-	_, err = ecrClient.DeleteRepository(context.TODO(), &ecr.DeleteRepositoryInput{
-		RepositoryName: aws.String(ecrRepositoryName),
-		Force:          true,
-	})
-	if err != nil {
-		return parameters, err
+	deployedFromImage, _ := jobs.GetParameterValue[bool](parameters, parameters_enums.DeployedFromImage)
+	if !deployedFromImage {
+		//delete ecr repository if necessary
+		ecrClient, err := cloud_api_clients.GetEcrClient(parameters)
+		if err != nil {
+			return parameters, err
+		}
+		ecrRepositoryName, err := getEcrRepositoryName(parameters)
+		if err != nil {
+			return parameters, err
+		}
+		io.WriteString(logsWriter, fmt.Sprintf("Deleting ECR repository: %s\n", ecrRepositoryName))
+		_, err = ecrClient.DeleteRepository(context.TODO(), &ecr.DeleteRepositoryInput{
+			RepositoryName: aws.String(ecrRepositoryName),
+			Force:          true,
+		})
+		if err != nil {
+			return parameters, err
+		}
 	}
 
 	//delete listeners

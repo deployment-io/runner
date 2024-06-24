@@ -246,6 +246,8 @@ func Get(p commands_enums.Type) (jobs.Command, error) {
 		return &DeleteAwsWebService{}, nil
 	case commands_enums.ListCloudWatchMetricsAwsEcsWebService:
 		return &ListCloudWatchMetricsAwsEcsWebService{}, nil
+	case commands_enums.CreateSecretAwsSecretManager:
+		return &CreateSecretAwsSecretManager{}, nil
 	}
 	return nil, fmt.Errorf("error getting command for %s", p)
 }

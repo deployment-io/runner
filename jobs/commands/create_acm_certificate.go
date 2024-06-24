@@ -60,6 +60,12 @@ func (c *CreateAcmCertificate) Run(parameters map[string]interface{}, logsWriter
 		SubjectAlternativeNames: []string{
 			parentDomain,
 		},
+		Tags: []acm_types.Tag{
+			{
+				Key:   aws.String("created by"),
+				Value: aws.String("deployment.io"),
+			},
+		},
 	})
 	if err != nil {
 		return parameters, err
