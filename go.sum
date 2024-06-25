@@ -86,8 +86,8 @@ github.com/creack/pty v1.1.9/go.mod h1:oKZEueFk5CKHvIhNR5MUki03XCEU+Q6VDXinZuGJ3
 github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
-github.com/deployment-io/deployment-runner-kit v0.0.0-20240624074350-3558ac90aba3 h1:l7JU+dHW0Y1vWkfRZuEoCiIFGuNlmFxFHnkvCjg/mA8=
-github.com/deployment-io/deployment-runner-kit v0.0.0-20240624074350-3558ac90aba3/go.mod h1:eBzXMB9XTRDy3WxAFYATeGFCueufMQ624qo832CvqJY=
+github.com/deployment-io/deployment-runner-kit v0.0.0-20240624173330-b221c2e1e219 h1:ArrBbxzH1Zl+7HSkOzYXugLTxRwswksq5iUg3oHI1OI=
+github.com/deployment-io/deployment-runner-kit v0.0.0-20240624173330-b221c2e1e219/go.mod h1:eBzXMB9XTRDy3WxAFYATeGFCueufMQ624qo832CvqJY=
 github.com/distribution/reference v0.6.0 h1:0IXCQ5g4/QMHHkarYzh5l+u8T3t73zM5QvfrDyIgxBk=
 github.com/distribution/reference v0.6.0/go.mod h1:BbU0aIcezP1/5jX/8MP0YiH4SdvB5Y4f/wlDRiLyi3E=
 github.com/docker/docker v25.0.1+incompatible h1:k5TYd5rIVQRSqcTwCID+cyVA0yRg86+Pcrz1ls0/frA=
