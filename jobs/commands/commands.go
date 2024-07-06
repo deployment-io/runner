@@ -222,6 +222,8 @@ func Get(p commands_enums.Type) (jobs.Command, error) {
 		return &BuildDockerImage{}, nil
 	case commands_enums.DeployAwsWebService:
 		return &DeployAwsWebService{}, nil
+	case commands_enums.DeployAwsPrivateService:
+		return &DeployAwsPrivateService{}, nil
 	case commands_enums.CreateAwsVpc:
 		return &CreateDefaultAwsVPC{}, nil
 	case commands_enums.CreateEcsCluster:
@@ -244,6 +246,8 @@ func Get(p commands_enums.Type) (jobs.Command, error) {
 		return &DeleteAwsStaticSite{}, nil
 	case commands_enums.DeleteAwsWebService:
 		return &DeleteAwsWebService{}, nil
+	case commands_enums.DeleteAwsPrivateService:
+		return &DeleteAwsPrivateService{}, nil
 	case commands_enums.ListCloudWatchMetricsAwsEcsWebService:
 		return &ListCloudWatchMetricsAwsEcsWebService{}, nil
 	case commands_enums.CreateSecretAwsSecretManager:
