@@ -10,6 +10,8 @@ import (
 	ecsTypes "github.com/aws/aws-sdk-go-v2/service/ecs/types"
 	"github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2"
 	elbTypes "github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2/types"
+	"github.com/aws/aws-sdk-go-v2/service/servicediscovery"
+	sd_types "github.com/aws/aws-sdk-go-v2/service/servicediscovery/types"
 	"github.com/deployment-io/deployment-runner-kit/builds"
 	"github.com/deployment-io/deployment-runner-kit/cloud_api_clients"
 	"github.com/deployment-io/deployment-runner-kit/deployments"
@@ -25,6 +27,7 @@ import (
 	"github.com/deployment-io/deployment-runner/utils"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"io"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -599,6 +602,18 @@ func getEcsServiceCreationClientToken(parameters map[string]interface{}) (string
 	return fmt.Sprintf("es-%d", time.Now().Unix()), nil
 }
 
+func getPortMappingName(parameters map[string]interface{}) (string, error) {
+	deploymentID, err := jobs.GetParameterValue[string](parameters, parameters_enums.DeploymentID)
+	if err != nil {
+		return "", err
+	}
+	port, err := jobs.GetParameterValue[int64](parameters, parameters_enums.Port)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("port-mapping-%s-%d", deploymentID, port), nil
+}
+
 func registerTaskDefinition(parameters map[string]interface{}, ecsClient *ecs.Client) (taskDefinitionArn string, err error) {
 
 	taskDefinitionArnFromParams, err := jobs.GetParameterValue[string](parameters, parameters_enums.TaskDefinitionArn)
@@ -611,9 +626,14 @@ func registerTaskDefinition(parameters map[string]interface{}, ecsClient *ecs.Cl
 		return "", err
 	}
 
+	portMappingName, err := getPortMappingName(parameters)
+	if err != nil {
+		return "", err
+	}
+
 	containerPortMapping := ecsTypes.PortMapping{
 		ContainerPort: aws.Int32(int32(port)),
-		Name:          aws.String(fmt.Sprintf("port-mapping-%d", port)),
+		Name:          aws.String(portMappingName),
 		Protocol:      ecsTypes.TransportProtocolTcp,
 	}
 
@@ -749,7 +769,132 @@ func registerTaskDefinition(parameters map[string]interface{}, ecsClient *ecs.Cl
 	return taskDefinitionArn, nil
 }
 
-func createEcsServiceIfNeeded(parameters map[string]interface{}, ecsClient *ecs.Client, ecsClusterArn, targetGroupArn, taskDefinitionArn string, logsWriter io.Writer) (ecsServiceArn string, shouldUpdateService bool, err error) {
+func getNamespaceName(parameters map[string]interface{}) (string, error) {
+	environmentID, err := jobs.GetParameterValue[string](parameters, parameters_enums.EnvironmentID)
+	if err != nil {
+		return "", err
+	}
+	environmentName, err := jobs.GetParameterValue[string](parameters, parameters_enums.EnvironmentName)
+	if err != nil {
+		return "", err
+	}
+
+	namespaceName := fmt.Sprintf("%s-%s", environmentName, environmentID[len(environmentID)-4:])
+
+	namespaceName = strings.ToLower(namespaceName)
+
+	pattern := "[^a-z0-9-]"
+
+	re := regexp.MustCompile(pattern)
+
+	// Replace all unmatched characters with -
+	sanitized := re.ReplaceAllString(namespaceName, "-")
+
+	// Remove '-' prefix if it exists
+	for len(sanitized) > 0 && sanitized[0] == '-' {
+		sanitized = strings.TrimPrefix(sanitized, "-")
+	}
+
+	if len(sanitized) == 0 {
+		return "", fmt.Errorf("empty namespace name")
+	}
+	return sanitized, nil
+}
+
+func createNamespaceIfNeeded(parameters map[string]interface{}, logsWriter io.Writer) (string, error) {
+	namespaceName, err := getNamespaceName(parameters)
+	if err != nil {
+		return "", err
+	}
+	vpcID, err := jobs.GetParameterValue[string](parameters, parameters_enums.VpcID)
+	if err != nil {
+		return "", err
+	}
+	serviceDiscoveryClient, err := cloud_api_clients.GetServiceDiscoveryClient(parameters)
+	if err != nil {
+		return "", err
+	}
+
+	triedCreating := false
+	maxAttempts := 30
+
+	for i := 0; i < maxAttempts; i++ {
+		listNamespacesOutput, err := serviceDiscoveryClient.ListNamespaces(context.TODO(), &servicediscovery.ListNamespacesInput{
+			Filters: []sd_types.NamespaceFilter{{
+				Name:      sd_types.NamespaceFilterNameName,
+				Values:    []string{namespaceName},
+				Condition: sd_types.FilterConditionEq,
+			}},
+		})
+
+		if err == nil && listNamespacesOutput != nil && len(listNamespacesOutput.Namespaces) > 0 {
+			//already exists
+			return namespaceName, nil
+		}
+
+		if !triedCreating {
+			//try creating
+			io.WriteString(logsWriter, fmt.Sprintf("Creating new namespace for environment: %s\n", namespaceName))
+			requestId := fmt.Sprintf("%d", time.Now().Unix())
+			input := &servicediscovery.CreatePrivateDnsNamespaceInput{
+				Name:             aws.String(namespaceName),
+				CreatorRequestId: aws.String(requestId),
+				Description:      aws.String(fmt.Sprintf("namespace for environment: %s", namespaceName)),
+				Vpc:              aws.String(vpcID),
+				Tags: []sd_types.Tag{{
+					Key:   aws.String("created by"),
+					Value: aws.String("deployment.io"),
+				}},
+			}
+
+			_, err = serviceDiscoveryClient.CreatePrivateDnsNamespace(context.TODO(), input)
+			if err != nil {
+				return "", err
+			}
+			triedCreating = true
+		}
+
+		time.Sleep(5 * time.Second)
+	}
+
+	return "", fmt.Errorf("exceeded max attempts while creating namespace")
+}
+
+func getInternalDnsName(parameters map[string]interface{}) (string, error) {
+	deploymentName, err := jobs.GetParameterValue[string](parameters, parameters_enums.DeploymentName)
+	if err != nil {
+		return "", err
+	}
+	deploymentID, err := jobs.GetParameterValue[string](parameters, parameters_enums.DeploymentID)
+	if err != nil {
+		return "", err
+	}
+
+	// Convert all upper case letters in string to lower case
+	deploymentName = strings.ToLower(deploymentName)
+
+	// Pattern excluding the characters you want to keep
+	pattern := "[^a-z0-9_.-]"
+
+	re := regexp.MustCompile(pattern)
+
+	// Replace all unmatched characters with -
+	dnsName := re.ReplaceAllString(deploymentName, "-")
+
+	// Remove '-' prefix if it exists
+	for len(dnsName) > 0 && dnsName[0] == '-' {
+		dnsName = strings.TrimPrefix(dnsName, "-")
+	}
+	if len(dnsName) == 0 {
+		return "", fmt.Errorf("empty dns name")
+	}
+
+	dnsName = fmt.Sprintf("%s-%s", dnsName, deploymentID[len(deploymentID)-4:])
+	return dnsName, nil
+}
+
+func createEcsServiceIfNeeded(parameters map[string]interface{}, ecsClient *ecs.Client,
+	ecsClusterArn, targetGroupArn, taskDefinitionArn string, logsWriter io.Writer) (ecsServiceArn string, shouldUpdateService bool, err error) {
 
 	ecsServiceArnFromParams, err := jobs.GetParameterValue[string](parameters, parameters_enums.EcsServiceArn)
 	if err == nil && len(ecsServiceArnFromParams) > 0 {
@@ -775,10 +920,16 @@ func createEcsServiceIfNeeded(parameters map[string]interface{}, ecsClient *ecs.
 		return "", false, err
 	}
 
+	var dnsName, namespaceName string
+
 	if len(describeServicesOutput.Services) > 0 {
 		ecsServiceArn = aws.ToString(describeServicesOutput.Services[0].ServiceArn)
 		shouldUpdateService = true
 	} else {
+		namespaceName, err = createNamespaceIfNeeded(parameters, logsWriter)
+		if err != nil {
+			return "", false, err
+		}
 		privateSubnets, err := jobs.GetParameterValue[primitive.A](parameters, parameters_enums.PrivateSubnets)
 		if err != nil {
 			return "", false, err
@@ -810,6 +961,28 @@ func createEcsServiceIfNeeded(parameters map[string]interface{}, ecsClient *ecs.
 			return "", false, err
 		}
 
+		portMappingName, err := getPortMappingName(parameters)
+		if err != nil {
+			return "", false, err
+		}
+
+		dnsName, err = getInternalDnsName(parameters)
+		if err != nil {
+			return "", false, err
+		}
+
+		var loadBalancers []ecsTypes.LoadBalancer
+		var healthCheckGracePeriod *int32
+		if len(targetGroupArn) > 0 {
+			//only needed for public web services
+			loadBalancers = []ecsTypes.LoadBalancer{{
+				ContainerName:  aws.String(containerName),
+				ContainerPort:  aws.Int32(int32(port)),
+				TargetGroupArn: aws.String(targetGroupArn),
+			}}
+			healthCheckGracePeriod = aws.Int32(30)
+		}
+
 		createServiceInput := &ecs.CreateServiceInput{
 			ServiceName:                   aws.String(ecsServiceName),
 			CapacityProviderStrategy:      nil, // launchtype should be present since this in nil
@@ -818,16 +991,12 @@ func createEcsServiceIfNeeded(parameters map[string]interface{}, ecsClient *ecs.
 			DesiredCount:                  aws.Int32(1),
 			EnableECSManagedTags:          false,
 			EnableExecuteCommand:          false,
-			HealthCheckGracePeriodSeconds: aws.Int32(30),              //use the startPeriod in the task definition health check parameters if this is empty - 30 seconds for now
+			HealthCheckGracePeriodSeconds: healthCheckGracePeriod,     //use the startPeriod in the task definition health check parameters if this is empty - 30 seconds for now
 			LaunchType:                    ecsTypes.LaunchTypeFargate, //use capacity provider for fargate spot
-			LoadBalancers: []ecsTypes.LoadBalancer{{
-				ContainerName:  aws.String(containerName),
-				ContainerPort:  aws.Int32(int32(port)),
-				TargetGroupArn: aws.String(targetGroupArn),
-			}},
-			NetworkConfiguration: networkConfiguration,
-			PropagateTags:        ecsTypes.PropagateTagsTaskDefinition,
-			SchedulingStrategy:   ecsTypes.SchedulingStrategyReplica,
+			LoadBalancers:                 loadBalancers,
+			NetworkConfiguration:          networkConfiguration,
+			PropagateTags:                 ecsTypes.PropagateTagsTaskDefinition,
+			SchedulingStrategy:            ecsTypes.SchedulingStrategyReplica,
 			Tags: []ecsTypes.Tag{
 				{
 					Key:   aws.String("Name"),
@@ -839,6 +1008,17 @@ func createEcsServiceIfNeeded(parameters map[string]interface{}, ecsClient *ecs.
 				},
 			},
 			TaskDefinition: aws.String(taskDefinitionArn),
+			ServiceConnectConfiguration: &ecsTypes.ServiceConnectConfiguration{
+				Enabled:   true,
+				Namespace: aws.String(namespaceName),
+				Services: []ecsTypes.ServiceConnectService{{
+					PortName: aws.String(portMappingName),
+					ClientAliases: []ecsTypes.ServiceConnectClientAlias{{
+						Port:    aws.Int32(int32(port)),
+						DnsName: aws.String(dnsName),
+					}},
+				}},
+			},
 		}
 
 		createServiceOutput, err := ecsClient.CreateService(context.TODO(), createServiceInput)
@@ -870,12 +1050,16 @@ func createEcsServiceIfNeeded(parameters map[string]interface{}, ecsClient *ecs.
 		updateDeploymentsPipeline.Add(updateDeploymentsKey, deployments.UpdateDeploymentDtoV1{
 			ID:            deploymentID,
 			EcsServiceArn: ecsServiceArn,
+			DnsName:       dnsName,
+			NamespaceName: namespaceName,
 		})
 	} else {
 		previewID := deploymentID
 		updatePreviewsPipeline.Add(updatePreviewsKey, previews.UpdatePreviewDtoV1{
 			ID:            previewID,
 			EcsServiceArn: ecsServiceArn,
+			DnsName:       dnsName,
+			NamespaceName: namespaceName,
 		})
 	}
 
