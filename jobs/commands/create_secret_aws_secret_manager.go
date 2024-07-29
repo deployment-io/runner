@@ -21,7 +21,7 @@ type CreateSecretAwsSecretManager struct {
 func (c *CreateSecretAwsSecretManager) Run(parameters map[string]interface{}, logsWriter io.Writer) (newParameters map[string]interface{}, err error) {
 	defer func() {
 		if err != nil {
-			<-MarkBuildDone(parameters, err)
+			<-MarkDeploymentDone(parameters, err)
 		}
 	}()
 	//add iam policy for secret manager

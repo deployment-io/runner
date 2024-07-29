@@ -194,7 +194,7 @@ func stopContainer(containerID string) error {
 func (b *BuildStaticSite) Run(parameters map[string]interface{}, logsWriter io.Writer) (newParameters map[string]interface{}, err error) {
 	defer func() {
 		if err != nil {
-			<-MarkBuildDone(parameters, err)
+			<-MarkDeploymentDone(parameters, err)
 		}
 	}()
 	repoDirectoryPath, err := jobs.GetParameterValue[string](parameters, parameters_enums.RepoDirectoryPath)

@@ -18,7 +18,7 @@ type DeployAwsPrivateService struct {
 func (d *DeployAwsPrivateService) Run(parameters map[string]interface{}, logsWriter io.Writer) (newParameters map[string]interface{}, err error) {
 	defer func() {
 		if err != nil {
-			<-MarkBuildDone(parameters, err)
+			<-MarkDeploymentDone(parameters, err)
 		}
 	}()
 
@@ -30,6 +30,14 @@ func (d *DeployAwsPrivateService) Run(parameters map[string]interface{}, logsWri
 	}
 	err = iam_policies.AddAwsPolicyForDeploymentRunner(iam_policy_enums.AwsWebServiceDeployment,
 		runnerData.OsType.String(), runnerData.CpuArchEnum.String(), organizationID, runnerData.RunnerRegion, runnerData.Mode, runnerData.TargetCloud)
+	if err != nil {
+		return parameters, err
+	}
+	ec2Client, err := cloud_api_clients.GetEC2Client(parameters)
+	if err != nil {
+		return parameters, err
+	}
+	err = addIngressRuleToDefaultVpcSecurityGroupForPortIfNeeded(parameters, ec2Client)
 	if err != nil {
 		return parameters, err
 	}
@@ -77,7 +85,7 @@ func (d *DeployAwsPrivateService) Run(parameters map[string]interface{}, logsWri
 	}
 
 	//mark build done successfully
-	<-MarkBuildDone(parameters, nil)
+	<-MarkDeploymentDone(parameters, nil)
 
 	return parameters, nil
 }

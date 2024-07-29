@@ -224,6 +224,8 @@ func Get(p commands_enums.Type) (jobs.Command, error) {
 		return &DeployAwsWebService{}, nil
 	case commands_enums.DeployAwsPrivateService:
 		return &DeployAwsPrivateService{}, nil
+	case commands_enums.DeployAwsRdsDatabase:
+		return &DeployAwsRdsDatabase{}, nil
 	case commands_enums.CreateAwsVpc:
 		return &CreateDefaultAwsVPC{}, nil
 	case commands_enums.CreateEcsCluster:
@@ -248,6 +250,8 @@ func Get(p commands_enums.Type) (jobs.Command, error) {
 		return &DeleteAwsWebService{}, nil
 	case commands_enums.DeleteAwsPrivateService:
 		return &DeleteAwsPrivateService{}, nil
+	case commands_enums.DeleteAwsRdsDatabase:
+		return &DeleteAwsRdsDatabase{}, nil
 	case commands_enums.ListCloudWatchMetricsAwsEcsWebService:
 		return &ListCloudWatchMetricsAwsEcsWebService{}, nil
 	case commands_enums.CreateSecretAwsSecretManager:
@@ -264,7 +268,7 @@ func isPreview(parameters map[string]interface{}) bool {
 	return p
 }
 
-func MarkBuildDone(parameters map[string]interface{}, err error) <-chan struct{} {
+func MarkDeploymentDone(parameters map[string]interface{}, err error) <-chan struct{} {
 	done := make(chan struct{})
 	go func() {
 		defer func() {
@@ -298,20 +302,9 @@ func MarkBuildDone(parameters map[string]interface{}, err error) <-chan struct{}
 			return
 		}
 
-		buildID, e := jobs.GetParameterValue[string](parameters, parameters_enums.BuildID)
-		if e != nil {
-			//Weird error. Would show up in logs. Return for now.
-			return
-		}
-		updateBuildsPipeline.Add(updateBuildsKey, builds.UpdateBuildDtoV1{
-			ID:           buildID,
-			BuildTs:      nowEpoch,
-			Status:       status,
-			ErrorMessage: errorMessage,
-		})
 		deploymentID, e := jobs.GetParameterValue[string](parameters, parameters_enums.DeploymentID)
 		if e != nil {
-			//Weird error. Would show up in logs. Return for now.
+			//job is not a deployment type
 			return
 		}
 		updateDeploymentsPipeline.Add(updateDeploymentsKey, deployments.UpdateDeploymentDtoV1{
@@ -319,6 +312,18 @@ func MarkBuildDone(parameters map[string]interface{}, err error) <-chan struct{}
 			LastDeploymentTs: nowEpoch,
 			Status:           status,
 			ErrorMessage:     errorMessage,
+		})
+
+		buildID, e := jobs.GetParameterValue[string](parameters, parameters_enums.BuildID)
+		if e != nil {
+			//job is not a build type
+			return
+		}
+		updateBuildsPipeline.Add(updateBuildsKey, builds.UpdateBuildDtoV1{
+			ID:           buildID,
+			BuildTs:      nowEpoch,
+			Status:       status,
+			ErrorMessage: errorMessage,
 		})
 	}()
 	return done

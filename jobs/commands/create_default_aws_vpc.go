@@ -776,123 +776,6 @@ func getDefaultSecurityGroupIdForVpc(parameters map[string]interface{}, ec2Clien
 	return
 }
 
-func getDefaultVpcSecurityGroupIngressRuleNameForPort(parameters map[string]interface{}) (string, error) {
-	//sgin-<port>
-	port, err := jobs.GetParameterValue[int64](parameters, parameters_enums.Port)
-	if err != nil {
-		return "", err
-	}
-	return fmt.Sprintf("sgin-%d", port), nil
-}
-
-func addIngressRuleToDefaultVpcSecurityGroup(parameters map[string]interface{}, ec2Client *ec2.Client, vpcId, vpcCidr string) error {
-	//TODO create new security group
-	defaultSecurityGroupId, err := getDefaultSecurityGroupIdForVpc(parameters, ec2Client, vpcId)
-	if err != nil {
-		return err
-	}
-	defaultVpcSecurityGroupIngressRuleNameForPort, err := getDefaultVpcSecurityGroupIngressRuleNameForPort(parameters)
-	if err != nil {
-		return err
-	}
-
-	describeSecurityGroupRulesOutput, err := ec2Client.DescribeSecurityGroupRules(context.TODO(), &ec2.DescribeSecurityGroupRulesInput{
-		DryRun: aws.Bool(false),
-		Filters: []ec2Types.Filter{
-			{
-				Name: aws.String("tag:Name"),
-				Values: []string{
-					defaultVpcSecurityGroupIngressRuleNameForPort,
-				},
-			},
-			{
-				Name: aws.String("group-id"),
-				Values: []string{
-					defaultSecurityGroupId,
-				},
-			},
-		},
-	})
-
-	if err != nil {
-		return err
-	}
-
-	if len(describeSecurityGroupRulesOutput.SecurityGroupRules) == 0 {
-		port, err := jobs.GetParameterValue[int64](parameters, parameters_enums.Port)
-		if err != nil {
-			return err
-		}
-		authorizeSecurityGroupIngressInput := &ec2.AuthorizeSecurityGroupIngressInput{
-			CidrIp:     aws.String(vpcCidr),
-			DryRun:     aws.Bool(false),
-			FromPort:   aws.Int32(int32(port)),
-			GroupId:    aws.String(defaultSecurityGroupId),
-			IpProtocol: aws.String("tcp"),
-			TagSpecifications: []ec2Types.TagSpecification{{
-				ResourceType: ec2Types.ResourceTypeSecurityGroupRule,
-				Tags: []ec2Types.Tag{
-					{
-						Key:   aws.String("Name"),
-						Value: aws.String(defaultVpcSecurityGroupIngressRuleNameForPort),
-					},
-					{
-						Key:   aws.String("created by"),
-						Value: aws.String("deployment.io"),
-					},
-					{
-						Key:   aws.String("vpc-default-security-group-id"),
-						Value: aws.String(defaultSecurityGroupId),
-					},
-				},
-			}},
-			ToPort: aws.Int32(int32(port)),
-		}
-		_, err = ec2Client.AuthorizeSecurityGroupIngress(context.TODO(), authorizeSecurityGroupIngressInput)
-		if err != nil {
-			return err
-		}
-
-		describeSecurityGroupRulesOutput, err = ec2Client.DescribeSecurityGroupRules(context.TODO(), &ec2.DescribeSecurityGroupRulesInput{
-			DryRun: aws.Bool(false),
-			Filters: []ec2Types.Filter{
-				{
-					Name: aws.String("group-id"),
-					Values: []string{
-						defaultSecurityGroupId,
-					},
-				},
-			},
-		})
-
-		if err != nil {
-			return err
-		}
-
-		var ingressRules []vpcs.DefaultSecurityIngressRuleDtoV1
-		for _, securityGroupRule := range describeSecurityGroupRulesOutput.SecurityGroupRules {
-			if !*securityGroupRule.IsEgress {
-				ingressRules = append(ingressRules, vpcs.DefaultSecurityIngressRuleDtoV1{
-					ID: aws.ToString(securityGroupRule.SecurityGroupRuleId),
-				})
-			}
-		}
-
-		region, err := jobs.GetParameterValue[int64](parameters, parameters_enums.Region)
-		if err != nil {
-			return err
-		}
-
-		upsertVpcsPipeline.Add(upsertVpcKey, vpcs.UpsertVpcDtoV1{
-			Type:                        vpc_enums.AwsVpc,
-			Region:                      region_enums.Type(region),
-			DefaultSecurityIngressRules: ingressRules,
-			DefaultSecurityGroupId:      defaultSecurityGroupId,
-		})
-	}
-	return nil
-}
-
 type routeTableInfo struct {
 	routeTableId string
 	isPrivate    bool
@@ -902,7 +785,7 @@ type routeTableInfo struct {
 func (c *CreateDefaultAwsVPC) Run(parameters map[string]interface{}, logsWriter io.Writer) (newParameters map[string]interface{}, err error) {
 	defer func() {
 		if err != nil {
-			<-MarkBuildDone(parameters, err)
+			<-MarkDeploymentDone(parameters, err)
 		}
 	}()
 	//try creating subnets for each of these cidr blocks
@@ -925,10 +808,10 @@ func (c *CreateDefaultAwsVPC) Run(parameters map[string]interface{}, logsWriter 
 
 		io.WriteString(logsWriter, fmt.Sprintf("Created VPC - %s\n", vpcId))
 
-		err = addIngressRuleToDefaultVpcSecurityGroup(parameters, ec2Client, vpcId, cidrBlock)
-		if err != nil {
-			return parameters, err
-		}
+		//err = addIngressRuleToDefaultVpcSecurityGroupForPortIfNeeded(parameters, ec2Client, vpcId, cidrBlock)
+		//if err != nil {
+		//	return parameters, err
+		//}
 		var internetGatewayId string
 		internetGatewayId, err = createAndAttachInternetGatewayIfNeeded(parameters, ec2Client, vpcId)
 		if err != nil {
