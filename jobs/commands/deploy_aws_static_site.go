@@ -412,7 +412,7 @@ func attachPolicyToS3Bucket(distributionArn *string, s3BucketName, policySid, po
 func (d *DeployAwsStaticSite) Run(parameters map[string]interface{}, logsWriter io.Writer) (newParameters map[string]interface{}, err error) {
 	defer func() {
 		if err != nil {
-			<-MarkBuildDone(parameters, err)
+			<-MarkDeploymentDone(parameters, err)
 		}
 	}()
 
@@ -704,7 +704,7 @@ func (d *DeployAwsStaticSite) Run(parameters map[string]interface{}, logsWriter 
 	}
 
 	//mark build done successfully
-	<-MarkBuildDone(parameters, nil)
+	<-MarkDeploymentDone(parameters, nil)
 
 	return parameters, nil
 }

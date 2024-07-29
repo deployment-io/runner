@@ -74,7 +74,7 @@ func executeJobs(jobsStream <-chan jobs.PendingJobDtoV1, noOfWorkers int, mode r
 								Ts:      time.Now().Unix(),
 							})
 							//if job is a build type it will be marked done
-							<-commands.MarkBuildDone(parameters, err)
+							<-commands.MarkDeploymentDone(parameters, err)
 							return
 						}
 						logsWriter, err := loggers.GetJobLogsWriter(pendingJob.JobID, logger, mode)
@@ -94,8 +94,8 @@ func executeJobs(jobsStream <-chan jobs.PendingJobDtoV1, noOfWorkers int, mode r
 								handleLogEnd(errStoppedByUser, pendingJob.JobID, logsWriter)
 								result := getJobResult(pendingJob, errStoppedByUser.Error())
 								resultsStream <- result
-								//if job is a build type it will be marked done
-								<-commands.MarkBuildDone(parameters, errStoppedByUser)
+								//if job is a deployment/build/preview type, this will be marked them done
+								<-commands.MarkDeploymentDone(parameters, errStoppedByUser)
 								return
 							default:
 								command, err := commands.Get(commandEnum)

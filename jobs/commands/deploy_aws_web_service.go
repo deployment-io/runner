@@ -20,9 +20,11 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/enums/os_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/region_enums"
+	"github.com/deployment-io/deployment-runner-kit/enums/vpc_enums"
 	"github.com/deployment-io/deployment-runner-kit/iam_policies"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner-kit/previews"
+	"github.com/deployment-io/deployment-runner-kit/vpcs"
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
 	"github.com/deployment-io/deployment-runner/utils"
 	"go.mongodb.org/mongo-driver/bson/primitive"
@@ -72,6 +74,131 @@ func getIngressIpPermissionFromInternetToPort(port int64) ec2Types.IpPermission 
 		}},
 		ToPort: aws.Int32(int32(port)),
 	}
+}
+
+func getDefaultVpcSecurityGroupIngressRuleNameForPort(parameters map[string]interface{}) (string, error) {
+	//sgin-<port>
+	port, err := jobs.GetParameterValue[int64](parameters, parameters_enums.Port)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("sgin-%d", port), nil
+}
+
+func addIngressRuleToDefaultVpcSecurityGroupForPortIfNeeded(parameters map[string]interface{}, ec2Client *ec2.Client) error {
+	vpcId, err := jobs.GetParameterValue[string](parameters, parameters_enums.VpcID)
+	if err != nil {
+		return err
+	}
+	vpcCidr, err := jobs.GetParameterValue[string](parameters, parameters_enums.VpcCidr)
+	if err != nil {
+		return err
+	}
+
+	defaultSecurityGroupId, err := getDefaultSecurityGroupIdForVpc(parameters, ec2Client, vpcId)
+	if err != nil {
+		return err
+	}
+	defaultVpcSecurityGroupIngressRuleNameForPort, err := getDefaultVpcSecurityGroupIngressRuleNameForPort(parameters)
+	if err != nil {
+		return err
+	}
+
+	describeSecurityGroupRulesOutput, err := ec2Client.DescribeSecurityGroupRules(context.TODO(), &ec2.DescribeSecurityGroupRulesInput{
+		DryRun: aws.Bool(false),
+		Filters: []ec2Types.Filter{
+			{
+				Name: aws.String("tag:Name"),
+				Values: []string{
+					defaultVpcSecurityGroupIngressRuleNameForPort,
+				},
+			},
+			{
+				Name: aws.String("group-id"),
+				Values: []string{
+					defaultSecurityGroupId,
+				},
+			},
+		},
+	})
+
+	if err != nil {
+		return err
+	}
+
+	if len(describeSecurityGroupRulesOutput.SecurityGroupRules) == 0 {
+		port, err := jobs.GetParameterValue[int64](parameters, parameters_enums.Port)
+		if err != nil {
+			return err
+		}
+		authorizeSecurityGroupIngressInput := &ec2.AuthorizeSecurityGroupIngressInput{
+			CidrIp:     aws.String(vpcCidr),
+			DryRun:     aws.Bool(false),
+			FromPort:   aws.Int32(int32(port)),
+			GroupId:    aws.String(defaultSecurityGroupId),
+			IpProtocol: aws.String("tcp"),
+			TagSpecifications: []ec2Types.TagSpecification{{
+				ResourceType: ec2Types.ResourceTypeSecurityGroupRule,
+				Tags: []ec2Types.Tag{
+					{
+						Key:   aws.String("Name"),
+						Value: aws.String(defaultVpcSecurityGroupIngressRuleNameForPort),
+					},
+					{
+						Key:   aws.String("created by"),
+						Value: aws.String("deployment.io"),
+					},
+					{
+						Key:   aws.String("vpc-default-security-group-id"),
+						Value: aws.String(defaultSecurityGroupId),
+					},
+				},
+			}},
+			ToPort: aws.Int32(int32(port)),
+		}
+		_, err = ec2Client.AuthorizeSecurityGroupIngress(context.TODO(), authorizeSecurityGroupIngressInput)
+		if err != nil {
+			return err
+		}
+
+		describeSecurityGroupRulesOutput, err = ec2Client.DescribeSecurityGroupRules(context.TODO(), &ec2.DescribeSecurityGroupRulesInput{
+			DryRun: aws.Bool(false),
+			Filters: []ec2Types.Filter{
+				{
+					Name: aws.String("group-id"),
+					Values: []string{
+						defaultSecurityGroupId,
+					},
+				},
+			},
+		})
+
+		if err != nil {
+			return err
+		}
+
+		var ingressRules []vpcs.DefaultSecurityIngressRuleDtoV1
+		for _, securityGroupRule := range describeSecurityGroupRulesOutput.SecurityGroupRules {
+			if !*securityGroupRule.IsEgress {
+				ingressRules = append(ingressRules, vpcs.DefaultSecurityIngressRuleDtoV1{
+					ID: aws.ToString(securityGroupRule.SecurityGroupRuleId),
+				})
+			}
+		}
+
+		region, err := jobs.GetParameterValue[int64](parameters, parameters_enums.Region)
+		if err != nil {
+			return err
+		}
+
+		upsertVpcsPipeline.Add(upsertVpcKey, vpcs.UpsertVpcDtoV1{
+			Type:                        vpc_enums.AwsVpc,
+			Region:                      region_enums.Type(region),
+			DefaultSecurityIngressRules: ingressRules,
+			DefaultSecurityGroupId:      defaultSecurityGroupId,
+		})
+	}
+	return nil
 }
 
 func createAlbSecurityGroupIfNeeded(parameters map[string]interface{}, ec2Client *ec2.Client) (albSecurityGroupId string, err error) {
@@ -1119,7 +1246,7 @@ func updateEcsService(parameters map[string]interface{}, ecsClient *ecs.Client, 
 func (d *DeployAwsWebService) Run(parameters map[string]interface{}, logsWriter io.Writer) (newParameters map[string]interface{}, err error) {
 	defer func() {
 		if err != nil {
-			<-MarkBuildDone(parameters, err)
+			<-MarkDeploymentDone(parameters, err)
 		}
 	}()
 
@@ -1136,6 +1263,10 @@ func (d *DeployAwsWebService) Run(parameters map[string]interface{}, logsWriter 
 	}
 
 	ec2Client, err := cloud_api_clients.GetEC2Client(parameters)
+	if err != nil {
+		return parameters, err
+	}
+	err = addIngressRuleToDefaultVpcSecurityGroupForPortIfNeeded(parameters, ec2Client)
 	if err != nil {
 		return parameters, err
 	}
@@ -1195,7 +1326,7 @@ func (d *DeployAwsWebService) Run(parameters map[string]interface{}, logsWriter 
 	}
 
 	//mark build done successfully
-	<-MarkBuildDone(parameters, nil)
+	<-MarkDeploymentDone(parameters, nil)
 
 	return parameters, nil
 }
