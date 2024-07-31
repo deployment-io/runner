@@ -2,6 +2,7 @@ package common
 
 import (
 	"fmt"
+	goConcurrentPipeline "github.com/ankit-arora/go-utils/go-concurrent-pipeline"
 	goPipeline "github.com/ankit-arora/go-utils/go-concurrent-pipeline/go-pipeline"
 	goShutdownHook "github.com/ankit-arora/go-utils/go-shutdown-hook"
 	"github.com/deployment-io/deployment-runner-kit/enums/cpu_architecture_enums"
@@ -220,11 +221,13 @@ func GetAndRunJobs(c *client.RunnerClient, mode runner_enums.Mode) {
 			}
 		}
 	})
-	goShutdownHook.ADD(func() {
-		//fmt.Println("waiting for jobs done pipeline shutdown")
-		jobsDonePipeline.Shutdown()
-		//fmt.Println("waiting for jobs done pipeline shutdown -- done")
-	})
+	executePendingJobsConcurrentPipeline, _ := goConcurrentPipeline.NewConcurrentPipeline(3, 20,
+		1*time.Second, func(s string, pendingJobs []jobs.PendingJobDtoV1) {
+			jobsStream := allocateJobs(pendingJobs)
+			resultsStream := executeJobs(jobsStream, 5, mode, c)
+			<-sendJobResults(resultsStream, 5, jobsDonePipeline)
+		})
+
 	printPendingJobsMessage := true
 	for !shutdown {
 		select {
@@ -242,17 +245,17 @@ func GetAndRunJobs(c *client.RunnerClient, mode runner_enums.Mode) {
 					continue
 				}
 			} else {
-				jobsStream := allocateJobs(pendingJobs)
-				resultsStream := executeJobs(jobsStream, 5, mode, c)
-				<-sendJobResults(resultsStream, 5, jobsDonePipeline)
-				printPendingJobsMessage = true
+				for _, pendingJob := range pendingJobs {
+					executePendingJobsConcurrentPipeline.Add("executeJob", pendingJob)
+				}
 			}
 			time.Sleep(10 * time.Second)
 		}
 	}
-	//log.Println("waiting for pending jobs to complete......")
+	executePendingJobsConcurrentPipeline.Shutdown()
 	commands.Shutdown()
 	loggers.Shutdown()
+	jobsDonePipeline.Shutdown()
 	goShutdownHook.Wait()
 	log.Println("No pending deployment jobs left - exiting now.")
 }
