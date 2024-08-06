@@ -1,8 +1,10 @@
 package commands
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	md "github.com/ankit-arora/markdown"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatch"
 	cloudwatch_types "github.com/aws/aws-sdk-go-v2/service/cloudwatch/types"
@@ -120,14 +122,25 @@ func (l *ListCloudWatchMetricsAwsEcsWebService) Run(parameters map[string]interf
 
 	if shouldSendChatOutput {
 		//send the results back
-		jobID, err := jobs.GetParameterValue[string](parameters, parameters_enums.JobID)
+		var jobID string
+		jobID, err = jobs.GetParameterValue[string](parameters, parameters_enums.JobID)
 		if err != nil {
 			return parameters, err
 		}
+		buf := new(bytes.Buffer)
+		err = md.NewMarkdown(buf).Table(md.TableSet{
+			Header: []string{"Cpu", "Memory"},
+			Rows: [][]string{
+				{fmt.Sprintf("%f%%", latestCpuValue), fmt.Sprintf("%f%%", latestMemoryValue)},
+			},
+		}).Build()
+		if err != nil {
+			return parameters, err
+		}
+
 		updateJobOutputPipeline.Add(updateJobOutputsKey, jobs.UpdateJobOutputDtoV1{
-			ID: jobID,
-			Output: fmt.Sprintf("Cpu utilization from Cloudwatch: %f%% at %s\n"+
-				"Memory utilization from Cloudwatch: %f%% at %s\n", latestCpuValue, latestCpuTimestamp, latestMemoryValue, latestMemoryTimestamp),
+			ID:     jobID,
+			Output: buf.String(),
 		})
 	}
 

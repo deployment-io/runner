@@ -193,7 +193,7 @@ func Init() {
 		//sendNotificationPipeline.Shutdown()
 		//fmt.Println("waiting for notifications send pipeline shutdown -- done")
 	})
-	updateJobOutputPipeline, _ = goPipeline.NewPipeline(5, 10*time.Second,
+	updateJobOutputPipeline, _ = goPipeline.NewPipeline(5, 1*time.Second,
 		func(job string, jobOutputs []jobs.UpdateJobOutputDtoV1) {
 			e := true
 			for e {
