@@ -46,7 +46,7 @@ func (d *DeleteAwsWebService) Run(parameters map[string]interface{}, logsWriter 
 	err = inactiveWaiter.Wait(context.TODO(), &ecs.DescribeServicesInput{
 		Services: []string{ecsServiceName},
 		Cluster:  aws.String(clusterArn),
-	}, 10*time.Minute)
+	}, 20*time.Minute)
 	if err != nil {
 		return parameters, err
 	}
@@ -127,7 +127,7 @@ func (d *DeleteAwsWebService) Run(parameters map[string]interface{}, logsWriter 
 		LoadBalancerArns: []string{
 			loadBalancerArn,
 		},
-	}, 10*time.Minute)
+	}, 20*time.Minute)
 	if err != nil {
 		return parameters, err
 	}

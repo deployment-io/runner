@@ -90,7 +90,7 @@ func waitTillRdsAvailable(rdsClient *rds.Client, rdsDatabaseArn, rdsInstanceIden
 
 	io.WriteString(logsWriter, fmt.Sprintf("Waiting for RDS database to be available: %s\n", rdsDatabaseArn))
 
-	maxWaitDuration := time.Minute * 10
+	maxWaitDuration := time.Minute * 20
 
 	if useMultiAZ {
 		maxWaitDuration = time.Minute * 30

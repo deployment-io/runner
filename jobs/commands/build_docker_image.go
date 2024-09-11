@@ -63,7 +63,7 @@ func printBodyToLog(rd io.Reader, logsWriter io.Writer) error {
 }
 
 func imageBuild(parameters map[string]interface{}, dockerClient *client.Client, repoDir, dockerImageNameAndTag, dockerFile string, logsWriter io.Writer) error {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*500)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*1800)
 	defer cancel()
 	tar, err := archive.TarWithOptions(repoDir, &archive.TarOptions{
 		ExcludePatterns: []string{},
