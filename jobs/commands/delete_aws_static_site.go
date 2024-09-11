@@ -54,7 +54,7 @@ func (d *DeleteAwsStaticSite) Run(parameters map[string]interface{}, logsWriter 
 		return parameters, err
 	}
 	waiter := cloudfront.NewDistributionDeployedWaiter(cloudfrontClient)
-	err = waiter.Wait(context.TODO(), &cloudfront.GetDistributionInput{Id: aws.String(cloudfrontDistributionId)}, 10*time.Minute)
+	err = waiter.Wait(context.TODO(), &cloudfront.GetDistributionInput{Id: aws.String(cloudfrontDistributionId)}, 20*time.Minute)
 	if err != nil {
 		return parameters, err
 	}

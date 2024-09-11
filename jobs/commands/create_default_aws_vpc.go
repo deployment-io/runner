@@ -250,7 +250,7 @@ func createVpcIfNeeded(parameters map[string]interface{}, ec2Client *ec2.Client,
 		err = newVpcAvailableWaiter.Wait(context.TODO(), &ec2.DescribeVpcsInput{
 			DryRun: aws.Bool(false),
 			VpcIds: []string{vpcId},
-		}, 10*time.Minute)
+		}, 20*time.Minute)
 		if err != nil {
 			return "", err
 		}
@@ -428,7 +428,7 @@ func createSubnetIfNeeded(parameters map[string]interface{}, ec2Client *ec2.Clie
 			SubnetIds: []string{
 				subnetId,
 			},
-		}, 10*time.Minute)
+		}, 20*time.Minute)
 		if err != nil {
 			return "", false, err
 		}
@@ -582,7 +582,7 @@ func waitForNatGatewayAvailability(ec2Client *ec2.Client, natGatewayId string) e
 	}
 
 	waiter := ec2.NewNatGatewayAvailableWaiter(ec2Client)
-	err := waiter.Wait(context.TODO(), describeNatGatewaysInput, time.Minute*10)
+	err := waiter.Wait(context.TODO(), describeNatGatewaysInput, time.Minute*20)
 
 	if err != nil {
 		return err

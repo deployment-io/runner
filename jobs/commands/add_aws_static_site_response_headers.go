@@ -291,7 +291,7 @@ func invalidateCloudfrontDistribution(parameters map[string]interface{}, cloudfr
 	err = invalidationWaiter.Wait(context.TODO(), &cloudfront.GetInvalidationInput{
 		DistributionId: aws.String(cloudfrontDistributionId),
 		Id:             createInvalidationOutput.Invalidation.Id,
-	}, 10*time.Minute)
+	}, 20*time.Minute)
 
 	if err != nil {
 		return err

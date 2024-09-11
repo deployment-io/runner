@@ -72,7 +72,7 @@ func (v *VerifyAcmCertificate) Run(parameters map[string]interface{}, logsWriter
 	io.WriteString(logsWriter, fmt.Sprintf("Waiting for certificate to be validated.....Please wait.\n"))
 	newCertificateValidatedWaiter := acm.NewCertificateValidatedWaiter(acmClient)
 	err = newCertificateValidatedWaiter.Wait(context.TODO(), &acm.DescribeCertificateInput{CertificateArn: aws.String(certificateArn)},
-		10*time.Minute)
+		20*time.Minute)
 	if err != nil {
 		return parameters, err
 	}

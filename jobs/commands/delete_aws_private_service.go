@@ -44,7 +44,7 @@ func (d *DeleteAwsPrivateService) Run(parameters map[string]interface{}, logsWri
 	err = inactiveWaiter.Wait(context.TODO(), &ecs.DescribeServicesInput{
 		Services: []string{ecsServiceName},
 		Cluster:  aws.String(clusterArn),
-	}, 10*time.Minute)
+	}, 20*time.Minute)
 	if err != nil {
 		return parameters, err
 	}
