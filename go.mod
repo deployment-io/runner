@@ -25,7 +25,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/servicediscovery v1.31.1
 	github.com/aws/aws-sdk-go-v2/service/sts v1.28.6
 	github.com/aws/smithy-go v1.20.3
-	github.com/deployment-io/deployment-runner-kit v0.0.0-20240909084135-c7cddd25c542
+	github.com/deployment-io/deployment-runner-kit v0.0.0-20240920115237-07a80df708fa
 	github.com/docker/docker v27.3.0+incompatible
 	github.com/joho/godotenv v1.5.1
 	github.com/moby/moby v27.3.0+incompatible
