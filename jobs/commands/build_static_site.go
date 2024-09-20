@@ -5,10 +5,10 @@ import (
 	"fmt"
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
-	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/mount"
-	"github.com/docker/docker/client"
+	"github.com/moby/moby/client"
 	"io"
 	"os"
 	"os/exec"
@@ -80,7 +80,7 @@ func execCommand(containerID, repoDir string, command []string, env []string, lo
 	}
 	defer cli.Close()
 
-	config := types.ExecConfig{
+	config := container.ExecOptions{
 		AttachStderr: true,
 		AttachStdout: true,
 		WorkingDir:   repoDir,
@@ -96,7 +96,7 @@ func execCommand(containerID, repoDir string, command []string, env []string, lo
 	execID := idResponse.ID
 
 	resp, err := cli.ContainerExecAttach(ctx, execID,
-		types.ExecStartCheck{
+		container.ExecAttachOptions{
 			Detach: false,
 			Tty:    false,
 		},
@@ -129,7 +129,7 @@ func pullDockerImageForBuilding(imageID string) error {
 	}
 	defer cli.Close()
 
-	reader, err := cli.ImagePull(ctx, fmt.Sprintf("docker.io/library/%s", imageID), types.ImagePullOptions{})
+	reader, err := cli.ImagePull(ctx, fmt.Sprintf("docker.io/library/%s", imageID), image.PullOptions{})
 	if err != nil {
 		return err
 	}
@@ -167,7 +167,7 @@ func startBuildContainer(imageId, repoDir string) (string, error) {
 		return "", err
 	}
 
-	if err = cli.ContainerStart(ctx, resp.ID, types.ContainerStartOptions{}); err != nil {
+	if err = cli.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
 		return "", err
 	}
 
