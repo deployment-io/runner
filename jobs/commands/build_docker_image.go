@@ -10,8 +10,8 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
 	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/client"
-	"github.com/docker/docker/pkg/archive"
+	"github.com/moby/moby/client"
+	"github.com/moby/moby/pkg/archive"
 	"io"
 	"strings"
 	"time"
@@ -114,8 +114,10 @@ func (b *BuildDockerImage) Run(parameters map[string]interface{}, logsWriter io.
 		return parameters, err
 	}
 
-	//TODO support for only Dockerfile for now
-	dockerFile := "Dockerfile"
+	dockerFile, _ := jobs.GetParameterValue[string](parameters, parameters_enums.DockerFilePath)
+	if len(dockerFile) == 0 {
+		dockerFile = "Dockerfile"
+	}
 	var dockerImageNameAndTag string
 	dockerImageNameAndTag, err = getDockerImageNameAndTag(parameters)
 	if err != nil {
