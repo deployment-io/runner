@@ -16,9 +16,9 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner-kit/previews"
 	"github.com/deployment-io/deployment-runner/utils"
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/registry"
-	"github.com/docker/docker/client"
+	"github.com/docker/docker/api/types/image"
+	"github.com/moby/moby/api/types/registry"
+	"github.com/moby/moby/client"
 	"io"
 	"strings"
 )
@@ -169,7 +169,7 @@ func pushDockerImageToEcr(parameters map[string]interface{}, ecrClient *ecr.Clie
 	}
 	authStr := base64.URLEncoding.EncodeToString(encodedJSON)
 
-	push, err := cli.ImagePush(context.TODO(), ecrRepositoryUriWithTag, types.ImagePushOptions{
+	push, err := cli.ImagePush(context.TODO(), ecrRepositoryUriWithTag, image.PushOptions{
 		RegistryAuth: authStr,
 	})
 
