@@ -1,13 +1,12 @@
 module github.com/deployment-io/deployment-runner
 
-go 1.21
-
-toolchain go1.22.0
+go 1.22.2
 
 require (
 	github.com/ankit-arora/go-utils v0.0.0-20230703175629-90641e500c7c
 	github.com/ankit-arora/ipnets v0.0.0-20230525113803-5d737bfe484b
 	github.com/ankit-arora/markdown v0.0.0-20240801070227-28eff2aa6649
+	github.com/ankit-arora/nixpacks-go v0.0.0-20240923060527-923cca404da2
 	github.com/aws/aws-sdk-go-v2 v1.30.3
 	github.com/aws/aws-sdk-go-v2/config v1.27.11
 	github.com/aws/aws-sdk-go-v2/service/acm v1.25.4
@@ -25,7 +24,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/servicediscovery v1.31.1
 	github.com/aws/aws-sdk-go-v2/service/sts v1.28.6
 	github.com/aws/smithy-go v1.20.3
-	github.com/deployment-io/deployment-runner-kit v0.0.0-20240921120041-527d1db2fdc1
+	github.com/deployment-io/deployment-runner-kit v0.0.0-20240923144746-74d40cea67a9
 	github.com/docker/docker v27.3.0+incompatible
 	github.com/joho/godotenv v1.5.1
 	github.com/moby/moby v27.3.0+incompatible
@@ -89,15 +88,16 @@ require (
 	go.opentelemetry.io/otel/metric v1.24.0 // indirect
 	go.opentelemetry.io/otel/sdk v1.19.0 // indirect
 	go.opentelemetry.io/otel/trace v1.24.0 // indirect
-	golang.org/x/crypto v0.21.0 // indirect
+	golang.org/x/crypto v0.23.0 // indirect
 	golang.org/x/mod v0.8.0 // indirect
-	golang.org/x/net v0.22.0 // indirect
-	golang.org/x/sync v0.3.0 // indirect
-	golang.org/x/sys v0.18.0 // indirect
+	golang.org/x/net v0.25.0 // indirect
+	golang.org/x/sync v0.7.0 // indirect
+	golang.org/x/sys v0.20.0 // indirect
 	golang.org/x/time v0.5.0 // indirect
 	golang.org/x/tools v0.6.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20230731190214-cbb8c96f2d6d // indirect
 	google.golang.org/grpc v1.58.3 // indirect
+	google.golang.org/protobuf v1.34.1 // indirect
 	gopkg.in/check.v1 v1.0.0-20201130134442-10cb98267c6c // indirect
 	gopkg.in/src-d/go-billy.v4 v4.3.2 // indirect
 	gopkg.in/warnings.v0 v0.1.2 // indirect
