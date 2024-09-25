@@ -68,28 +68,29 @@ func (b *BuildNixPacksImage) Run(parameters map[string]interface{}, logsWriter i
 		return parameters, fmt.Errorf("failed to login to nixpacks builder")
 	}
 
-	buildCommand, err := jobs.GetParameterValue[string](parameters, parameters_enums.BuildCommand)
-	if err != nil {
-		return parameters, err
-	}
+	buildCommand, _ := jobs.GetParameterValue[string](parameters, parameters_enums.BuildCommand)
 
-	startCommand, err := jobs.GetParameterValue[string](parameters, parameters_enums.StartCommand)
-	if err != nil {
-		return parameters, err
-	}
+	startCommand, _ := jobs.GetParameterValue[string](parameters, parameters_enums.StartCommand)
 
 	n, err := nixpacks.NewNixpacks()
 	if err != nil {
 		return parameters, err
 	}
 
-	cmd, err := n.Build(context.Background(), nixpacks.BuildOptions{
-		Path:         repoDirectoryPath,
-		Name:         dockerImageNameAndTag,
-		BuildCommand: buildCommand,
-		StartCommand: startCommand,
-		LogsWriter:   logsWriter,
-	})
+	buildOptions := nixpacks.BuildOptions{
+		Path:       repoDirectoryPath,
+		Name:       dockerImageNameAndTag,
+		LogsWriter: logsWriter,
+	}
+
+	if len(startCommand) > 0 {
+		buildOptions.StartCommand = startCommand
+	}
+	if len(buildCommand) > 0 {
+		buildOptions.BuildCommand = buildCommand
+	}
+
+	cmd, err := n.Build(context.Background(), buildOptions)
 	if err != nil {
 		return parameters, err
 	}
