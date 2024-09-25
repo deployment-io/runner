@@ -6,7 +6,7 @@ require (
 	github.com/ankit-arora/go-utils v0.0.0-20230703175629-90641e500c7c
 	github.com/ankit-arora/ipnets v0.0.0-20230525113803-5d737bfe484b
 	github.com/ankit-arora/markdown v0.0.0-20240801070227-28eff2aa6649
-	github.com/ankit-arora/nixpacks-go v0.0.0-20240923060527-923cca404da2
+	github.com/ankit-arora/nixpacks-go v0.0.0-20240925063829-e4f7ef9412db
 	github.com/aws/aws-sdk-go-v2 v1.30.3
 	github.com/aws/aws-sdk-go-v2/config v1.27.11
 	github.com/aws/aws-sdk-go-v2/service/acm v1.25.4

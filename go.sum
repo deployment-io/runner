@@ -13,8 +13,8 @@ github.com/ankit-arora/ipnets v0.0.0-20230525113803-5d737bfe484b h1:dzDzU00XC3U3
 github.com/ankit-arora/ipnets v0.0.0-20230525113803-5d737bfe484b/go.mod h1:F1MZruFLgjQPlziMNCy10PWWItD/cPuoD9sCHNsz3Cg=
 github.com/ankit-arora/markdown v0.0.0-20240801070227-28eff2aa6649 h1:ZFXCrDrD1KpoJvokudBD12jzVcj3o+Th8KUoFXYQS90=
 github.com/ankit-arora/markdown v0.0.0-20240801070227-28eff2aa6649/go.mod h1:4kBvz8n0wtKcG2YNAEqBAWye7wYeVO+r0KJ74ht6R4Q=
-github.com/ankit-arora/nixpacks-go v0.0.0-20240923060527-923cca404da2 h1:OHzVwOkXIP2x6Cy+HHNaFfCsfhrNQkdZXdTDTmw5e6A=
-github.com/ankit-arora/nixpacks-go v0.0.0-20240923060527-923cca404da2/go.mod h1:A0gyc97+ynO2PfITJTFQDVpf+IbuORUgpiczx0gpXUs=
+github.com/ankit-arora/nixpacks-go v0.0.0-20240925063829-e4f7ef9412db h1:w90J4fp+tMZjZ3Abmvf2s9vll7riJOAbLL9uA2rHdJ8=
+github.com/ankit-arora/nixpacks-go v0.0.0-20240925063829-e4f7ef9412db/go.mod h1:A0gyc97+ynO2PfITJTFQDVpf+IbuORUgpiczx0gpXUs=
 github.com/anmitsu/go-shlex v0.0.0-20161002113705-648efa622239 h1:kFOfPq6dUM1hTo4JG6LR5AXSUEsOjtdm0kw0FtQtMJA=
 github.com/anmitsu/go-shlex v0.0.0-20161002113705-648efa622239/go.mod h1:2FmKhYUyUczH0OGQWaF5ceTx0UBShxjsH6f8oGKYe2c=
 github.com/armon/go-socks5 v0.0.0-20160902184237-e75332964ef5 h1:0CwZNZbxp69SHPdPJAN/hZIm0C4OItdklCFmMRWYpio=

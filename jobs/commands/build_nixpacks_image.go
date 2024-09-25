@@ -88,12 +88,13 @@ func (b *BuildNixPacksImage) Run(parameters map[string]interface{}, logsWriter i
 		Name:         dockerImageNameAndTag,
 		BuildCommand: buildCommand,
 		StartCommand: startCommand,
+		LogsWriter:   logsWriter,
 	})
 	if err != nil {
 		return parameters, err
 	}
 
-	out, err := cmd.Result()
+	err = cmd.ResultAsync()
 	if err != nil {
 		return parameters, err
 	}
@@ -105,9 +106,9 @@ func (b *BuildNixPacksImage) Run(parameters map[string]interface{}, logsWriter i
 	//fmt.Println("start:", out.Start)
 	//fmt.Println("buildError:", out.BuildError)
 
-	if len(out.BuildError) > 0 {
-		return parameters, fmt.Errorf(out.BuildError)
-	}
+	//if len(out.BuildError) > 0 {
+	//	return parameters, fmt.Errorf(out.BuildError)
+	//}
 
 	return parameters, nil
 }
