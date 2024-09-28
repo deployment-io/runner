@@ -220,6 +220,8 @@ func Get(p commands_enums.Type) (jobs.Command, error) {
 		return &DeployAwsStaticSite{}, nil
 	case commands_enums.BuildDockerImage:
 		return &BuildDockerImage{}, nil
+	case commands_enums.BuildNixPacksImage:
+		return &BuildNixPacksImage{}, nil
 	case commands_enums.DeployAwsWebService:
 		return &DeployAwsWebService{}, nil
 	case commands_enums.DeployAwsPrivateService:
