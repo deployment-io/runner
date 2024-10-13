@@ -5,12 +5,12 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/vpcs"
 )
 
-func (r *RunnerClient) UpsertVpcs(upsertVpcs []vpcs.UpsertVpcDtoV1) error {
+func (r *RunnerClient) UpsertVpcs(upsertVpcs []vpcs.UpsertVpcDtoV1, organizationID string) error {
 	if !r.isConnected {
 		return ErrConnection
 	}
 	args := vpcs.UpsertVpcsArgsV2{}
-	args.OrganizationID = r.GetComputedOrganizationID()
+	args.OrganizationID = r.GetComputedOrganizationID(organizationID)
 	args.Token = r.token
 	args.CloudAccountID = r.cloudAccountID
 	args.Vpcs = upsertVpcs

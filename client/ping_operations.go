@@ -6,20 +6,20 @@ import (
 	"runtime"
 )
 
-func (r *RunnerClient) GetComputedOrganizationID() string {
+func (r *RunnerClient) GetComputedOrganizationID(organizationID string) string {
 	if len(r.userID) > 0 {
 		return fmt.Sprintf("du_%s", r.userID)
 	} else {
-		return r.organizationID
+		return organizationID
 	}
 }
 
-func (r *RunnerClient) Ping(firstPing bool) error {
+func (r *RunnerClient) Ping(firstPing bool, organizationID string) error {
 	args := ping.ArgsV2{}
 	args.Send = "ping"
 	args.FirstPing = firstPing
 	args.GoArch = runtime.GOARCH
-	args.OrganizationID = r.GetComputedOrganizationID()
+	args.OrganizationID = r.GetComputedOrganizationID(organizationID)
 	args.Token = r.token
 	args.GoOS = runtime.GOOS
 	args.RunnerRegion = r.runnerRegion

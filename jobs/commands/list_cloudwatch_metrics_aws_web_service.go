@@ -137,8 +137,12 @@ func (l *ListCloudWatchMetricsAwsEcsWebService) Run(parameters map[string]interf
 		if err != nil {
 			return parameters, err
 		}
-
-		updateJobOutputPipeline.Add(updateJobOutputsKey, jobs.UpdateJobOutputDtoV1{
+		var organizationIdFromJob string
+		organizationIdFromJob, err = jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIdFromJob)
+		if err != nil {
+			return parameters, err
+		}
+		updateJobOutputPipeline.Add(organizationIdFromJob, jobs.UpdateJobOutputDtoV1{
 			ID:     jobID,
 			Output: buf.String(),
 		})

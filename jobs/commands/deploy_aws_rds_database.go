@@ -27,7 +27,7 @@ type DeployAwsRdsDatabase struct {
 
 func getDBSubnetGroupName(parameters map[string]interface{}) (string, error) {
 	//db-subnet-group-<organizationId>
-	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationID)
+	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIDNamespace)
 	if err != nil {
 		return "", err
 	}
@@ -169,7 +169,13 @@ func syncRds(parameters map[string]interface{}, rdsClient *rds.Client, rdsInstan
 		updateDeploymentDtoV1.DBInstanceClass = dbInstanceClass
 	}
 
-	updateDeploymentsPipeline.Add(updateDeploymentsKey, updateDeploymentDtoV1)
+	var organizationIdFromJob string
+	organizationIdFromJob, err = jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIdFromJob)
+	if err != nil {
+		return err
+	}
+
+	updateDeploymentsPipeline.Add(organizationIdFromJob, updateDeploymentDtoV1)
 
 	if !syncOnError {
 		io.WriteString(logsWriter, fmt.Sprintf("RDS database is available at: %s:%d\n", endpointAddress, endpointPort))
@@ -196,7 +202,7 @@ func (d *DeployAwsRdsDatabase) Run(parameters map[string]interface{}, logsWriter
 
 	//check and add policy for AWS RDS deployment
 	runnerData := runnerUtils.RunnerData.Get()
-	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationID)
+	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIDNamespace)
 	if err != nil {
 		return parameters, err
 	}

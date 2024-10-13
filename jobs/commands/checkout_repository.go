@@ -25,7 +25,7 @@ type CheckoutRepository struct {
 }
 
 func getRepositoryDirectoryPath(parameters map[string]interface{}) (string, error) {
-	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationID)
+	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIDNamespace)
 	if err != nil {
 		return "", err
 	}
@@ -114,13 +114,17 @@ func refreshGitToken(parameters map[string]interface{}) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	token, err := client.Get().RefreshGitToken(installationID)
+	orgIdFromJob, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIdFromJob)
+	if err != nil {
+		return "", err
+	}
+	token, err := client.Get().RefreshGitToken(installationID, orgIdFromJob)
 	if err == nil {
 		return token, nil
 	}
 	for errors.Is(err, oauth.ErrRefreshInProcess) {
 		time.Sleep(10 * time.Second)
-		token, err = client.Get().RefreshGitToken(installationID)
+		token, err = client.Get().RefreshGitToken(installationID, orgIdFromJob)
 		if err == nil {
 			return token, nil
 		}
@@ -282,6 +286,11 @@ func (cr *CheckoutRepository) Run(parameters map[string]interface{}, logsWriter 
 	var commitHashFromParams string
 	commitHashFromParams, err = jobs.GetParameterValue[string](parameters, parameters_enums.CommitHash)
 
+	var organizationIdFromJob string
+	organizationIdFromJob, err = jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIdFromJob)
+	if err != nil {
+		return parameters, err
+	}
 	if err == nil && len(commitHashFromParams) > 0 {
 		hash := plumbing.NewHash(commitHashFromParams)
 		err = worktree.Checkout(&git.CheckoutOptions{
@@ -292,13 +301,13 @@ func (cr *CheckoutRepository) Run(parameters map[string]interface{}, logsWriter 
 		}
 		if !isPreview {
 			//update build
-			updateBuildsPipeline.Add(updateBuildsKey, builds.UpdateBuildDtoV1{
+			updateBuildsPipeline.Add(organizationIdFromJob, builds.UpdateBuildDtoV1{
 				ID:     buildOrPreviewID,
 				Status: build_enums.Running,
 			})
 		} else {
 			//update preview
-			updatePreviewsPipeline.Add(updatePreviewsKey, previews.UpdatePreviewDtoV1{
+			updatePreviewsPipeline.Add(organizationIdFromJob, previews.UpdatePreviewDtoV1{
 				ID:     buildOrPreviewID,
 				Status: build_enums.Running,
 			})
@@ -323,14 +332,14 @@ func (cr *CheckoutRepository) Run(parameters map[string]interface{}, logsWriter 
 		commitMessage := strings.TrimSpace(commitObject.Message)
 
 		if !isPreview {
-			updateBuildsPipeline.Add(updateBuildsKey, builds.UpdateBuildDtoV1{
+			updateBuildsPipeline.Add(organizationIdFromJob, builds.UpdateBuildDtoV1{
 				ID:            buildOrPreviewID,
 				CommitHash:    commitHash,
 				CommitMessage: commitMessage,
 				Status:        build_enums.Running,
 			})
 		} else {
-			updatePreviewsPipeline.Add(updatePreviewsKey, previews.UpdatePreviewDtoV1{
+			updatePreviewsPipeline.Add(organizationIdFromJob, previews.UpdatePreviewDtoV1{
 				ID:            buildOrPreviewID,
 				CommitHash:    commitHash,
 				CommitMessage: commitMessage,

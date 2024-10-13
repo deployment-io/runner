@@ -15,10 +15,10 @@ import (
 
 type RunnerClient struct {
 	sync.Mutex
-	c                  *rpc.Client
-	isConnected        bool
-	isStarted          bool
-	organizationID     string
+	c           *rpc.Client
+	isConnected bool
+	isStarted   bool
+	//organizationID     string
 	token              string
 	currentDockerImage string
 	runnerRegion       string
@@ -74,7 +74,7 @@ func connect(options Options) (err error) {
 		}
 
 		client.c = c
-		client.organizationID = options.OrganizationID
+		//client.organizationID = options.OrganizationID
 		client.userID = options.UserID
 		client.token = options.Token
 		client.currentDockerImage = options.DockerImage
@@ -90,8 +90,8 @@ func connect(options Options) (err error) {
 var disconnectSignal = make(chan struct{})
 
 type Options struct {
-	Service               string
-	OrganizationID        string
+	Service string
+	//OrganizationID        string
 	UserID                string
 	Token                 string
 	ClientCertPem         string
@@ -104,7 +104,7 @@ type Options struct {
 	TargetCloud           runner_enums.TargetCloud
 }
 
-func Connect(options Options) chan struct{} {
+func Connect(options Options, organizationID string) chan struct{} {
 	firstTimeConnectSignal := make(chan struct{})
 	if !client.isStarted {
 		client.Lock()
@@ -124,7 +124,7 @@ func Connect(options Options) chan struct{} {
 							connect(options)
 						}
 						if client.c != nil {
-							err := client.Ping(firstPing)
+							err := client.Ping(firstPing, organizationID)
 							if err != nil {
 								if types.ErrInvalidUserKeySecret.Error() == err.Error() && options.RunnerMode == runner_enums.LOCAL {
 									log.Fatal(err)

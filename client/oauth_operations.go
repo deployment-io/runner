@@ -4,12 +4,12 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/oauth"
 )
 
-func (r *RunnerClient) RefreshGitToken(installationID string) (string, error) {
+func (r *RunnerClient) RefreshGitToken(installationID string, organizationID string) (string, error) {
 	if !r.isConnected {
 		return "", ErrConnection
 	}
 	args := oauth.RefreshGitProviderTokenArgsV1{}
-	args.OrganizationID = r.GetComputedOrganizationID()
+	args.OrganizationID = r.GetComputedOrganizationID(organizationID)
 	args.Token = r.token
 	args.InstallationID = installationID
 	var refreshTokenDto oauth.RefreshGitProviderTokenDtoV1

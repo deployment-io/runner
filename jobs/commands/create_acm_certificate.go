@@ -24,7 +24,7 @@ func (c *CreateAcmCertificate) Run(parameters map[string]interface{}, logsWriter
 
 	//check and add policy for AWS ACM certificate creation
 	runnerData := utils.RunnerData.Get()
-	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationID)
+	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIDNamespace)
 	if err != nil {
 		return parameters, err
 	}
@@ -70,6 +70,11 @@ func (c *CreateAcmCertificate) Run(parameters map[string]interface{}, logsWriter
 	if err != nil {
 		return parameters, err
 	}
+	var organizationIdFromJob string
+	organizationIdFromJob, err = jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIdFromJob)
+	if err != nil {
+		return parameters, err
+	}
 	certificateArn := requestCertificateOutput.CertificateArn
 	go func() {
 		//wait till verification cnames are ready and send them back
@@ -86,7 +91,7 @@ func (c *CreateAcmCertificate) Run(parameters map[string]interface{}, logsWriter
 					len(aws.ToString(describeCertificateOutput.Certificate.DomainValidationOptions[0].ResourceRecord.Name)) > 0 &&
 					len(aws.ToString(describeCertificateOutput.Certificate.DomainValidationOptions[0].ResourceRecord.Value)) > 0 {
 
-					updateCertificatesPipeline.Add(updateCertificatesKey, certificates.UpdateCertificateDtoV1{
+					updateCertificatesPipeline.Add(organizationIdFromJob, certificates.UpdateCertificateDtoV1{
 						ID:         certificateID,
 						CnameName:  aws.ToString(describeCertificateOutput.Certificate.DomainValidationOptions[0].ResourceRecord.Name),
 						CnameValue: aws.ToString(describeCertificateOutput.Certificate.DomainValidationOptions[0].ResourceRecord.Value),
@@ -101,7 +106,7 @@ func (c *CreateAcmCertificate) Run(parameters map[string]interface{}, logsWriter
 	}()
 
 	io.WriteString(logsWriter, fmt.Sprintf("Got certificate from ACM: %s\n", aws.ToString(certificateArn)))
-	updateCertificatesPipeline.Add(updateCertificatesKey, certificates.UpdateCertificateDtoV1{
+	updateCertificatesPipeline.Add(organizationIdFromJob, certificates.UpdateCertificateDtoV1{
 		ID:             certificateID,
 		CertificateArn: aws.ToString(certificateArn),
 	})

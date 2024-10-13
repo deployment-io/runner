@@ -5,12 +5,12 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/previews"
 )
 
-func (r *RunnerClient) UpdatePreviews(updatePreviews []previews.UpdatePreviewDtoV1) error {
+func (r *RunnerClient) UpdatePreviews(updatePreviews []previews.UpdatePreviewDtoV1, organizationID string) error {
 	if !r.isConnected {
 		return ErrConnection
 	}
 	args := previews.UpdatePreviewsArgsV1{}
-	args.OrganizationID = r.GetComputedOrganizationID()
+	args.OrganizationID = r.GetComputedOrganizationID(organizationID)
 	args.Token = r.token
 	args.Previews = updatePreviews
 	var reply previews.UpdatePreviewsReplyV1
@@ -24,12 +24,12 @@ func (r *RunnerClient) UpdatePreviews(updatePreviews []previews.UpdatePreviewDto
 	return nil
 }
 
-func (r *RunnerClient) GetPreviewData(previewIDs []string) ([]previews.GetPreviewDtoV1, error) {
+func (r *RunnerClient) GetPreviewData(previewIDs []string, organizationID string) ([]previews.GetPreviewDtoV1, error) {
 	if !r.isConnected {
 		return nil, ErrConnection
 	}
 	args := previews.GetPreviewsArgsV1{}
-	args.OrganizationID = r.GetComputedOrganizationID()
+	args.OrganizationID = r.GetComputedOrganizationID(organizationID)
 	args.Token = r.token
 	args.IDs = previewIDs
 	var reply previews.GetPreviewsReplyV1

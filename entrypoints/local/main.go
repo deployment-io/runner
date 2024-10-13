@@ -70,10 +70,10 @@ func main() {
 		RunnerMode:            runnerMode,
 		TargetCloud:           targetCloud,
 		UserID:                userId,
-	})
+	}, "")
 	common.Init()
 	archEnum, osType := common.GetRuntimeEnvironment()
 	utils.RunnerData.Set(region, cloudAccountID, archEnum, osType, runnerMode, targetCloud)
 	c := client.Get()
-	common.GetAndRunJobs(c, runnerMode)
+	common.GetAndRunJobs(c, runnerMode, userId)
 }

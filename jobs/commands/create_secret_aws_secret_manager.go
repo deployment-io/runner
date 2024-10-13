@@ -26,7 +26,7 @@ func (c *CreateSecretAwsSecretManager) Run(parameters map[string]interface{}, lo
 	}()
 	//add iam policy for secret manager
 	runnerData := utils.RunnerData.Get()
-	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationID)
+	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIDNamespace)
 	if err != nil {
 		return parameters, err
 	}

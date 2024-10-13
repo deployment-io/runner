@@ -6,12 +6,12 @@ import (
 	"runtime"
 )
 
-func (r *RunnerClient) GetPendingJobs() ([]jobs.PendingJobDtoV1, error) {
+func (r *RunnerClient) GetPendingJobs(organizationID string) ([]jobs.PendingJobDtoV1, error) {
 	if !r.isConnected {
 		return nil, ErrConnection
 	}
 	args := jobs.PendingJobsArgsV2{}
-	args.OrganizationID = r.GetComputedOrganizationID()
+	args.OrganizationID = r.GetComputedOrganizationID(organizationID)
 	args.Token = r.token
 	args.CloudAccountID = r.cloudAccountID
 	args.RunnerRegion = r.runnerRegion
@@ -25,12 +25,31 @@ func (r *RunnerClient) GetPendingJobs() ([]jobs.PendingJobDtoV1, error) {
 	return jobsDto.Jobs, nil
 }
 
-func (r *RunnerClient) MarkJobsComplete(completingJobs []jobs.CompletingJobDtoV1) error {
+func (r *RunnerClient) GetPendingJobsForSaas(organizationID string) ([]jobs.PendingJobForSaasDtoV1, error) {
+	if !r.isConnected {
+		return nil, ErrConnection
+	}
+	args := jobs.PendingJobsForSaasArgsV1{}
+	args.OrganizationID = r.GetComputedOrganizationID(organizationID)
+	args.Token = r.token
+	args.CloudAccountID = r.cloudAccountID
+	args.RunnerRegion = r.runnerRegion
+	args.GoArch = runtime.GOARCH
+	args.GoOS = runtime.GOOS
+	var jobsDto jobs.PendingJobsForSaasDtoV1
+	err := r.c.Call("Jobs.GetPendingForSaasV1", args, &jobsDto)
+	if err != nil {
+		return nil, err
+	}
+	return jobsDto.Jobs, nil
+}
+
+func (r *RunnerClient) MarkJobsComplete(completingJobs []jobs.CompletingJobDtoV1, organizationID string) error {
 	if !r.isConnected {
 		return ErrConnection
 	}
 	args := jobs.CompletingJobsArgsV1{}
-	args.OrganizationID = r.GetComputedOrganizationID()
+	args.OrganizationID = r.GetComputedOrganizationID(organizationID)
 	args.Token = r.token
 	args.Jobs = completingJobs
 	var reply jobs.CompletingJobsReplyV1
@@ -44,12 +63,12 @@ func (r *RunnerClient) MarkJobsComplete(completingJobs []jobs.CompletingJobDtoV1
 	return nil
 }
 
-func (r *RunnerClient) UpsertJobHeartbeat(jobID string) (bool, error) {
+func (r *RunnerClient) UpsertJobHeartbeat(jobID string, organizationID string) (bool, error) {
 	if !r.isConnected {
 		return false, ErrConnection
 	}
 	args := jobs.UpsertJobHeartbeatArgsV1{}
-	args.OrganizationID = r.GetComputedOrganizationID()
+	args.OrganizationID = r.GetComputedOrganizationID(organizationID)
 	args.Token = r.token
 	args.JobID = jobID
 	var reply jobs.UpsertJobHeartbeatReplyV1
@@ -60,12 +79,12 @@ func (r *RunnerClient) UpsertJobHeartbeat(jobID string) (bool, error) {
 	return reply.Stopping, nil
 }
 
-func (r *RunnerClient) UpdateJobOutputs(jobOutputs []jobs.UpdateJobOutputDtoV1) error {
+func (r *RunnerClient) UpdateJobOutputs(jobOutputs []jobs.UpdateJobOutputDtoV1, organizationID string) error {
 	if !r.isConnected {
 		return ErrConnection
 	}
 	args := jobs.UpdateJobOutputArgsV1{}
-	args.OrganizationID = r.GetComputedOrganizationID()
+	args.OrganizationID = r.GetComputedOrganizationID(organizationID)
 	args.Token = r.token
 	args.Jobs = jobOutputs
 	var reply jobs.UpdateJobOutputReplyV1

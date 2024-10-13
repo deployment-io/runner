@@ -19,13 +19,13 @@ import (
 	"io"
 )
 
-const upsertClusterKey = "upsertClusters"
+//const upsertClusterKey = "upsertClusters"
 
 type CreateEcsCluster struct {
 }
 
 func getDefaultEcsClusterName(parameters map[string]interface{}) (string, error) {
-	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationID)
+	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIDNamespace)
 	if err != nil {
 		return "", err
 	}
@@ -81,7 +81,12 @@ func createEcsClusterIfNeeded(ecsClient *ecs.Client, parameters map[string]inter
 		return "", err
 	}
 
-	upsertClustersPipeline.Add(upsertClusterKey, clusters.UpsertClusterDtoV1{
+	var organizationIdFromJob string
+	organizationIdFromJob, err = jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIdFromJob)
+	if err != nil {
+		return "", err
+	}
+	upsertClustersPipeline.Add(organizationIdFromJob, clusters.UpsertClusterDtoV1{
 		Type:       cluster_enums.ECS,
 		Region:     region_enums.Type(region),
 		Name:       ecsClusterName,
@@ -94,7 +99,7 @@ func createEcsClusterIfNeeded(ecsClient *ecs.Client, parameters map[string]inter
 func getDefaultTaskExecutionRoleName(parameters map[string]interface{}) (string, error) {
 	//eTERole-<os>-<cpuArch>-<organizationID>-<runner region>
 	runnerData := utils.RunnerData.Get()
-	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationID)
+	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIDNamespace)
 	if err != nil {
 		return "", err
 	}
@@ -187,7 +192,12 @@ func getEcsTaskExecutionRoleIfNeeded(iamClient *iam.Client, parameters map[strin
 		if err != nil {
 			return "", err
 		}
-		upsertClustersPipeline.Add(upsertClusterKey, clusters.UpsertClusterDtoV1{
+		var organizationIdFromJob string
+		organizationIdFromJob, err = jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIdFromJob)
+		if err != nil {
+			return "", err
+		}
+		upsertClustersPipeline.Add(organizationIdFromJob, clusters.UpsertClusterDtoV1{
 			Type:                    cluster_enums.ECS,
 			Region:                  region_enums.Type(region),
 			EcsTaskExecutionRoleArn: ecsTaskExecutionRoleArn,

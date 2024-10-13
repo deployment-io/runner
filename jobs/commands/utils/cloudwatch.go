@@ -8,7 +8,7 @@ import (
 
 func GetLogGroupName(parameters map[string]interface{}) (string, error) {
 	//<organizationId>/<deploymentId>
-	organizationID, err := jobTypes.GetParameterValue[string](parameters, parameters_enums.OrganizationID)
+	organizationID, err := jobTypes.GetParameterValue[string](parameters, parameters_enums.OrganizationIDNamespace)
 	if err != nil {
 		return "", err
 	}
