@@ -24,7 +24,7 @@ func (d *DeployAwsPrivateService) Run(parameters map[string]interface{}, logsWri
 
 	//check and add policy for AWS web service deployment
 	runnerData := utils.RunnerData.Get()
-	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationID)
+	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIDNamespace)
 	if err != nil {
 		return parameters, err
 	}
@@ -69,16 +69,20 @@ func (d *DeployAwsPrivateService) Run(parameters map[string]interface{}, logsWri
 	if err != nil {
 		return parameters, err
 	}
-
+	var organizationIdFromJob string
+	organizationIdFromJob, err = jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIdFromJob)
+	if err != nil {
+		return parameters, err
+	}
 	if !isPreview(parameters) {
-		updateBuildsPipeline.Add(updateBuildsKey, builds.UpdateBuildDtoV1{
+		updateBuildsPipeline.Add(organizationIdFromJob, builds.UpdateBuildDtoV1{
 			ID:                buildID,
 			TaskDefinitionArn: taskDefinitionArn,
 		})
 	} else {
 		//build id is preview id
 		previewID := buildID
-		updatePreviewsPipeline.Add(updateBuildsKey, previews.UpdatePreviewDtoV1{
+		updatePreviewsPipeline.Add(organizationIdFromJob, previews.UpdatePreviewDtoV1{
 			ID:                previewID,
 			TaskDefinitionArn: taskDefinitionArn,
 		})

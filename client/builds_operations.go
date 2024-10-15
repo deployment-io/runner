@@ -5,12 +5,12 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/builds"
 )
 
-func (r *RunnerClient) UpdateBuilds(updateBuilds []builds.UpdateBuildDtoV1) error {
+func (r *RunnerClient) UpdateBuilds(updateBuilds []builds.UpdateBuildDtoV1, organizationID string) error {
 	if !r.isConnected {
 		return ErrConnection
 	}
 	args := builds.UpdateBuildsArgsV1{}
-	args.OrganizationID = r.GetComputedOrganizationID()
+	args.OrganizationID = r.GetComputedOrganizationID(organizationID)
 	args.Token = r.token
 	args.Builds = updateBuilds
 	var reply builds.UpdateBuildsReplyV1

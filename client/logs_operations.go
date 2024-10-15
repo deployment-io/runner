@@ -5,12 +5,12 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/logs"
 )
 
-func (r *RunnerClient) AddJobLogs(addBuildLogs []logs.AddJobLogDtoV1) error {
+func (r *RunnerClient) AddJobLogs(addBuildLogs []logs.AddJobLogDtoV1, organizationID string) error {
 	if !r.isConnected {
 		return ErrConnection
 	}
 	args := logs.AddJobLogsArgsV1{}
-	args.OrganizationID = r.GetComputedOrganizationID()
+	args.OrganizationID = r.GetComputedOrganizationID(organizationID)
 	args.Token = r.token
 	args.JobLogs = addBuildLogs
 	var reply logs.AddJobLogsReplyV1

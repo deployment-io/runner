@@ -24,12 +24,14 @@ import (
 	"time"
 )
 
-const updateDeploymentsKey = "updateDeployments"
-const updateBuildsKey = "updateBuilds"
-const updatePreviewsKey = "updatePreviews"
-const updateCertificatesKey = "updateCertificates"
-const sendNotificationsKey = "sendNotifications"
-const updateJobOutputsKey = "updateJobOutputs"
+//const updateDeploymentsKey = "updateDeployments"
+
+// const updateBuildsKey = "updateBuilds"
+// const updatePreviewsKey = "updatePreviews"
+// const updateCertificatesKey = "updateCertificates"
+//const sendNotificationsKey = "sendNotifications"
+
+//const updateJobOutputsKey = "updateJobOutputs"
 
 const cloudfrontRegion = "us-east-1"
 
@@ -56,10 +58,10 @@ func Shutdown() {
 func Init() {
 	c := client.Get()
 	updateBuildsPipeline, _ = goPipeline.NewPipeline(5, 10*time.Second,
-		func(build string, builds []builds.UpdateBuildDtoV1) {
+		func(organizationId string, builds []builds.UpdateBuildDtoV1) {
 			e := true
 			for e {
-				err := c.UpdateBuilds(builds)
+				err := c.UpdateBuilds(builds, organizationId)
 				//TODO we can handle for ErrConnection
 				//will block till error
 				if err != nil {
@@ -76,10 +78,10 @@ func Init() {
 		//fmt.Println("waiting for builds update pipeline shutdown -- done")
 	})
 	updatePreviewsPipeline, _ = goPipeline.NewPipeline(5, 10*time.Second,
-		func(preview string, previews []previews.UpdatePreviewDtoV1) {
+		func(organizationId string, previews []previews.UpdatePreviewDtoV1) {
 			e := true
 			for e {
-				err := c.UpdatePreviews(previews)
+				err := c.UpdatePreviews(previews, organizationId)
 				//TODO we can handle for ErrConnection
 				//will block till error
 				if err != nil {
@@ -96,10 +98,10 @@ func Init() {
 		//fmt.Println("waiting for previews update pipeline shutdown -- done")
 	})
 	updateDeploymentsPipeline, _ = goPipeline.NewPipeline(5, 10*time.Second,
-		func(deployment string, deployments []deployments.UpdateDeploymentDtoV1) {
+		func(organizationId string, deployments []deployments.UpdateDeploymentDtoV1) {
 			e := true
 			for e {
-				err := c.UpdateDeployments(deployments)
+				err := c.UpdateDeployments(deployments, organizationId)
 				//TODO we can handle for ErrConnection
 				//will block till error
 				if err != nil {
@@ -115,10 +117,10 @@ func Init() {
 		//updateDeploymentsPipeline.Shutdown()
 		//fmt.Println("waiting for deployments update pipeline shutdown -- done")
 	})
-	upsertVpcsPipeline, _ = goPipeline.NewPipeline(5, 10*time.Second, func(vpc string, vpcs []vpcs.UpsertVpcDtoV1) {
+	upsertVpcsPipeline, _ = goPipeline.NewPipeline(5, 10*time.Second, func(organizationId string, vpcs []vpcs.UpsertVpcDtoV1) {
 		e := true
 		for e {
-			err := c.UpsertVpcs(vpcs)
+			err := c.UpsertVpcs(vpcs, organizationId)
 			//TODO we can handle for ErrConnection
 			//will block till error
 			if err != nil {
@@ -134,10 +136,10 @@ func Init() {
 		//upsertVpcsPipeline.Shutdown()
 		//fmt.Println("waiting for vpcs upsert pipeline shutdown -- done")
 	})
-	upsertClustersPipeline, _ = goPipeline.NewPipeline(5, 10*time.Second, func(cluster string, clusters []clusters.UpsertClusterDtoV1) {
+	upsertClustersPipeline, _ = goPipeline.NewPipeline(5, 10*time.Second, func(organizationId string, clusters []clusters.UpsertClusterDtoV1) {
 		e := true
 		for e {
-			err := c.UpsertClusters(clusters)
+			err := c.UpsertClusters(clusters, organizationId)
 			//TODO we can handle for ErrConnection
 			//will block till error
 			if err != nil {
@@ -154,10 +156,10 @@ func Init() {
 		//fmt.Println("waiting for clusters upsert pipeline shutdown -- done")
 	})
 	updateCertificatesPipeline, _ = goPipeline.NewPipeline(5, 2*time.Second,
-		func(certificate string, certificates []certificates.UpdateCertificateDtoV1) {
+		func(organizationId string, certificates []certificates.UpdateCertificateDtoV1) {
 			e := true
 			for e {
-				err := c.UpdateCertificates(certificates)
+				err := c.UpdateCertificates(certificates, organizationId)
 				//TODO we can handle for ErrConnection
 				//will block till error
 				if err != nil {
@@ -174,10 +176,10 @@ func Init() {
 		//fmt.Println("waiting for certificates update pipeline shutdown -- done")
 	})
 	sendNotificationPipeline, _ = goPipeline.NewPipeline(5, 10*time.Second,
-		func(notification string, notifications []notifications.SendNotificationDtoV1) {
+		func(organizationId string, notifications []notifications.SendNotificationDtoV1) {
 			e := true
 			for e {
-				err := c.SendNotifications(notifications)
+				err := c.SendNotifications(notifications, organizationId)
 				//TODO we can handle for ErrConnection
 				//will block till error
 				if err != nil {
@@ -194,10 +196,10 @@ func Init() {
 		//fmt.Println("waiting for notifications send pipeline shutdown -- done")
 	})
 	updateJobOutputPipeline, _ = goPipeline.NewPipeline(5, 1*time.Second,
-		func(job string, jobOutputs []jobs.UpdateJobOutputDtoV1) {
+		func(organizationId string, jobOutputs []jobs.UpdateJobOutputDtoV1) {
 			e := true
 			for e {
-				err := c.UpdateJobOutputs(jobOutputs)
+				err := c.UpdateJobOutputs(jobOutputs, organizationId)
 				//TODO we can handle for ErrConnection
 				//will block till error
 				if err != nil {
@@ -287,6 +289,7 @@ func MarkDeploymentDone(parameters map[string]interface{}, err error) <-chan str
 			status = build_enums.Error
 			errorMessage = err.Error()
 		}
+		organizationIdFromJob, _ := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIdFromJob)
 		nowEpoch := time.Now().Unix()
 		if isPreview(parameters) {
 			//update preview and return
@@ -295,7 +298,7 @@ func MarkDeploymentDone(parameters map[string]interface{}, err error) <-chan str
 				//Weird error. Would show up in logs. Return for now.
 				return
 			}
-			updatePreviewsPipeline.Add(updatePreviewsKey, previews.UpdatePreviewDtoV1{
+			updatePreviewsPipeline.Add(organizationIdFromJob, previews.UpdatePreviewDtoV1{
 				ID:           previewID,
 				BuildTs:      nowEpoch,
 				Status:       status,
@@ -309,7 +312,7 @@ func MarkDeploymentDone(parameters map[string]interface{}, err error) <-chan str
 			//job is not a deployment type
 			return
 		}
-		updateDeploymentsPipeline.Add(updateDeploymentsKey, deployments.UpdateDeploymentDtoV1{
+		updateDeploymentsPipeline.Add(organizationIdFromJob, deployments.UpdateDeploymentDtoV1{
 			ID:               deploymentID,
 			LastDeploymentTs: nowEpoch,
 			Status:           status,
@@ -321,7 +324,7 @@ func MarkDeploymentDone(parameters map[string]interface{}, err error) <-chan str
 			//job is not a build type
 			return
 		}
-		updateBuildsPipeline.Add(updateBuildsKey, builds.UpdateBuildDtoV1{
+		updateBuildsPipeline.Add(organizationIdFromJob, builds.UpdateBuildDtoV1{
 			ID:           buildID,
 			BuildTs:      nowEpoch,
 			Status:       status,
@@ -389,7 +392,7 @@ func deleteAllS3Files(s3Client *s3.Client, bucketName string) error {
 
 func getDockerImageNameAndTag(parameters map[string]interface{}) (string, error) {
 	//ex. <organizationID>-<deploymentID>:<commit-hash>
-	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationID)
+	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIDNamespace)
 	if err != nil {
 		return "", err
 	}

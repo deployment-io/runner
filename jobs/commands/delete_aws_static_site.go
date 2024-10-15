@@ -121,15 +121,20 @@ func (d *DeleteAwsStaticSite) Run(parameters map[string]interface{}, logsWriter 
 	if err != nil {
 		return parameters, err
 	}
+	var organizationIdFromJob string
+	organizationIdFromJob, err = jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIdFromJob)
+	if err != nil {
+		return parameters, err
+	}
 	if !isPreview(parameters) {
 		//update deployment to deleted and delete domain
-		updateDeploymentsPipeline.Add(updateDeploymentsKey, deployments.UpdateDeploymentDtoV1{
+		updateDeploymentsPipeline.Add(organizationIdFromJob, deployments.UpdateDeploymentDtoV1{
 			ID:            deploymentID,
 			DeletionState: deployment_enums.DeletionDone,
 		})
 	} else {
 		previewID := deploymentID
-		updatePreviewsPipeline.Add(updatePreviewsKey, previews.UpdatePreviewDtoV1{
+		updatePreviewsPipeline.Add(organizationIdFromJob, previews.UpdatePreviewDtoV1{
 			ID:            previewID,
 			DeletionState: deployment_enums.DeletionDone,
 		})

@@ -94,7 +94,7 @@ func createOriginAccessControl(name string, cloudFrontClient *cloudfront.Client)
 
 func getBucketName(parameters map[string]interface{}) (string, error) {
 	//bucket name = <organizationID>-<deploymentID>
-	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationID)
+	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIDNamespace)
 	if err != nil {
 		return "", err
 	}
@@ -185,7 +185,7 @@ func createS3BucketIfNeeded(s3Client *s3.Client, s3Bucket, s3Region string) (*st
 }
 
 func getCommentForCloudfront(parameters map[string]interface{}) (string, error) {
-	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationID)
+	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIDNamespace)
 	if err != nil {
 		return "", err
 	}
@@ -197,7 +197,7 @@ func getCommentForCloudfront(parameters map[string]interface{}) (string, error) 
 }
 
 func getCallerReference(parameters map[string]interface{}) (string, error) {
-	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationID)
+	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIDNamespace)
 	if err != nil {
 		return "", err
 	}
@@ -209,7 +209,7 @@ func getCallerReference(parameters map[string]interface{}) (string, error) {
 }
 
 func getCachePolicyName(parameters map[string]interface{}) (string, error) {
-	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationID)
+	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIDNamespace)
 	if err != nil {
 		return "", err
 	}
@@ -221,7 +221,7 @@ func getCachePolicyName(parameters map[string]interface{}) (string, error) {
 }
 
 func getOriginAccessName(parameters map[string]interface{}) (string, error) {
-	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationID)
+	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIDNamespace)
 	if err != nil {
 		return "", err
 	}
@@ -336,7 +336,7 @@ type bucketPolicyDto struct {
 }
 
 func getBucketPolicySid(parameters map[string]interface{}) (string, error) {
-	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationID)
+	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIDNamespace)
 	if err != nil {
 		return "", err
 	}
@@ -348,7 +348,7 @@ func getBucketPolicySid(parameters map[string]interface{}) (string, error) {
 }
 
 func getBucketPolicyId(parameters map[string]interface{}) (string, error) {
-	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationID)
+	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIDNamespace)
 	if err != nil {
 		return "", err
 	}
@@ -423,7 +423,7 @@ func (d *DeployAwsStaticSite) Run(parameters map[string]interface{}, logsWriter 
 
 	//check and add policy for AWS static site deployment
 	runnerData := utils.RunnerData.Get()
-	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationID)
+	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIDNamespace)
 	if err != nil {
 		return parameters, err
 	}
@@ -462,6 +462,12 @@ func (d *DeployAwsStaticSite) Run(parameters map[string]interface{}, logsWriter 
 		return parameters, err
 	}
 
+	var organizationIdFromJob string
+	organizationIdFromJob, err = jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIdFromJob)
+	if err != nil {
+		return parameters, err
+	}
+
 	var cloudfrontID string
 	ignoreErrorsTillCF := false
 	if !isNewBucketCreated {
@@ -479,7 +485,7 @@ func (d *DeployAwsStaticSite) Run(parameters map[string]interface{}, logsWriter 
 			if !isPreview(parameters) {
 				var deploymentData []deployments.GetDeploymentDtoV1
 				for !e {
-					deploymentData, err = c.GetDeploymentData([]string{deploymentID})
+					deploymentData, err = c.GetDeploymentData([]string{deploymentID}, organizationIdFromJob)
 					if err == client.ErrConnection {
 						time.Sleep(time.Second * 20)
 						continue
@@ -498,7 +504,7 @@ func (d *DeployAwsStaticSite) Run(parameters map[string]interface{}, logsWriter 
 				//preview id is deployment id in case of preview
 				previewID := deploymentID
 				for !e {
-					previewData, err = c.GetPreviewData([]string{previewID})
+					previewData, err = c.GetPreviewData([]string{previewID}, organizationIdFromJob)
 					if err == client.ErrConnection {
 						time.Sleep(time.Second * 20)
 						continue
@@ -636,7 +642,7 @@ func (d *DeployAwsStaticSite) Run(parameters map[string]interface{}, logsWriter 
 		}
 		if !isPreview(parameters) {
 			//send data back to save for deployment
-			updateDeploymentsPipeline.Add(updateDeploymentsKey, deployments.UpdateDeploymentDtoV1{
+			updateDeploymentsPipeline.Add(organizationIdFromJob, deployments.UpdateDeploymentDtoV1{
 				ID:                               deploymentID,
 				CloudfrontDistributionID:         aws.ToString(createDistributionOutput.Distribution.Id),
 				CloudfrontDistributionArn:        aws.ToString(createDistributionOutput.Distribution.ARN),
@@ -646,7 +652,7 @@ func (d *DeployAwsStaticSite) Run(parameters map[string]interface{}, logsWriter 
 			//deployment id is preview id in case of preview
 			previewID := deploymentID
 			//send data back to save for preview
-			updatePreviewsPipeline.Add(updatePreviewsKey, previews.UpdatePreviewDtoV1{
+			updatePreviewsPipeline.Add(organizationIdFromJob, previews.UpdatePreviewDtoV1{
 				ID:                               previewID,
 				CloudfrontDistributionID:         aws.ToString(createDistributionOutput.Distribution.Id),
 				CloudfrontDistributionArn:        aws.ToString(createDistributionOutput.Distribution.ARN),

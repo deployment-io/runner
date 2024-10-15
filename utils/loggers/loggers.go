@@ -21,10 +21,11 @@ import (
 )
 
 type JobLog struct {
-	Logger       jobs.Logger
-	Message      string
-	ErrorMessage string
-	Ts           int64
+	Logger         jobs.Logger
+	Message        string
+	ErrorMessage   string
+	Ts             int64
+	OrganizationID string
 }
 
 var AddJobLogsPipeline *goPipeline.Pipeline[string, JobLog]
@@ -34,8 +35,10 @@ func Init() {
 	AddJobLogsPipeline, _ = goPipeline.NewPipeline(20, 5*time.Second,
 		func(jobId string, jobLogs []JobLog) {
 			var logger jobs.Logger
+			var organizationId string
 			if len(jobLogs) > 0 {
 				logger = jobLogs[0].Logger
+				organizationId = jobLogs[0].OrganizationID
 			}
 			var messages []string
 			var jobLogsDto []logs.AddJobLogDtoV1
@@ -61,7 +64,7 @@ func Init() {
 
 			e := true
 			for e {
-				err := c.AddJobLogs(jobLogsDto)
+				err := c.AddJobLogs(jobLogsDto, organizationId)
 				//TODO we can handle for ErrConnection
 				//will block till error
 				if err != nil {
@@ -107,7 +110,7 @@ func LogBuffer(logBuffer *bytes.Buffer, logger jobs.Logger) error {
 	return logger.Log(messages)
 }
 
-func GetJobLogsWriter(jobId string, logger jobs.Logger, mode runner_enums.Mode) (*io.PipeWriter, error) {
+func GetJobLogsWriter(jobId, organizationId string, logger jobs.Logger, mode runner_enums.Mode) (*io.PipeWriter, error) {
 	reader, writer := io.Pipe()
 	go func() {
 		defer reader.Close()
@@ -119,9 +122,10 @@ func GetJobLogsWriter(jobId string, logger jobs.Logger, mode runner_enums.Mode) 
 			s = strings.Trim(s, " \n \r")
 			if len(s) > 0 {
 				AddJobLogsPipeline.Add(jobId, JobLog{
-					Logger:  logger,
-					Message: s,
-					Ts:      time.Now().Unix(),
+					Logger:         logger,
+					Message:        s,
+					Ts:             time.Now().Unix(),
+					OrganizationID: organizationId,
 				})
 				if mode == runner_enums.LOCAL {
 					log.Println(s)
@@ -130,9 +134,10 @@ func GetJobLogsWriter(jobId string, logger jobs.Logger, mode runner_enums.Mode) 
 		}
 		if err := scanner.Err(); err != nil {
 			AddJobLogsPipeline.Add(jobId, JobLog{
-				Logger:       logger,
-				ErrorMessage: err.Error(),
-				Ts:           time.Now().Unix(),
+				Logger:         logger,
+				ErrorMessage:   err.Error(),
+				Ts:             time.Now().Unix(),
+				OrganizationID: organizationId,
 			})
 			if mode == runner_enums.LOCAL {
 				log.Println(err.Error())

@@ -28,7 +28,7 @@ type UploadDockerImageToEcr struct {
 
 func getEcrRepositoryName(parameters map[string]interface{}) (string, error) {
 	//ecr-<organizationID>-<deploymentID>
-	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationID)
+	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIDNamespace)
 	if err != nil {
 		return "", err
 	}
@@ -93,16 +93,20 @@ func createEcrRepositoryIfNeeded(parameters map[string]interface{}, ecrClient *e
 	if err != nil {
 		return "", err
 	}
-
+	var organizationIdFromJob string
+	organizationIdFromJob, err = jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIdFromJob)
+	if err != nil {
+		return "", err
+	}
 	if !isPreview(parameters) {
-		updateDeploymentsPipeline.Add(updateDeploymentsKey, deployments.UpdateDeploymentDtoV1{
+		updateDeploymentsPipeline.Add(organizationIdFromJob, deployments.UpdateDeploymentDtoV1{
 			ID:               deploymentID,
 			EcrRepositoryUri: ecrRepositoryUri,
 		})
 	} else {
 		//for preview
 		previewID := deploymentID
-		updatePreviewsPipeline.Add(updatePreviewsKey, previews.UpdatePreviewDtoV1{
+		updatePreviewsPipeline.Add(organizationIdFromJob, previews.UpdatePreviewDtoV1{
 			ID:               previewID,
 			EcrRepositoryUri: ecrRepositoryUri,
 		})
@@ -194,7 +198,7 @@ func (u *UploadDockerImageToEcr) Run(parameters map[string]interface{}, logsWrit
 
 	//check and add policy for AWS ECR upload
 	runnerData := utils.RunnerData.Get()
-	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationID)
+	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIDNamespace)
 	if err != nil {
 		return parameters, err
 	}

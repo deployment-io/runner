@@ -24,7 +24,7 @@ type VerifyAcmCertificate struct {
 func (v *VerifyAcmCertificate) Run(parameters map[string]interface{}, logsWriter io.Writer) (newParameters map[string]interface{}, err error) {
 	//check and add policy for AWS ACM certificate verification
 	runnerData := utils.RunnerData.Get()
-	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationID)
+	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIDNamespace)
 	if err != nil {
 		return parameters, err
 	}
@@ -51,12 +51,17 @@ func (v *VerifyAcmCertificate) Run(parameters map[string]interface{}, logsWriter
 	if err != nil {
 		return parameters, err
 	}
+	var organizationIdFromJob string
+	organizationIdFromJob, err = jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIdFromJob)
+	if err != nil {
+		return parameters, err
+	}
 	if describeCertificateOutput.Certificate != nil {
 		io.WriteString(logsWriter, fmt.Sprintf("Current status of certificate: %s\n", describeCertificateOutput.Certificate.Status))
 		if describeCertificateOutput.Certificate.Status == acm_types.CertificateStatusIssued {
 			//certificate is already issued
 			//sync verified status
-			updateCertificatesPipeline.Add(updateCertificatesKey, certificates.UpdateCertificateDtoV1{
+			updateCertificatesPipeline.Add(organizationIdFromJob, certificates.UpdateCertificateDtoV1{
 				ID:       certificateID,
 				Verified: types.True,
 			})
@@ -77,7 +82,7 @@ func (v *VerifyAcmCertificate) Run(parameters map[string]interface{}, logsWriter
 		return parameters, err
 	}
 	//sync verified status
-	updateCertificatesPipeline.Add(updateCertificatesKey, certificates.UpdateCertificateDtoV1{
+	updateCertificatesPipeline.Add(organizationIdFromJob, certificates.UpdateCertificateDtoV1{
 		ID:       certificateID,
 		Verified: types.True,
 	})
