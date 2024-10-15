@@ -5,12 +5,12 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/certificates"
 )
 
-func (r *RunnerClient) UpdateCertificates(updateCertificates []certificates.UpdateCertificateDtoV1) error {
+func (r *RunnerClient) UpdateCertificates(updateCertificates []certificates.UpdateCertificateDtoV1, organizationID string) error {
 	if !r.isConnected {
 		return ErrConnection
 	}
 	args := certificates.UpdateCertificatesArgsV1{}
-	args.OrganizationID = r.GetComputedOrganizationID()
+	args.OrganizationID = r.GetComputedOrganizationID(organizationID)
 	args.Token = r.token
 	args.Certificates = updateCertificates
 	var reply certificates.UpdateCertificatesReplyV1

@@ -22,14 +22,14 @@ import (
 	"time"
 )
 
-const upsertVpcKey = "upsertVpcs"
+//const upsertVpcKey = "upsertVpcs"
 
 type CreateDefaultAwsVPC struct {
 }
 
 func getDefaultVpcName(parameters map[string]interface{}) (string, error) {
 	//vpc-<organizationId>
-	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationID)
+	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIDNamespace)
 	if err != nil {
 		return "", err
 	}
@@ -38,7 +38,7 @@ func getDefaultVpcName(parameters map[string]interface{}) (string, error) {
 
 func getDefaultInternetGatewayName(parameters map[string]interface{}) (string, error) {
 	//ig-<organizationId>
-	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationID)
+	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIDNamespace)
 	if err != nil {
 		return "", err
 	}
@@ -47,7 +47,7 @@ func getDefaultInternetGatewayName(parameters map[string]interface{}) (string, e
 
 func getDefaultElasticIPName(parameters map[string]interface{}, az string) (string, error) {
 	//elastic-ip-<organizationId>-public-eu-west-1b
-	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationID)
+	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIDNamespace)
 	if err != nil {
 		return "", err
 	}
@@ -56,7 +56,7 @@ func getDefaultElasticIPName(parameters map[string]interface{}, az string) (stri
 
 func getDefaultNatGatewayName(parameters map[string]interface{}, az string) (string, error) {
 	//nat-gateway-<organizationId>-public-eu-west-1b
-	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationID)
+	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIDNamespace)
 	if err != nil {
 		return "", err
 	}
@@ -65,7 +65,7 @@ func getDefaultNatGatewayName(parameters map[string]interface{}, az string) (str
 
 func getDefaultRouteTableName(parameters map[string]interface{}, isPrivate bool, availabilityZone string) (string, error) {
 	//route-table-<organizationId>-public-eu-west-1b
-	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationID)
+	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIDNamespace)
 	if err != nil {
 		return "", err
 	}
@@ -120,7 +120,7 @@ func divideInToSubnets(cidr string, count int) ([]string, error) {
 
 func getDefaultSubnetName(parameters map[string]interface{}, isPrivate bool, availabilityZone string) (string, error) {
 	//subnet-<organizationId>-public-eu-west-1b
-	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationID)
+	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIDNamespace)
 	if err != nil {
 		return "", err
 	}
@@ -261,7 +261,12 @@ func createVpcIfNeeded(parameters map[string]interface{}, ec2Client *ec2.Client,
 	if err != nil {
 		return "", err
 	}
-	upsertVpcsPipeline.Add(upsertVpcKey, vpcs.UpsertVpcDtoV1{
+	var organizationIdFromJob string
+	organizationIdFromJob, err = jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIdFromJob)
+	if err != nil {
+		return "", err
+	}
+	upsertVpcsPipeline.Add(organizationIdFromJob, vpcs.UpsertVpcDtoV1{
 		Type:   vpc_enums.AwsVpc,
 		Region: region_enums.Type(region),
 		VpcId:  vpcId,
@@ -346,7 +351,12 @@ func createAndAttachInternetGatewayIfNeeded(parameters map[string]interface{}, e
 	if err != nil {
 		return "", err
 	}
-	upsertVpcsPipeline.Add(upsertVpcKey, vpcs.UpsertVpcDtoV1{
+	var organizationIdFromJob string
+	organizationIdFromJob, err = jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIdFromJob)
+	if err != nil {
+		return "", err
+	}
+	upsertVpcsPipeline.Add(organizationIdFromJob, vpcs.UpsertVpcDtoV1{
 		Type:              vpc_enums.AwsVpc,
 		Region:            region_enums.Type(region),
 		InternetGatewayId: aws.ToString(internetGatewayId),
@@ -968,8 +978,14 @@ func (c *CreateDefaultAwsVPC) Run(parameters map[string]interface{}, logsWriter 
 			return parameters, err
 		}
 
+		var organizationIdFromJob string
+		organizationIdFromJob, err = jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIdFromJob)
+		if err != nil {
+			return parameters, err
+		}
+
 		if shouldSyncSubnetsAll {
-			upsertVpcsPipeline.Add(upsertVpcKey, vpcs.UpsertVpcDtoV1{
+			upsertVpcsPipeline.Add(organizationIdFromJob, vpcs.UpsertVpcDtoV1{
 				Type:    vpc_enums.AwsVpc,
 				Region:  region_enums.Type(region),
 				Subnets: subnetsDto,
@@ -977,20 +993,20 @@ func (c *CreateDefaultAwsVPC) Run(parameters map[string]interface{}, logsWriter 
 		}
 
 		if shouldSyncRouteTablesAll {
-			upsertVpcsPipeline.Add(upsertVpcKey, vpcs.UpsertVpcDtoV1{
+			upsertVpcsPipeline.Add(organizationIdFromJob, vpcs.UpsertVpcDtoV1{
 				Type:        vpc_enums.AwsVpc,
 				Region:      region_enums.Type(region),
 				RouteTables: routeTablesDto,
 			})
 		}
 
-		upsertVpcsPipeline.Add(upsertVpcKey, vpcs.UpsertVpcDtoV1{
+		upsertVpcsPipeline.Add(organizationIdFromJob, vpcs.UpsertVpcDtoV1{
 			Type:        vpc_enums.AwsVpc,
 			Region:      region_enums.Type(region),
 			NatGateways: natGatewaysDto,
 		})
 
-		upsertVpcsPipeline.Add(upsertVpcKey, vpcs.UpsertVpcDtoV1{
+		upsertVpcsPipeline.Add(organizationIdFromJob, vpcs.UpsertVpcDtoV1{
 			Type:    vpc_enums.AwsVpc,
 			Region:  region_enums.Type(region),
 			VpcCidr: cidrBlock,

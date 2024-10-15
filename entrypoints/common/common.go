@@ -22,8 +22,8 @@ import (
 	"time"
 )
 
-func allocateJobs(pendingJobs []jobs.PendingJobDtoV1) <-chan jobs.PendingJobDtoV1 {
-	jobsStream := make(chan jobs.PendingJobDtoV1)
+func allocateJobs(pendingJobs []pendingJobType) <-chan pendingJobType {
+	jobsStream := make(chan pendingJobType)
 	go func() {
 		defer close(jobsStream)
 		for _, job := range pendingJobs {
@@ -33,10 +33,11 @@ func allocateJobs(pendingJobs []jobs.PendingJobDtoV1) <-chan jobs.PendingJobDtoV
 	return jobsStream
 }
 
-func getJobResult(job jobs.PendingJobDtoV1, error string) jobs.CompletingJobDtoV1 {
-	return jobs.CompletingJobDtoV1{
-		Error: error,
-		ID:    job.JobID,
+func getJobResult(job pendingJobType, error string) completingJobType {
+	return completingJobType{
+		error:          error,
+		id:             job.jobID,
+		organizationID: job.organizationID,
 	}
 }
 
@@ -48,8 +49,8 @@ func handleLogEnd(err error, jobID string, logsWriter io.Writer) {
 	}
 }
 
-func executeJobs(jobsStream <-chan jobs.PendingJobDtoV1, noOfWorkers int, mode runner_enums.Mode, c *client.RunnerClient) <-chan jobs.CompletingJobDtoV1 {
-	resultsStream := make(chan jobs.CompletingJobDtoV1)
+func executeJobs(jobsStream <-chan pendingJobType, noOfWorkers int, mode runner_enums.Mode, globalOrganizationIdFromEnv string, c *client.RunnerClient) <-chan completingJobType {
+	resultsStream := make(chan completingJobType)
 	go func() {
 		defer close(resultsStream)
 		var wg sync.WaitGroup
@@ -61,24 +62,31 @@ func executeJobs(jobsStream <-chan jobs.PendingJobDtoV1, noOfWorkers int, mode r
 					wg.Done()
 				}()
 				for pendingJob := range jobsStream {
-					func(pendingJob jobs.PendingJobDtoV1) {
-						parameters := pendingJob.Parameters
+					func(pendingJob pendingJobType) {
+						parameters := pendingJob.parameters
 						//add job id in parameters
-						_ = jobs.SetParameterValue(parameters, parameters_enums.JobID, pendingJob.JobID)
+						_ = jobs.SetParameterValue(parameters, parameters_enums.JobID, pendingJob.jobID)
+						//add organization id from job in parameters
+						_ = jobs.SetParameterValue(parameters, parameters_enums.OrganizationIdFromJob, pendingJob.organizationID)
+						if mode == runner_enums.Saas {
+							//rewrite to global org id for saas mode
+							_ = jobs.SetParameterValue[string](parameters, parameters_enums.OrganizationIDNamespace, globalOrganizationIdFromEnv)
+						}
 						logger, err := loggers.Get(parameters)
 						if err != nil {
 							result := getJobResult(pendingJob, err.Error())
 							resultsStream <- result
-							loggers.AddJobLogsPipeline.Add(pendingJob.JobID, loggers.JobLog{
-								Logger:  nil,
-								Message: fmt.Sprintf("Error in executing - %s - %s\n", pendingJob.JobID, err.Error()),
-								Ts:      time.Now().Unix(),
+							loggers.AddJobLogsPipeline.Add(pendingJob.jobID, loggers.JobLog{
+								Logger:         nil,
+								Message:        fmt.Sprintf("Error in executing - %s - %s\n", pendingJob.jobID, err.Error()),
+								Ts:             time.Now().Unix(),
+								OrganizationID: pendingJob.organizationID,
 							})
 							//if job is a build type it will be marked done
 							<-commands.MarkDeploymentDone(parameters, err)
 							return
 						}
-						logsWriter, err := loggers.GetJobLogsWriter(pendingJob.JobID, logger, mode)
+						logsWriter, err := loggers.GetJobLogsWriter(pendingJob.jobID, pendingJob.organizationID, logger, mode)
 						if err != nil {
 							result := getJobResult(pendingJob, err.Error())
 							resultsStream <- result
@@ -88,11 +96,11 @@ func executeJobs(jobsStream <-chan jobs.PendingJobDtoV1, noOfWorkers int, mode r
 						jobDoneSignal := make(chan struct{})
 						defer close(jobDoneSignal)
 						stopJobSignal := getJobStopSignal(pendingJob, jobDoneSignal, c)
-						for _, commandEnum := range pendingJob.CommandEnums {
+						for _, commandEnum := range pendingJob.commandEnums {
 							select {
 							case <-stopJobSignal:
 								errStoppedByUser := types.ErrJobStoppedByUser
-								handleLogEnd(errStoppedByUser, pendingJob.JobID, logsWriter)
+								handleLogEnd(errStoppedByUser, pendingJob.jobID, logsWriter)
 								result := getJobResult(pendingJob, errStoppedByUser.Error())
 								resultsStream <- result
 								//if job is a deployment/build/preview type, this will be marked them done
@@ -101,21 +109,21 @@ func executeJobs(jobsStream <-chan jobs.PendingJobDtoV1, noOfWorkers int, mode r
 							default:
 								command, err := commands.Get(commandEnum)
 								if err != nil {
-									handleLogEnd(err, pendingJob.JobID, logsWriter)
+									handleLogEnd(err, pendingJob.jobID, logsWriter)
 									result := getJobResult(pendingJob, err.Error())
 									resultsStream <- result
 									return
 								}
 								parameters, err = command.Run(parameters, logsWriter)
 								if err != nil {
-									handleLogEnd(err, pendingJob.JobID, logsWriter)
+									handleLogEnd(err, pendingJob.jobID, logsWriter)
 									result := getJobResult(pendingJob, err.Error())
 									resultsStream <- result
 									return
 								}
 							}
 						}
-						handleLogEnd(nil, pendingJob.JobID, logsWriter)
+						handleLogEnd(nil, pendingJob.jobID, logsWriter)
 						result := getJobResult(pendingJob, "")
 						resultsStream <- result
 					}(pendingJob)
@@ -127,7 +135,7 @@ func executeJobs(jobsStream <-chan jobs.PendingJobDtoV1, noOfWorkers int, mode r
 	return resultsStream
 }
 
-func getJobStopSignal(job jobs.PendingJobDtoV1, jobDoneSignal <-chan struct{}, c *client.RunnerClient) <-chan struct{} {
+func getJobStopSignal(job pendingJobType, jobDoneSignal <-chan struct{}, c *client.RunnerClient) <-chan struct{} {
 	jobStopSignal := make(chan struct{})
 	go func() {
 		defer close(jobStopSignal)
@@ -137,7 +145,7 @@ func getJobStopSignal(job jobs.PendingJobDtoV1, jobDoneSignal <-chan struct{}, c
 				return
 			default:
 				//ignoring error in client
-				isStopping, _ := c.UpsertJobHeartbeat(job.JobID)
+				isStopping, _ := c.UpsertJobHeartbeat(job.jobID, job.organizationID)
 				if isStopping {
 					jobStopSignal <- struct{}{}
 					return
@@ -149,7 +157,7 @@ func getJobStopSignal(job jobs.PendingJobDtoV1, jobDoneSignal <-chan struct{}, c
 	return jobStopSignal
 }
 
-func sendJobResults(resultsStream <-chan jobs.CompletingJobDtoV1,
+func sendJobResults(resultsStream <-chan completingJobType,
 	noOfResultWorkers int, jobsDonePipeline *goPipeline.Pipeline[string, jobs.CompletingJobDtoV1]) <-chan struct{} {
 	done := make(chan struct{})
 	go func() {
@@ -164,7 +172,10 @@ func sendJobResults(resultsStream <-chan jobs.CompletingJobDtoV1,
 					wg.Done()
 				}()
 				for result := range resultsStream {
-					jobsDonePipeline.Add("done", result)
+					jobsDonePipeline.Add(result.organizationID, jobs.CompletingJobDtoV1{
+						Error: result.error,
+						ID:    result.id,
+					})
 				}
 			}()
 		}
@@ -193,7 +204,7 @@ func GetRuntimeEnvironment() (cpu_architecture_enums.Type, os_enums.Type) {
 	return archEnum, osType
 }
 
-func GetAndRunJobs(c *client.RunnerClient, mode runner_enums.Mode) {
+func GetAndRunJobs(c *client.RunnerClient, mode runner_enums.Mode, globalOrganizationIdFromEnv string) {
 	shutdownSignal := make(chan struct{})
 	goShutdownHook.ADD(func() {
 		log.Println("Waiting for pending deployment jobs to complete......Please wait.")
@@ -201,10 +212,10 @@ func GetAndRunJobs(c *client.RunnerClient, mode runner_enums.Mode) {
 		close(shutdownSignal)
 	})
 	shutdown := false
-	jobsDonePipeline, _ := goPipeline.NewPipeline(10, time.Second*10, func(s string, completingJobs []jobs.CompletingJobDtoV1) {
+	jobsDonePipeline, _ := goPipeline.NewPipeline(10, time.Second*10, func(organizationId string, completingJobs []jobs.CompletingJobDtoV1) {
 		e := true
 		for e {
-			err := c.MarkJobsComplete(completingJobs)
+			err := c.MarkJobsComplete(completingJobs, organizationId)
 			//TODO we can handle for ErrConnection
 			if err != nil {
 				fmt.Println(err)
@@ -222,9 +233,9 @@ func GetAndRunJobs(c *client.RunnerClient, mode runner_enums.Mode) {
 		}
 	})
 	executePendingJobsConcurrentPipeline, _ := goConcurrentPipeline.NewConcurrentPipeline(3, 20,
-		1*time.Second, func(s string, pendingJobs []jobs.PendingJobDtoV1) {
+		1*time.Second, func(s string, pendingJobs []pendingJobType) {
 			jobsStream := allocateJobs(pendingJobs)
-			resultsStream := executeJobs(jobsStream, 5, mode, c)
+			resultsStream := executeJobs(jobsStream, 5, mode, globalOrganizationIdFromEnv, c)
 			<-sendJobResults(resultsStream, 5, jobsDonePipeline)
 		})
 
@@ -234,19 +245,47 @@ func GetAndRunJobs(c *client.RunnerClient, mode runner_enums.Mode) {
 		case <-shutdownSignal:
 			shutdown = true
 		default:
-			pendingJobs, err := c.GetPendingJobs()
-			if len(pendingJobs) == 0 {
-				if printPendingJobsMessage {
-					log.Println("Waiting for new deployment jobs. You can create them at https://app.deployment.io ......")
-					printPendingJobsMessage = false
-				}
-				if err != nil {
-					time.Sleep(10 * time.Second)
-					continue
+			if mode == runner_enums.Saas {
+				pendingJobsForSaas, err := c.GetPendingJobsForSaas(globalOrganizationIdFromEnv)
+				if len(pendingJobsForSaas) == 0 {
+					if printPendingJobsMessage {
+						log.Println("Waiting for new deployment jobs. You can create them at https://app.deployment.io ......")
+						printPendingJobsMessage = false
+					}
+					if err != nil {
+						time.Sleep(10 * time.Second)
+						continue
+					}
+				} else {
+					for _, pendingJob := range pendingJobsForSaas {
+						executePendingJobsConcurrentPipeline.Add("executeJob", pendingJobType{
+							jobID:          pendingJob.JobID,
+							organizationID: pendingJob.OrganizationID,
+							commandEnums:   pendingJob.CommandEnums,
+							parameters:     pendingJob.Parameters,
+						})
+					}
 				}
 			} else {
-				for _, pendingJob := range pendingJobs {
-					executePendingJobsConcurrentPipeline.Add("executeJob", pendingJob)
+				pendingJobs, err := c.GetPendingJobs(globalOrganizationIdFromEnv)
+				if len(pendingJobs) == 0 {
+					if printPendingJobsMessage {
+						log.Println("Waiting for new deployment jobs. You can create them at https://app.deployment.io ......")
+						printPendingJobsMessage = false
+					}
+					if err != nil {
+						time.Sleep(10 * time.Second)
+						continue
+					}
+				} else {
+					for _, pendingJob := range pendingJobs {
+						executePendingJobsConcurrentPipeline.Add("executeJob", pendingJobType{
+							jobID:          pendingJob.JobID,
+							organizationID: globalOrganizationIdFromEnv,
+							commandEnums:   pendingJob.CommandEnums,
+							parameters:     pendingJob.Parameters,
+						})
+					}
 				}
 			}
 			time.Sleep(10 * time.Second)

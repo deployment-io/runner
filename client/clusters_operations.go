@@ -5,12 +5,12 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/clusters"
 )
 
-func (r *RunnerClient) UpsertClusters(upsertClusters []clusters.UpsertClusterDtoV1) error {
+func (r *RunnerClient) UpsertClusters(upsertClusters []clusters.UpsertClusterDtoV1, organizationID string) error {
 	if !r.isConnected {
 		return ErrConnection
 	}
 	args := clusters.UpsertClustersArgsV2{}
-	args.OrganizationID = r.GetComputedOrganizationID()
+	args.OrganizationID = r.GetComputedOrganizationID(organizationID)
 	args.Token = r.token
 	args.CloudAccountID = r.cloudAccountID
 	args.Clusters = upsertClusters

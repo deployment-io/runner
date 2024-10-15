@@ -110,8 +110,11 @@ func (a *AddAwsWebServiceDomain) Run(parameters map[string]interface{}, logsWrit
 	if err != nil {
 		return parameters, err
 	}
-
-	updateDeploymentsPipeline.Add(updateDeploymentsKey, deployments.UpdateDeploymentDtoV1{
+	organizationIdFromJob, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIdFromJob)
+	if err != nil {
+		return parameters, err
+	}
+	updateDeploymentsPipeline.Add(organizationIdFromJob, deployments.UpdateDeploymentDtoV1{
 		ID:                 deploymentID,
 		ListenerArnPort443: listenerArn,
 	})

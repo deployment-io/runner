@@ -5,12 +5,12 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/notifications"
 )
 
-func (r *RunnerClient) SendNotifications(sendNotifications []notifications.SendNotificationDtoV1) error {
+func (r *RunnerClient) SendNotifications(sendNotifications []notifications.SendNotificationDtoV1, organizationID string) error {
 	if !r.isConnected {
 		return ErrConnection
 	}
 	args := notifications.SendNotificationsArgsV1{}
-	args.OrganizationID = r.GetComputedOrganizationID()
+	args.OrganizationID = r.GetComputedOrganizationID(organizationID)
 	args.Token = r.token
 	args.Notifications = sendNotifications
 	var reply notifications.SendNotificationsReplyV1

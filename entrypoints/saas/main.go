@@ -17,7 +17,7 @@ import (
 var clientCertPem, clientKeyPem string
 
 func main() {
-	service, organizationId, token, region, dockerImage, _, _, _, awsAccountID := getEnvironmentForAws()
+	service, dummyOrganizationId, token, region, dockerImage, _, _, _, awsAccountID := getEnvironmentForSaas()
 	stsClient, err := cloud_api_clients.GetStsClient(region)
 	if err != nil {
 		log.Fatal(err)
@@ -34,11 +34,10 @@ func main() {
 	} else {
 		log.Fatal("error getting AWS account ID from AWS environment")
 	}
-	runnerMode := runner_enums.AwsEcs
+	runnerMode := runner_enums.Saas
 	targetCloud := runner_enums.AwsCloud
 	client.Connect(client.Options{
-		Service: service,
-		//OrganizationID:        organizationId,
+		Service:               service,
 		Token:                 token,
 		ClientCertPem:         clientCertPem,
 		ClientKeyPem:          clientKeyPem,
@@ -48,18 +47,18 @@ func main() {
 		BlockTillFirstConnect: false,
 		RunnerMode:            runnerMode,
 		TargetCloud:           targetCloud,
-	}, organizationId)
+	}, dummyOrganizationId)
 	common.Init()
 	archEnum, osType := common.GetRuntimeEnvironment()
 	utils.RunnerData.Set(region, awsAccountID, archEnum, osType, runnerMode, targetCloud)
 	if len(awsAccountID) > 0 {
 		//add permissions for sending logs to cloudwatch
 		err = iam_policies.AddAwsPolicyForDeploymentRunner(iam_policy_enums.AwsLogs, osType.String(),
-			archEnum.String(), organizationId, region, runnerMode, targetCloud)
+			archEnum.String(), dummyOrganizationId, region, runnerMode, targetCloud)
 		if err != nil {
 			log.Fatal(err)
 		}
 	}
 	c := client.Get()
-	common.GetAndRunJobs(c, runnerMode, organizationId)
+	common.GetAndRunJobs(c, runnerMode, dummyOrganizationId)
 }

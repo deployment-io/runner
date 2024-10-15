@@ -191,7 +191,13 @@ func addIngressRuleToDefaultVpcSecurityGroupForPortIfNeeded(parameters map[strin
 			return err
 		}
 
-		upsertVpcsPipeline.Add(upsertVpcKey, vpcs.UpsertVpcDtoV1{
+		var organizationIdFromJob string
+		organizationIdFromJob, err = jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIdFromJob)
+		if err != nil {
+			return err
+		}
+
+		upsertVpcsPipeline.Add(organizationIdFromJob, vpcs.UpsertVpcDtoV1{
 			Type:                        vpc_enums.AwsVpc,
 			Region:                      region_enums.Type(region),
 			DefaultSecurityIngressRules: ingressRules,
@@ -405,8 +411,13 @@ func createAlbSecurityGroupIfNeeded(parameters map[string]interface{}, ec2Client
 	if err != nil {
 		return "", err
 	}
+	var organizationIdFromJob string
+	organizationIdFromJob, err = jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIdFromJob)
+	if err != nil {
+		return "", err
+	}
 	if !isPreview(parameters) {
-		updateDeploymentsPipeline.Add(updateDeploymentsKey, deployments.UpdateDeploymentDtoV1{
+		updateDeploymentsPipeline.Add(organizationIdFromJob, deployments.UpdateDeploymentDtoV1{
 			ID:                       deploymentID,
 			AlbSecurityGroupId:       albSecurityGroupId,
 			AlbSecurityIngressRuleId: albSecurityGroupIngressRuleId,
@@ -414,7 +425,7 @@ func createAlbSecurityGroupIfNeeded(parameters map[string]interface{}, ec2Client
 		})
 	} else {
 		previewID := deploymentID
-		updatePreviewsPipeline.Add(updatePreviewsKey, previews.UpdatePreviewDtoV1{
+		updatePreviewsPipeline.Add(organizationIdFromJob, previews.UpdatePreviewDtoV1{
 			ID:                       previewID,
 			AlbSecurityGroupId:       albSecurityGroupId,
 			AlbSecurityIngressRuleId: albSecurityGroupIngressRuleId,
@@ -640,9 +651,13 @@ func createAlbIfNeeded(parameters map[string]interface{},
 	if err != nil {
 		return "", "", err
 	}
-
+	var organizationIdFromJob string
+	organizationIdFromJob, err = jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIdFromJob)
+	if err != nil {
+		return "", "", err
+	}
 	if !isPreview(parameters) {
-		updateDeploymentsPipeline.Add(updateDeploymentsKey, deployments.UpdateDeploymentDtoV1{
+		updateDeploymentsPipeline.Add(organizationIdFromJob, deployments.UpdateDeploymentDtoV1{
 			ID:                deploymentID,
 			TargetGroupArn:    targetGroupArn,
 			ListenerArnPort80: listenerArn,
@@ -651,7 +666,7 @@ func createAlbIfNeeded(parameters map[string]interface{},
 		})
 	} else {
 		previewID := deploymentID
-		updatePreviewsPipeline.Add(updatePreviewsKey, previews.UpdatePreviewDtoV1{
+		updatePreviewsPipeline.Add(organizationIdFromJob, previews.UpdatePreviewDtoV1{
 			ID:                previewID,
 			TargetGroupArn:    targetGroupArn,
 			ListenerArnPort80: listenerArn,
@@ -1172,9 +1187,13 @@ func createEcsServiceIfNeeded(parameters map[string]interface{}, ecsClient *ecs.
 	if err != nil {
 		return "", false, err
 	}
-
+	var organizationIdFromJob string
+	organizationIdFromJob, err = jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIdFromJob)
+	if err != nil {
+		return "", false, err
+	}
 	if !isPreview(parameters) {
-		updateDeploymentsPipeline.Add(updateDeploymentsKey, deployments.UpdateDeploymentDtoV1{
+		updateDeploymentsPipeline.Add(organizationIdFromJob, deployments.UpdateDeploymentDtoV1{
 			ID:            deploymentID,
 			EcsServiceArn: ecsServiceArn,
 			DnsName:       dnsName,
@@ -1182,7 +1201,7 @@ func createEcsServiceIfNeeded(parameters map[string]interface{}, ecsClient *ecs.
 		})
 	} else {
 		previewID := deploymentID
-		updatePreviewsPipeline.Add(updatePreviewsKey, previews.UpdatePreviewDtoV1{
+		updatePreviewsPipeline.Add(organizationIdFromJob, previews.UpdatePreviewDtoV1{
 			ID:            previewID,
 			EcsServiceArn: ecsServiceArn,
 			DnsName:       dnsName,
@@ -1252,7 +1271,7 @@ func (d *DeployAwsWebService) Run(parameters map[string]interface{}, logsWriter 
 
 	//check and add policy for AWS web service deployment
 	runnerData := utils.RunnerData.Get()
-	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationID)
+	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIDNamespace)
 	if err != nil {
 		return parameters, err
 	}
@@ -1310,16 +1329,20 @@ func (d *DeployAwsWebService) Run(parameters map[string]interface{}, logsWriter 
 	if err != nil {
 		return parameters, err
 	}
-
+	var organizationIdFromJob string
+	organizationIdFromJob, err = jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIdFromJob)
+	if err != nil {
+		return parameters, err
+	}
 	if !isPreview(parameters) {
-		updateBuildsPipeline.Add(updateBuildsKey, builds.UpdateBuildDtoV1{
+		updateBuildsPipeline.Add(organizationIdFromJob, builds.UpdateBuildDtoV1{
 			ID:                buildID,
 			TaskDefinitionArn: taskDefinitionArn,
 		})
 	} else {
 		//build id is preview id
 		previewID := buildID
-		updatePreviewsPipeline.Add(updateBuildsKey, previews.UpdatePreviewDtoV1{
+		updatePreviewsPipeline.Add(organizationIdFromJob, previews.UpdatePreviewDtoV1{
 			ID:                previewID,
 			TaskDefinitionArn: taskDefinitionArn,
 		})
