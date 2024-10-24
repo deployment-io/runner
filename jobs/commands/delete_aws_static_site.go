@@ -22,6 +22,28 @@ type DeleteAwsStaticSite struct {
 func (d *DeleteAwsStaticSite) Run(parameters map[string]interface{}, logsWriter io.Writer) (newParameters map[string]interface{}, err error) {
 	//For static site
 	io.WriteString(logsWriter, fmt.Sprintf("Deleting static site on AWS\n"))
+	deploymentID, err := jobs.GetParameterValue[string](parameters, parameters_enums.DeploymentID)
+	if err != nil {
+		return parameters, err
+	}
+	var organizationIdFromJob string
+	organizationIdFromJob, err = jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIdFromJob)
+	if err != nil {
+		return parameters, err
+	}
+	if !isPreview(parameters) {
+		//update deployment to deleted and delete domain
+		updateDeploymentsPipeline.Add(organizationIdFromJob, deployments.UpdateDeploymentDtoV1{
+			ID:            deploymentID,
+			DeletionState: deployment_enums.DeletionInProcess,
+		})
+	} else {
+		previewID := deploymentID
+		updatePreviewsPipeline.Add(organizationIdFromJob, previews.UpdatePreviewDtoV1{
+			ID:            previewID,
+			DeletionState: deployment_enums.DeletionInProcess,
+		})
+	}
 	//delete cloudfront distribution
 	cloudfrontDistributionId, err := jobs.GetParameterValue[string](parameters, parameters_enums.CloudfrontID)
 	if err != nil {
@@ -117,15 +139,6 @@ func (d *DeleteAwsStaticSite) Run(parameters map[string]interface{}, logsWriter 
 		return parameters, err
 	}
 
-	deploymentID, err := jobs.GetParameterValue[string](parameters, parameters_enums.DeploymentID)
-	if err != nil {
-		return parameters, err
-	}
-	var organizationIdFromJob string
-	organizationIdFromJob, err = jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIdFromJob)
-	if err != nil {
-		return parameters, err
-	}
 	if !isPreview(parameters) {
 		//update deployment to deleted and delete domain
 		updateDeploymentsPipeline.Add(organizationIdFromJob, deployments.UpdateDeploymentDtoV1{
