@@ -22,6 +22,28 @@ type DeleteAwsPrivateService struct {
 func (d *DeleteAwsPrivateService) Run(parameters map[string]interface{}, logsWriter io.Writer) (newParameters map[string]interface{}, err error) {
 	//stop service //delete service
 	io.WriteString(logsWriter, fmt.Sprintf("Deleting private service\n"))
+	deploymentID, err := jobs.GetParameterValue[string](parameters, parameters_enums.DeploymentID)
+	if err != nil {
+		return parameters, err
+	}
+	var organizationIdFromJob string
+	organizationIdFromJob, err = jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIdFromJob)
+	if err != nil {
+		return parameters, err
+	}
+	if !isPreview(parameters) {
+		//update deployment to deleted and delete domain
+		updateDeploymentsPipeline.Add(organizationIdFromJob, deployments.UpdateDeploymentDtoV1{
+			ID:            deploymentID,
+			DeletionState: deployment_enums.DeletionInProcess,
+		})
+	} else {
+		previewID := deploymentID
+		updatePreviewsPipeline.Add(organizationIdFromJob, previews.UpdatePreviewDtoV1{
+			ID:            previewID,
+			DeletionState: deployment_enums.DeletionInProcess,
+		})
+	}
 	clusterArn, err := jobs.GetParameterValue[string](parameters, parameters_enums.EcsClusterArn)
 	if err != nil {
 		return parameters, err
@@ -106,16 +128,6 @@ func (d *DeleteAwsPrivateService) Run(parameters map[string]interface{}, logsWri
 		if err != nil {
 			return parameters, err
 		}
-	}
-
-	deploymentID, err := jobs.GetParameterValue[string](parameters, parameters_enums.DeploymentID)
-	if err != nil {
-		return parameters, err
-	}
-	var organizationIdFromJob string
-	organizationIdFromJob, err = jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIdFromJob)
-	if err != nil {
-		return parameters, err
 	}
 	if !isPreview(parameters) {
 		//update deployment to deleted and delete domain
