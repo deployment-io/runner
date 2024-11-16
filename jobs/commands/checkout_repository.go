@@ -166,7 +166,7 @@ func updateSubmodules(repository *git.Repository, username, repoProviderToken st
 			},
 		})
 		if err != nil {
-			return fmt.Errorf("error updating submodules: %s", err)
+			return fmt.Errorf("error updating submodule: %s: %s", submodule.Config().Path, err)
 		}
 
 		io.WriteString(logsWriter, fmt.Sprintf("Submodule %s updated successfully\n", submodule.Config().Path))
