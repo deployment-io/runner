@@ -136,13 +136,13 @@ func fetchRepository(repository *git.Repository, repoProviderToken, repoGitProvi
 func updateSubmodules(repository *git.Repository, username, repoProviderToken string, logsWriter io.Writer) error {
 	wt, err := repository.Worktree()
 	if err != nil {
-		return err
+		return fmt.Errorf("error updating submodules: %s", err)
 	}
 
 	// Get the submodules
 	submodules, err := wt.Submodules()
 	if err != nil {
-		return err
+		return fmt.Errorf("error updating submodules: %s", err)
 	}
 
 	for _, submodule := range submodules {
@@ -153,7 +153,7 @@ func updateSubmodules(repository *git.Repository, username, repoProviderToken st
 			if errors.Is(err, git.ErrSubmoduleAlreadyInitialized) {
 				//io.WriteString(logsWriter, fmt.Sprintf("Submodule %s is already initialized\n", submodule.Config().Path))
 			} else {
-				return err
+				return fmt.Errorf("error updating submodules: %s", err)
 			}
 		}
 
@@ -166,7 +166,7 @@ func updateSubmodules(repository *git.Repository, username, repoProviderToken st
 			},
 		})
 		if err != nil {
-			return err
+			return fmt.Errorf("error updating submodules: %s", err)
 		}
 
 		io.WriteString(logsWriter, fmt.Sprintf("Submodule %s updated successfully\n", submodule.Config().Path))
