@@ -11,19 +11,21 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/oauth"
 	"github.com/deployment-io/deployment-runner-kit/previews"
 	"github.com/deployment-io/deployment-runner/client"
-	"gopkg.in/src-d/go-git.v4"
-	"gopkg.in/src-d/go-git.v4/plumbing"
-	"gopkg.in/src-d/go-git.v4/plumbing/object"
-	"gopkg.in/src-d/go-git.v4/plumbing/transport/http"
+	"github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v5/plumbing/object"
+	"github.com/go-git/go-git/v5/plumbing/transport/http"
 	"io"
 	"os"
 	"strings"
 	"time"
 )
 
+// CheckoutRepository is responsible for managing the cloning and updating of repository branches and commits.
 type CheckoutRepository struct {
 }
 
+// getRepositoryDirectoryPath returns the directory path for the repository based on organization and build ID parameters.
 func getRepositoryDirectoryPath(parameters map[string]interface{}) (string, error) {
 	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIDNamespace)
 	if err != nil {
@@ -36,6 +38,7 @@ func getRepositoryDirectoryPath(parameters map[string]interface{}) (string, erro
 	return fmt.Sprintf("/tmp/%s/%s", organizationID, buildID), nil
 }
 
+// addFile creates a file at the specified filePath with the provided contents. Returns an error if file creation or writing fails.
 func addFile(filePath, contents string) error {
 	//delete file. ignoring error since file may not exist
 	_ = os.Remove(filePath)
@@ -53,6 +56,7 @@ func addFile(filePath, contents string) error {
 	return nil
 }
 
+// isErrorAuthenticationRequired checks if the provided error indicates an authentication requirement.
 func isErrorAuthenticationRequired(err error) bool {
 	if err.Error() == "authentication required" {
 		return true
@@ -60,12 +64,12 @@ func isErrorAuthenticationRequired(err error) bool {
 	return false
 }
 
+// cloneRepository clones a Git repository to the specified directory path.
+// It supports authentication using a provided token and handles submodule initialization and updating.
+// If the repository already exists locally, it opens the existing repository instead of cloning it.
 func cloneRepository(repoDirectoryPath, repoCloneUrlWithToken, repoProviderToken, repoGitProvider string, logsWriter io.Writer) (*git.Repository, error) {
-	username := "oauth2"
-	if repoGitProvider == git_provider_enums.BitBucket.String() {
-		username = "x-token-auth"
-	}
-	var repository *git.Repository
+	username := getUsernameForProvider(repoGitProvider)
+
 	repository, err := git.PlainClone(repoDirectoryPath, false, &git.CloneOptions{
 		URL:      repoCloneUrlWithToken,
 		Progress: logsWriter,
@@ -73,6 +77,7 @@ func cloneRepository(repoDirectoryPath, repoCloneUrlWithToken, repoProviderToken
 			Username: username,
 			Password: repoProviderToken,
 		},
+		RecurseSubmodules: git.DefaultSubmoduleRecursionDepth, // Ensure submodules are initialized
 	})
 
 	if err != nil {
@@ -85,14 +90,20 @@ func cloneRepository(repoDirectoryPath, repoCloneUrlWithToken, repoProviderToken
 			return nil, err
 		}
 	}
+
+	// Initialize and update submodules
+	err = updateSubmodules(repository, username, repoProviderToken, logsWriter)
+	if err != nil {
+		return nil, err
+	}
+
 	return repository, nil
 }
 
+// fetchRepository fetches the latest changes of the provided repository using the given authentication tokens and logs progress.
 func fetchRepository(repository *git.Repository, repoProviderToken, repoGitProvider string, logsWriter io.Writer) error {
-	username := "oauth2"
-	if repoGitProvider == git_provider_enums.BitBucket.String() {
-		username = "x-token-auth"
-	}
+	username := getUsernameForProvider(repoGitProvider)
+
 	err := repository.Fetch(&git.FetchOptions{
 		Auth: &http.BasicAuth{
 			Username: username,
@@ -106,9 +117,65 @@ func fetchRepository(repository *git.Repository, repoProviderToken, repoGitProvi
 	if err != nil && err != git.NoErrAlreadyUpToDate {
 		return err
 	}
+
+	// Update submodules
+	err = updateSubmodules(repository, username, repoProviderToken, logsWriter)
+	if err != nil {
+		return err
+	}
+
 	return nil
 }
 
+// updateSubmodules initializes and updates all submodules in a given Git repository.
+// repository: the Git repository containing submodules to update.
+// username: the username for authentication with the repository provider.
+// repoProviderToken: the token used for authentication with the repository provider.
+// logsWriter: the writer where log messages will be output.
+// Returns an error if it fails to initialize or update any submodule.
+func updateSubmodules(repository *git.Repository, username, repoProviderToken string, logsWriter io.Writer) error {
+	wt, err := repository.Worktree()
+	if err != nil {
+		return err
+	}
+
+	// Get the submodules
+	submodules, err := wt.Submodules()
+	if err != nil {
+		return err
+	}
+
+	for _, submodule := range submodules {
+		// ignore err if submodule is already initialized
+		err = submodule.Init()
+		if err != nil {
+			// Handle specific error if needed
+			if errors.Is(err, git.ErrSubmoduleAlreadyInitialized) {
+				//io.WriteString(logsWriter, fmt.Sprintf("Submodule %s is already initialized\n", submodule.Config().Path))
+			} else {
+				return err
+			}
+		}
+
+		// Update each submodule
+		err = submodule.Update(&git.SubmoduleUpdateOptions{
+			RecurseSubmodules: git.DefaultSubmoduleRecursionDepth,
+			Auth: &http.BasicAuth{
+				Username: username,
+				Password: repoProviderToken,
+			},
+		})
+		if err != nil {
+			return err
+		}
+
+		io.WriteString(logsWriter, fmt.Sprintf("Submodule %s updated successfully\n", submodule.Config().Path))
+	}
+
+	return nil
+}
+
+// refreshGitToken refreshes the Git token using provided parameters with installation ID and organization ID.
 func refreshGitToken(parameters map[string]interface{}) (string, error) {
 	installationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.InstallationId)
 	if err != nil {
@@ -132,6 +199,7 @@ func refreshGitToken(parameters map[string]interface{}) (string, error) {
 	return "", err
 }
 
+// addRootDirectory appends a root directory from parameters to the repository directory path if specified.
 func addRootDirectory(parameters map[string]interface{}, repoDirectoryPath string) string {
 	var rootDirectoryPath string
 	rootDirectoryPath, err := jobs.GetParameterValue[string](parameters, parameters_enums.RootDirectory)
@@ -147,6 +215,7 @@ func addRootDirectory(parameters map[string]interface{}, repoDirectoryPath strin
 	return repoDirectoryPath
 }
 
+// getRepoUrlWithToken generates a repository URL with an embedded OAuth token for authentication with the given git provider.
 func getRepoUrlWithToken(gitProvider, repoProviderToken, repoCloneUrl string) (string, error) {
 	switch gitProvider {
 	case git_provider_enums.GitHub.String():
@@ -179,6 +248,17 @@ func getRepoUrlWithToken(gitProvider, repoProviderToken, repoCloneUrl string) (s
 	}
 }
 
+// getUsernameForProvider returns the appropriate username for the specified Git provider.
+// For BitBucket, it returns "x-token-auth"; otherwise, it returns "oauth2".
+func getUsernameForProvider(repoGitProvider string) string {
+	if repoGitProvider == git_provider_enums.BitBucket.String() {
+		return "x-token-auth"
+	}
+	return "oauth2"
+}
+
+// Run clones a specified repository, checks out the designated branch or commit, updates submodules, and updates build or preview status.
+// It takes a map of parameters and a writer for logs, returning a modified set of parameters and an error if any occurs during execution.
 func (cr *CheckoutRepository) Run(parameters map[string]interface{}, logsWriter io.Writer) (newParameters map[string]interface{}, err error) {
 	defer func() {
 		//_ = loggers.LogBuffer(logBuffer, logger)
@@ -211,11 +291,7 @@ func (cr *CheckoutRepository) Run(parameters map[string]interface{}, logsWriter 
 		return parameters, err
 	}
 
-	//after, found := strings.CutPrefix(repoCloneUrl, "https://")
-	//if found {
 	io.WriteString(logsWriter, fmt.Sprintf("Checking out branch %s for repository: %s\n", repoBranch, repoCloneUrl))
-
-	//repoCloneUrlWithToken := "https://oauth2:" + repoProviderToken + "@" + after
 
 	var repoDirectoryPath string
 	repoDirectoryPath, err = getRepositoryDirectoryPath(parameters)
@@ -230,7 +306,6 @@ func (cr *CheckoutRepository) Run(parameters map[string]interface{}, logsWriter 
 			if err != nil {
 				return parameters, err
 			}
-			//repoCloneUrlWithToken = "https://oauth2:" + repoProviderToken + "@" + after
 			repoCloneUrlWithToken, err = getRepoUrlWithToken(repoGitProvider, repoProviderToken, repoCloneUrl)
 			if err != nil {
 				return parameters, err
@@ -283,19 +358,25 @@ func (cr *CheckoutRepository) Run(parameters map[string]interface{}, logsWriter 
 		}
 	}
 
-	var commitHashFromParams string
-	commitHashFromParams, err = jobs.GetParameterValue[string](parameters, parameters_enums.CommitHash)
-
 	var organizationIdFromJob string
 	organizationIdFromJob, err = jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIdFromJob)
 	if err != nil {
 		return parameters, err
 	}
+	var commitHashFromParams string
+	commitHashFromParams, err = jobs.GetParameterValue[string](parameters, parameters_enums.CommitHash)
+
 	if err == nil && len(commitHashFromParams) > 0 {
 		hash := plumbing.NewHash(commitHashFromParams)
 		err = worktree.Checkout(&git.CheckoutOptions{
 			Hash: hash,
 		})
+		if err != nil {
+			return parameters, err
+		}
+		username := getUsernameForProvider(repoGitProvider)
+		// Ensure submodules are updated after the checkout
+		err = updateSubmodules(repository, username, repoProviderToken, logsWriter)
 		if err != nil {
 			return parameters, err
 		}
@@ -317,6 +398,12 @@ func (cr *CheckoutRepository) Run(parameters map[string]interface{}, logsWriter 
 		err = worktree.Checkout(&git.CheckoutOptions{
 			Branch: referenceName,
 		})
+		if err != nil {
+			return parameters, err
+		}
+		username := getUsernameForProvider(repoGitProvider)
+		// Ensure submodules are updated after the checkout
+		err = updateSubmodules(repository, username, repoProviderToken, logsWriter)
 		if err != nil {
 			return parameters, err
 		}
@@ -368,11 +455,6 @@ func (cr *CheckoutRepository) Run(parameters map[string]interface{}, logsWriter 
 	}
 
 	jobs.SetParameterValue[string](parameters, parameters_enums.RepoDirectoryPath, repoDirectoryPath)
-
-	//} else {
-	//	err = fmt.Errorf("clone URL doesn't start with https://")
-	//	return parameters, err
-	//}
 
 	return parameters, nil
 }
