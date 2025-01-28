@@ -11,6 +11,7 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/cloud_api_clients"
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
+	"github.com/deployment-io/deployment-runner/utils/aws_utils"
 	"io"
 	"time"
 )
@@ -29,7 +30,7 @@ func (l *ListCloudWatchMetricsAwsEcsWebService) Run(parameters map[string]interf
 	if err != nil {
 		return parameters, nil
 	}
-	ecsServiceName, err := getEcsServiceName(parameters)
+	ecsServiceName, err := aws_utils.GetEcsServiceName(parameters)
 	if err != nil {
 		return parameters, err
 	}

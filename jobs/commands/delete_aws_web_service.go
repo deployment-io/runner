@@ -14,6 +14,7 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner-kit/previews"
+	"github.com/deployment-io/deployment-runner/utils/aws_utils"
 	"io"
 	"time"
 )
@@ -50,11 +51,14 @@ func (d *DeleteAwsWebService) Run(parameters map[string]interface{}, logsWriter 
 	if err != nil {
 		return parameters, err
 	}
-	ecsServiceName, err := getEcsServiceName(parameters)
+	ecsServiceName, err := aws_utils.GetEcsServiceName(parameters)
 	if err != nil {
 		return parameters, err
 	}
 	ecsClient, err := cloud_api_clients.GetEcsClient(parameters)
+	if err != nil {
+		return parameters, err
+	}
 	io.WriteString(logsWriter, fmt.Sprintf("Deleting ECS service: %s in cluster: %s\n", ecsServiceName, clusterArn))
 	_, err = ecsClient.DeleteService(context.TODO(), &ecs.DeleteServiceInput{
 		Service: aws.String(ecsServiceName),
