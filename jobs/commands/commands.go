@@ -8,6 +8,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	s3Types "github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/deployment-io/deployment-runner-kit/automations"
 	"github.com/deployment-io/deployment-runner-kit/builds"
 	"github.com/deployment-io/deployment-runner-kit/certificates"
 	"github.com/deployment-io/deployment-runner-kit/clusters"
@@ -24,15 +25,6 @@ import (
 	"time"
 )
 
-//const updateDeploymentsKey = "updateDeployments"
-
-// const updateBuildsKey = "updateBuilds"
-// const updatePreviewsKey = "updatePreviews"
-// const updateCertificatesKey = "updateCertificates"
-//const sendNotificationsKey = "sendNotifications"
-
-//const updateJobOutputsKey = "updateJobOutputs"
-
 const cloudfrontRegion = "us-east-1"
 
 var updateBuildsPipeline *goPipeline.Pipeline[string, builds.UpdateBuildDtoV1]
@@ -43,6 +35,7 @@ var upsertVpcsPipeline *goPipeline.Pipeline[string, vpcs.UpsertVpcDtoV1]
 var upsertClustersPipeline *goPipeline.Pipeline[string, clusters.UpsertClusterDtoV1]
 var updateCertificatesPipeline *goPipeline.Pipeline[string, certificates.UpdateCertificateDtoV1]
 var updateJobOutputPipeline *goPipeline.Pipeline[string, jobs.UpdateJobOutputDtoV1]
+var updateAutomationOutputPipeline *goPipeline.Pipeline[string, automations.UpdateResponseDtoV1]
 
 func Shutdown() {
 	updateBuildsPipeline.Shutdown()
@@ -210,6 +203,21 @@ func Init() {
 				e = false
 			}
 		})
+	updateAutomationOutputPipeline, _ = goPipeline.NewPipeline(5, 1*time.Second,
+		func(organizationId string, automationResponses []automations.UpdateResponseDtoV1) {
+			e := true
+			for e {
+				err := c.UpdateAutomationResponses(automationResponses, organizationId)
+				//TODO we can handle for ErrConnection
+				//will block till error
+				if err != nil {
+					fmt.Println(err)
+					time.Sleep(2 * time.Second)
+					continue
+				}
+				e = false
+			}
+		})
 }
 
 func Get(p commands_enums.Type) (jobs.Command, error) {
@@ -260,6 +268,8 @@ func Get(p commands_enums.Type) (jobs.Command, error) {
 		return &ListCloudWatchMetricsAwsEcsWebService{}, nil
 	case commands_enums.CreateSecretAwsSecretManager:
 		return &CreateSecretAwsSecretManager{}, nil
+	case commands_enums.RunNewAutomation:
+		return &RunNewAutomation{}, nil
 	}
 	return nil, fmt.Errorf("error getting command for %s", p)
 }

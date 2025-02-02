@@ -27,6 +27,7 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/vpcs"
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
 	"github.com/deployment-io/deployment-runner/utils"
+	"github.com/deployment-io/deployment-runner/utils/aws_utils"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"io"
 	"regexp"
@@ -730,15 +731,6 @@ func getContainerName(parameters map[string]interface{}) (string, error) {
 	return fmt.Sprintf("c-%s", deploymentID), nil
 }
 
-func getEcsServiceName(parameters map[string]interface{}) (string, error) {
-	//es--<deploymentID>
-	deploymentID, err := jobs.GetParameterValue[string](parameters, parameters_enums.DeploymentID)
-	if err != nil {
-		return "", err
-	}
-	return fmt.Sprintf("es-%s", deploymentID), nil
-}
-
 func getEcsServiceCreationClientToken(parameters map[string]interface{}) (string, error) {
 	//es-<epoch>
 	return fmt.Sprintf("es-%d", time.Now().Unix()), nil
@@ -1043,7 +1035,7 @@ func createEcsServiceIfNeeded(parameters map[string]interface{}, ecsClient *ecs.
 		return ecsServiceArnFromParams, true, nil
 	}
 
-	ecsServiceName, err := getEcsServiceName(parameters)
+	ecsServiceName, err := aws_utils.GetEcsServiceName(parameters)
 	if err != nil {
 		return "", false, err
 	}
@@ -1215,7 +1207,7 @@ func createEcsServiceIfNeeded(parameters map[string]interface{}, ecsClient *ecs.
 func updateEcsService(parameters map[string]interface{}, ecsClient *ecs.Client, ecsClusterArn string,
 	taskDefinitionArn string, logsWriter io.Writer) error {
 	//TODO desired count is 1 for now.
-	ecsServiceName, err := getEcsServiceName(parameters)
+	ecsServiceName, err := aws_utils.GetEcsServiceName(parameters)
 	if err != nil {
 		return err
 	}
