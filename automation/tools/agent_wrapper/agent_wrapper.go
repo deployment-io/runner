@@ -27,7 +27,7 @@ type Tool struct {
 const maxIterations = 10
 
 func (t *Tool) newAgent() (llm_implementations.AgentInterface, error) {
-	httpClient := rpc.NewHTTPClient(rpcs.AzureOpenAI, false, true, 2)
+	httpClient := rpc.NewHTTPClient(rpcs.AzureOpenAI, true, true, 2)
 	return llm_implementations.Get(llm_implementation_enums.OpenAIFunctionAgent, agent_options.WithBackstory(t.AgentBackstory),
 		agent_options.WithRole(t.AgentRole),
 		agent_options.WithMaxIterations(maxIterations),

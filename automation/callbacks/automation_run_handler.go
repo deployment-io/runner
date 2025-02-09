@@ -102,3 +102,6 @@ func (a *AutomationRunHandler) HandleLLMGenerateContentEnd(_ context.Context, re
 		}
 	}
 }
+
+func (a *AutomationRunHandler) HandleStreamingFunc(ctx context.Context, chunk []byte) {
+}
