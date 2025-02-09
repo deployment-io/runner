@@ -26,7 +26,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/sts v1.28.6
 	github.com/aws/smithy-go v1.22.2
 	github.com/deployment-io/deployment-runner-kit v0.0.0-20250202061701-6f13e0a14d00
-	github.com/deployment-io/team-ai v0.0.0-20250128093350-54ca23274c34
+	github.com/deployment-io/team-ai v0.0.0-20250209082535-d8af7b8dc275
 	github.com/docker/docker v27.3.0+incompatible
 	github.com/go-git/go-billy/v5 v5.6.0
 	github.com/go-git/go-git/v5 v5.12.0
