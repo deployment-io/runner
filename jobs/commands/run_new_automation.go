@@ -64,7 +64,7 @@ func getToolForNode(nodeID string, nodesMap map[string]automations.NodeDtoV1, vi
 		}
 		//wrap agent node into a tool and return
 		agentLlm := currentNode.LlmModelType.String()
-		toolWrappedOnAgent := runnerTools.GetToolWrappedOnAgent(agentTools, currentNode.ID, currentNode.Role,
+		toolWrappedOnAgent := runnerTools.GetToolWrappedOnAgent(agentTools, currentNode.ID,
 			currentNode.Goal, currentNode.Backstory, agentLlm, logsWriter, handler)
 		return toolWrappedOnAgent, nil
 	} else {
@@ -81,7 +81,7 @@ func getToolForNode(nodeID string, nodesMap map[string]automations.NodeDtoV1, vi
 		} else if currentNode.NodeType.IsAgentType() {
 			//wrap agent node into a tool and return
 			agentLlm := currentNode.LlmModelType.String()
-			toolWrappedOnAgent := runnerTools.GetToolWrappedOnAgent(nil, currentNode.ID, currentNode.Role,
+			toolWrappedOnAgent := runnerTools.GetToolWrappedOnAgent(nil, currentNode.ID,
 				currentNode.Goal, currentNode.Backstory, agentLlm, logsWriter, handler)
 			return toolWrappedOnAgent, nil
 		}
