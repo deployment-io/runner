@@ -45,12 +45,11 @@ type Options struct {
 	CallbacksHandler callbacks.Handler
 }
 
-func GetToolWrappedOnAgent(agentTools []tools.Tool, agentName, agentRole, agentGoal, agentBackstory, llm string,
+func GetToolWrappedOnAgent(agentTools []tools.Tool, agentName, agentGoal, agentBackstory, llm string,
 	logsWriter io.Writer, handler callbacks.Handler) tools.Tool {
 	return &agent_wrapper.Tool{
 		AgentTools:      agentTools,
 		AgentName:       agentName,
-		AgentRole:       agentRole,
 		AgentGoal:       agentGoal,
 		AgentBackstory:  agentBackstory,
 		AgentLLM:        llm,
