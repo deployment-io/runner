@@ -133,9 +133,10 @@ func (t *Tool) Name() string {
 }
 
 func (t *Tool) Description() string {
-	description := "Sends an email to the specified recipient. Takes in email_address, subject, html_message, " +
-		"and plain_text_message as inputs. " +
-		"Ask the user for email_address if it's not provided. Don't assume anything."
+	description := `Sends an email to a specified recipient using SMTP configurations. 
+The tool requires the following inputs: email_address (the recipient's email), subject (email subject), html_message (HTML-formatted content), and plain_text_message (plain-text fallback content). 
+If the email_address is not provided, you should prompt the user to supply it. This tool ensures the email is delivered in both HTML and plain-text formats while maintaining configurability and customization via SMTP.
+`
 	return description
 }
 
