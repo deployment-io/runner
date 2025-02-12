@@ -241,6 +241,8 @@ func getEventLogs(cloudwatchLogsClient *cloudwatchlogs.Client, logGroupName, log
 		nextBackwardToken = getLogEventsOutput.NextBackwardToken
 	}
 
+	originalLogsCount = len(allLogEvents)
+
 	for _, event := range allLogEvents {
 		eventMessage := *event.Message
 		searchResult := searchSimilarLogs(eventMessage, filter, k, threshold)
@@ -260,6 +262,7 @@ func getEventLogs(cloudwatchLogsClient *cloudwatchlogs.Client, logGroupName, log
 			})
 		}
 	}
+	filteredLogsCount = len(logs)
 	return logs, nil
 }
 
@@ -349,6 +352,9 @@ func searchSimilarLogs(query string, filter *bloom.BloomFilter, k int, threshold
 	return similarity >= threshold
 }
 
+var originalLogsCount int
+var filteredLogsCount int
+
 func (t *Tool) Call(ctx context.Context, input string) (string, error) {
 	if len(input) == 0 {
 		return "Input cannot be empty. Please provide required parameters of start time and end time.", nil
@@ -433,7 +439,8 @@ func (t *Tool) Call(ctx context.Context, input string) (string, error) {
 		if len(smallOut) > 200 {
 			smallOut = smallOut[:200] + "..."
 		}
-		info := fmt.Sprintf("Exiting get application logs with output: %s", smallOut)
+		info := fmt.Sprintf("Exiting get application logs with output: %s : original logs count: %d : "+
+			"filtered logs count: %d", smallOut, originalLogsCount, filteredLogsCount)
 		t.CallbacksHandler.HandleToolEnd(ctx, info)
 	}
 	return out, nil
