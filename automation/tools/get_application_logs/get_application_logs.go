@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/ankit-arora/bloom"
 	"github.com/ankit-arora/langchaingo/callbacks"
 	"github.com/ankit-arora/langchaingo/tools"
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -14,6 +15,7 @@ import (
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
 	"github.com/go-playground/validator/v10"
 	"io"
+	"math"
 	"time"
 )
 
@@ -192,7 +194,8 @@ func parseAndValidateInput(response, location string, input *Input) (int64, int6
 }
 
 func getEventLogs(cloudwatchLogsClient *cloudwatchlogs.Client, logGroupName, logStreamPrefix string,
-	endTimeInMilliseconds, startTimeInMilliSeconds int64, logsWriter io.Writer) ([]Log, error) {
+	endTimeInMilliseconds, startTimeInMilliSeconds int64, logsWriter io.Writer, filter *bloom.BloomFilter, k int,
+	threshold float64) ([]Log, error) {
 	var logs []Log
 	describeLogStreamsOutput, err := cloudwatchLogsClient.DescribeLogStreams(context.TODO(), &cloudwatchlogs.DescribeLogStreamsInput{
 		Descending:          aws.Bool(true),
@@ -212,14 +215,15 @@ func getEventLogs(cloudwatchLogsClient *cloudwatchlogs.Client, logGroupName, log
 	}
 	logStreamName := aws.ToString(describeLogStreamsOutput.LogStreams[0].LogStreamName)
 	var allLogEvents []types.OutputLogEvent
-	var nextForwardToken *string
+	var nextBackwardToken *string
 	for {
 		getLogEventsOutput, err := cloudwatchLogsClient.GetLogEvents(context.TODO(), &cloudwatchlogs.GetLogEventsInput{
 			LogStreamName: aws.String(logStreamName),
 			EndTime:       aws.Int64(endTimeInMilliseconds),
 			LogGroupName:  aws.String(logGroupName),
 			StartTime:     aws.Int64(startTimeInMilliSeconds),
-			NextToken:     nextForwardToken,
+			NextToken:     nextBackwardToken,
+			StartFromHead: aws.Bool(false),
 		})
 
 		if err != nil {
@@ -231,32 +235,37 @@ func getEventLogs(cloudwatchLogsClient *cloudwatchlogs.Client, logGroupName, log
 			allLogEvents = append(allLogEvents, getLogEventsOutput.Events...)
 		}
 
-		if getLogEventsOutput.NextForwardToken == nil || aws.ToString(getLogEventsOutput.NextForwardToken) == aws.ToString(nextForwardToken) {
+		if getLogEventsOutput.NextBackwardToken == nil || aws.ToString(getLogEventsOutput.NextBackwardToken) == aws.ToString(nextBackwardToken) {
 			break // No more pages
 		}
-		nextForwardToken = getLogEventsOutput.NextForwardToken
+		nextBackwardToken = getLogEventsOutput.NextBackwardToken
 	}
 
 	for _, event := range allLogEvents {
 		eventMessage := *event.Message
-		tsInMilli := *event.Timestamp
-		//assume UCT for now
-		timeZoneLocation := ""
-		timeString, err := convertEpochMilliToTimeString(tsInMilli, timeZoneLocation)
-		if err != nil {
-			io.WriteString(logsWriter, fmt.Sprintf("Error converting epoch to time: %s\n", err))
-			return nil, fmt.Errorf("failed to convert epoch to time: %w", err)
+		searchResult := searchSimilarLogs(eventMessage, filter, k, threshold)
+		if !searchResult {
+			addLogToBloomFilter(eventMessage, filter, k)
+			tsInMilli := *event.Timestamp
+			//assume UCT for now
+			timeZoneLocation := ""
+			timeString, err := convertEpochMilliToTimeString(tsInMilli, timeZoneLocation)
+			if err != nil {
+				io.WriteString(logsWriter, fmt.Sprintf("Error converting epoch to time: %s\n", err))
+				return nil, fmt.Errorf("failed to convert epoch to time: %w", err)
+			}
+			logs = append(logs, Log{
+				Message:   eventMessage,
+				TimeInUTC: timeString,
+			})
 		}
-		logs = append(logs, Log{
-			Message:   eventMessage,
-			TimeInUTC: timeString,
-		})
 	}
 	return logs, nil
 }
 
 func getFilteredEventLogs(cloudwatchLogsClient *cloudwatchlogs.Client, logGroupName, logStreamPrefix, filterPattern string,
-	endTimeInMilliseconds, startTimeInMilliseconds int64, logsWriter io.Writer) ([]Log, error) {
+	endTimeInMilliseconds, startTimeInMilliseconds int64, logsWriter io.Writer, filter *bloom.BloomFilter, k int,
+	threshold float64) ([]Log, error) {
 	var logs []Log
 	var filteredLogEvents []types.FilteredLogEvent
 	var nextToken *string
@@ -283,20 +292,61 @@ func getFilteredEventLogs(cloudwatchLogsClient *cloudwatchlogs.Client, logGroupN
 	}
 	for _, event := range filteredLogEvents {
 		eventMessage := *event.Message
-		tsInMilli := *event.Timestamp
-		//assume UCT for now
-		timeZoneLocation := ""
-		timeString, err := convertEpochMilliToTimeString(tsInMilli, timeZoneLocation)
-		if err != nil {
-			io.WriteString(logsWriter, fmt.Sprintf("Error converting epoch to time: %s\n", err))
-			return nil, fmt.Errorf("failed to convert epoch to time: %w", err)
+		searchResult := searchSimilarLogs(eventMessage, filter, k, threshold)
+		if !searchResult {
+			addLogToBloomFilter(eventMessage, filter, k)
+			tsInMilli := *event.Timestamp
+			//assume UCT for now
+			timeZoneLocation := ""
+			timeString, err := convertEpochMilliToTimeString(tsInMilli, timeZoneLocation)
+			if err != nil {
+				io.WriteString(logsWriter, fmt.Sprintf("Error converting epoch to time: %s\n", err))
+				return nil, fmt.Errorf("failed to convert epoch to time: %w", err)
+			}
+			logs = append(logs, Log{
+				Message:   eventMessage,
+				TimeInUTC: timeString,
+			})
 		}
-		logs = append(logs, Log{
-			Message:   eventMessage,
-			TimeInUTC: timeString,
-		})
 	}
 	return logs, nil
+}
+
+func generateShingles(log string, k int) []string {
+	if k <= 0 || k > len(log) { // Ensure k is valid
+		return []string{}
+	}
+
+	var shingles []string
+	for i := 0; i <= len(log)-k; i++ {
+		shingles = append(shingles, log[i:i+k])
+	}
+	return shingles
+}
+
+func addLogToBloomFilter(log string, filter *bloom.BloomFilter, k int) {
+	shingles := generateShingles(log, k)
+	for _, shingle := range shingles {
+		filter.Add([]byte(shingle)) // Add shingle to Bloom Filter
+	}
+}
+
+func searchSimilarLogs(query string, filter *bloom.BloomFilter, k int, threshold float64) bool {
+	shingles := generateShingles(query, k)
+	matchCount := 0
+	totalShingles := len(shingles)
+	if totalShingles == 0 {
+		return false
+	}
+
+	for _, shingle := range shingles {
+		if filter.Test([]byte(shingle)) { // Check membership in Bloom Filter
+			matchCount++
+		}
+	}
+
+	similarity := float64(matchCount) / float64(totalShingles)
+	return similarity >= threshold
 }
 
 func (t *Tool) Call(ctx context.Context, input string) (string, error) {
@@ -345,12 +395,19 @@ func (t *Tool) Call(ctx context.Context, input string) (string, error) {
 		return "There was an error. We'll get back to you.", nil
 	}
 	var logs []Log
+	numElements := 1000000
+	falsePositiveRate := 0.001
+	m := uint(-float64(numElements) * math.Log(falsePositiveRate) / (math.Log(2) * math.Log(2)))
+	numHashFunctions := math.Ceil((float64(m) / float64(numElements)) * math.Log(2))
+	filter := bloom.New(m, uint(numHashFunctions))
+	k := 4
+	threshold := 0.7
 	if len(searchPattern) > 0 {
 		logs, err = getFilteredEventLogs(cloudwatchLogsClient, logGroupName, logStreamPrefix, searchPattern,
-			endTimeInMilliseconds, startTimeInMilliSeconds, t.LogsWriter)
+			endTimeInMilliseconds, startTimeInMilliSeconds, t.LogsWriter, filter, k, threshold)
 	} else {
 		logs, err = getEventLogs(cloudwatchLogsClient, logGroupName, logStreamPrefix, endTimeInMilliseconds,
-			startTimeInMilliSeconds, t.LogsWriter)
+			startTimeInMilliSeconds, t.LogsWriter, filter, k, threshold)
 	}
 	if err != nil {
 		if t.CallbacksHandler != nil {

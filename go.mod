@@ -1,8 +1,9 @@
 module github.com/deployment-io/deployment-runner
 
-go 1.22.2
+go 1.23.3
 
 require (
+	github.com/ankit-arora/bloom v0.0.0-20250212075533-bfbc7b922c3b
 	github.com/ankit-arora/go-utils v0.0.0-20230703175629-90641e500c7c
 	github.com/ankit-arora/ipnets v0.0.0-20230525113803-5d737bfe484b
 	github.com/ankit-arora/langchaingo v0.0.0-20250127131401-1bbb9b54c14a
@@ -45,6 +46,7 @@ require (
 	github.com/Masterminds/sprig/v3 v3.2.3 // indirect
 	github.com/Microsoft/go-winio v0.6.1 // indirect
 	github.com/ProtonMail/go-crypto v1.0.0 // indirect
+	github.com/ankit-arora/bitset v0.0.0-20250212073004-6a047aa1a9a0 // indirect
 	github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream v1.6.7 // indirect
 	github.com/aws/aws-sdk-go-v2/credentials v1.17.11 // indirect
 	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.16.1 // indirect
