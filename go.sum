@@ -46,8 +46,8 @@ github.com/ankit-arora/go-utils v0.0.0-20230703175629-90641e500c7c h1:GXRfkeMmxH
 github.com/ankit-arora/go-utils v0.0.0-20230703175629-90641e500c7c/go.mod h1:I5eGrm/beDHS5N5yq6sJEGCRt2Wh3FBOqhb5qHMH3sU=
 github.com/ankit-arora/ipnets v0.0.0-20230525113803-5d737bfe484b h1:dzDzU00XC3U3PLZ3g5jdbWKMrFlte7q7gfMe2Uj4Hp4=
 github.com/ankit-arora/ipnets v0.0.0-20230525113803-5d737bfe484b/go.mod h1:F1MZruFLgjQPlziMNCy10PWWItD/cPuoD9sCHNsz3Cg=
-github.com/ankit-arora/langchaingo v0.0.0-20250127131401-1bbb9b54c14a h1:rY/CPXP+GEuQEEowrOP0v/WDlrHuQqJVFZ7COnyVv8c=
-github.com/ankit-arora/langchaingo v0.0.0-20250127131401-1bbb9b54c14a/go.mod h1:tuR7RnOKiaZ5NrccsutKEoVl0bcfy2CFj+nhIpmf68c=
+github.com/ankit-arora/langchaingo v0.0.0-20250213122302-122a5007324f h1:sps4duYiN3eHn4aOUOH0ztgIU0elXwxOol9X3519cLU=
+github.com/ankit-arora/langchaingo v0.0.0-20250213122302-122a5007324f/go.mod h1:tuR7RnOKiaZ5NrccsutKEoVl0bcfy2CFj+nhIpmf68c=
 github.com/ankit-arora/markdown v0.0.0-20240801070227-28eff2aa6649 h1:ZFXCrDrD1KpoJvokudBD12jzVcj3o+Th8KUoFXYQS90=
 github.com/ankit-arora/markdown v0.0.0-20240801070227-28eff2aa6649/go.mod h1:4kBvz8n0wtKcG2YNAEqBAWye7wYeVO+r0KJ74ht6R4Q=
 github.com/ankit-arora/nixpacks-go v0.0.0-20240925063829-e4f7ef9412db h1:w90J4fp+tMZjZ3Abmvf2s9vll7riJOAbLL9uA2rHdJ8=
@@ -153,8 +153,8 @@ github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/deployment-io/deployment-runner-kit v0.0.0-20250210133321-9221bb11c56c h1:GHVwbCNUGPVUG3rYXA8B72Ib1sPrgkNNYVGYwbQVKos=
 github.com/deployment-io/deployment-runner-kit v0.0.0-20250210133321-9221bb11c56c/go.mod h1:NbK8phHt+EFceZtkE7vsm9YaHBVMpfUorr8v0Jwj0nM=
-github.com/deployment-io/team-ai v0.0.0-20250209082535-d8af7b8dc275 h1:1r6s4l0wbRhx71IOny621UYzhthw9DVrK+YtLncnNCw=
-github.com/deployment-io/team-ai v0.0.0-20250209082535-d8af7b8dc275/go.mod h1:xTjCmKJzaC3roDzVIyQmVeZl4LQILwN0tNCXhqO3g3Y=
+github.com/deployment-io/team-ai v0.0.0-20250213123139-02f37cd26c13 h1:iazvWD4rewERNrR5Z0Fyb18ZxITD1YEs/7ZjI7p7CJ4=
+github.com/deployment-io/team-ai v0.0.0-20250213123139-02f37cd26c13/go.mod h1:B0fxmLJICi0qP2R2m3I2tR1uRIKQxn4ekK67lyBRHjw=
 github.com/distribution/reference v0.6.0 h1:0IXCQ5g4/QMHHkarYzh5l+u8T3t73zM5QvfrDyIgxBk=
 github.com/distribution/reference v0.6.0/go.mod h1:BbU0aIcezP1/5jX/8MP0YiH4SdvB5Y4f/wlDRiLyi3E=
 github.com/dlclark/regexp2 v1.10.0 h1:+/GIL799phkJqYW+3YbOd8LCcbHzT0Pbo8zl70MHsq0=
