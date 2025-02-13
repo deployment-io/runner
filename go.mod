@@ -6,7 +6,7 @@ require (
 	github.com/ankit-arora/bloom v0.0.0-20250212075533-bfbc7b922c3b
 	github.com/ankit-arora/go-utils v0.0.0-20230703175629-90641e500c7c
 	github.com/ankit-arora/ipnets v0.0.0-20230525113803-5d737bfe484b
-	github.com/ankit-arora/langchaingo v0.0.0-20250127131401-1bbb9b54c14a
+	github.com/ankit-arora/langchaingo v0.0.0-20250213122302-122a5007324f
 	github.com/ankit-arora/markdown v0.0.0-20240801070227-28eff2aa6649
 	github.com/ankit-arora/nixpacks-go v0.0.0-20240925063829-e4f7ef9412db
 	github.com/aws/aws-sdk-go-v2 v1.34.0
@@ -27,7 +27,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/sts v1.28.6
 	github.com/aws/smithy-go v1.22.2
 	github.com/deployment-io/deployment-runner-kit v0.0.0-20250210133321-9221bb11c56c
-	github.com/deployment-io/team-ai v0.0.0-20250209082535-d8af7b8dc275
+	github.com/deployment-io/team-ai v0.0.0-20250213123139-02f37cd26c13
 	github.com/docker/docker v27.3.0+incompatible
 	github.com/go-git/go-billy/v5 v5.6.0
 	github.com/go-git/go-git/v5 v5.12.0
