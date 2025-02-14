@@ -22,7 +22,8 @@ func GetToolFromType(toolType automation_enums.ToolType, options Options) (tools
 			Entities:         toolType.GetEntities(),
 		}, nil
 	case automation_enums.SendEmail:
-		tool, err := send_email.NewTool(options.Parameters, options.LogsWriter, options.CallbacksHandler)
+		tool, err := send_email.NewTool(options.Parameters, options.LogsWriter, options.CallbacksHandler,
+			options.DebugOpenAICalls)
 		if err != nil {
 			return nil, err
 		}
@@ -33,6 +34,7 @@ func GetToolFromType(toolType automation_enums.ToolType, options Options) (tools
 			LogsWriter:       options.LogsWriter,
 			CallbacksHandler: options.CallbacksHandler,
 			Entities:         toolType.GetEntities(),
+			DebugOpenAICalls: options.DebugOpenAICalls,
 		}, nil
 	default:
 		return nil, fmt.Errorf("tool type %s not supported", toolType.String())
@@ -43,6 +45,7 @@ type Options struct {
 	Parameters       map[string]interface{}
 	LogsWriter       io.Writer
 	CallbacksHandler callbacks.Handler
+	DebugOpenAICalls bool
 }
 
 func GetToolWrappedOnAgent(agentTools []tools.Tool, agentName, agentGoal, agentBackstory, llm string,

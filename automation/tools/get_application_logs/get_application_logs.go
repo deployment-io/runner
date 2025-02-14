@@ -24,6 +24,7 @@ type Tool struct {
 	LogsWriter       io.Writer
 	CallbacksHandler callbacks.Handler
 	Entities         []automation_enums.Entity
+	DebugOpenAICalls bool
 }
 
 func (t *Tool) entitiesString() string {
@@ -436,9 +437,12 @@ func (t *Tool) Call(ctx context.Context, input string) (string, error) {
 	out := string(outBytes)
 	if t.CallbacksHandler != nil {
 		smallOut := out
-		//if len(smallOut) > 200 {
-		//	smallOut = smallOut[:200] + "..."
-		//}
+		if !t.DebugOpenAICalls {
+			//show all logs only in debug mode
+			if len(smallOut) > 200 {
+				smallOut = smallOut[:200] + "..."
+			}
+		}
 		info := fmt.Sprintf("Exiting get application logs with output: %s : original logs count: %d : "+
 			"filtered logs count: %d", smallOut, originalLogsCount, filteredLogsCount)
 		t.CallbacksHandler.HandleToolEnd(ctx, info)
