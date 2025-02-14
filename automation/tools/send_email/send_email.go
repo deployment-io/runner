@@ -27,7 +27,8 @@ func NewSmtpEmailImplementation(host, port, username, password string) (email2.E
 	return smtpImpl, nil
 }
 
-func NewTool(params map[string]interface{}, logsWriter io.Writer, callbacksHandler callbacks.Handler) (*Tool, error) {
+func NewTool(params map[string]interface{}, logsWriter io.Writer, callbacksHandler callbacks.Handler,
+	debugOpenAICalls bool) (*Tool, error) {
 	smtpHost, err := jobs.GetParameterValue[string](params, parameters_enums.SmtpHost)
 	if err != nil {
 		return nil, fmt.Errorf("error getting smtp host: %s", err)
@@ -58,6 +59,7 @@ func NewTool(params map[string]interface{}, logsWriter io.Writer, callbacksHandl
 		CallbacksHandler: callbacksHandler,
 		SmtpImpl:         smtpImpl,
 		FromAddress:      fromAddress,
+		DebugOpenAICalls: debugOpenAICalls,
 	}, nil
 }
 
@@ -67,6 +69,7 @@ type Tool struct {
 	CallbacksHandler callbacks.Handler
 	SmtpImpl         email2.EmailI
 	FromAddress      string
+	DebugOpenAICalls bool
 }
 
 type Input struct {
@@ -160,6 +163,11 @@ func (t *Tool) Call(ctx context.Context, input string) (string, error) {
 	}
 	if t.CallbacksHandler != nil {
 		info := fmt.Sprintf("Sending email with input: %s", input)
+		if !t.DebugOpenAICalls {
+			if len(info) > 200 {
+				info = info[:200] + "..."
+			}
+		}
 		t.CallbacksHandler.HandleToolStart(ctx, info)
 	}
 	inputJsonObj := &Input{}
@@ -183,8 +191,14 @@ func (t *Tool) Call(ctx context.Context, input string) (string, error) {
 		return fmt.Sprintf("Email was not sent due to the following reason: %s", err), nil
 	}
 	out := fmt.Sprintf("Email sent successfuly to: %s", inputJsonObj.EmailAddress)
-	info := fmt.Sprintf("Exiting send email tool with output: %s", out)
+
 	if t.CallbacksHandler != nil {
+		info := fmt.Sprintf("Exiting send email tool with output: %s", out)
+		if !t.DebugOpenAICalls {
+			if len(info) > 200 {
+				info = info[:200] + "..."
+			}
+		}
 		t.CallbacksHandler.HandleToolEnd(ctx, info)
 	}
 	return out, nil

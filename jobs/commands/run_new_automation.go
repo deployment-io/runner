@@ -39,7 +39,8 @@ type RunNewAutomation struct {
 }
 
 func getToolForNode(nodeID string, nodesMap map[string]automations.NodeDtoV1, visited map[string]bool,
-	parameters map[string]interface{}, logsWriter io.Writer, handler *callbacks.AutomationRunHandler) (tools.Tool, error) {
+	parameters map[string]interface{}, logsWriter io.Writer, handler *callbacks.AutomationRunHandler,
+	debugOpenAICalls bool) (tools.Tool, error) {
 	if visited[nodeID] {
 		return nil, nil
 	}
@@ -54,7 +55,8 @@ func getToolForNode(nodeID string, nodesMap map[string]automations.NodeDtoV1, vi
 		//only agent type will have children since we have handled the trigger node in the caller
 		var agentTools []tools.Tool
 		for _, childNodeID := range currentNode.Children {
-			toolForAgentNode, err := getToolForNode(childNodeID, nodesMap, visited, parameters, logsWriter, handler)
+			toolForAgentNode, err := getToolForNode(childNodeID, nodesMap, visited, parameters, logsWriter, handler,
+				debugOpenAICalls)
 			if err != nil {
 				return nil, err
 			}
@@ -73,6 +75,7 @@ func getToolForNode(nodeID string, nodesMap map[string]automations.NodeDtoV1, vi
 				Parameters:       parameters,
 				LogsWriter:       logsWriter,
 				CallbacksHandler: handler,
+				DebugOpenAICalls: debugOpenAICalls,
 			})
 			if err != nil {
 				return nil, err
@@ -216,7 +219,7 @@ func (r *RunNewAutomation) Run(parameters map[string]interface{}, logsWriter io.
 	for _, childNodeID := range startNode.Children {
 		var toolForNode tools.Tool
 		toolForNode, err = getToolForNode(childNodeID, automationData.NodesMap, map[string]bool{}, parameters, logsWriter,
-			automationRunHandler)
+			automationRunHandler, debugOpenAICalls)
 		if err != nil {
 			updateAutomationOutputPipeline.Add(organizationIdFromJob, automations.UpdateResponseDtoV1{
 				JobID:    jobID,
