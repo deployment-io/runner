@@ -407,7 +407,7 @@ func (t *Tool) Call(ctx context.Context, input string) (string, error) {
 	numHashFunctions := math.Ceil((float64(m) / float64(numElements)) * math.Log(2))
 	filter := bloom.New(m, uint(numHashFunctions))
 	k := 4
-	threshold := 0.8
+	threshold := 0.87
 	if len(searchPattern) > 0 {
 		logs, err = getFilteredEventLogs(cloudwatchLogsClient, logGroupName, logStreamPrefix, searchPattern,
 			endTimeInMilliseconds, startTimeInMilliSeconds, t.LogsWriter, filter, k, threshold)
