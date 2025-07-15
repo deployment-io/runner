@@ -6,6 +6,7 @@ import (
 	"github.com/ankit-arora/langchaingo/tools"
 	"github.com/deployment-io/deployment-runner-kit/enums/automation_enums"
 	"github.com/deployment-io/deployment-runner/automation/tools/agent_wrapper"
+	"github.com/deployment-io/deployment-runner/automation/tools/code_tools/query_code"
 	"github.com/deployment-io/deployment-runner/automation/tools/get_application_logs"
 	"github.com/deployment-io/deployment-runner/automation/tools/get_cpu_memory_usage"
 	"github.com/deployment-io/deployment-runner/automation/tools/send_email"
@@ -30,6 +31,14 @@ func GetToolFromType(toolType automation_enums.ToolType, options Options) (tools
 		return tool, nil
 	case automation_enums.GetApplicationLogs:
 		return &get_application_logs.Tool{
+			Params:           options.Parameters,
+			LogsWriter:       options.LogsWriter,
+			CallbacksHandler: options.CallbacksHandler,
+			Entities:         toolType.GetEntities(),
+			DebugOpenAICalls: options.DebugOpenAICalls,
+		}, nil
+	case automation_enums.QueryCode:
+		return &query_code.Tool{
 			Params:           options.Parameters,
 			LogsWriter:       options.LogsWriter,
 			CallbacksHandler: options.CallbacksHandler,

@@ -21,6 +21,7 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/previews"
 	"github.com/deployment-io/deployment-runner-kit/vpcs"
 	"github.com/deployment-io/deployment-runner/client"
+	"github.com/deployment-io/deployment-runner/jobs/commands/utils"
 	"os"
 	"time"
 )
@@ -287,7 +288,7 @@ func MarkDeploymentDone(parameters map[string]interface{}, err error) <-chan str
 	go func() {
 		defer func() {
 			//Delete old repo directory to clean up
-			repoDirectoryPath, _ := getRepositoryDirectoryPath(parameters)
+			repoDirectoryPath, _ := utils.GetRepositoryDirectoryPath(parameters)
 			if len(repoDirectoryPath) > 0 {
 				os.RemoveAll(repoDirectoryPath)
 			}
