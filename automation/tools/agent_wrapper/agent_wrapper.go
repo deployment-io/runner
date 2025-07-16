@@ -39,8 +39,20 @@ func (t *Tool) Name() string {
 	return t.AgentName
 }
 
+func (t *Tool) getCustomAgentToolsInfo() string {
+	toolsInfo := ""
+	for _, tool := range t.AgentTools {
+		toolsInfo += "Name : " + tool.Name() + "\n" + "Description : " + tool.Description() + "\n"
+	}
+	return toolsInfo
+}
+
 func (t *Tool) Description() string {
-	return t.AgentGoal
+	description := `Calls a custom AI agent with the following goal: %s
+The custom agent has access to the following tools and can use them to complete the goal: 
+%s`
+	description = fmt.Sprintf(description, t.AgentGoal, t.getCustomAgentToolsInfo())
+	return description
 }
 
 func (t *Tool) Call(ctx context.Context, input string) (string, error) {

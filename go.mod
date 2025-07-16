@@ -1,6 +1,8 @@
 module github.com/deployment-io/deployment-runner
 
-go 1.23.3
+go 1.24
+
+toolchain go1.24.0
 
 require (
 	github.com/ankit-arora/bloom v0.0.0-20250212075533-bfbc7b922c3b
@@ -26,7 +28,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/servicediscovery v1.31.1
 	github.com/aws/aws-sdk-go-v2/service/sts v1.28.6
 	github.com/aws/smithy-go v1.22.2
-	github.com/deployment-io/deployment-runner-kit v0.0.0-20250210133321-9221bb11c56c
+	github.com/deployment-io/deployment-runner-kit v0.0.0-20250715132321-8fb18b78ea32
 	github.com/deployment-io/team-ai v0.0.0-20250213123139-02f37cd26c13
 	github.com/docker/docker v27.3.0+incompatible
 	github.com/go-git/go-billy/v5 v5.6.0
@@ -34,8 +36,11 @@ require (
 	github.com/go-playground/validator/v10 v10.23.0
 	github.com/joho/godotenv v1.5.1
 	github.com/moby/moby v27.3.0+incompatible
+	github.com/tree-sitter/go-tree-sitter v0.25.0
+	github.com/tree-sitter/tree-sitter-go v0.23.4
 	go.mongodb.org/mongo-driver v1.14.0
-	golang.org/x/net v0.34.0
+	golang.org/x/net v0.41.0
+	gonum.org/v1/gonum v0.16.0
 )
 
 require (
@@ -92,6 +97,7 @@ require (
 	github.com/kevinburke/ssh_config v1.2.0 // indirect
 	github.com/klauspost/compress v1.17.7 // indirect
 	github.com/leodido/go-urn v1.4.0 // indirect
+	github.com/mattn/go-pointer v0.0.1 // indirect
 	github.com/mattn/go-runewidth v0.0.9 // indirect
 	github.com/mitchellh/copystructure v1.0.0 // indirect
 	github.com/mitchellh/reflectwalk v1.0.0 // indirect
@@ -131,13 +137,13 @@ require (
 	go.opentelemetry.io/otel/sdk v1.19.0 // indirect
 	go.opentelemetry.io/otel/trace v1.26.0 // indirect
 	go.starlark.net v0.0.0-20230302034142-4b1e35fe2254 // indirect
-	golang.org/x/crypto v0.32.0 // indirect
-	golang.org/x/exp v0.0.0-20240719175910-8a7402abbf56 // indirect
-	golang.org/x/mod v0.19.0 // indirect
-	golang.org/x/sync v0.10.0 // indirect
-	golang.org/x/sys v0.29.0 // indirect
-	golang.org/x/text v0.21.0 // indirect
-	golang.org/x/tools v0.23.0 // indirect
+	golang.org/x/crypto v0.39.0 // indirect
+	golang.org/x/exp v0.0.0-20241009180824-f66d83c29e7c // indirect
+	golang.org/x/mod v0.25.0 // indirect
+	golang.org/x/sync v0.15.0 // indirect
+	golang.org/x/sys v0.33.0 // indirect
+	golang.org/x/text v0.26.0 // indirect
+	golang.org/x/tools v0.34.0 // indirect
 	gopkg.in/warnings.v0 v0.1.2 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	gotest.tools/v3 v3.4.0 // indirect
