@@ -192,7 +192,7 @@ func (t *Tool) getAnswerFromFunctionUsingLLM(query string, nodeIDs []int64, grap
 			llms.TextParts(llms.ChatMessageTypeHuman, userMessage),
 		}
 
-		chatCompletion, err := llm.GenerateContent(ctx, content)
+		chatCompletion, err := llm.GenerateContent(ctx, content, llms.WithModel(automationData.LlmCodeQueryModelType.String()))
 		if err != nil {
 			return "", fmt.Errorf("failed to get function summary from LLM: %w", err)
 		}
@@ -247,7 +247,7 @@ func (t *Tool) findRelevantFunctions(question string, graph *types.CodeGraph) ([
 		llms.TextParts(llms.ChatMessageTypeHuman, userMessage),
 	}
 
-	chatCompletion, err := llm.GenerateContent(ctx, content)
+	chatCompletion, err := llm.GenerateContent(ctx, content, llms.WithModel(automationData.LlmCodeQueryModelType.String()))
 	if err != nil {
 		return nil, fmt.Errorf("failed to get function summary from LLM: %w", err)
 	}
@@ -303,7 +303,7 @@ func (t *Tool) getFunctionSummaryFromLLM(graph *types.CodeGraph) error {
 				llms.TextParts(llms.ChatMessageTypeHuman, userMessage),
 			}
 
-			chatCompletion, err := llm.GenerateContent(ctx, content)
+			chatCompletion, err := llm.GenerateContent(ctx, content, llms.WithModel(automationData.LlmCodeQueryModelType.String()))
 
 			if err != nil {
 				return fmt.Errorf("failed to get function summary from LLM: %w", err)
