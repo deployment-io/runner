@@ -166,7 +166,8 @@ func (t *Tool) getAnswerFromFunctionUsingLLM(query string, nodeIDs []int64, grap
 
 	llm, err := openai.New(openai.WithModel(automationData.LlmCodeQueryModelType.String()), openai.WithAPIType(openai.APITypeAzure),
 		openai.WithAPIVersion("2024-02-01"), openai.WithHTTPClient(httpClient),
-		openai.WithCallback(t.CallbacksHandler))
+		openai.WithCallback(t.CallbacksHandler), openai.WithBaseURL(automationData.OpenAIBaseUrl),
+		openai.WithToken(automationData.OpenAIAPIKey))
 	if err != nil {
 		return "", err
 	}
@@ -213,7 +214,8 @@ func (t *Tool) findRelevantFunctions(question string, graph *types.CodeGraph) ([
 
 	llm, err := openai.New(openai.WithModel(automationData.LlmCodeQueryModelType.String()), openai.WithAPIType(openai.APITypeAzure),
 		openai.WithAPIVersion("2024-02-01"), openai.WithHTTPClient(httpClient),
-		openai.WithCallback(t.CallbacksHandler))
+		openai.WithCallback(t.CallbacksHandler), openai.WithBaseURL(automationData.OpenAIBaseUrl),
+		openai.WithToken(automationData.OpenAIAPIKey))
 	if err != nil {
 		return nil, err
 	}
@@ -280,7 +282,8 @@ func (t *Tool) getFunctionSummaryFromLLM(graph *types.CodeGraph) error {
 
 	llm, err := openai.New(openai.WithModel(automationData.LlmCodeQueryModelType.String()), openai.WithAPIType(openai.APITypeAzure),
 		openai.WithAPIVersion("2024-02-01"), openai.WithHTTPClient(httpClient),
-		openai.WithCallback(t.CallbacksHandler))
+		openai.WithCallback(t.CallbacksHandler), openai.WithBaseURL(automationData.OpenAIBaseUrl),
+		openai.WithToken(automationData.OpenAIAPIKey))
 	if err != nil {
 		return err
 	}
