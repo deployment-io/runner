@@ -21,6 +21,7 @@ import (
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-playground/validator/v10"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -164,7 +165,9 @@ func (t *Tool) getAnswerFromFunctionUsingLLM(query string, nodeIDs []int64, grap
 		return "", fmt.Errorf("failed to get automation data: %w", err)
 	}
 
-	llm, err := openai.New(openai.WithModel(automationData.LlmCodeQueryModelType.String()), openai.WithAPIType(openai.APITypeAzure),
+	llmQueryCodeModel := automationData.LlmCodeQueryModelType.String()
+	log.Printf("code query model: %s\n", llmQueryCodeModel)
+	llm, err := openai.New(openai.WithModel(llmQueryCodeModel), openai.WithAPIType(openai.APITypeAzure),
 		openai.WithAPIVersion("2024-02-01"), openai.WithHTTPClient(httpClient),
 		openai.WithCallback(t.CallbacksHandler), openai.WithBaseURL(automationData.OpenAIBaseUrl),
 		openai.WithToken(automationData.OpenAIAPIKey))
@@ -192,7 +195,7 @@ func (t *Tool) getAnswerFromFunctionUsingLLM(query string, nodeIDs []int64, grap
 			llms.TextParts(llms.ChatMessageTypeHuman, userMessage),
 		}
 
-		chatCompletion, err := llm.GenerateContent(ctx, content, llms.WithModel(automationData.LlmCodeQueryModelType.String()))
+		chatCompletion, err := llm.GenerateContent(ctx, content, llms.WithModel(llmQueryCodeModel))
 		if err != nil {
 			return "", fmt.Errorf("failed to get function summary from LLM: %w", err)
 		}
@@ -212,7 +215,10 @@ func (t *Tool) findRelevantFunctions(question string, graph *types.CodeGraph) ([
 		return nil, fmt.Errorf("failed to get automation data: %w", err)
 	}
 
-	llm, err := openai.New(openai.WithModel(automationData.LlmCodeQueryModelType.String()), openai.WithAPIType(openai.APITypeAzure),
+	llmQueryCodeModel := automationData.LlmCodeQueryModelType.String()
+	log.Printf("code query model: %s\n", llmQueryCodeModel)
+
+	llm, err := openai.New(openai.WithModel(llmQueryCodeModel), openai.WithAPIType(openai.APITypeAzure),
 		openai.WithAPIVersion("2024-02-01"), openai.WithHTTPClient(httpClient),
 		openai.WithCallback(t.CallbacksHandler), openai.WithBaseURL(automationData.OpenAIBaseUrl),
 		openai.WithToken(automationData.OpenAIAPIKey))
@@ -247,7 +253,7 @@ func (t *Tool) findRelevantFunctions(question string, graph *types.CodeGraph) ([
 		llms.TextParts(llms.ChatMessageTypeHuman, userMessage),
 	}
 
-	chatCompletion, err := llm.GenerateContent(ctx, content, llms.WithModel(automationData.LlmCodeQueryModelType.String()))
+	chatCompletion, err := llm.GenerateContent(ctx, content, llms.WithModel(llmQueryCodeModel))
 	if err != nil {
 		return nil, fmt.Errorf("failed to get function summary from LLM: %w", err)
 	}
@@ -280,7 +286,10 @@ func (t *Tool) getFunctionSummaryFromLLM(graph *types.CodeGraph) error {
 		return fmt.Errorf("failed to get automation data: %w", err)
 	}
 
-	llm, err := openai.New(openai.WithModel(automationData.LlmCodeQueryModelType.String()), openai.WithAPIType(openai.APITypeAzure),
+	llmQueryCodeModel := automationData.LlmCodeQueryModelType.String()
+	log.Printf("code query model: %s\n", llmQueryCodeModel)
+
+	llm, err := openai.New(openai.WithModel(llmQueryCodeModel), openai.WithAPIType(openai.APITypeAzure),
 		openai.WithAPIVersion("2024-02-01"), openai.WithHTTPClient(httpClient),
 		openai.WithCallback(t.CallbacksHandler), openai.WithBaseURL(automationData.OpenAIBaseUrl),
 		openai.WithToken(automationData.OpenAIAPIKey))
@@ -303,7 +312,7 @@ func (t *Tool) getFunctionSummaryFromLLM(graph *types.CodeGraph) error {
 				llms.TextParts(llms.ChatMessageTypeHuman, userMessage),
 			}
 
-			chatCompletion, err := llm.GenerateContent(ctx, content, llms.WithModel(automationData.LlmCodeQueryModelType.String()))
+			chatCompletion, err := llm.GenerateContent(ctx, content, llms.WithModel(llmQueryCodeModel))
 
 			if err != nil {
 				return fmt.Errorf("failed to get function summary from LLM: %w", err)
