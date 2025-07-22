@@ -19,6 +19,7 @@ type Tool struct {
 	AgentGoal       string
 	AgentBackstory  string
 	AgentLLM        string
+	AgentApiVersion string
 	LogsWriter      io.Writer
 	CallbackHandler callbacks.Handler
 }
@@ -30,6 +31,7 @@ func (t *Tool) newAgent() (llm_implementations.AgentInterface, error) {
 	return llm_implementations.Get(llm_implementation_enums.OpenAIFunctionAgent, agent_options.WithBackstory(t.AgentBackstory),
 		agent_options.WithMaxIterations(maxIterations),
 		agent_options.WithLLM(t.AgentLLM),
+		agent_options.WithApiVersion(t.AgentApiVersion),
 		agent_options.WithHttpClient(httpClient),
 		agent_options.WithCallbackHandler(t.CallbackHandler),
 	)

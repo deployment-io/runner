@@ -57,7 +57,7 @@ type Options struct {
 	DebugOpenAICalls bool
 }
 
-func GetToolWrappedOnAgent(agentTools []tools.Tool, agentName, agentGoal, agentBackstory, llm string,
+func GetToolWrappedOnAgent(agentTools []tools.Tool, agentName, agentGoal, agentBackstory, llm, llmVersion string,
 	logsWriter io.Writer, handler callbacks.Handler) tools.Tool {
 	return &agent_wrapper.Tool{
 		AgentTools:      agentTools,
@@ -65,6 +65,7 @@ func GetToolWrappedOnAgent(agentTools []tools.Tool, agentName, agentGoal, agentB
 		AgentGoal:       agentGoal,
 		AgentBackstory:  agentBackstory,
 		AgentLLM:        llm,
+		AgentApiVersion: llmVersion,
 		LogsWriter:      logsWriter,
 		CallbackHandler: handler,
 	}

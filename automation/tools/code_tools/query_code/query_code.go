@@ -21,7 +21,6 @@ import (
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-playground/validator/v10"
 	"io"
-	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -166,9 +165,10 @@ func (t *Tool) getAnswerFromFunctionUsingLLM(query string, nodeIDs []int64, grap
 	}
 
 	llmQueryCodeModel := automationData.LlmCodeQueryModelType.String()
-	log.Printf("code query model: %s\n", llmQueryCodeModel)
+	llmQueryCodeModelVersion := automationData.LlmCodeQueryApiVersion.String()
+
 	llm, err := openai.New(openai.WithModel(llmQueryCodeModel), openai.WithAPIType(openai.APITypeAzure),
-		openai.WithAPIVersion("2024-02-01"), openai.WithHTTPClient(httpClient),
+		openai.WithAPIVersion(llmQueryCodeModelVersion), openai.WithHTTPClient(httpClient),
 		openai.WithCallback(t.CallbacksHandler), openai.WithBaseURL(automationData.OpenAIBaseUrl),
 		openai.WithToken(automationData.OpenAIAPIKey))
 	if err != nil {
@@ -216,10 +216,10 @@ func (t *Tool) findRelevantFunctions(question string, graph *types.CodeGraph) ([
 	}
 
 	llmQueryCodeModel := automationData.LlmCodeQueryModelType.String()
-	log.Printf("code query model: %s\n", llmQueryCodeModel)
+	llmQueryCodeModelVersion := automationData.LlmCodeQueryApiVersion.String()
 
 	llm, err := openai.New(openai.WithModel(llmQueryCodeModel), openai.WithAPIType(openai.APITypeAzure),
-		openai.WithAPIVersion("2024-02-01"), openai.WithHTTPClient(httpClient),
+		openai.WithAPIVersion(llmQueryCodeModelVersion), openai.WithHTTPClient(httpClient),
 		openai.WithCallback(t.CallbacksHandler), openai.WithBaseURL(automationData.OpenAIBaseUrl),
 		openai.WithToken(automationData.OpenAIAPIKey))
 	if err != nil {
@@ -287,10 +287,10 @@ func (t *Tool) getFunctionSummaryFromLLM(graph *types.CodeGraph) error {
 	}
 
 	llmQueryCodeModel := automationData.LlmCodeQueryModelType.String()
-	log.Printf("code query model: %s\n", llmQueryCodeModel)
+	llmQueryCodeModelVersion := automationData.LlmCodeQueryApiVersion.String()
 
 	llm, err := openai.New(openai.WithModel(llmQueryCodeModel), openai.WithAPIType(openai.APITypeAzure),
-		openai.WithAPIVersion("2024-02-01"), openai.WithHTTPClient(httpClient),
+		openai.WithAPIVersion(llmQueryCodeModelVersion), openai.WithHTTPClient(httpClient),
 		openai.WithCallback(t.CallbacksHandler), openai.WithBaseURL(automationData.OpenAIBaseUrl),
 		openai.WithToken(automationData.OpenAIAPIKey))
 	if err != nil {

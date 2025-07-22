@@ -66,8 +66,9 @@ func getToolForNode(nodeID string, nodesMap map[string]automations.NodeDtoV1, vi
 		}
 		//wrap agent node into a tool and return
 		agentLlm := currentNode.LlmModelType.String()
+		agentLlmVersion := currentNode.LlmApiVersion.String()
 		toolWrappedOnAgent := runnerTools.GetToolWrappedOnAgent(agentTools, currentNode.ID,
-			currentNode.Goal, currentNode.Backstory, agentLlm, logsWriter, handler)
+			currentNode.Goal, currentNode.Backstory, agentLlm, agentLlmVersion, logsWriter, handler)
 		return toolWrappedOnAgent, nil
 	} else {
 		if currentNode.NodeType.IsToolType() {
@@ -84,8 +85,9 @@ func getToolForNode(nodeID string, nodesMap map[string]automations.NodeDtoV1, vi
 		} else if currentNode.NodeType.IsAgentType() {
 			//wrap agent node into a tool and return
 			agentLlm := currentNode.LlmModelType.String()
+			agentLlmVersion := currentNode.LlmApiVersion.String()
 			toolWrappedOnAgent := runnerTools.GetToolWrappedOnAgent(nil, currentNode.ID,
-				currentNode.Goal, currentNode.Backstory, agentLlm, logsWriter, handler)
+				currentNode.Goal, currentNode.Backstory, agentLlm, agentLlmVersion, logsWriter, handler)
 			return toolWrappedOnAgent, nil
 		}
 	}
@@ -189,7 +191,8 @@ func (r *RunNewAutomation) Run(parameters map[string]interface{}, logsWriter io.
 		DebugOpenAICalls: debugOpenAICalls,
 	}
 	automationLlmType := automationData.LlmModelType.String()
-	automationAgent, err := agents.GetAgentToAssist(agent_enums.AutomationAgent, automationLlmType,
+	automationLlmApiVersion := automationData.LlmApiVersion.String()
+	automationAgent, err := agents.GetAgentToAssist(agent_enums.AutomationAgent, automationLlmType, automationLlmApiVersion,
 		"", automationRunHandler)
 	if err != nil {
 		updateAutomationOutputPipeline.Add(organizationIdFromJob, automations.UpdateResponseDtoV1{
