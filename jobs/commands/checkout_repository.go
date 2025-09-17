@@ -2,18 +2,19 @@ package commands
 
 import (
 	"fmt"
+	"io"
+	"os"
+	"strings"
+
 	"github.com/deployment-io/deployment-runner-kit/builds"
 	"github.com/deployment-io/deployment-runner-kit/enums/build_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner-kit/previews"
-	"github.com/deployment-io/deployment-runner/jobs/commands/utils"
+	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/object"
-	"io"
-	"os"
-	"strings"
 )
 
 // CheckoutRepository is responsible for managing the cloning and updating of repository branches and commits.
@@ -83,7 +84,7 @@ func (cr *CheckoutRepository) Run(parameters map[string]interface{}, logsWriter 
 		return parameters, err
 	}
 
-	repoCloneUrlWithToken, err := utils.GetRepoUrlWithToken(repoGitProvider, repoProviderToken, repoCloneUrl)
+	repoCloneUrlWithToken, err := commandUtils.GetRepoUrlWithToken(repoGitProvider, repoProviderToken, repoCloneUrl)
 	if err != nil {
 		return parameters, err
 	}
@@ -91,23 +92,23 @@ func (cr *CheckoutRepository) Run(parameters map[string]interface{}, logsWriter 
 	io.WriteString(logsWriter, fmt.Sprintf("Checking out branch %s for repository: %s\n", repoBranch, repoCloneUrl))
 
 	var repoDirectoryPath string
-	repoDirectoryPath, err = utils.GetRepositoryDirectoryPath(parameters)
+	repoDirectoryPath, err = commandUtils.GetRepositoryDirectoryPath(parameters)
 	if err != nil {
 		return parameters, err
 	}
 	var repository *git.Repository
-	repository, err = utils.CloneRepository(repoDirectoryPath, repoCloneUrlWithToken, repoProviderToken, repoGitProvider, logsWriter)
+	repository, err = commandUtils.CloneRepository(repoDirectoryPath, repoCloneUrlWithToken, repoProviderToken, repoGitProvider, logsWriter)
 	if err != nil {
-		if utils.IsErrorAuthenticationRequired(err) {
-			repoProviderToken, err = utils.RefreshGitToken(parameters)
+		if commandUtils.IsErrorAuthenticationRequired(err) {
+			repoProviderToken, err = commandUtils.RefreshGitToken(parameters)
 			if err != nil {
 				return parameters, err
 			}
-			repoCloneUrlWithToken, err = utils.GetRepoUrlWithToken(repoGitProvider, repoProviderToken, repoCloneUrl)
+			repoCloneUrlWithToken, err = commandUtils.GetRepoUrlWithToken(repoGitProvider, repoProviderToken, repoCloneUrl)
 			if err != nil {
 				return parameters, err
 			}
-			repository, err = utils.CloneRepository(repoDirectoryPath, repoCloneUrlWithToken, repoProviderToken, repoGitProvider, logsWriter)
+			repository, err = commandUtils.CloneRepository(repoDirectoryPath, repoCloneUrlWithToken, repoProviderToken, repoGitProvider, logsWriter)
 			if err != nil {
 				return parameters, err
 			}
@@ -123,14 +124,14 @@ func (cr *CheckoutRepository) Run(parameters map[string]interface{}, logsWriter 
 		return parameters, err
 	}
 
-	err = utils.FetchRepository(repository, repoProviderToken, repoGitProvider, logsWriter)
+	err = commandUtils.FetchRepository(repository, repoProviderToken, repoGitProvider, logsWriter)
 	if err != nil {
-		if utils.IsErrorAuthenticationRequired(err) {
-			repoProviderToken, err = utils.RefreshGitToken(parameters)
+		if commandUtils.IsErrorAuthenticationRequired(err) {
+			repoProviderToken, err = commandUtils.RefreshGitToken(parameters)
 			if err != nil {
 				return parameters, err
 			}
-			err = utils.FetchRepository(repository, repoProviderToken, repoGitProvider, logsWriter)
+			err = commandUtils.FetchRepository(repository, repoProviderToken, repoGitProvider, logsWriter)
 			if err != nil {
 				return parameters, err
 			}
@@ -171,21 +172,21 @@ func (cr *CheckoutRepository) Run(parameters map[string]interface{}, logsWriter 
 		if err != nil {
 			return parameters, err
 		}
-		username := utils.GetUsernameForProvider(repoGitProvider)
+		username := commandUtils.GetUsernameForProvider(repoGitProvider)
 		// Ensure submodules are updated after the checkout
-		err = utils.UpdateSubmodules(repository, username, repoProviderToken, logsWriter)
+		err = commandUtils.UpdateSubmodules(repository, username, repoProviderToken, logsWriter)
 		if err != nil {
 			return parameters, err
 		}
 		if !isPreview {
 			//update build
-			updateBuildsPipeline.Add(organizationIdFromJob, builds.UpdateBuildDtoV1{
+			commandUtils.UpdateBuildsPipeline.Add(organizationIdFromJob, builds.UpdateBuildDtoV1{
 				ID:     buildOrPreviewID,
 				Status: build_enums.Running,
 			})
 		} else {
 			//update preview
-			updatePreviewsPipeline.Add(organizationIdFromJob, previews.UpdatePreviewDtoV1{
+			commandUtils.UpdatePreviewsPipeline.Add(organizationIdFromJob, previews.UpdatePreviewDtoV1{
 				ID:     buildOrPreviewID,
 				Status: build_enums.Running,
 			})
@@ -198,9 +199,9 @@ func (cr *CheckoutRepository) Run(parameters map[string]interface{}, logsWriter 
 		if err != nil {
 			return parameters, err
 		}
-		username := utils.GetUsernameForProvider(repoGitProvider)
+		username := commandUtils.GetUsernameForProvider(repoGitProvider)
 		// Ensure submodules are updated after the checkout
-		err = utils.UpdateSubmodules(repository, username, repoProviderToken, logsWriter)
+		err = commandUtils.UpdateSubmodules(repository, username, repoProviderToken, logsWriter)
 		if err != nil {
 			return parameters, err
 		}
@@ -216,14 +217,14 @@ func (cr *CheckoutRepository) Run(parameters map[string]interface{}, logsWriter 
 		commitMessage := strings.TrimSpace(commitObject.Message)
 
 		if !isPreview {
-			updateBuildsPipeline.Add(organizationIdFromJob, builds.UpdateBuildDtoV1{
+			commandUtils.UpdateBuildsPipeline.Add(organizationIdFromJob, builds.UpdateBuildDtoV1{
 				ID:            buildOrPreviewID,
 				CommitHash:    commitHash,
 				CommitMessage: commitMessage,
 				Status:        build_enums.Running,
 			})
 		} else {
-			updatePreviewsPipeline.Add(organizationIdFromJob, previews.UpdatePreviewDtoV1{
+			commandUtils.UpdatePreviewsPipeline.Add(organizationIdFromJob, previews.UpdatePreviewDtoV1{
 				ID:            buildOrPreviewID,
 				CommitHash:    commitHash,
 				CommitMessage: commitMessage,

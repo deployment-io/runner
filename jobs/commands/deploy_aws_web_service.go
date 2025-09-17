@@ -3,6 +3,11 @@ package commands
 import (
 	"context"
 	"fmt"
+	"io"
+	"regexp"
+	"strings"
+	"time"
+
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	ec2Types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
@@ -29,10 +34,6 @@ import (
 	"github.com/deployment-io/deployment-runner/utils"
 	"github.com/deployment-io/deployment-runner/utils/aws_utils"
 	"go.mongodb.org/mongo-driver/bson/primitive"
-	"io"
-	"regexp"
-	"strings"
-	"time"
 )
 
 type DeployAwsWebService struct {
@@ -198,7 +199,7 @@ func addIngressRuleToDefaultVpcSecurityGroupForPortIfNeeded(parameters map[strin
 			return err
 		}
 
-		upsertVpcsPipeline.Add(organizationIdFromJob, vpcs.UpsertVpcDtoV1{
+		commandUtils.UpsertVpcsPipeline.Add(organizationIdFromJob, vpcs.UpsertVpcDtoV1{
 			Type:                        vpc_enums.AwsVpc,
 			Region:                      region_enums.Type(region),
 			DefaultSecurityIngressRules: ingressRules,
@@ -418,7 +419,7 @@ func createAlbSecurityGroupIfNeeded(parameters map[string]interface{}, ec2Client
 		return "", err
 	}
 	if !isPreview(parameters) {
-		updateDeploymentsPipeline.Add(organizationIdFromJob, deployments.UpdateDeploymentDtoV1{
+		commandUtils.UpdateDeploymentsPipeline.Add(organizationIdFromJob, deployments.UpdateDeploymentDtoV1{
 			ID:                       deploymentID,
 			AlbSecurityGroupId:       albSecurityGroupId,
 			AlbSecurityIngressRuleId: albSecurityGroupIngressRuleId,
@@ -426,7 +427,7 @@ func createAlbSecurityGroupIfNeeded(parameters map[string]interface{}, ec2Client
 		})
 	} else {
 		previewID := deploymentID
-		updatePreviewsPipeline.Add(organizationIdFromJob, previews.UpdatePreviewDtoV1{
+		commandUtils.UpdatePreviewsPipeline.Add(organizationIdFromJob, previews.UpdatePreviewDtoV1{
 			ID:                       previewID,
 			AlbSecurityGroupId:       albSecurityGroupId,
 			AlbSecurityIngressRuleId: albSecurityGroupIngressRuleId,
@@ -658,7 +659,7 @@ func createAlbIfNeeded(parameters map[string]interface{},
 		return "", "", err
 	}
 	if !isPreview(parameters) {
-		updateDeploymentsPipeline.Add(organizationIdFromJob, deployments.UpdateDeploymentDtoV1{
+		commandUtils.UpdateDeploymentsPipeline.Add(organizationIdFromJob, deployments.UpdateDeploymentDtoV1{
 			ID:                deploymentID,
 			TargetGroupArn:    targetGroupArn,
 			ListenerArnPort80: listenerArn,
@@ -667,7 +668,7 @@ func createAlbIfNeeded(parameters map[string]interface{},
 		})
 	} else {
 		previewID := deploymentID
-		updatePreviewsPipeline.Add(organizationIdFromJob, previews.UpdatePreviewDtoV1{
+		commandUtils.UpdatePreviewsPipeline.Add(organizationIdFromJob, previews.UpdatePreviewDtoV1{
 			ID:                previewID,
 			TargetGroupArn:    targetGroupArn,
 			ListenerArnPort80: listenerArn,
@@ -1185,7 +1186,7 @@ func createEcsServiceIfNeeded(parameters map[string]interface{}, ecsClient *ecs.
 		return "", false, err
 	}
 	if !isPreview(parameters) {
-		updateDeploymentsPipeline.Add(organizationIdFromJob, deployments.UpdateDeploymentDtoV1{
+		commandUtils.UpdateDeploymentsPipeline.Add(organizationIdFromJob, deployments.UpdateDeploymentDtoV1{
 			ID:            deploymentID,
 			EcsServiceArn: ecsServiceArn,
 			DnsName:       dnsName,
@@ -1193,7 +1194,7 @@ func createEcsServiceIfNeeded(parameters map[string]interface{}, ecsClient *ecs.
 		})
 	} else {
 		previewID := deploymentID
-		updatePreviewsPipeline.Add(organizationIdFromJob, previews.UpdatePreviewDtoV1{
+		commandUtils.UpdatePreviewsPipeline.Add(organizationIdFromJob, previews.UpdatePreviewDtoV1{
 			ID:            previewID,
 			EcsServiceArn: ecsServiceArn,
 			DnsName:       dnsName,
@@ -1327,14 +1328,14 @@ func (d *DeployAwsWebService) Run(parameters map[string]interface{}, logsWriter 
 		return parameters, err
 	}
 	if !isPreview(parameters) {
-		updateBuildsPipeline.Add(organizationIdFromJob, builds.UpdateBuildDtoV1{
+		commandUtils.UpdateBuildsPipeline.Add(organizationIdFromJob, builds.UpdateBuildDtoV1{
 			ID:                buildID,
 			TaskDefinitionArn: taskDefinitionArn,
 		})
 	} else {
 		//build id is preview id
 		previewID := buildID
-		updatePreviewsPipeline.Add(organizationIdFromJob, previews.UpdatePreviewDtoV1{
+		commandUtils.UpdatePreviewsPipeline.Add(organizationIdFromJob, previews.UpdatePreviewDtoV1{
 			ID:                previewID,
 			TaskDefinitionArn: taskDefinitionArn,
 		})

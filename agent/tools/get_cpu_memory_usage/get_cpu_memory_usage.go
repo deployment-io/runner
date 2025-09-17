@@ -3,36 +3,24 @@ package get_cpu_memory_usage
 import (
 	"context"
 	"fmt"
+	"io"
+	"time"
+
 	"github.com/ankit-arora/langchaingo/callbacks"
 	"github.com/ankit-arora/langchaingo/tools"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatch"
 	cloudwatchTypes "github.com/aws/aws-sdk-go-v2/service/cloudwatch/types"
 	"github.com/deployment-io/deployment-runner-kit/cloud_api_clients"
-	"github.com/deployment-io/deployment-runner-kit/enums/automation_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner/utils/aws_utils"
-	"io"
-	"time"
 )
 
 type Tool struct {
 	Parameters       map[string]interface{}
 	LogsWriter       io.Writer
 	CallbacksHandler callbacks.Handler
-	Entities         []automation_enums.Entity
-}
-
-func (t *Tool) entitiesString() string {
-	entities := ""
-	for index, entity := range t.Entities {
-		entities += entity.String()
-		if index < len(t.Entities)-1 {
-			entities += ", "
-		}
-	}
-	return entities
 }
 
 func (t *Tool) Name() string {
@@ -40,9 +28,8 @@ func (t *Tool) Name() string {
 }
 
 func (t *Tool) Description() string {
-	entitiesString := t.entitiesString()
-	return fmt.Sprintf("Gets cpu or memory usage metrics for %s. "+
-		"This function doesn't require a name or any other input.", entitiesString)
+	return fmt.Sprintf("Gets cpu or memory usage metrics. " +
+		"This function doesn't require a name or any other input.")
 }
 
 func (t *Tool) Call(ctx context.Context, input string) (string, error) {

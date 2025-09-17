@@ -4,6 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"math"
+	"time"
+
 	"github.com/ankit-arora/bloom"
 	"github.com/ankit-arora/langchaingo/callbacks"
 	"github.com/ankit-arora/langchaingo/tools"
@@ -11,31 +15,15 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs/types"
 	"github.com/deployment-io/deployment-runner-kit/cloud_api_clients"
-	"github.com/deployment-io/deployment-runner-kit/enums/automation_enums"
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
 	"github.com/go-playground/validator/v10"
-	"io"
-	"math"
-	"time"
 )
 
 type Tool struct {
 	Params           map[string]interface{}
 	LogsWriter       io.Writer
 	CallbacksHandler callbacks.Handler
-	Entities         []automation_enums.Entity
 	DebugOpenAICalls bool
-}
-
-func (t *Tool) entitiesString() string {
-	entities := ""
-	for index, entity := range t.Entities {
-		entities += entity.String()
-		if index < len(t.Entities)-1 {
-			entities += ", "
-		}
-	}
-	return entities
 }
 
 func getCurrentTimeString(timeZoneLocation string) (string, error) {
@@ -68,12 +56,11 @@ type Output struct {
 }
 
 func (t *Tool) Description() string {
-	entitiesString := t.entitiesString()
 	currentTimeStr, err := getCurrentTimeString("")
 	if err != nil {
 		currentTimeStr = ""
 	}
-	info := "Gets application logs for %s"
+	info := "Gets application logs"
 	inputInfo := `This function takes in a time range and a search pattern as an input. The time range is mandatory and the search pattern is optional. 
 You should ask the user if the time range is not available.`
 	outputInfo := `The output is in a structured JSON object format with the following fields:
@@ -95,7 +82,6 @@ Output Format Example:
 }
 `
 	description := ""
-	info = fmt.Sprintf(info, entitiesString)
 	description += fmt.Sprintf("%s\n", info)
 	description += fmt.Sprintf("%s\n", inputInfo)
 	description += fmt.Sprintf("%s\n", outputInfo)

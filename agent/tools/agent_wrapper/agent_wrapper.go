@@ -3,6 +3,8 @@ package agent_wrapper
 import (
 	"context"
 	"fmt"
+	"io"
+
 	"github.com/ankit-arora/langchaingo/callbacks"
 	"github.com/ankit-arora/langchaingo/tools"
 	"github.com/deployment-io/team-ai/enums/llm_implementation_enums"
@@ -10,12 +12,12 @@ import (
 	"github.com/deployment-io/team-ai/llm_implementations"
 	"github.com/deployment-io/team-ai/options/agent_options"
 	"github.com/deployment-io/team-ai/rpc"
-	"io"
 )
 
 type Tool struct {
 	AgentTools      []tools.Tool
 	AgentName       string
+	AgentID         string
 	AgentGoal       string
 	AgentBackstory  string
 	AgentLLM        string
@@ -27,8 +29,15 @@ type Tool struct {
 const maxIterations = 10
 
 func (t *Tool) newAgent() (llm_implementations.AgentInterface, error) {
+	extraContext := "Don't assume anything. Only use the tools provided.\n" +
+		"If you need a tool to do something then tell the user about it.\n" +
+		"If asked to perform actions outside your tool capabilities, explain what tools you have available and how they can help achieve the user's goal.\n" +
+		"Be specific about what information or permissions you need if a tool requires additional context."
+
 	httpClient := rpc.NewHTTPClient(rpcs.AzureOpenAI, true, true, 2)
-	return llm_implementations.Get(llm_implementation_enums.OpenAIFunctionAgent, agent_options.WithBackstory(t.AgentBackstory),
+
+	backstory := t.AgentBackstory + "\n" + extraContext
+	return llm_implementations.Get(llm_implementation_enums.OpenAIFunctionAgent, agent_options.WithBackstory(backstory),
 		agent_options.WithMaxIterations(maxIterations),
 		agent_options.WithLLM(t.AgentLLM),
 		agent_options.WithApiVersion(t.AgentApiVersion),
@@ -38,7 +47,7 @@ func (t *Tool) newAgent() (llm_implementations.AgentInterface, error) {
 }
 
 func (t *Tool) Name() string {
-	return t.AgentName
+	return t.AgentID
 }
 
 func (t *Tool) getCustomAgentToolsInfo() string {
@@ -60,15 +69,20 @@ The custom agent has access to the following tools and can use them to complete 
 func (t *Tool) Call(ctx context.Context, input string) (string, error) {
 	agent, err := t.newAgent()
 	if err != nil {
-		io.WriteString(t.LogsWriter, fmt.Sprintf("Error getting agent with name: %s : %s\n", t.AgentName, err))
+		io.WriteString(t.LogsWriter, fmt.Sprintf("Error getting agent: %s : %s\n", t.AgentName, err))
 		return "There was an error. We'll get back to you.", nil
 	}
-	output, err := agent.Do(ctx, input, agent_options.WithToolChoice("auto"),
-		agent_options.WithTools(t.AgentTools), agent_options.WithCallback(t.CallbackHandler))
+	var agentOptions []agent_options.Execution
+	agentOptions = append(agentOptions, agent_options.WithTools(t.AgentTools), agent_options.WithCallback(t.CallbackHandler))
+	if len(t.AgentTools) > 0 {
+		agentOptions = append(agentOptions, agent_options.WithToolChoice("auto"))
+	}
+	output, err := agent.Do(ctx, input, agentOptions...)
 	if err != nil {
-		io.WriteString(t.LogsWriter, fmt.Sprintf("Error getting output for the agent with name: %s : %s\n", t.AgentName, err))
+		io.WriteString(t.LogsWriter, fmt.Sprintf("Error getting output for the agent: %s : %s\n", t.AgentName, err))
 		return "There was an error. We'll get back to you.", nil
 	}
+	io.WriteString(t.LogsWriter, fmt.Sprintf("Output for the agent: %s : %s\n", t.AgentName, output))
 	return output, nil
 }
 

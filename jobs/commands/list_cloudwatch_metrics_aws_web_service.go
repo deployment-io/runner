@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
+	"time"
+
 	md "github.com/ankit-arora/markdown"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatch"
@@ -11,9 +14,8 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/cloud_api_clients"
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
+	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
 	"github.com/deployment-io/deployment-runner/utils/aws_utils"
-	"io"
-	"time"
 )
 
 // ListCloudWatchMetricsAwsEcsWebService sends only CPU and memory utilization for now
@@ -143,7 +145,7 @@ func (l *ListCloudWatchMetricsAwsEcsWebService) Run(parameters map[string]interf
 		if err != nil {
 			return parameters, err
 		}
-		updateJobOutputPipeline.Add(organizationIdFromJob, jobs.UpdateJobOutputDtoV1{
+		commandUtils.UpdateJobOutputPipeline.Add(organizationIdFromJob, jobs.UpdateJobOutputDtoV1{
 			ID:     jobID,
 			Output: buf.String(),
 		})

@@ -3,6 +3,9 @@ package commands
 import (
 	"context"
 	"fmt"
+	"io"
+	"time"
+
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/rds"
 	rdsTypes "github.com/aws/aws-sdk-go-v2/service/rds/types"
@@ -18,8 +21,6 @@ import (
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
 	runnerUtils "github.com/deployment-io/deployment-runner/utils"
 	"go.mongodb.org/mongo-driver/bson/primitive"
-	"io"
-	"time"
 )
 
 type DeployAwsRdsDatabase struct {
@@ -175,7 +176,7 @@ func syncRds(parameters map[string]interface{}, rdsClient *rds.Client, rdsInstan
 		return err
 	}
 
-	updateDeploymentsPipeline.Add(organizationIdFromJob, updateDeploymentDtoV1)
+	commandUtils.UpdateDeploymentsPipeline.Add(organizationIdFromJob, updateDeploymentDtoV1)
 
 	if !syncOnError {
 		io.WriteString(logsWriter, fmt.Sprintf("RDS database is available at: %s:%d\n", endpointAddress, endpointPort))

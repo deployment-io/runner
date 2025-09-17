@@ -2,14 +2,15 @@ package golang
 
 import (
 	"fmt"
-	"github.com/deployment-io/deployment-runner/automation/tools/code_tools/query_code/types"
-	"github.com/deployment-io/deployment-runner/automation/tools/code_tools/query_code/utils"
-	treeSitter "github.com/tree-sitter/go-tree-sitter"
-	treeSitterGo "github.com/tree-sitter/tree-sitter-go/bindings/go"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
+
+	"github.com/deployment-io/deployment-runner/agent/tools/code_tools/query_code/types"
+	"github.com/deployment-io/deployment-runner/agent/tools/code_tools/query_code/utils"
+	treeSitter "github.com/tree-sitter/go-tree-sitter"
+	treeSitterGo "github.com/tree-sitter/tree-sitter-go/bindings/go"
 )
 
 func parseGoModFile(path string) string {

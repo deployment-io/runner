@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+
 	"github.com/ankit-arora/langchaingo/callbacks"
 	"github.com/ankit-arora/langchaingo/tools"
 	email2 "github.com/deployment-io/deployment-runner-kit/dependencies/email"
@@ -11,7 +13,6 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/go-playground/validator/v10"
-	"io"
 )
 
 func NewSmtpEmailImplementation(host, port, username, password string) (email2.EmailI, error) {

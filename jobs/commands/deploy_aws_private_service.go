@@ -1,6 +1,8 @@
 package commands
 
 import (
+	"io"
+
 	"github.com/deployment-io/deployment-runner-kit/builds"
 	"github.com/deployment-io/deployment-runner-kit/cloud_api_clients"
 	"github.com/deployment-io/deployment-runner-kit/enums/iam_policy_enums"
@@ -8,8 +10,8 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/iam_policies"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner-kit/previews"
+	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
 	"github.com/deployment-io/deployment-runner/utils"
-	"io"
 )
 
 type DeployAwsPrivateService struct {
@@ -75,14 +77,14 @@ func (d *DeployAwsPrivateService) Run(parameters map[string]interface{}, logsWri
 		return parameters, err
 	}
 	if !isPreview(parameters) {
-		updateBuildsPipeline.Add(organizationIdFromJob, builds.UpdateBuildDtoV1{
+		commandUtils.UpdateBuildsPipeline.Add(organizationIdFromJob, builds.UpdateBuildDtoV1{
 			ID:                buildID,
 			TaskDefinitionArn: taskDefinitionArn,
 		})
 	} else {
 		//build id is preview id
 		previewID := buildID
-		updatePreviewsPipeline.Add(organizationIdFromJob, previews.UpdatePreviewDtoV1{
+		commandUtils.UpdatePreviewsPipeline.Add(organizationIdFromJob, previews.UpdatePreviewDtoV1{
 			ID:                previewID,
 			TaskDefinitionArn: taskDefinitionArn,
 		})

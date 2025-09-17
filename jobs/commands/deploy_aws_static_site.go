@@ -5,6 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/cloudfront"
 	cloudfrontTypes "github.com/aws/aws-sdk-go-v2/service/cloudfront/types"
@@ -24,12 +31,6 @@ import (
 	"github.com/deployment-io/deployment-runner/utils"
 	awsS3Uploads "github.com/deployment-io/deployment-runner/utils/uploads/aws-s3"
 	"go.mongodb.org/mongo-driver/bson/primitive"
-	"io"
-	"log"
-	"os"
-	"strconv"
-	"strings"
-	"time"
 )
 
 type DeployAwsStaticSite struct {
@@ -642,7 +643,7 @@ func (d *DeployAwsStaticSite) Run(parameters map[string]interface{}, logsWriter 
 		}
 		if !isPreview(parameters) {
 			//send data back to save for deployment
-			updateDeploymentsPipeline.Add(organizationIdFromJob, deployments.UpdateDeploymentDtoV1{
+			commandUtils.UpdateDeploymentsPipeline.Add(organizationIdFromJob, deployments.UpdateDeploymentDtoV1{
 				ID:                               deploymentID,
 				CloudfrontDistributionID:         aws.ToString(createDistributionOutput.Distribution.Id),
 				CloudfrontDistributionArn:        aws.ToString(createDistributionOutput.Distribution.ARN),
@@ -652,7 +653,7 @@ func (d *DeployAwsStaticSite) Run(parameters map[string]interface{}, logsWriter 
 			//deployment id is preview id in case of preview
 			previewID := deploymentID
 			//send data back to save for preview
-			updatePreviewsPipeline.Add(organizationIdFromJob, previews.UpdatePreviewDtoV1{
+			commandUtils.UpdatePreviewsPipeline.Add(organizationIdFromJob, previews.UpdatePreviewDtoV1{
 				ID:                               previewID,
 				CloudfrontDistributionID:         aws.ToString(createDistributionOutput.Distribution.Id),
 				CloudfrontDistributionArn:        aws.ToString(createDistributionOutput.Distribution.ARN),

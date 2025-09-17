@@ -4,45 +4,33 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+
 	"github.com/ankit-arora/langchaingo/callbacks"
 	"github.com/ankit-arora/langchaingo/llms"
 	"github.com/ankit-arora/langchaingo/llms/openai"
 	"github.com/ankit-arora/langchaingo/tools"
 	"github.com/deployment-io/deployment-runner-kit/automations"
-	"github.com/deployment-io/deployment-runner-kit/enums/automation_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
-	"github.com/deployment-io/deployment-runner/automation/tools/code_tools/query_code/golang"
-	"github.com/deployment-io/deployment-runner/automation/tools/code_tools/query_code/types"
+	"github.com/deployment-io/deployment-runner/agent/tools/code_tools/query_code/golang"
+	"github.com/deployment-io/deployment-runner/agent/tools/code_tools/query_code/types"
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
 	"github.com/deployment-io/team-ai/enums/rpcs"
 	"github.com/deployment-io/team-ai/rpc"
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-playground/validator/v10"
-	"io"
-	"os"
-	"path/filepath"
-	"strings"
 )
 
 type Tool struct {
 	Params           map[string]interface{}
 	LogsWriter       io.Writer
 	CallbacksHandler callbacks.Handler
-	Entities         []automation_enums.Entity
 	DebugOpenAICalls bool
-}
-
-func (t *Tool) entitiesString() string {
-	entities := ""
-	for index, entity := range t.Entities {
-		entities += entity.String()
-		if index < len(t.Entities)-1 {
-			entities += ", "
-		}
-	}
-	return entities
 }
 
 type Input struct {
@@ -78,10 +66,9 @@ func (t *Tool) Name() string {
 }
 
 func (t *Tool) Description() string {
-	entitiesString := t.entitiesString()
-	description := `Queries the source code for %s, and returns the answer to the input query. The tool has access to the source code and checks out the source code from GitHub, GitLab, or Bitbucket.
+	description := `Queries the source code, and returns the answer to the input query. The tool has access to the source code and checks out the source code from GitHub, GitLab, or Bitbucket.
 	The tool requires the following inputs: query (the input query).`
-	description = fmt.Sprintf(description, entitiesString)
+	description = fmt.Sprintf(description)
 	return description
 }
 

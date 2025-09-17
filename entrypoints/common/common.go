@@ -2,6 +2,13 @@ package common
 
 import (
 	"fmt"
+	"io"
+	"log"
+	"runtime"
+	"strings"
+	"sync"
+	"time"
+
 	goConcurrentPipeline "github.com/ankit-arora/go-utils/go-concurrent-pipeline"
 	goPipeline "github.com/ankit-arora/go-utils/go-concurrent-pipeline/go-pipeline"
 	goShutdownHook "github.com/ankit-arora/go-utils/go-shutdown-hook"
@@ -13,13 +20,8 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/types"
 	"github.com/deployment-io/deployment-runner/client"
 	"github.com/deployment-io/deployment-runner/jobs/commands"
+	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
 	"github.com/deployment-io/deployment-runner/utils/loggers"
-	"io"
-	"log"
-	"runtime"
-	"strings"
-	"sync"
-	"time"
 )
 
 func allocateJobs(pendingJobs []pendingJobType) <-chan pendingJobType {
@@ -185,7 +187,7 @@ func sendJobResults(resultsStream <-chan completingJobType,
 }
 
 func Init() {
-	commands.Init()
+	commandUtils.Init()
 	loggers.Init()
 	jobs.RegisterGobDataTypes()
 }
@@ -292,7 +294,7 @@ func GetAndRunJobs(c *client.RunnerClient, mode runner_enums.Mode, globalOrganiz
 		}
 	}
 	executePendingJobsConcurrentPipeline.Shutdown()
-	commands.Shutdown()
+	commandUtils.Shutdown()
 	loggers.Shutdown()
 	jobsDonePipeline.Shutdown()
 	goShutdownHook.Wait()

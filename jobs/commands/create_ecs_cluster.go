@@ -3,6 +3,8 @@ package commands
 import (
 	"context"
 	"fmt"
+	"io"
+
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ecs"
 	ecsTypes "github.com/aws/aws-sdk-go-v2/service/ecs/types"
@@ -15,8 +17,8 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/enums/region_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/runner_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
+	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
 	"github.com/deployment-io/deployment-runner/utils"
-	"io"
 )
 
 //const upsertClusterKey = "upsertClusters"
@@ -86,7 +88,7 @@ func createEcsClusterIfNeeded(ecsClient *ecs.Client, parameters map[string]inter
 	if err != nil {
 		return "", err
 	}
-	upsertClustersPipeline.Add(organizationIdFromJob, clusters.UpsertClusterDtoV1{
+	commandUtils.UpsertClustersPipeline.Add(organizationIdFromJob, clusters.UpsertClusterDtoV1{
 		Type:       cluster_enums.ECS,
 		Region:     region_enums.Type(region),
 		Name:       ecsClusterName,
@@ -197,7 +199,7 @@ func getEcsTaskExecutionRoleIfNeeded(iamClient *iam.Client, parameters map[strin
 		if err != nil {
 			return "", err
 		}
-		upsertClustersPipeline.Add(organizationIdFromJob, clusters.UpsertClusterDtoV1{
+		commandUtils.UpsertClustersPipeline.Add(organizationIdFromJob, clusters.UpsertClusterDtoV1{
 			Type:                    cluster_enums.ECS,
 			Region:                  region_enums.Type(region),
 			EcsTaskExecutionRoleArn: ecsTaskExecutionRoleArn,

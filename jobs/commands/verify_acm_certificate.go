@@ -3,6 +3,9 @@ package commands
 import (
 	"context"
 	"fmt"
+	"io"
+	"time"
+
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/acm"
 	acm_types "github.com/aws/aws-sdk-go-v2/service/acm/types"
@@ -13,9 +16,8 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/iam_policies"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner-kit/types"
+	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
 	"github.com/deployment-io/deployment-runner/utils"
-	"io"
-	"time"
 )
 
 type VerifyAcmCertificate struct {
@@ -61,7 +63,7 @@ func (v *VerifyAcmCertificate) Run(parameters map[string]interface{}, logsWriter
 		if describeCertificateOutput.Certificate.Status == acm_types.CertificateStatusIssued {
 			//certificate is already issued
 			//sync verified status
-			updateCertificatesPipeline.Add(organizationIdFromJob, certificates.UpdateCertificateDtoV1{
+			commandUtils.UpdateCertificatesPipeline.Add(organizationIdFromJob, certificates.UpdateCertificateDtoV1{
 				ID:       certificateID,
 				Verified: types.True,
 			})
@@ -82,7 +84,7 @@ func (v *VerifyAcmCertificate) Run(parameters map[string]interface{}, logsWriter
 		return parameters, err
 	}
 	//sync verified status
-	updateCertificatesPipeline.Add(organizationIdFromJob, certificates.UpdateCertificateDtoV1{
+	commandUtils.UpdateCertificatesPipeline.Add(organizationIdFromJob, certificates.UpdateCertificateDtoV1{
 		ID:       certificateID,
 		Verified: types.True,
 	})

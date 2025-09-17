@@ -3,6 +3,7 @@ package commands
 import (
 	"context"
 	"fmt"
+
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/rds"
 	"github.com/deployment-io/deployment-runner-kit/cloud_api_clients"
@@ -10,6 +11,8 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/enums/deployment_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
+	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
+
 	"io"
 )
 
@@ -71,7 +74,7 @@ func (d *DeleteAwsRdsDatabase) Run(parameters map[string]interface{}, logsWriter
 		return parameters, err
 	}
 	//update deployment to deleted
-	updateDeploymentsPipeline.Add(organizationIdFromJob, deployments.UpdateDeploymentDtoV1{
+	commandUtils.UpdateDeploymentsPipeline.Add(organizationIdFromJob, deployments.UpdateDeploymentDtoV1{
 		ID:            deploymentID,
 		DeletionState: deployment_enums.DeletionDone,
 	})

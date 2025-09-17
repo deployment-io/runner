@@ -3,22 +3,24 @@ package commands
 import (
 	"encoding/json"
 	"fmt"
+	"io"
+	"os"
+
 	"github.com/ankit-arora/langchaingo/memory"
 	"github.com/ankit-arora/langchaingo/tools"
 	"github.com/deployment-io/deployment-runner-kit/automations"
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
+	runnerTools "github.com/deployment-io/deployment-runner/agent/tools"
 	"github.com/deployment-io/deployment-runner/automation/callbacks"
 	"github.com/deployment-io/deployment-runner/automation/memory/automation_agent_chat_history"
 	"github.com/deployment-io/deployment-runner/automation/memory/file_store"
-	runnerTools "github.com/deployment-io/deployment-runner/automation/tools"
+	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
 	"github.com/deployment-io/team-ai/agents"
 	"github.com/deployment-io/team-ai/enums/agent_enums"
 	"github.com/deployment-io/team-ai/options/agent_options"
 	"github.com/go-playground/validator/v10"
 	"golang.org/x/net/context"
-	"io"
-	"os"
 )
 
 const responseFormatPrompt = `Please make sure your response follows a structured JSON object format, consisting of the following keys:
@@ -67,7 +69,7 @@ func getToolForNode(nodeID string, nodesMap map[string]automations.NodeDtoV1, vi
 		//wrap agent node into a tool and return
 		agentLlm := currentNode.LlmModelType.String()
 		agentLlmVersion := currentNode.LlmApiVersion.String()
-		toolWrappedOnAgent := runnerTools.GetToolWrappedOnAgent(agentTools, currentNode.ID,
+		toolWrappedOnAgent := runnerTools.GetToolWrappedOnAgent(agentTools, currentNode.ID, currentNode.Name,
 			currentNode.Goal, currentNode.Backstory, agentLlm, agentLlmVersion, logsWriter, handler)
 		return toolWrappedOnAgent, nil
 	} else {
@@ -86,7 +88,7 @@ func getToolForNode(nodeID string, nodesMap map[string]automations.NodeDtoV1, vi
 			//wrap agent node into a tool and return
 			agentLlm := currentNode.LlmModelType.String()
 			agentLlmVersion := currentNode.LlmApiVersion.String()
-			toolWrappedOnAgent := runnerTools.GetToolWrappedOnAgent(nil, currentNode.ID,
+			toolWrappedOnAgent := runnerTools.GetToolWrappedOnAgent(nil, currentNode.ID, currentNode.Name,
 				currentNode.Goal, currentNode.Backstory, agentLlm, agentLlmVersion, logsWriter, handler)
 			return toolWrappedOnAgent, nil
 		}
@@ -136,7 +138,7 @@ func (r *RunNewAutomation) Run(parameters map[string]interface{}, logsWriter io.
 	organizationIdFromJob, _ := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIdFromJob)
 	jobID, err := jobs.GetParameterValue[string](parameters, parameters_enums.JobID)
 	if err != nil {
-		updateAutomationOutputPipeline.Add(organizationIdFromJob, automations.UpdateResponseDtoV1{
+		commandUtils.UpdateAutomationOutputPipeline.Add(organizationIdFromJob, automations.UpdateResponseDtoV1{
 			JobID:    jobID,
 			Output:   "There was an error running your automation. Please try again later.",
 			NeedHelp: false,
@@ -145,7 +147,7 @@ func (r *RunNewAutomation) Run(parameters map[string]interface{}, logsWriter io.
 	}
 	automationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.AutomationID)
 	if err != nil {
-		updateAutomationOutputPipeline.Add(organizationIdFromJob, automations.UpdateResponseDtoV1{
+		commandUtils.UpdateAutomationOutputPipeline.Add(organizationIdFromJob, automations.UpdateResponseDtoV1{
 			JobID:    jobID,
 			Output:   "There was an error running your automation. Please try again later.",
 			NeedHelp: false,
@@ -154,7 +156,7 @@ func (r *RunNewAutomation) Run(parameters map[string]interface{}, logsWriter io.
 	}
 	automationData, err := jobs.GetParameterValue[automations.AutomationDataDtoV1](parameters, parameters_enums.AutomationData)
 	if err != nil {
-		updateAutomationOutputPipeline.Add(organizationIdFromJob, automations.UpdateResponseDtoV1{
+		commandUtils.UpdateAutomationOutputPipeline.Add(organizationIdFromJob, automations.UpdateResponseDtoV1{
 			JobID:    jobID,
 			Output:   "There was an error running your automation. Please try again later.",
 			NeedHelp: false,
@@ -165,7 +167,7 @@ func (r *RunNewAutomation) Run(parameters map[string]interface{}, logsWriter io.
 	//TODO set open ai api key in environment for now
 	err = os.Setenv("OPENAI_API_KEY", openAIAPIKey)
 	if err != nil {
-		updateAutomationOutputPipeline.Add(organizationIdFromJob, automations.UpdateResponseDtoV1{
+		commandUtils.UpdateAutomationOutputPipeline.Add(organizationIdFromJob, automations.UpdateResponseDtoV1{
 			JobID:    jobID,
 			Output:   "There was an error running your automation. Please try again later.",
 			NeedHelp: false,
@@ -175,7 +177,7 @@ func (r *RunNewAutomation) Run(parameters map[string]interface{}, logsWriter io.
 	openAIBaseUrl := automationData.OpenAIBaseUrl
 	err = os.Setenv("OPENAI_BASE_URL", openAIBaseUrl)
 	if err != nil {
-		updateAutomationOutputPipeline.Add(organizationIdFromJob, automations.UpdateResponseDtoV1{
+		commandUtils.UpdateAutomationOutputPipeline.Add(organizationIdFromJob, automations.UpdateResponseDtoV1{
 			JobID:    jobID,
 			Output:   "There was an error running your automation. Please try again later.",
 			NeedHelp: false,
@@ -195,7 +197,7 @@ func (r *RunNewAutomation) Run(parameters map[string]interface{}, logsWriter io.
 	automationAgent, err := agents.GetAgentToAssist(agent_enums.AutomationAgent, automationLlmType, automationLlmApiVersion,
 		"", automationRunHandler)
 	if err != nil {
-		updateAutomationOutputPipeline.Add(organizationIdFromJob, automations.UpdateResponseDtoV1{
+		commandUtils.UpdateAutomationOutputPipeline.Add(organizationIdFromJob, automations.UpdateResponseDtoV1{
 			JobID:    jobID,
 			Output:   "There was an error running your automation. Please try again later.",
 			NeedHelp: false,
@@ -212,7 +214,7 @@ func (r *RunNewAutomation) Run(parameters map[string]interface{}, logsWriter io.
 	startNode, startNodeExists := automationData.NodesMap[automationData.StartNodeID]
 	if !startNodeExists {
 		err = fmt.Errorf("start node doesn't exists")
-		updateAutomationOutputPipeline.Add(organizationIdFromJob, automations.UpdateResponseDtoV1{
+		commandUtils.UpdateAutomationOutputPipeline.Add(organizationIdFromJob, automations.UpdateResponseDtoV1{
 			JobID:    jobID,
 			Output:   "There was an error running your automation. Please try again later.",
 			NeedHelp: false,
@@ -224,7 +226,7 @@ func (r *RunNewAutomation) Run(parameters map[string]interface{}, logsWriter io.
 		toolForNode, err = getToolForNode(childNodeID, automationData.NodesMap, map[string]bool{}, parameters, logsWriter,
 			automationRunHandler, debugOpenAICalls)
 		if err != nil {
-			updateAutomationOutputPipeline.Add(organizationIdFromJob, automations.UpdateResponseDtoV1{
+			commandUtils.UpdateAutomationOutputPipeline.Add(organizationIdFromJob, automations.UpdateResponseDtoV1{
 				JobID:    jobID,
 				Output:   "There was an error running your automation. Please try again later.",
 				NeedHelp: false,
@@ -237,7 +239,7 @@ func (r *RunNewAutomation) Run(parameters map[string]interface{}, logsWriter io.
 	}
 	err = file_store.AddChatHistory(jobID, automationID, automationData.ChatHistory)
 	if err != nil {
-		updateAutomationOutputPipeline.Add(organizationIdFromJob, automations.UpdateResponseDtoV1{
+		commandUtils.UpdateAutomationOutputPipeline.Add(organizationIdFromJob, automations.UpdateResponseDtoV1{
 			JobID:    jobID,
 			Output:   "There was an error running your automation. Please try again later.",
 			NeedHelp: false,
@@ -247,7 +249,7 @@ func (r *RunNewAutomation) Run(parameters map[string]interface{}, logsWriter io.
 	defer file_store.DeleteFile(jobID)
 	automationChatHistory, err := automation_agent_chat_history.NewAutomationAgentChatMessageHistory(jobID, automationID)
 	if err != nil {
-		updateAutomationOutputPipeline.Add(organizationIdFromJob, automations.UpdateResponseDtoV1{
+		commandUtils.UpdateAutomationOutputPipeline.Add(organizationIdFromJob, automations.UpdateResponseDtoV1{
 			JobID:    jobID,
 			Output:   "There was an error running your automation. Please try again later.",
 			NeedHelp: false,
@@ -256,11 +258,18 @@ func (r *RunNewAutomation) Run(parameters map[string]interface{}, logsWriter io.
 	}
 	automationConversationBuffer := memory.NewConversationBuffer(memory.WithMemoryKey("chat_history"),
 		memory.WithReturnMessages(true), memory.WithChatHistory(automationChatHistory))
-	output, err := automationAgent.Do(context.TODO(), input, agent_options.WithToolChoice("auto"),
-		agent_options.WithTools(automationTools), agent_options.WithMemory(automationConversationBuffer),
-		agent_options.WithJSONMode(true))
+	var automationAgentOptions []agent_options.Execution
+	automationAgentOptions = append(automationAgentOptions, agent_options.WithMemory(automationConversationBuffer))
+
+	// Only set tool choice if we have tools
+	if len(automationTools) > 0 {
+		automationAgentOptions = append(automationAgentOptions, agent_options.WithToolChoice("auto"))
+	}
+	automationAgentOptions = append(automationAgentOptions, agent_options.WithTools(automationTools), agent_options.WithCallback(automationRunHandler))
+
+	output, err := automationAgent.Do(context.TODO(), input, automationAgentOptions...)
 	if err != nil {
-		updateAutomationOutputPipeline.Add(organizationIdFromJob, automations.UpdateResponseDtoV1{
+		commandUtils.UpdateAutomationOutputPipeline.Add(organizationIdFromJob, automations.UpdateResponseDtoV1{
 			JobID:    jobID,
 			Output:   "There was an error running your automation. Please try again later.",
 			NeedHelp: false,
@@ -286,7 +295,7 @@ func (r *RunNewAutomation) Run(parameters map[string]interface{}, logsWriter io.
 	}
 	if jsonParseErr != nil {
 		//send the output as an error status
-		updateAutomationOutputPipeline.Add(organizationIdFromJob, automations.UpdateResponseDtoV1{
+		commandUtils.UpdateAutomationOutputPipeline.Add(organizationIdFromJob, automations.UpdateResponseDtoV1{
 			JobID:    jobID,
 			Output:   "There was an error running your automation. Please try again later.",
 			NeedHelp: false,
@@ -294,7 +303,7 @@ func (r *RunNewAutomation) Run(parameters map[string]interface{}, logsWriter io.
 		return parameters, jsonParseErr
 	}
 	//send the output and status back
-	updateAutomationOutputPipeline.Add(organizationIdFromJob, automations.UpdateResponseDtoV1{
+	commandUtils.UpdateAutomationOutputPipeline.Add(organizationIdFromJob, automations.UpdateResponseDtoV1{
 		JobID:    jobID,
 		Output:   automationAgentOutput.Output,
 		NeedHelp: *automationAgentOutput.NeedHelp,

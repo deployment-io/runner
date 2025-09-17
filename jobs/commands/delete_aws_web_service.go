@@ -3,6 +3,9 @@ package commands
 import (
 	"context"
 	"fmt"
+	"io"
+	"time"
+
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/ecr"
@@ -14,9 +17,8 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner-kit/previews"
+	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
 	"github.com/deployment-io/deployment-runner/utils/aws_utils"
-	"io"
-	"time"
 )
 
 type DeleteAwsWebService struct {
@@ -36,13 +38,13 @@ func (d *DeleteAwsWebService) Run(parameters map[string]interface{}, logsWriter 
 	}
 	if !isPreview(parameters) {
 		//update deployment to deleted and delete domain
-		updateDeploymentsPipeline.Add(organizationIdFromJob, deployments.UpdateDeploymentDtoV1{
+		commandUtils.UpdateDeploymentsPipeline.Add(organizationIdFromJob, deployments.UpdateDeploymentDtoV1{
 			ID:            deploymentID,
 			DeletionState: deployment_enums.DeletionInProcess,
 		})
 	} else {
 		previewID := deploymentID
-		updatePreviewsPipeline.Add(organizationIdFromJob, previews.UpdatePreviewDtoV1{
+		commandUtils.UpdatePreviewsPipeline.Add(organizationIdFromJob, previews.UpdatePreviewDtoV1{
 			ID:            previewID,
 			DeletionState: deployment_enums.DeletionInProcess,
 		})
@@ -193,13 +195,13 @@ func (d *DeleteAwsWebService) Run(parameters map[string]interface{}, logsWriter 
 
 	if !isPreview(parameters) {
 		//update deployment to deleted and delete domain
-		updateDeploymentsPipeline.Add(organizationIdFromJob, deployments.UpdateDeploymentDtoV1{
+		commandUtils.UpdateDeploymentsPipeline.Add(organizationIdFromJob, deployments.UpdateDeploymentDtoV1{
 			ID:            deploymentID,
 			DeletionState: deployment_enums.DeletionDone,
 		})
 	} else {
 		previewID := deploymentID
-		updatePreviewsPipeline.Add(organizationIdFromJob, previews.UpdatePreviewDtoV1{
+		commandUtils.UpdatePreviewsPipeline.Add(organizationIdFromJob, previews.UpdatePreviewDtoV1{
 			ID:            previewID,
 			DeletionState: deployment_enums.DeletionDone,
 		})

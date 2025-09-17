@@ -3,6 +3,7 @@ package commands
 import (
 	"context"
 	"fmt"
+
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2"
 	elbTypes "github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2/types"
@@ -10,6 +11,8 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/deployments"
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
+	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
+
 	"io"
 )
 
@@ -114,7 +117,7 @@ func (a *AddAwsWebServiceDomain) Run(parameters map[string]interface{}, logsWrit
 	if err != nil {
 		return parameters, err
 	}
-	updateDeploymentsPipeline.Add(organizationIdFromJob, deployments.UpdateDeploymentDtoV1{
+	commandUtils.UpdateDeploymentsPipeline.Add(organizationIdFromJob, deployments.UpdateDeploymentDtoV1{
 		ID:                 deploymentID,
 		ListenerArnPort443: listenerArn,
 	})

@@ -5,6 +5,9 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
+	"strings"
+
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ecr"
 	ecrTypes "github.com/aws/aws-sdk-go-v2/service/ecr/types"
@@ -15,12 +18,11 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/iam_policies"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner-kit/previews"
+	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
 	"github.com/deployment-io/deployment-runner/utils"
 	"github.com/docker/docker/api/types/image"
 	"github.com/moby/moby/api/types/registry"
 	"github.com/moby/moby/client"
-	"io"
-	"strings"
 )
 
 type UploadDockerImageToEcr struct {
@@ -99,14 +101,14 @@ func createEcrRepositoryIfNeeded(parameters map[string]interface{}, ecrClient *e
 		return "", err
 	}
 	if !isPreview(parameters) {
-		updateDeploymentsPipeline.Add(organizationIdFromJob, deployments.UpdateDeploymentDtoV1{
+		commandUtils.UpdateDeploymentsPipeline.Add(organizationIdFromJob, deployments.UpdateDeploymentDtoV1{
 			ID:               deploymentID,
 			EcrRepositoryUri: ecrRepositoryUri,
 		})
 	} else {
 		//for preview
 		previewID := deploymentID
-		updatePreviewsPipeline.Add(organizationIdFromJob, previews.UpdatePreviewDtoV1{
+		commandUtils.UpdatePreviewsPipeline.Add(organizationIdFromJob, previews.UpdatePreviewDtoV1{
 			ID:               previewID,
 			EcrRepositoryUri: ecrRepositoryUri,
 		})

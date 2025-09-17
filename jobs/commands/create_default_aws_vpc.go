@@ -3,6 +3,12 @@ package commands
 import (
 	"context"
 	"fmt"
+	"io"
+	"net"
+	"strconv"
+	"sync"
+	"time"
+
 	"github.com/ankit-arora/ipnets"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
@@ -14,12 +20,8 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner-kit/types"
 	"github.com/deployment-io/deployment-runner-kit/vpcs"
+	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
 	"go.mongodb.org/mongo-driver/bson/primitive"
-	"io"
-	"net"
-	"strconv"
-	"sync"
-	"time"
 )
 
 //const upsertVpcKey = "upsertVpcs"
@@ -266,7 +268,7 @@ func createVpcIfNeeded(parameters map[string]interface{}, ec2Client *ec2.Client,
 	if err != nil {
 		return "", err
 	}
-	upsertVpcsPipeline.Add(organizationIdFromJob, vpcs.UpsertVpcDtoV1{
+	commandUtils.UpsertVpcsPipeline.Add(organizationIdFromJob, vpcs.UpsertVpcDtoV1{
 		Type:   vpc_enums.AwsVpc,
 		Region: region_enums.Type(region),
 		VpcId:  vpcId,
@@ -356,7 +358,7 @@ func createAndAttachInternetGatewayIfNeeded(parameters map[string]interface{}, e
 	if err != nil {
 		return "", err
 	}
-	upsertVpcsPipeline.Add(organizationIdFromJob, vpcs.UpsertVpcDtoV1{
+	commandUtils.UpsertVpcsPipeline.Add(organizationIdFromJob, vpcs.UpsertVpcDtoV1{
 		Type:              vpc_enums.AwsVpc,
 		Region:            region_enums.Type(region),
 		InternetGatewayId: aws.ToString(internetGatewayId),
@@ -985,7 +987,7 @@ func (c *CreateDefaultAwsVPC) Run(parameters map[string]interface{}, logsWriter 
 		}
 
 		if shouldSyncSubnetsAll {
-			upsertVpcsPipeline.Add(organizationIdFromJob, vpcs.UpsertVpcDtoV1{
+			commandUtils.UpsertVpcsPipeline.Add(organizationIdFromJob, vpcs.UpsertVpcDtoV1{
 				Type:    vpc_enums.AwsVpc,
 				Region:  region_enums.Type(region),
 				Subnets: subnetsDto,
@@ -993,20 +995,20 @@ func (c *CreateDefaultAwsVPC) Run(parameters map[string]interface{}, logsWriter 
 		}
 
 		if shouldSyncRouteTablesAll {
-			upsertVpcsPipeline.Add(organizationIdFromJob, vpcs.UpsertVpcDtoV1{
+			commandUtils.UpsertVpcsPipeline.Add(organizationIdFromJob, vpcs.UpsertVpcDtoV1{
 				Type:        vpc_enums.AwsVpc,
 				Region:      region_enums.Type(region),
 				RouteTables: routeTablesDto,
 			})
 		}
 
-		upsertVpcsPipeline.Add(organizationIdFromJob, vpcs.UpsertVpcDtoV1{
+		commandUtils.UpsertVpcsPipeline.Add(organizationIdFromJob, vpcs.UpsertVpcDtoV1{
 			Type:        vpc_enums.AwsVpc,
 			Region:      region_enums.Type(region),
 			NatGateways: natGatewaysDto,
 		})
 
-		upsertVpcsPipeline.Add(organizationIdFromJob, vpcs.UpsertVpcDtoV1{
+		commandUtils.UpsertVpcsPipeline.Add(organizationIdFromJob, vpcs.UpsertVpcDtoV1{
 			Type:    vpc_enums.AwsVpc,
 			Region:  region_enums.Type(region),
 			VpcCidr: cidrBlock,

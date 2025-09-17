@@ -3,18 +3,20 @@ package commands
 import (
 	"context"
 	"fmt"
+	"io"
+	"time"
+
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/acm"
-	acm_types "github.com/aws/aws-sdk-go-v2/service/acm/types"
+	acmTypes "github.com/aws/aws-sdk-go-v2/service/acm/types"
 	"github.com/deployment-io/deployment-runner-kit/certificates"
 	"github.com/deployment-io/deployment-runner-kit/cloud_api_clients"
 	"github.com/deployment-io/deployment-runner-kit/enums/iam_policy_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/iam_policies"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
+	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
 	"github.com/deployment-io/deployment-runner/utils"
-	"io"
-	"time"
 )
 
 type CreateAcmCertificate struct {
@@ -54,13 +56,13 @@ func (c *CreateAcmCertificate) Run(parameters map[string]interface{}, logsWriter
 	requestCertificateOutput, err := acmClient.RequestCertificate(context.TODO(), &acm.RequestCertificateInput{
 		DomainName:       aws.String(certificateDomain),
 		IdempotencyToken: aws.String(certificateID), //will be unique for each creation request
-		KeyAlgorithm:     acm_types.KeyAlgorithmRsa2048,
-		Options:          &acm_types.CertificateOptions{CertificateTransparencyLoggingPreference: acm_types.CertificateTransparencyLoggingPreferenceEnabled},
-		ValidationMethod: acm_types.ValidationMethodDns,
+		KeyAlgorithm:     acmTypes.KeyAlgorithmRsa2048,
+		Options:          &acmTypes.CertificateOptions{CertificateTransparencyLoggingPreference: acmTypes.CertificateTransparencyLoggingPreferenceEnabled},
+		ValidationMethod: acmTypes.ValidationMethodDns,
 		SubjectAlternativeNames: []string{
 			parentDomain,
 		},
-		Tags: []acm_types.Tag{
+		Tags: []acmTypes.Tag{
 			{
 				Key:   aws.String("created by"),
 				Value: aws.String("deployment.io"),
@@ -91,7 +93,7 @@ func (c *CreateAcmCertificate) Run(parameters map[string]interface{}, logsWriter
 					len(aws.ToString(describeCertificateOutput.Certificate.DomainValidationOptions[0].ResourceRecord.Name)) > 0 &&
 					len(aws.ToString(describeCertificateOutput.Certificate.DomainValidationOptions[0].ResourceRecord.Value)) > 0 {
 
-					updateCertificatesPipeline.Add(organizationIdFromJob, certificates.UpdateCertificateDtoV1{
+					commandUtils.UpdateCertificatesPipeline.Add(organizationIdFromJob, certificates.UpdateCertificateDtoV1{
 						ID:         certificateID,
 						CnameName:  aws.ToString(describeCertificateOutput.Certificate.DomainValidationOptions[0].ResourceRecord.Name),
 						CnameValue: aws.ToString(describeCertificateOutput.Certificate.DomainValidationOptions[0].ResourceRecord.Value),
@@ -106,7 +108,7 @@ func (c *CreateAcmCertificate) Run(parameters map[string]interface{}, logsWriter
 	}()
 
 	io.WriteString(logsWriter, fmt.Sprintf("Got certificate from ACM: %s\n", aws.ToString(certificateArn)))
-	updateCertificatesPipeline.Add(organizationIdFromJob, certificates.UpdateCertificateDtoV1{
+	commandUtils.UpdateCertificatesPipeline.Add(organizationIdFromJob, certificates.UpdateCertificateDtoV1{
 		ID:             certificateID,
 		CertificateArn: aws.ToString(certificateArn),
 	})
