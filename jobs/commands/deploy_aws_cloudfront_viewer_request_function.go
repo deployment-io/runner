@@ -55,7 +55,7 @@ func getViewerRequestFunctionCode(parameters map[string]interface{}) (string, er
             statusCode: 301,
             statusDescription: 'Moved Permanently',
             headers: {
-                'location': { value: '%s://%s'+event.request.uri }
+                'location': { value: '%s://%s'+event.request.uri + buildQS(request.querystring) }
             }
         };
         return response;
@@ -82,7 +82,7 @@ func getViewerRequestFunctionCode(parameters map[string]interface{}) (string, er
            statusCode: 301,
            statusDescription: 'Moved Permanently',
            headers: {
-               'location': { value: '%s://%s'+event.request.uri }
+               'location': { value: '%s://%s'+event.request.uri + buildQS(request.querystring) }
            }
        };
        return response;
@@ -111,11 +111,8 @@ func getViewerRequestFunctionCode(parameters map[string]interface{}) (string, er
 		subdirectoryIndexStatement = `if (request.uri.endsWith('/')) {
         request.uri += 'index.html';
      } else if (!request.uri.includes('.')) {
-        var host = request.headers.host.value;
-        var qs = Object.keys(request.querystring).map(function(k) {
-            return k + '=' + request.querystring[k].value;
-        }).join('&');
-        var location = 'https://' + host + request.uri + '/' + (qs ? '?' + qs : '');
+        var host = request.headers["host"].value;
+        var location = 'https://' + host + request.uri + '/' + buildQS(request.querystring);
         var response = {
             statusCode: 301,
             statusDescription: 'Moved Permanently',
@@ -127,7 +124,14 @@ func getViewerRequestFunctionCode(parameters map[string]interface{}) (string, er
      }`
 	}
 
-	cloudfrontFunction := fmt.Sprintf(`function handler(event) {
+	cloudfrontFunction := fmt.Sprintf(`function buildQS(querystring) {
+    var qs = Object.keys(querystring).map(function(k) {
+        return k + '=' + querystring[k].value;
+    }).join('&');
+    return qs ? '?' + qs : '';
+}
+
+function handler(event) {
     var request = event.request;
     %s
     %s
