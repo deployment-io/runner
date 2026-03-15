@@ -3,6 +3,8 @@ package commands
 import (
 	"context"
 	"fmt"
+	"io"
+
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/cloudfront"
 	cloudfront_types "github.com/aws/aws-sdk-go-v2/service/cloudfront/types"
@@ -11,7 +13,6 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
 	"go.mongodb.org/mongo-driver/bson/primitive"
-	"io"
 )
 
 type DeployAwsCloudfrontViewerRequestFunction struct {
@@ -110,11 +111,16 @@ func getViewerRequestFunctionCode(parameters map[string]interface{}) (string, er
 		subdirectoryIndexStatement = `if (request.uri.endsWith('/')) {
         request.uri += 'index.html';
      } else if (!request.uri.includes('.')) {
+        var host = request.headers.host.value;
+        var qs = Object.keys(request.querystring).map(function(k) {
+            return k + '=' + request.querystring[k].value;
+        }).join('&');
+        var location = 'https://' + host + request.uri + '/' + (qs ? '?' + qs : '');
         var response = {
             statusCode: 301,
             statusDescription: 'Moved Permanently',
             headers: {
-                'location': { value: request.uri + '/' }
+                'location': { value: location }
             }
         };
         return response;
