@@ -8,7 +8,6 @@ import (
 	"io"
 	"log"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 
@@ -30,7 +29,6 @@ import (
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
 	"github.com/deployment-io/deployment-runner/utils"
 	awsS3Uploads "github.com/deployment-io/deployment-runner/utils/uploads/aws-s3"
-	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
 type DeployAwsStaticSite struct {
@@ -270,32 +268,8 @@ func createDistributionConfigForNewCloudfront(parameters map[string]interface{},
 		Quantity: aws.Int32(1),
 	}
 
-	errorPagesA, err := jobs.GetParameterValue[primitive.A](parameters, parameters_enums.ErrorPages)
-	if err != nil {
-		return nil, err
-	}
-	errorPages, err := commandUtils.ConvertPrimitiveAToTwoDStringSlice(errorPagesA)
-	if err != nil {
-		return nil, err
-	}
-
-	var customErrorResponses []cloudfrontTypes.CustomErrorResponse
-	var q int32 = 0
-	for _, errorPageRow := range errorPages {
-		if len(errorPageRow) == 3 {
-			i, err := strconv.ParseInt(errorPageRow[0], 10, 64)
-			if err == nil {
-				customErrorResponse := cloudfrontTypes.CustomErrorResponse{
-					ErrorCode:        aws.Int32(int32(i)),
-					ResponsePagePath: aws.String(errorPageRow[1]),
-					ResponseCode:     aws.String(errorPageRow[2]),
-				}
-				customErrorResponses = append(customErrorResponses, customErrorResponse)
-				q++
-			}
-		}
-	}
-
+	// CustomErrorResponses are set by DeployAwsCloudfrontViewerRequestFunction (Command 4)
+	// based on the IsSpa parameter. This keeps all distribution config modifications in one place.
 	distributionConfig := &cloudfrontTypes.DistributionConfig{
 		CallerReference:      aws.String(callerReference),
 		Comment:              aws.String(comment),
@@ -303,8 +277,8 @@ func createDistributionConfigForNewCloudfront(parameters map[string]interface{},
 		Enabled:              aws.Bool(true),
 		Origins:              origins,
 		CustomErrorResponses: &cloudfrontTypes.CustomErrorResponses{
-			Quantity: aws.Int32(q),
-			Items:    customErrorResponses,
+			Quantity: aws.Int32(0),
+			Items:    []cloudfrontTypes.CustomErrorResponse{},
 		},
 		DefaultRootObject: aws.String("index.html"),
 		PriceClass:        cloudfrontTypes.PriceClassPriceClassAll,
