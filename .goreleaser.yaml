@@ -13,6 +13,9 @@ builds:
     goarch:
       - amd64
       - arm64
+    ignore:
+      - goos: linux
+        goarch: arm64
     binary: deployment-runner
     id: deployment-runner
     main: ./entrypoints/local
