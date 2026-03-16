@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"strconv"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/cloudfront"
@@ -196,6 +197,66 @@ func associateFunctionToCloudfrontDistribution(distributionConfig *cloudfront_ty
 	return true
 }
 
+func updateCustomErrorResponses(parameters map[string]interface{}, distributionConfig *cloudfront_types.DistributionConfig) bool {
+	errorPagesA, _ := jobs.GetParameterValue[primitive.A](parameters, parameters_enums.ErrorPages)
+	if len(errorPagesA) == 0 {
+		return false
+	}
+	errorPages, err := commandUtils.ConvertPrimitiveAToTwoDStringSlice(errorPagesA)
+	if err != nil {
+		return false
+	}
+
+	type errorPageInfo struct {
+		pagePath     string
+		responseCode string
+	}
+	desired := make(map[int32]errorPageInfo)
+	for _, row := range errorPages {
+		if len(row) == 3 {
+			code, parseErr := strconv.ParseInt(row[0], 10, 32)
+			if parseErr == nil {
+				desired[int32(code)] = errorPageInfo{pagePath: row[1], responseCode: row[2]}
+			}
+		}
+	}
+
+	updated := false
+	existingResponses := distributionConfig.CustomErrorResponses
+	if existingResponses != nil {
+		for i, item := range existingResponses.Items {
+			code := aws.ToInt32(item.ErrorCode)
+			if info, ok := desired[code]; ok {
+				if aws.ToString(existingResponses.Items[i].ResponsePagePath) != info.pagePath ||
+					aws.ToString(existingResponses.Items[i].ResponseCode) != info.responseCode {
+					existingResponses.Items[i].ResponsePagePath = aws.String(info.pagePath)
+					existingResponses.Items[i].ResponseCode = aws.String(info.responseCode)
+					updated = true
+				}
+				delete(desired, code)
+			}
+		}
+	}
+
+	if len(desired) > 0 {
+		if existingResponses == nil {
+			existingResponses = &cloudfront_types.CustomErrorResponses{}
+		}
+		for code, info := range desired {
+			existingResponses.Items = append(existingResponses.Items, cloudfront_types.CustomErrorResponse{
+				ErrorCode:        aws.Int32(code),
+				ResponsePagePath: aws.String(info.pagePath),
+				ResponseCode:     aws.String(info.responseCode),
+			})
+		}
+		existingResponses.Quantity = aws.Int32(int32(len(existingResponses.Items)))
+		distributionConfig.CustomErrorResponses = existingResponses
+		updated = true
+	}
+
+	return updated
+}
+
 func (d *DeployAwsCloudfrontViewerRequestFunction) Run(parameters map[string]interface{}, logsWriter io.Writer) (newParameters map[string]interface{}, err error) {
 
 	cloudfrontClient, err := cloud_api_clients.GetCloudfrontClient(parameters, cloudfrontRegion)
@@ -282,59 +343,20 @@ func (d *DeployAwsCloudfrontViewerRequestFunction) Run(parameters map[string]int
 		return parameters, err
 	}
 	//associate function to distribution config
-	associateFunctionToCloudfrontDistribution(distributionConfig, functionARN, cloudfront_types.EventTypeViewerRequest)
+	associate := associateFunctionToCloudfrontDistribution(distributionConfig, functionARN, cloudfront_types.EventTypeViewerRequest)
 
-	// Determine IsSpa for error pages (default true for backward compat)
-	isSpa := true
-	isSpaVal, isSpaErr := jobs.GetParameterValue[bool](parameters, parameters_enums.IsSpa)
-	if isSpaErr == nil {
-		isSpa = isSpaVal
-	}
+	errorPagesUpdated := updateCustomErrorResponses(parameters, distributionConfig)
 
-	// Update CustomErrorResponses based on IsSpa, preserving existing fields
-	var responsePage, responseCode string
-	if isSpa {
-		responsePage = "/index.html"
-		responseCode = "200"
-	} else {
-		responsePage = "/404.html"
-		responseCode = "404"
-	}
-	desiredErrors := map[int32]bool{403: true, 404: true}
-	existingResponses := distributionConfig.CustomErrorResponses
-	if existingResponses != nil && len(existingResponses.Items) > 0 {
-		for i, item := range existingResponses.Items {
-			code := aws.ToInt32(item.ErrorCode)
-			if desiredErrors[code] {
-				existingResponses.Items[i].ResponsePagePath = aws.String(responsePage)
-				existingResponses.Items[i].ResponseCode = aws.String(responseCode)
-				delete(desiredErrors, code)
-			}
-		}
-	}
-	// Add any missing error responses
-	if existingResponses == nil {
-		existingResponses = &cloudfront_types.CustomErrorResponses{}
-	}
-	for code := range desiredErrors {
-		existingResponses.Items = append(existingResponses.Items, cloudfront_types.CustomErrorResponse{
-			ErrorCode:        aws.Int32(code),
-			ResponsePagePath: aws.String(responsePage),
-			ResponseCode:     aws.String(responseCode),
+	if associate || errorPagesUpdated {
+		io.WriteString(logsWriter, fmt.Sprintf("Updating cloudfront distribution %s with function and error pages\n", cloudfrontDistributionId))
+		_, err = cloudfrontClient.UpdateDistribution(context.TODO(), &cloudfront.UpdateDistributionInput{
+			DistributionConfig: distributionConfig,
+			Id:                 aws.String(cloudfrontDistributionId),
+			IfMatch:            distributionConfigOutput.ETag,
 		})
-	}
-	existingResponses.Quantity = aws.Int32(int32(len(existingResponses.Items)))
-	distributionConfig.CustomErrorResponses = existingResponses
-
-	// Always update distribution — function association and error pages
-	io.WriteString(logsWriter, fmt.Sprintf("Updating cloudfront distribution %s with function and error pages\n", cloudfrontDistributionId))
-	_, err = cloudfrontClient.UpdateDistribution(context.TODO(), &cloudfront.UpdateDistributionInput{
-		DistributionConfig: distributionConfig,
-		Id:                 aws.String(cloudfrontDistributionId),
-		IfMatch:            distributionConfigOutput.ETag,
-	})
-	if err != nil {
-		return parameters, err
+		if err != nil {
+			return parameters, err
+		}
 	}
 
 	err = invalidateCloudfrontDistribution(parameters, cloudfrontClient, cloudfrontDistributionId, logsWriter)
