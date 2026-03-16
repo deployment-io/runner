@@ -3,6 +3,8 @@ package commands
 import (
 	"context"
 	"fmt"
+	"io"
+
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/cloudfront"
 	cloudfront_types "github.com/aws/aws-sdk-go-v2/service/cloudfront/types"
@@ -11,7 +13,6 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
 	"go.mongodb.org/mongo-driver/bson/primitive"
-	"io"
 )
 
 type DeployAwsCloudfrontViewerRequestFunction struct {
@@ -54,7 +55,7 @@ func getViewerRequestFunctionCode(parameters map[string]interface{}) (string, er
             statusCode: 301,
             statusDescription: 'Moved Permanently',
             headers: {
-                'location': { value: '%s://%s'+event.request.uri }
+                'location': { value: '%s://%s'+event.request.uri + buildQS(request.querystring) }
             }
         };
         return response;
@@ -81,7 +82,7 @@ func getViewerRequestFunctionCode(parameters map[string]interface{}) (string, er
            statusCode: 301,
            statusDescription: 'Moved Permanently',
            headers: {
-               'location': { value: '%s://%s'+event.request.uri }
+               'location': { value: '%s://%s'+event.request.uri + buildQS(request.querystring) }
            }
        };
        return response;
@@ -90,13 +91,47 @@ func getViewerRequestFunctionCode(parameters map[string]interface{}) (string, er
 
 	}
 
-	subdirectoryIndexStatement := `if (request.uri.endsWith('/')) {
+	// Determine SPA vs static site behavior (default true for backward compat)
+	isSpa := true
+	isSpaVal, isSpaErr := jobs.GetParameterValue[bool](parameters, parameters_enums.IsSpa)
+	if isSpaErr == nil {
+		isSpa = isSpaVal
+	}
+
+	var subdirectoryIndexStatement string
+	if isSpa {
+		// SPA: silently rewrite to index.html (client-side router handles routing)
+		subdirectoryIndexStatement = `if (request.uri.endsWith('/')) {
         request.uri += 'index.html';
      } else if (!request.uri.includes('.')) {
         request.uri += '/index.html';
      }`
+	} else {
+		// Non-SPA: 301 redirect to add trailing slash (proper canonical URLs)
+		subdirectoryIndexStatement = `if (request.uri.endsWith('/')) {
+        request.uri += 'index.html';
+     } else if (!request.uri.includes('.')) {
+        var host = request.headers["host"].value;
+        var location = 'https://' + host + request.uri + '/' + buildQS(request.querystring);
+        var response = {
+            statusCode: 301,
+            statusDescription: 'Moved Permanently',
+            headers: {
+                'location': { value: location }
+            }
+        };
+        return response;
+     }`
+	}
 
-	cloudfrontFunction := fmt.Sprintf(`function handler(event) {
+	cloudfrontFunction := fmt.Sprintf(`function buildQS(querystring) {
+    var qs = Object.keys(querystring).map(function(k) {
+        return k + '=' + querystring[k].value;
+    }).join('&');
+    return qs ? '?' + qs : '';
+}
+
+function handler(event) {
     var request = event.request;
     %s
     %s
@@ -247,19 +282,43 @@ func (d *DeployAwsCloudfrontViewerRequestFunction) Run(parameters map[string]int
 		return parameters, err
 	}
 	//associate function to distribution config
-	associate := associateFunctionToCloudfrontDistribution(distributionConfig, functionARN, cloudfront_types.EventTypeViewerRequest)
-	if associate {
-		io.WriteString(logsWriter, fmt.Sprintf("Associating cloudfront function %s to cloudfront distribution: %s\n",
-			viewerRequestsFunctionName, cloudfrontDistributionId))
-		_, err = cloudfrontClient.UpdateDistribution(context.TODO(), &cloudfront.UpdateDistributionInput{
-			DistributionConfig: distributionConfig,
-			Id:                 aws.String(cloudfrontDistributionId),
-			IfMatch:            distributionConfigOutput.ETag,
-		})
+	associateFunctionToCloudfrontDistribution(distributionConfig, functionARN, cloudfront_types.EventTypeViewerRequest)
 
-		if err != nil {
-			return parameters, err
+	// Determine IsSpa for error pages (default true for backward compat)
+	isSpa := true
+	isSpaVal, isSpaErr := jobs.GetParameterValue[bool](parameters, parameters_enums.IsSpa)
+	if isSpaErr == nil {
+		isSpa = isSpaVal
+	}
+
+	// Set CustomErrorResponses based on IsSpa
+	if isSpa {
+		distributionConfig.CustomErrorResponses = &cloudfront_types.CustomErrorResponses{
+			Quantity: aws.Int32(2),
+			Items: []cloudfront_types.CustomErrorResponse{
+				{ErrorCode: aws.Int32(403), ResponsePagePath: aws.String("/index.html"), ResponseCode: aws.String("200")},
+				{ErrorCode: aws.Int32(404), ResponsePagePath: aws.String("/index.html"), ResponseCode: aws.String("200")},
+			},
 		}
+	} else {
+		distributionConfig.CustomErrorResponses = &cloudfront_types.CustomErrorResponses{
+			Quantity: aws.Int32(2),
+			Items: []cloudfront_types.CustomErrorResponse{
+				{ErrorCode: aws.Int32(403), ResponsePagePath: aws.String("/404.html"), ResponseCode: aws.String("404")},
+				{ErrorCode: aws.Int32(404), ResponsePagePath: aws.String("/404.html"), ResponseCode: aws.String("404")},
+			},
+		}
+	}
+
+	// Always update distribution — function association and error pages
+	io.WriteString(logsWriter, fmt.Sprintf("Updating cloudfront distribution %s with function and error pages\n", cloudfrontDistributionId))
+	_, err = cloudfrontClient.UpdateDistribution(context.TODO(), &cloudfront.UpdateDistributionInput{
+		DistributionConfig: distributionConfig,
+		Id:                 aws.String(cloudfrontDistributionId),
+		IfMatch:            distributionConfigOutput.ETag,
+	})
+	if err != nil {
+		return parameters, err
 	}
 
 	err = invalidateCloudfrontDistribution(parameters, cloudfrontClient, cloudfrontDistributionId, logsWriter)
