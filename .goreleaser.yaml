@@ -8,16 +8,53 @@ before:
     - go generate ./...
 
 builds:
-  - env:
-      - CGO_ENABLED=0
+  - id: linux
+    env:
+      - CGO_ENABLED=1
+      - >-
+        {{- if eq .Arch "amd64"}}CC=x86_64-linux-gnu-gcc{{- end}}
+        {{- if eq .Arch "arm64"}}CC=aarch64-linux-gnu-gcc{{- end}}
+    goos:
+      - linux
     goarch:
       - amd64
       - arm64
-    ignore:
-      - goos: linux
-        goarch: arm64
     binary: deployment-runner
-    id: deployment-runner
+    main: ./entrypoints/local
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+      - '-s -w -X "main.clientCertPem={{.Env.TLS_CERT}}"'
+      - '-s -w -X "main.clientKeyPem={{.Env.TLS_KEY}}"'
+      - -s -w -X main.serviceFromBuild={{.Env.SERVICE}}
+
+  - id: darwin
+    env:
+      - CGO_ENABLED=1
+      - >-
+        {{- if eq .Arch "amd64"}}CC=o64-clang{{- end}}
+        {{- if eq .Arch "arm64"}}CC=oa64-clang{{- end}}
+    goos:
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+    binary: deployment-runner
+    main: ./entrypoints/local
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+      - '-s -w -X "main.clientCertPem={{.Env.TLS_CERT}}"'
+      - '-s -w -X "main.clientKeyPem={{.Env.TLS_KEY}}"'
+      - -s -w -X main.serviceFromBuild={{.Env.SERVICE}}
+
+  - id: windows
+    env:
+      - CGO_ENABLED=1
+      - CC=x86_64-w64-mingw32-gcc
+    goos:
+      - windows
+    goarch:
+      - amd64
+    binary: deployment-runner
     main: ./entrypoints/local
     ldflags:
       - -s -w -X main.version={{.Version}}
