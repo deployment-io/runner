@@ -291,24 +291,40 @@ func (d *DeployAwsCloudfrontViewerRequestFunction) Run(parameters map[string]int
 		isSpa = isSpaVal
 	}
 
-	// Set CustomErrorResponses based on IsSpa
+	// Update CustomErrorResponses based on IsSpa, preserving existing fields
+	var responsePage, responseCode string
 	if isSpa {
-		distributionConfig.CustomErrorResponses = &cloudfront_types.CustomErrorResponses{
-			Quantity: aws.Int32(2),
-			Items: []cloudfront_types.CustomErrorResponse{
-				{ErrorCode: aws.Int32(403), ResponsePagePath: aws.String("/index.html"), ResponseCode: aws.String("200")},
-				{ErrorCode: aws.Int32(404), ResponsePagePath: aws.String("/index.html"), ResponseCode: aws.String("200")},
-			},
-		}
+		responsePage = "/index.html"
+		responseCode = "200"
 	} else {
-		distributionConfig.CustomErrorResponses = &cloudfront_types.CustomErrorResponses{
-			Quantity: aws.Int32(2),
-			Items: []cloudfront_types.CustomErrorResponse{
-				{ErrorCode: aws.Int32(403), ResponsePagePath: aws.String("/404.html"), ResponseCode: aws.String("404")},
-				{ErrorCode: aws.Int32(404), ResponsePagePath: aws.String("/404.html"), ResponseCode: aws.String("404")},
-			},
+		responsePage = "/404.html"
+		responseCode = "404"
+	}
+	desiredErrors := map[int32]bool{403: true, 404: true}
+	existingResponses := distributionConfig.CustomErrorResponses
+	if existingResponses != nil && len(existingResponses.Items) > 0 {
+		for i, item := range existingResponses.Items {
+			code := aws.ToInt32(item.ErrorCode)
+			if desiredErrors[code] {
+				existingResponses.Items[i].ResponsePagePath = aws.String(responsePage)
+				existingResponses.Items[i].ResponseCode = aws.String(responseCode)
+				delete(desiredErrors, code)
+			}
 		}
 	}
+	// Add any missing error responses
+	if existingResponses == nil {
+		existingResponses = &cloudfront_types.CustomErrorResponses{}
+	}
+	for code := range desiredErrors {
+		existingResponses.Items = append(existingResponses.Items, cloudfront_types.CustomErrorResponse{
+			ErrorCode:        aws.Int32(code),
+			ResponsePagePath: aws.String(responsePage),
+			ResponseCode:     aws.String(responseCode),
+		})
+	}
+	existingResponses.Quantity = aws.Int32(int32(len(existingResponses.Items)))
+	distributionConfig.CustomErrorResponses = existingResponses
 
 	// Always update distribution — function association and error pages
 	io.WriteString(logsWriter, fmt.Sprintf("Updating cloudfront distribution %s with function and error pages\n", cloudfrontDistributionId))

@@ -268,8 +268,7 @@ func createDistributionConfigForNewCloudfront(parameters map[string]interface{},
 		Quantity: aws.Int32(1),
 	}
 
-	// CustomErrorResponses are set by DeployAwsCloudfrontViewerRequestFunction (Command 4)
-	// based on the IsSpa parameter. This keeps all distribution config modifications in one place.
+	// Default error responses for SPA (Command 4 updates these based on IsSpa)
 	distributionConfig := &cloudfrontTypes.DistributionConfig{
 		CallerReference:      aws.String(callerReference),
 		Comment:              aws.String(comment),
@@ -277,8 +276,11 @@ func createDistributionConfigForNewCloudfront(parameters map[string]interface{},
 		Enabled:              aws.Bool(true),
 		Origins:              origins,
 		CustomErrorResponses: &cloudfrontTypes.CustomErrorResponses{
-			Quantity: aws.Int32(0),
-			Items:    []cloudfrontTypes.CustomErrorResponse{},
+			Quantity: aws.Int32(2),
+			Items: []cloudfrontTypes.CustomErrorResponse{
+				{ErrorCode: aws.Int32(403), ResponsePagePath: aws.String("/index.html"), ResponseCode: aws.String("200")},
+				{ErrorCode: aws.Int32(404), ResponsePagePath: aws.String("/index.html"), ResponseCode: aws.String("200")},
+			},
 		},
 		DefaultRootObject: aws.String("index.html"),
 		PriceClass:        cloudfrontTypes.PriceClassPriceClassAll,
