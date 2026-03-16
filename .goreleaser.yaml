@@ -8,16 +8,29 @@ before:
     - go generate ./...
 
 builds:
-  - id: linux
+  - id: linux-amd64
     env:
       - CGO_ENABLED=1
-      - >-
-        {{- if eq .Arch "amd64"}}CC=x86_64-linux-gnu-gcc{{- end}}
-        {{- if eq .Arch "arm64"}}CC=aarch64-linux-gnu-gcc{{- end}}
     goos:
       - linux
     goarch:
       - amd64
+    binary: deployment-runner
+    main: ./entrypoints/local
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+      - '-s -w -X "main.clientCertPem={{.Env.TLS_CERT}}"'
+      - '-s -w -X "main.clientKeyPem={{.Env.TLS_KEY}}"'
+      - -s -w -X main.serviceFromBuild={{.Env.SERVICE}}
+
+  - id: linux-arm64
+    env:
+      - CGO_ENABLED=1
+      - CC=aarch64-linux-gnu-gcc
+      - CXX=aarch64-linux-gnu-g++
+    goos:
+      - linux
+    goarch:
       - arm64
     binary: deployment-runner
     main: ./entrypoints/local
@@ -27,16 +40,31 @@ builds:
       - '-s -w -X "main.clientKeyPem={{.Env.TLS_KEY}}"'
       - -s -w -X main.serviceFromBuild={{.Env.SERVICE}}
 
-  - id: darwin
+  - id: darwin-amd64
     env:
       - CGO_ENABLED=1
-      - >-
-        {{- if eq .Arch "amd64"}}CC=o64-clang{{- end}}
-        {{- if eq .Arch "arm64"}}CC=oa64-clang{{- end}}
+      - CC=/home/runner/osxcross/target/bin/o64-clang
+      - CXX=/home/runner/osxcross/target/bin/o64-clang++
     goos:
       - darwin
     goarch:
       - amd64
+    binary: deployment-runner
+    main: ./entrypoints/local
+    ldflags:
+      - -s -w -X main.version={{.Version}}
+      - '-s -w -X "main.clientCertPem={{.Env.TLS_CERT}}"'
+      - '-s -w -X "main.clientKeyPem={{.Env.TLS_KEY}}"'
+      - -s -w -X main.serviceFromBuild={{.Env.SERVICE}}
+
+  - id: darwin-arm64
+    env:
+      - CGO_ENABLED=1
+      - CC=/home/runner/osxcross/target/bin/oa64-clang
+      - CXX=/home/runner/osxcross/target/bin/oa64-clang++
+    goos:
+      - darwin
+    goarch:
       - arm64
     binary: deployment-runner
     main: ./entrypoints/local
@@ -46,10 +74,11 @@ builds:
       - '-s -w -X "main.clientKeyPem={{.Env.TLS_KEY}}"'
       - -s -w -X main.serviceFromBuild={{.Env.SERVICE}}
 
-  - id: windows
+  - id: windows-amd64
     env:
       - CGO_ENABLED=1
       - CC=x86_64-w64-mingw32-gcc
+      - CXX=x86_64-w64-mingw32-g++
     goos:
       - windows
     goarch:
