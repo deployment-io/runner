@@ -25,13 +25,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             gcc-aarch64-linux-gnu \
-            g++-aarch64-linux-gnu \
-            gcc-mingw-w64-x86-64 \
-            g++-mingw-w64-x86-64
-      - name: Set up OSXCross
-        run: |
-          mkdir -p /home/runner/osxcross
-          git clone https://github.com/plentico/osxcross-target.git /home/runner/osxcross/target
+            g++-aarch64-linux-gnu
       - name: Run Release
         uses: goreleaser/goreleaser-action@v5
         with:

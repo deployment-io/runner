@@ -40,39 +40,6 @@ builds:
       - '-s -w -X "main.clientKeyPem={{.Env.TLS_KEY}}"'
       - -s -w -X main.serviceFromBuild={{.Env.SERVICE}}
 
-  - id: darwin-arm64
-    env:
-      - CGO_ENABLED=1
-      - CC=/home/runner/osxcross/target/bin/oa64-clang
-      - CXX=/home/runner/osxcross/target/bin/oa64-clang++
-    goos:
-      - darwin
-    goarch:
-      - arm64
-    binary: deployment-runner
-    main: ./entrypoints/local
-    ldflags:
-      - -s -w -X main.version={{.Version}}
-      - '-s -w -X "main.clientCertPem={{.Env.TLS_CERT}}"'
-      - '-s -w -X "main.clientKeyPem={{.Env.TLS_KEY}}"'
-      - -s -w -X main.serviceFromBuild={{.Env.SERVICE}}
-
-  - id: windows-amd64
-    env:
-      - CGO_ENABLED=1
-      - CC=x86_64-w64-mingw32-gcc
-      - CXX=x86_64-w64-mingw32-g++
-    goos:
-      - windows
-    goarch:
-      - amd64
-    binary: deployment-runner
-    main: ./entrypoints/local
-    ldflags:
-      - -s -w -X main.version={{.Version}}
-      - '-s -w -X "main.clientCertPem={{.Env.TLS_CERT}}"'
-      - '-s -w -X "main.clientKeyPem={{.Env.TLS_KEY}}"'
-      - -s -w -X main.serviceFromBuild={{.Env.SERVICE}}
 
 archives:
   - format: tar.gz
