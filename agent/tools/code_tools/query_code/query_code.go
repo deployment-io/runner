@@ -108,7 +108,7 @@ func addNodes(dir, moduleName string, graph *types.CodeGraph, queryContent strin
 	return err
 }
 
-const queriesFilesDir = "./automation/tools/code_tools/queries"
+const queriesFilesDir = "./agent/tools/code_tools/queries"
 
 func extractFunctionContent(node *types.CodeNode) (string, error) {
 	content, err := os.ReadFile(node.Path)
