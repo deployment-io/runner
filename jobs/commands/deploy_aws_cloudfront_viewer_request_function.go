@@ -268,14 +268,6 @@ func (d *DeployAwsCloudfrontViewerRequestFunction) Run(parameters map[string]int
 		return parameters, err
 	}
 
-	distributionConfigOutput, err := cloudfrontClient.GetDistributionConfig(context.TODO(), &cloudfront.GetDistributionConfigInput{
-		Id: aws.String(cloudfrontDistributionId),
-	})
-
-	if err != nil {
-		return parameters, err
-	}
-	distributionConfig := distributionConfigOutput.DistributionConfig
 	describeFunctionOutput, functionExists, err := describeViewerRequestFunction(parameters, cloudfrontClient)
 	if err != nil {
 		return parameters, err
@@ -342,6 +334,15 @@ func (d *DeployAwsCloudfrontViewerRequestFunction) Run(parameters map[string]int
 	if err != nil {
 		return parameters, err
 	}
+	//get fresh distribution config right before update to avoid stale ETag (412 PreconditionFailed)
+	distributionConfigOutput, err := cloudfrontClient.GetDistributionConfig(context.TODO(), &cloudfront.GetDistributionConfigInput{
+		Id: aws.String(cloudfrontDistributionId),
+	})
+	if err != nil {
+		return parameters, err
+	}
+	distributionConfig := distributionConfigOutput.DistributionConfig
+
 	//associate function to distribution config
 	associate := associateFunctionToCloudfrontDistribution(distributionConfig, functionARN, cloudfront_types.EventTypeViewerRequest)
 
