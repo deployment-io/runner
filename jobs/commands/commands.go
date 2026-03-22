@@ -74,6 +74,8 @@ func Get(p commands_enums.Type) (jobs.Command, error) {
 		return &RunNewAutomation{}, nil
 	case commands_enums.RunNewAgent:
 		return &agents.RunNewAgent{}, nil
+	case commands_enums.GetDeploymentLogsAws:
+		return &GetDeploymentLogsAws{}, nil
 	}
 	return nil, fmt.Errorf("error getting command for %s", p)
 }
