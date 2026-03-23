@@ -35,12 +35,21 @@ func allocateJobs(pendingJobs []pendingJobType) <-chan pendingJobType {
 	return jobsStream
 }
 
-func getJobResult(job pendingJobType, error string) completingJobType {
-	return completingJobType{
+func getJobResult(job pendingJobType, error string, parameters map[string]interface{}) completingJobType {
+	result := completingJobType{
 		error:          error,
 		id:             job.jobID,
 		organizationID: job.organizationID,
 	}
+	// Extract job output JSON string from parameters if present (e.g., from get_deployment_logs command)
+	// Passed through as-is to deployment-server which unmarshals before persisting
+	if parameters != nil {
+		jobOutputJSON, err := jobs.GetParameterValue[string](parameters, parameters_enums.JobOutput)
+		if err == nil && len(jobOutputJSON) > 0 {
+			result.output = jobOutputJSON
+		}
+	}
+	return result
 }
 
 func handleLogEnd(err error, jobID string, logsWriter io.Writer) {
@@ -76,7 +85,7 @@ func executeJobs(jobsStream <-chan pendingJobType, noOfWorkers int, mode runner_
 						}
 						logger, err := loggers.Get(parameters)
 						if err != nil {
-							result := getJobResult(pendingJob, err.Error())
+							result := getJobResult(pendingJob, err.Error(), nil)
 							resultsStream <- result
 							loggers.AddJobLogsPipeline.Add(pendingJob.jobID, loggers.JobLog{
 								Logger:         nil,
@@ -90,7 +99,7 @@ func executeJobs(jobsStream <-chan pendingJobType, noOfWorkers int, mode runner_
 						}
 						logsWriter, err := loggers.GetJobLogsWriter(pendingJob.jobID, pendingJob.organizationID, logger, mode)
 						if err != nil {
-							result := getJobResult(pendingJob, err.Error())
+							result := getJobResult(pendingJob, err.Error(), nil)
 							resultsStream <- result
 							return
 						}
@@ -103,7 +112,7 @@ func executeJobs(jobsStream <-chan pendingJobType, noOfWorkers int, mode runner_
 							case <-stopJobSignal:
 								errStoppedByUser := types.ErrJobStoppedByUser
 								handleLogEnd(errStoppedByUser, pendingJob.jobID, logsWriter)
-								result := getJobResult(pendingJob, errStoppedByUser.Error())
+								result := getJobResult(pendingJob, errStoppedByUser.Error(), nil)
 								resultsStream <- result
 								//if job is a deployment/build/preview type, this will be marked them done
 								<-commands.MarkDeploymentDone(parameters, errStoppedByUser)
@@ -112,21 +121,21 @@ func executeJobs(jobsStream <-chan pendingJobType, noOfWorkers int, mode runner_
 								command, err := commands.Get(commandEnum)
 								if err != nil {
 									handleLogEnd(err, pendingJob.jobID, logsWriter)
-									result := getJobResult(pendingJob, err.Error())
+									result := getJobResult(pendingJob, err.Error(), nil)
 									resultsStream <- result
 									return
 								}
 								parameters, err = command.Run(parameters, logsWriter)
 								if err != nil {
 									handleLogEnd(err, pendingJob.jobID, logsWriter)
-									result := getJobResult(pendingJob, err.Error())
+									result := getJobResult(pendingJob, err.Error(), nil)
 									resultsStream <- result
 									return
 								}
 							}
 						}
 						handleLogEnd(nil, pendingJob.jobID, logsWriter)
-						result := getJobResult(pendingJob, "")
+						result := getJobResult(pendingJob, "", parameters)
 						resultsStream <- result
 					}(pendingJob)
 				}
@@ -175,8 +184,9 @@ func sendJobResults(resultsStream <-chan completingJobType,
 				}()
 				for result := range resultsStream {
 					jobsDonePipeline.Add(result.organizationID, jobs.CompletingJobDtoV1{
-						Error: result.error,
-						ID:    result.id,
+						Error:  result.error,
+						ID:     result.id,
+						Output: result.output,
 					})
 				}
 			}()

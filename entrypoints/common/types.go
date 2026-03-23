@@ -13,4 +13,5 @@ type completingJobType struct {
 	error          string
 	id             string
 	organizationID string
+	output         string
 }
