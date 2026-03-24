@@ -49,11 +49,17 @@ func (g *GetDeploymentLogsAws) Run(parameters map[string]interface{}, logsWriter
 	// Log stream prefix is optional — databases and deployments without builds won't have one
 	logStreamPrefix, _ := utils.GetApplicationLogStreamPrefix(parameters)
 
+	debug, _ := jobs.GetParameterValue[bool](parameters, parameters_enums.DebugGetDeploymentLogs)
+	if debug {
+		fmt.Printf("[DEBUG] logGroupName=%s logStreamPrefix=%s startTimeMs=%d endTimeMs=%d searchPattern=%s\n",
+			logGroupName, logStreamPrefix, startTimeMs, endTimeMs, searchPattern)
+	}
+
 	var logs []map[string]interface{}
 	if len(searchPattern) > 0 {
-		logs, err = getFilteredLogs(cloudwatchLogsClient, logGroupName, logStreamPrefix, searchPattern, startTimeMs, endTimeMs)
+		logs, err = getFilteredLogs(cloudwatchLogsClient, logGroupName, logStreamPrefix, searchPattern, startTimeMs, endTimeMs, debug)
 	} else {
-		logs, err = getLogs(cloudwatchLogsClient, logGroupName, logStreamPrefix, startTimeMs, endTimeMs)
+		logs, err = getLogs(cloudwatchLogsClient, logGroupName, logStreamPrefix, startTimeMs, endTimeMs, debug)
 	}
 	if err != nil {
 		return parameters, err
@@ -81,7 +87,7 @@ func (g *GetDeploymentLogsAws) Run(parameters map[string]interface{}, logsWriter
 }
 
 func getLogs(client *cloudwatchlogs.Client, logGroupName, logStreamPrefix string,
-	startTimeMs, endTimeMs int64) ([]map[string]interface{}, error) {
+	startTimeMs, endTimeMs int64, debug bool) ([]map[string]interface{}, error) {
 
 	// Find the most recent log stream matching the prefix (or any stream if prefix is empty)
 	describeInput := &cloudwatchlogs.DescribeLogStreamsInput{
@@ -97,10 +103,16 @@ func getLogs(client *cloudwatchlogs.Client, logGroupName, logStreamPrefix string
 		return nil, fmt.Errorf("failed to describe log streams: %w", err)
 	}
 	if len(describeOutput.LogStreams) == 0 {
+		if debug {
+			fmt.Printf("[DEBUG] No log streams found for logGroup=%s prefix=%s\n", logGroupName, logStreamPrefix)
+		}
 		return nil, nil
 	}
 
 	logStreamName := aws.ToString(describeOutput.LogStreams[0].LogStreamName)
+	if debug {
+		fmt.Printf("[DEBUG] Using log stream: %s\n", logStreamName)
+	}
 	var allEvents []cwTypes.OutputLogEvent
 	var nextToken *string
 	for {
@@ -114,6 +126,9 @@ func getLogs(client *cloudwatchlogs.Client, logGroupName, logStreamPrefix string
 		})
 		if err != nil {
 			return nil, fmt.Errorf("failed to get log events: %w", err)
+		}
+		if debug {
+			fmt.Printf("[DEBUG] getLogs: page returned %d events\n", len(output.Events))
 		}
 		allEvents = append(allEvents, output.Events...)
 		if len(allEvents) >= maxLogLines {
@@ -130,7 +145,7 @@ func getLogs(client *cloudwatchlogs.Client, logGroupName, logStreamPrefix string
 }
 
 func getFilteredLogs(client *cloudwatchlogs.Client, logGroupName, logStreamPrefix, filterPattern string,
-	startTimeMs, endTimeMs int64) ([]map[string]interface{}, error) {
+	startTimeMs, endTimeMs int64, debug bool) ([]map[string]interface{}, error) {
 
 	filterInput := &cloudwatchlogs.FilterLogEventsInput{
 		LogGroupName:  aws.String(logGroupName),
@@ -141,6 +156,10 @@ func getFilteredLogs(client *cloudwatchlogs.Client, logGroupName, logStreamPrefi
 	if len(logStreamPrefix) > 0 {
 		filterInput.LogStreamNamePrefix = aws.String(logStreamPrefix)
 	}
+	if debug {
+		fmt.Printf("[DEBUG] getFilteredLogs: logGroup=%s prefix=%s filterPattern=%%%s%% startTimeMs=%d endTimeMs=%d\n",
+			logGroupName, logStreamPrefix, filterPattern, startTimeMs, endTimeMs)
+	}
 
 	var allEvents []cwTypes.FilteredLogEvent
 	var nextToken *string
@@ -149,6 +168,9 @@ func getFilteredLogs(client *cloudwatchlogs.Client, logGroupName, logStreamPrefi
 		output, err := client.FilterLogEvents(context.TODO(), filterInput)
 		if err != nil {
 			return nil, fmt.Errorf("failed to filter log events: %w", err)
+		}
+		if debug {
+			fmt.Printf("[DEBUG] getFilteredLogs: page returned %d events\n", len(output.Events))
 		}
 		allEvents = append(allEvents, output.Events...)
 		if len(allEvents) >= maxLogLines {
