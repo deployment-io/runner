@@ -9,11 +9,14 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/tasks"
 )
 
-// IsTasksMode reports whether the Job is running for a Task. CheckoutRepo and
-// the new Tasks runner commands branch on this to take the multi-repo path
-// instead of the existing single-repo deployment path.
+// IsTasksMode reports whether the Job is running for a Task. CheckoutRepo
+// branches on this to take the multi-repo Tasks path instead of the
+// existing single-repo deployment path. Checks TaskID presence (the
+// canonical Task-job indicator, mirroring deployment-server's
+// !job.TaskID.IsZero() dispatch); the multi-repo Repositories parameter
+// is validated inside ParseTaskCheckoutContext.
 func IsTasksMode(parameters map[string]interface{}) bool {
-	v, err := jobs.GetParameterValue[string](parameters, parameters_enums.Repositories)
+	v, err := jobs.GetParameterValue[string](parameters, parameters_enums.TaskID)
 	return err == nil && len(v) > 0
 }
 
