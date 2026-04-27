@@ -78,6 +78,8 @@ func Get(p commands_enums.Type) (jobs.Command, error) {
 		return &GetDeploymentLogsAws{}, nil
 	case commands_enums.CommitAndPush:
 		return &CommitAndPush{}, nil
+	case commands_enums.OpenPullRequest:
+		return &OpenPullRequest{}, nil
 	}
 	return nil, fmt.Errorf("error getting command for %s", p)
 }
