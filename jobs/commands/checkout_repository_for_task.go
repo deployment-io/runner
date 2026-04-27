@@ -15,32 +15,73 @@ import (
 // First Step (StepIndex == 0): checkout each repo's BaseBranch and create the
 // shared Task branch locally so subsequent commits land on it.
 // Subsequent Steps: fetch + checkout the shared Task branch from origin
-// (where the prior Step pushed). Tokens are minted fresh per-repo via
-// RefreshGitTokenForInstallation; lazy-refresh on 401 follows the existing
-// CheckoutRepository pattern.
+// (where the prior Step pushed). Tokens are minted on demand and cached
+// per-installation across the loop, so multi-repo Tasks sharing one GitHub
+// App installation don't trigger redundant refresh RPCs.
 func (cr *CheckoutRepository) runForTask(parameters map[string]interface{}, logsWriter io.Writer) (map[string]interface{}, error) {
 	ctx, err := commandUtils.ParseTaskCheckoutContext(parameters)
 	if err != nil {
 		return parameters, err
 	}
+	tc := &taskCheckout{
+		ctx:        ctx,
+		tokenCache: make(map[string]string),
+		logsWriter: logsWriter,
+	}
 	for idx, entry := range ctx.Entries {
 		repoDir := commandUtils.GetTaskRepositoryDir(ctx.OrganizationID, ctx.TaskID, idx, entry.Name)
 		io.WriteString(logsWriter, fmt.Sprintf("Checking out repo %s into %s\n", entry.Name, repoDir))
-		if err := checkoutOneTaskRepo(repoDir, ctx, entry, logsWriter); err != nil {
+		if err := tc.checkoutOne(repoDir, entry); err != nil {
 			return parameters, fmt.Errorf("error checking out repo %s: %s", entry.Name, err)
 		}
 	}
 	return parameters, nil
 }
 
-// checkoutOneTaskRepo clones one repo and positions it on the right branch
-// for the current Step. Encapsulates the per-repo retry-on-401 dance.
-func checkoutOneTaskRepo(repoDir string, ctx commandUtils.TaskCheckoutContext, entry tasks.RepositoryEntry, logsWriter io.Writer) error {
-	token, err := commandUtils.RefreshGitTokenForInstallation(entry.InstallationID, ctx.OrganizationID)
-	if err != nil {
-		return fmt.Errorf("error minting installation token: %s", err)
+// taskCheckout bundles the per-Step-Job state shared across the per-repo
+// methods. The tokenCache eliminates redundant RefreshGitTokenForInstallation
+// RPCs when multiple repos in this Task share one installation.
+type taskCheckout struct {
+	ctx        commandUtils.TaskCheckoutContext
+	tokenCache map[string]string
+	logsWriter io.Writer
+}
+
+// getToken returns a fresh token for the installation, minting via the
+// server's RefreshGitToken RPC on cache miss. Cache hits skip the RPC,
+// which is the whole point of this struct.
+func (tc *taskCheckout) getToken(installationID string) (string, error) {
+	if token, ok := tc.tokenCache[installationID]; ok {
+		return token, nil
 	}
-	repository, token, err := cloneTaskRepoWithRetry(repoDir, entry, token, ctx.OrganizationID, logsWriter)
+	token, err := commandUtils.RefreshGitTokenForInstallation(installationID, tc.ctx.OrganizationID)
+	if err != nil {
+		return "", err
+	}
+	tc.tokenCache[installationID] = token
+	return token, nil
+}
+
+// refreshToken forces a refresh and overwrites the cache. Called from the
+// retry-on-401 paths so a fresh token reaches subsequent repos in the loop
+// that share this installation.
+func (tc *taskCheckout) refreshToken(installationID string) (string, error) {
+	token, err := commandUtils.RefreshGitTokenForInstallation(installationID, tc.ctx.OrganizationID)
+	if err != nil {
+		return "", err
+	}
+	tc.tokenCache[installationID] = token
+	return token, nil
+}
+
+// checkoutOne clones one repo and positions it on the right branch for the
+// current Step.
+func (tc *taskCheckout) checkoutOne(repoDir string, entry tasks.RepositoryEntry) error {
+	token, err := tc.getToken(entry.InstallationID)
+	if err != nil {
+		return fmt.Errorf("error getting installation token: %s", err)
+	}
+	repository, token, err := tc.cloneWithRetry(repoDir, entry, token)
 	if err != nil {
 		return err
 	}
@@ -48,28 +89,29 @@ func checkoutOneTaskRepo(repoDir string, ctx commandUtils.TaskCheckoutContext, e
 	if err != nil {
 		return fmt.Errorf("error getting worktree: %s", err)
 	}
-	if ctx.StepIndex == 0 {
-		return checkoutBaseBranchAndCreateTaskBranch(worktree, entry.BaseBranch, ctx.BranchName)
+	if tc.ctx.StepIndex == 0 {
+		return checkoutBaseBranchAndCreateTaskBranch(worktree, entry.BaseBranch, tc.ctx.BranchName)
 	}
-	return fetchAndCheckoutTaskBranch(repository, worktree, entry, token, ctx, logsWriter)
+	return tc.fetchAndCheckoutTaskBranch(repository, worktree, entry, token)
 }
 
-// cloneTaskRepoWithRetry runs the clone, refreshes token + retries once
-// on go-git's "authentication required" error. Returns the repository and
-// the (possibly-refreshed) token used for the successful clone.
-func cloneTaskRepoWithRetry(repoDir string, entry tasks.RepositoryEntry, token, orgID string, logsWriter io.Writer) (*git.Repository, string, error) {
+// cloneWithRetry runs the clone, refreshes the token + retries once on
+// go-git's "authentication required" error. Returns the (possibly-refreshed)
+// token used for the successful clone so the caller can pass it to the
+// subsequent fetch.
+func (tc *taskCheckout) cloneWithRetry(repoDir string, entry tasks.RepositoryEntry, token string) (*git.Repository, string, error) {
 	cloneURL, err := commandUtils.GetRepoUrlWithToken(entry.Provider, token, entry.CloneURL)
 	if err != nil {
 		return nil, token, err
 	}
-	repository, err := commandUtils.CloneRepository(repoDir, cloneURL, token, entry.Provider, logsWriter)
+	repository, err := commandUtils.CloneRepository(repoDir, cloneURL, token, entry.Provider, tc.logsWriter)
 	if err == nil {
 		return repository, token, nil
 	}
 	if !commandUtils.IsErrorAuthenticationRequired(err) {
 		return nil, token, err
 	}
-	token, err = commandUtils.RefreshGitTokenForInstallation(entry.InstallationID, orgID)
+	token, err = tc.refreshToken(entry.InstallationID)
 	if err != nil {
 		return nil, token, err
 	}
@@ -77,13 +119,43 @@ func cloneTaskRepoWithRetry(repoDir string, entry tasks.RepositoryEntry, token, 
 	if err != nil {
 		return nil, token, err
 	}
-	repository, err = commandUtils.CloneRepository(repoDir, cloneURL, token, entry.Provider, logsWriter)
+	repository, err = commandUtils.CloneRepository(repoDir, cloneURL, token, entry.Provider, tc.logsWriter)
 	return repository, token, err
+}
+
+// fetchAndCheckoutTaskBranch is the StepIndex>0 path: pull the shared Task
+// branch (where prior Steps pushed) and check it out so this Step's commits
+// stack on top.
+func (tc *taskCheckout) fetchAndCheckoutTaskBranch(repository *git.Repository, worktree *git.Worktree, entry tasks.RepositoryEntry, token string) error {
+	if err := tc.fetchWithRetry(repository, entry, token); err != nil {
+		return err
+	}
+	taskBranchRef := plumbing.NewRemoteReferenceName("origin", tc.ctx.BranchName)
+	if err := worktree.Checkout(&git.CheckoutOptions{Branch: taskBranchRef}); err != nil {
+		return fmt.Errorf("error checking out task branch %s: %s", tc.ctx.BranchName, err)
+	}
+	return nil
+}
+
+// fetchWithRetry runs FetchRepository, refreshes the token + retries once on
+// "authentication required". Mirrors the clone retry shape.
+func (tc *taskCheckout) fetchWithRetry(repository *git.Repository, entry tasks.RepositoryEntry, token string) error {
+	if err := commandUtils.FetchRepository(repository, token, entry.Provider, tc.logsWriter); err == nil {
+		return nil
+	} else if !commandUtils.IsErrorAuthenticationRequired(err) {
+		return err
+	}
+	token, err := tc.refreshToken(entry.InstallationID)
+	if err != nil {
+		return err
+	}
+	return commandUtils.FetchRepository(repository, token, entry.Provider, tc.logsWriter)
 }
 
 // checkoutBaseBranchAndCreateTaskBranch is the StepIndex==0 path: position
 // the worktree on the repo's base branch, then create the shared Task branch
-// locally so subsequent commits land on it.
+// locally so subsequent commits land on it. Stateless — kept as a free
+// function since it doesn't need any taskCheckout state.
 func checkoutBaseBranchAndCreateTaskBranch(worktree *git.Worktree, baseBranch, taskBranchName string) error {
 	baseRef := plumbing.NewRemoteReferenceName("origin", baseBranch)
 	if err := worktree.Checkout(&git.CheckoutOptions{Branch: baseRef}); err != nil {
@@ -94,34 +166,4 @@ func checkoutBaseBranchAndCreateTaskBranch(worktree *git.Worktree, baseBranch, t
 		return fmt.Errorf("error creating task branch %s: %s", taskBranchName, err)
 	}
 	return nil
-}
-
-// fetchAndCheckoutTaskBranch is the StepIndex>0 path: pull the shared Task
-// branch (where prior Steps pushed) and check it out so this Step's commits
-// stack on top.
-func fetchAndCheckoutTaskBranch(repository *git.Repository, worktree *git.Worktree,
-	entry tasks.RepositoryEntry, token string, ctx commandUtils.TaskCheckoutContext, logsWriter io.Writer) error {
-	if err := fetchWithRetry(repository, entry, token, ctx.OrganizationID, logsWriter); err != nil {
-		return err
-	}
-	taskBranchRef := plumbing.NewRemoteReferenceName("origin", ctx.BranchName)
-	if err := worktree.Checkout(&git.CheckoutOptions{Branch: taskBranchRef}); err != nil {
-		return fmt.Errorf("error checking out task branch %s: %s", ctx.BranchName, err)
-	}
-	return nil
-}
-
-// fetchWithRetry runs FetchRepository, refreshes token + retries once on
-// "authentication required". Mirrors the clone retry shape.
-func fetchWithRetry(repository *git.Repository, entry tasks.RepositoryEntry, token, orgID string, logsWriter io.Writer) error {
-	if err := commandUtils.FetchRepository(repository, token, entry.Provider, logsWriter); err == nil {
-		return nil
-	} else if !commandUtils.IsErrorAuthenticationRequired(err) {
-		return err
-	}
-	token, err := commandUtils.RefreshGitTokenForInstallation(entry.InstallationID, orgID)
-	if err != nil {
-		return err
-	}
-	return commandUtils.FetchRepository(repository, token, entry.Provider, logsWriter)
 }
