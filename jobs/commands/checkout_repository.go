@@ -63,6 +63,11 @@ func addRootDirectory(parameters map[string]interface{}, repoDirectoryPath strin
 // deployments.
 func (cr *CheckoutRepository) Run(parameters map[string]interface{}, logsWriter io.Writer) (newParameters map[string]interface{}, err error) {
 	if commandUtils.IsTasksMode(parameters) {
+		defer func() {
+			if err != nil {
+				<-MarkStepDone(parameters, err)
+			}
+		}()
 		return cr.runForTask(parameters, logsWriter)
 	}
 	defer func() {

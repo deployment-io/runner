@@ -93,8 +93,13 @@ func executeJobs(jobsStream <-chan pendingJobType, noOfWorkers int, mode runner_
 								Ts:             time.Now().Unix(),
 								OrganizationID: pendingJob.organizationID,
 							})
-							//if job is a build type it will be marked done
-							<-commands.MarkDeploymentDone(parameters, err)
+							//if job is a build type it will be marked done; if it's a Task
+							//Step Job the per-Task working dir is cleaned up instead
+							if commandUtils.IsTasksMode(parameters) {
+								<-commands.MarkStepDone(parameters, err)
+							} else {
+								<-commands.MarkDeploymentDone(parameters, err)
+							}
 							return
 						}
 						logsWriter, err := loggers.GetJobLogsWriter(pendingJob.jobID, pendingJob.organizationID, logger, mode)
@@ -114,8 +119,13 @@ func executeJobs(jobsStream <-chan pendingJobType, noOfWorkers int, mode runner_
 								handleLogEnd(errStoppedByUser, pendingJob.jobID, logsWriter)
 								result := getJobResult(pendingJob, errStoppedByUser.Error(), nil)
 								resultsStream <- result
-								//if job is a deployment/build/preview type, this will be marked them done
-								<-commands.MarkDeploymentDone(parameters, errStoppedByUser)
+								//if job is a deployment/build/preview type, this will be marked them done;
+								//if it's a Task Step Job, the per-Task working dir is cleaned up instead
+								if commandUtils.IsTasksMode(parameters) {
+									<-commands.MarkStepDone(parameters, errStoppedByUser)
+								} else {
+									<-commands.MarkDeploymentDone(parameters, errStoppedByUser)
+								}
 								return
 							default:
 								command, err := commands.Get(commandEnum)

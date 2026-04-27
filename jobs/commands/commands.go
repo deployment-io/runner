@@ -88,6 +88,35 @@ func isPreview(parameters map[string]interface{}) bool {
 	return p
 }
 
+// MarkStepDone is the Tasks-mode equivalent of MarkDeploymentDone, scoped
+// to working-directory cleanup only. Status updates flow through the
+// RunTaskStep.OnCompletion* hooks in deployment-server (fired from
+// MarkCompleteV1 after the Job result arrives), not from here.
+//
+// Removes /tmp/<orgID>/<taskID>/ — the per-Task base under which all
+// per-repo subdirs (<idx>-<name>) for this Step Job live. The whole base
+// is removable per Step Job because each Step Job re-clones via
+// CheckoutRepo from origin; nothing on disk needs to persist between
+// Step Jobs (commits do, via the pushed Task branch).
+//
+// The err parameter is reserved for future use (e.g., per-Job error
+// logging); currently unused. Channel-return shape mirrors
+// MarkDeploymentDone so callers consume identically:
+// `<-MarkStepDone(parameters, err)`.
+func MarkStepDone(parameters map[string]interface{}, err error) <-chan struct{} {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		orgID, _ := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIDNamespace)
+		taskID, _ := jobs.GetParameterValue[string](parameters, parameters_enums.TaskID)
+		if len(orgID) == 0 || len(taskID) == 0 {
+			return
+		}
+		os.RemoveAll(utils.GetTaskRepositoriesBaseDir(orgID, taskID))
+	}()
+	return done
+}
+
 func MarkDeploymentDone(parameters map[string]interface{}, err error) <-chan struct{} {
 	done := make(chan struct{})
 	go func() {
