@@ -14,7 +14,7 @@ import (
 // existing single-repo deployment path. Checks TaskID presence (the
 // canonical Task-job indicator, mirroring deployment-server's
 // !job.TaskID.IsZero() dispatch); the multi-repo Repositories parameter
-// is validated inside ParseTaskCheckoutContext.
+// is validated inside ParseTaskJobContext.
 func IsTasksMode(parameters map[string]interface{}) bool {
 	v, err := jobs.GetParameterValue[string](parameters, parameters_enums.TaskID)
 	return err == nil && len(v) > 0
@@ -37,19 +37,24 @@ func GetTaskRepositoryDir(orgID, taskID string, idx int, name string) string {
 	return fmt.Sprintf("%s/%d-%s", GetTaskRepositoriesBaseDir(orgID, taskID), idx, name)
 }
 
-// TaskCheckoutContext bundles the inputs the per-repo checkout loop needs.
-type TaskCheckoutContext struct {
+// TaskJobContext bundles the per-Task-Job inputs all Tasks runner commands
+// (CheckoutRepo, CommitAndPush, OpenPullRequest) need. Parsed once at the
+// top of each command's Run() and passed into the per-repo loop.
+type TaskJobContext struct {
 	OrganizationID string
 	TaskID         string
+	TaskTitle      string
+	DashboardURL   string // optional — empty if APP_URL wasn't set at job creation
 	StepIndex      int64
 	BranchName     string
 	Entries        []tasks.RepositoryEntry
 }
 
-// ParseTaskCheckoutContext reads and validates the Tasks-mode parameters.
+// ParseTaskJobContext reads and validates the Tasks-mode parameters.
 // Returns an error if any required parameter is missing or malformed.
-func ParseTaskCheckoutContext(parameters map[string]interface{}) (TaskCheckoutContext, error) {
-	var ctx TaskCheckoutContext
+// TaskTitle is required; DashboardURL is optional.
+func ParseTaskJobContext(parameters map[string]interface{}) (TaskJobContext, error) {
+	var ctx TaskJobContext
 	orgID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIDNamespace)
 	if err != nil {
 		return ctx, fmt.Errorf("organization id missing: %s", err)
@@ -57,6 +62,10 @@ func ParseTaskCheckoutContext(parameters map[string]interface{}) (TaskCheckoutCo
 	taskID, err := jobs.GetParameterValue[string](parameters, parameters_enums.TaskID)
 	if err != nil {
 		return ctx, fmt.Errorf("task id missing: %s", err)
+	}
+	taskTitle, err := jobs.GetParameterValue[string](parameters, parameters_enums.TaskTitle)
+	if err != nil {
+		return ctx, fmt.Errorf("task title missing: %s", err)
 	}
 	stepIndex, err := jobs.GetParameterValue[int64](parameters, parameters_enums.StepIndex)
 	if err != nil {
@@ -77,9 +86,12 @@ func ParseTaskCheckoutContext(parameters map[string]interface{}) (TaskCheckoutCo
 	if len(entries) == 0 {
 		return ctx, fmt.Errorf("repositories list is empty")
 	}
-	ctx = TaskCheckoutContext{
+	dashboardURL, _ := jobs.GetParameterValue[string](parameters, parameters_enums.DashboardURL)
+	ctx = TaskJobContext{
 		OrganizationID: orgID,
 		TaskID:         taskID,
+		TaskTitle:      taskTitle,
+		DashboardURL:   dashboardURL,
 		StepIndex:      stepIndex,
 		BranchName:     branchName,
 		Entries:        entries,

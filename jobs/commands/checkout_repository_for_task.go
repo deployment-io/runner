@@ -19,7 +19,7 @@ import (
 // per-installation across the loop, so multi-repo Tasks sharing one GitHub
 // App installation don't trigger redundant refresh RPCs.
 func (cr *CheckoutRepository) runForTask(parameters map[string]interface{}, logsWriter io.Writer) (map[string]interface{}, error) {
-	ctx, err := commandUtils.ParseTaskCheckoutContext(parameters)
+	ctx, err := commandUtils.ParseTaskJobContext(parameters)
 	if err != nil {
 		return parameters, err
 	}
@@ -42,7 +42,7 @@ func (cr *CheckoutRepository) runForTask(parameters map[string]interface{}, logs
 // methods. The tokenCache eliminates redundant RefreshGitTokenForInstallation
 // RPCs when multiple repos in this Task share one installation.
 type taskCheckout struct {
-	ctx        commandUtils.TaskCheckoutContext
+	ctx        commandUtils.TaskJobContext
 	tokenCache map[string]string
 	logsWriter io.Writer
 }
