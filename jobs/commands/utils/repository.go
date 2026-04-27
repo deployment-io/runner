@@ -113,13 +113,22 @@ func RefreshGitToken(parameters map[string]interface{}) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	token, err := client.Get().RefreshGitToken(installationID, orgIdFromJob)
+	return RefreshGitTokenForInstallation(installationID, orgIdFromJob)
+}
+
+// RefreshGitTokenForInstallation refreshes the Git token for a specific
+// installation directly. Used by Tasks-mode flows where multiple repos
+// (each with its own installation) are processed inside one Job and the
+// parameters-map helper's "single InstallationID" assumption doesn't hold.
+// Polls every 10s on ErrRefreshInProcess (another caller holds the lock).
+func RefreshGitTokenForInstallation(installationID, orgID string) (string, error) {
+	token, err := client.Get().RefreshGitToken(installationID, orgID)
 	if err == nil {
 		return token, nil
 	}
 	for errors.Is(err, oauth.ErrRefreshInProcess) {
 		time.Sleep(10 * time.Second)
-		token, err = client.Get().RefreshGitToken(installationID, orgIdFromJob)
+		token, err = client.Get().RefreshGitToken(installationID, orgID)
 		if err == nil {
 			return token, nil
 		}
