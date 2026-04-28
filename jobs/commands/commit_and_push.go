@@ -254,12 +254,26 @@ type repoOutput struct {
 	PRNumber   int    `json:"pr_number,omitempty"`
 }
 
+// jobOutputSchemaVersion is the current version of the JobOutput envelope
+// for Tasks Step Jobs. Bump when introducing breaking shape changes (e.g.,
+// renaming a field, removing a field, changing the type of a field).
+// Additive changes (new optional fields) don't require a bump — readers
+// tolerate unknown fields.
+const jobOutputSchemaVersion = 1
+
 // jobOutputData is the on-the-wire shape of parameters_enums.JobOutput
 // for Tasks Step Jobs. Agent block populated by RunAgentStep (Phase 5);
 // repositories block populated by CommitAndPush + OpenPullRequest.
+//
+// SchemaVersion is set on every write so consumers (deployment-server hook,
+// dashboard) can detect newer producers and reject incompatible payloads
+// rather than silently mis-parsing. Missing schema_version on read is
+// treated as version 1 for backward compat with payloads written before
+// this field landed.
 type jobOutputData struct {
-	Agent        *agentOutput `json:"agent,omitempty"`
-	Repositories []repoOutput `json:"repositories,omitempty"`
+	SchemaVersion int          `json:"schema_version"`
+	Agent         *agentOutput `json:"agent,omitempty"`
+	Repositories  []repoOutput `json:"repositories,omitempty"`
 }
 
 type agentOutput struct {
@@ -277,6 +291,10 @@ func (tcp *taskCommitPush) mergeRepositoriesIntoJobOutput(parameters map[string]
 	if existing, err := jobs.GetParameterValue[string](parameters, parameters_enums.JobOutput); err == nil && len(existing) > 0 {
 		_ = json.Unmarshal([]byte(existing), &data) // best-effort: malformed prior output is overwritten
 	}
+	if data.SchemaVersion == 0 {
+		data.SchemaVersion = jobOutputSchemaVersion // tolerate pre-versioning payloads
+	}
+	data.SchemaVersion = jobOutputSchemaVersion
 	data.Repositories = mergeRepoOutputs(data.Repositories, outputs)
 	merged, err := json.Marshal(data)
 	if err != nil {
