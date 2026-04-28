@@ -291,10 +291,7 @@ func (tcp *taskCommitPush) mergeRepositoriesIntoJobOutput(parameters map[string]
 	if existing, err := jobs.GetParameterValue[string](parameters, parameters_enums.JobOutput); err == nil && len(existing) > 0 {
 		_ = json.Unmarshal([]byte(existing), &data) // best-effort: malformed prior output is overwritten
 	}
-	if data.SchemaVersion == 0 {
-		data.SchemaVersion = jobOutputSchemaVersion // tolerate pre-versioning payloads
-	}
-	data.SchemaVersion = jobOutputSchemaVersion
+	data.SchemaVersion = jobOutputSchemaVersion // always stamp current; zero on read = pre-versioning payload, fine to overwrite
 	data.Repositories = mergeRepoOutputs(data.Repositories, outputs)
 	merged, err := json.Marshal(data)
 	if err != nil {
