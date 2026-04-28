@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"time"
 
@@ -97,7 +98,7 @@ func (tcp *taskCommitPush) commitAndPushAll() ([]repoOutput, error) {
 	outputs := make([]repoOutput, 0, len(tcp.ctx.Entries))
 	for idx, entry := range tcp.ctx.Entries {
 		repoDir := commandUtils.GetTaskRepositoryDir(tcp.ctx.OrganizationID, tcp.ctx.TaskID, idx, entry.Name)
-		out, err := tcp.commitAndPushOne(repoDir, entry)
+		out, err := tcp.commitAndPushOne(repoDir, entry, idx)
 		if err != nil {
 			return nil, fmt.Errorf("error committing/pushing repo %s: %s", entry.Name, err)
 		}
@@ -108,8 +109,10 @@ func (tcp *taskCommitPush) commitAndPushAll() ([]repoOutput, error) {
 
 // commitAndPushOne handles one repo. Returns a clean-but-no-changes output
 // when the working dir has nothing to commit; otherwise commits + pushes
-// and returns the new commit SHA.
-func (tcp *taskCommitPush) commitAndPushOne(repoDir string, entry tasks.RepositoryEntry) (repoOutput, error) {
+// and returns the new commit SHA. The idx is the position in the Task's
+// Repositories slice — used as the stable identifier in JobOutput because
+// repo Name can collide across orgs (org-a/api + org-b/api).
+func (tcp *taskCommitPush) commitAndPushOne(repoDir string, entry tasks.RepositoryEntry, idx int) (repoOutput, error) {
 	repository, err := git.PlainOpen(repoDir)
 	if err != nil {
 		return repoOutput{}, fmt.Errorf("error opening repo at %s: %s", repoDir, err)
@@ -124,7 +127,7 @@ func (tcp *taskCommitPush) commitAndPushOne(repoDir string, entry tasks.Reposito
 	}
 	if status.IsClean() {
 		io.WriteString(tcp.logsWriter, fmt.Sprintf("No changes in repo %s — skipping commit/push\n", entry.Name))
-		return repoOutput{Name: entry.Name, HasChanges: false}, nil
+		return repoOutput{Index: idx, Name: entry.Name, HasChanges: false}, nil
 	}
 	if err := worktree.AddGlob("."); err != nil {
 		return repoOutput{}, fmt.Errorf("error staging changes: %s", err)
@@ -138,6 +141,7 @@ func (tcp *taskCommitPush) commitAndPushOne(repoDir string, entry tasks.Reposito
 	}
 	io.WriteString(tcp.logsWriter, fmt.Sprintf("Committed %s and pushed %s for repo %s\n", commitSHA[:7], tcp.ctx.BranchName, entry.Name))
 	return repoOutput{
+		Index:      idx,
 		Name:       entry.Name,
 		HasChanges: true,
 		CommitSHA:  commitSHA,
@@ -243,9 +247,15 @@ func (tcp *taskCommitPush) push(repository *git.Repository, entry tasks.Reposito
 }
 
 // repoOutput is one entry in the JobOutput repositories block.
-// CommitAndPush populates Name + HasChanges + CommitSHA + Branch.
+// CommitAndPush populates Index + Name + HasChanges + CommitSHA + Branch.
 // OpenPullRequest (chunk #4) extends each entry with PRURL + PRNumber.
+//
+// Index is the position in Task.Repositories — the stable identifier
+// for merging output across commands. Name can collide across orgs
+// (org-a/api + org-b/api both have Name == "api"), so it's a display
+// field only, never the merge key.
 type repoOutput struct {
+	Index      int    `json:"index"`
 	Name       string `json:"name"`
 	HasChanges bool   `json:"has_changes"`
 	CommitSHA  string `json:"commit_sha,omitempty"`
@@ -301,22 +311,25 @@ func (tcp *taskCommitPush) mergeRepositoriesIntoJobOutput(parameters map[string]
 	return nil
 }
 
-// mergeRepoOutputs replaces existing entries by Name with new ones,
+// mergeRepoOutputs replaces existing entries by Index with new ones,
 // preserving any existing entries not in the new set. Used so that
 // OpenPullRequest's later PR-fields write doesn't clobber CommitAndPush's
 // commit-fields write — and vice-versa for retry scenarios.
+//
+// Keyed on Index (position in Task.Repositories) rather than Name because
+// repo names can collide across orgs in multi-org Tasks. Output is sorted
+// by Index for deterministic JSON.
 func mergeRepoOutputs(existing, incoming []repoOutput) []repoOutput {
 	if len(existing) == 0 {
 		return incoming
 	}
-	byName := make(map[string]repoOutput, len(existing))
+	byIndex := make(map[int]repoOutput, len(existing))
 	for _, e := range existing {
-		byName[e.Name] = e
+		byIndex[e.Index] = e
 	}
 	for _, in := range incoming {
 		// Preserve PR fields if existing entry had them and incoming doesn't.
-		prev, hadPrev := byName[in.Name]
-		if hadPrev {
+		if prev, hadPrev := byIndex[in.Index]; hadPrev {
 			if len(in.PRURL) == 0 && len(prev.PRURL) > 0 {
 				in.PRURL = prev.PRURL
 			}
@@ -324,12 +337,13 @@ func mergeRepoOutputs(existing, incoming []repoOutput) []repoOutput {
 				in.PRNumber = prev.PRNumber
 			}
 		}
-		byName[in.Name] = in
+		byIndex[in.Index] = in
 	}
-	out := make([]repoOutput, 0, len(byName))
-	for _, e := range byName {
+	out := make([]repoOutput, 0, len(byIndex))
+	for _, e := range byIndex {
 		out = append(out, e)
 	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Index < out[j].Index })
 	return out
 }
 
