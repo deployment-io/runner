@@ -91,6 +91,15 @@ func (opr *taskOpenPR) openAll(hasChangesByIndex map[int]bool) ([]repoOutput, er
 // base branch is its own (per-repo BaseBranch); head is the shared Task
 // branch name (same across all repos in the Task).
 func (opr *taskOpenPR) openOne(idx int, entry tasks.RepositoryEntry) (repoOutput, error) {
+	if len(entry.BaseBranch) == 0 {
+		// Defense in depth: connection-time probe and Task-creation gate
+		// should have caught this earlier (see PLAN_tasks.md "Net-New
+		// Infrastructure" item 8 and Phase 6 dashboard gate). If we got
+		// here with an empty BaseBranch, the repo's default branch is
+		// missing on the provider — error with a useful message rather
+		// than letting the provider 422 with a less helpful one.
+		return repoOutput{}, fmt.Errorf("repo %s has no base branch configured; set the default branch on the provider or use the per-Task override", entry.Name)
+	}
 	title, body := opr.buildPRTitleAndBody()
 	prURL, prNumber, err := client.Get().OpenPullRequest(opr.ctx.OrganizationID, entry.InstallationID,
 		entry.Name, entry.BaseBranch, opr.ctx.BranchName, title, body)
