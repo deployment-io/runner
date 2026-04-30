@@ -3,6 +3,7 @@ package commands
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
@@ -48,6 +50,20 @@ const (
 	agentboxResultDirRel    = ".agentbox-output"
 	agentboxResultFile      = "result.json"
 	agentboxResultPathInCtr = agentboxWorkDirInContainer + "/" + agentboxResultDirRel + "/" + agentboxResultFile
+
+	// defaultWallClockTimeout is the runner-side cap on how long agentbox
+	// can run. Defense in depth — agentbox's own NO_ACTIVITY_TIMEOUT
+	// (10m default) catches stdout-silent hangs; this catches the
+	// hypothetical case where agentbox itself hangs (orchestrator bug)
+	// or where the agent loops with periodic stdout but never finishes.
+	// Per PLAN_tasks Open Question 6: 4h proposed; tune after early
+	// usage. Phase 6 wires per-Task / per-org overrides via Task model
+	// field + Advanced UI.
+	defaultWallClockTimeout = 4 * time.Hour
+	// containerStopGraceSec mirrors agentbox's own SIGTERM grace window
+	// (per PLAN_agentbox.md). After this many seconds, Docker promotes
+	// SIGTERM to SIGKILL.
+	containerStopGraceSec = 10
 )
 
 func (rs *RunAgentStep) Run(parameters map[string]interface{}, logsWriter io.Writer) (newParameters map[string]interface{}, err error) {
@@ -175,8 +191,13 @@ func mapToEnvSlice(env map[string]string) []string {
 }
 
 // spawnAgentboxAndWait creates + starts the container, streams its logs
-// to the runner's job log writer, blocks until the container exits, then
-// reads /result.json from the bind-mounted host dir.
+// to the runner's job log writer, blocks until the container exits (or
+// the wall-clock cap fires), then reads /result.json from the
+// bind-mounted host dir.
+//
+// The wall-clock cap scopes to the container-wait phase only — image
+// pull and container creation happen on context.Background() so a slow
+// network pull doesn't eat into the agent's run budget.
 func spawnAgentboxAndWait(imageRef, workDirHost string, envVars []string, logsWriter io.Writer) (agentResult, error) {
 	dockerCtx := context.Background()
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
@@ -193,7 +214,9 @@ func spawnAgentboxAndWait(imageRef, workDirHost string, envVars []string, logsWr
 		return agentResult{}, fmt.Errorf("error starting container: %s", err)
 	}
 	go streamContainerLogs(dockerCtx, cli, containerID, logsWriter)
-	if err := waitForContainerExit(dockerCtx, cli, containerID); err != nil {
+	waitCtx, cancelWait := context.WithTimeout(dockerCtx, defaultWallClockTimeout)
+	defer cancelWait()
+	if err := waitForContainerExit(waitCtx, cli, containerID); err != nil {
 		return agentResult{}, err
 	}
 	return readAgentResult(workDirHost)
@@ -250,6 +273,16 @@ func waitForContainerExit(ctx context.Context, cli *client.Client, containerID s
 	statusCh, errCh := cli.ContainerWait(ctx, containerID, container.WaitConditionNotRunning)
 	select {
 	case err := <-errCh:
+		if errors.Is(err, context.DeadlineExceeded) {
+			// Wall-clock cap fired. SIGTERM the container with the standard
+			// 10s grace; agentbox catches and writes a partial result.json
+			// (status=cancelled) before SIGKILL. We surface the cap as the
+			// error so the Step is marked Failed with a clear cause.
+			stopCtx := context.Background() // ContainerStop on a fresh context — the wait ctx is already done
+			grace := containerStopGraceSec
+			_ = cli.ContainerStop(stopCtx, containerID, container.StopOptions{Timeout: &grace})
+			return fmt.Errorf("agentbox exceeded wall-clock cap of %s — SIGTERM sent", defaultWallClockTimeout)
+		}
 		if err != nil {
 			return fmt.Errorf("error waiting for container exit: %s", err)
 		}
