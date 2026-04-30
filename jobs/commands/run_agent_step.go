@@ -64,6 +64,30 @@ const (
 	// (per PLAN_agentbox.md). After this many seconds, Docker promotes
 	// SIGTERM to SIGKILL.
 	containerStopGraceSec = 10
+
+	// Hardened HostConfig defaults. All four are env-var-overridable
+	// (see resolveContainerLimits) so different runner instance sizes
+	// can dial up/down without a runner redeploy. Phase 6 wires per-org
+	// overrides via Settings UI.
+	//
+	// Memory + CPU sized for typical Tasks workloads. Memory accounts
+	// for Claude Code's working set during large-repo analysis (~1GB)
+	// + npm/pip install during agentbox startup (~500MB) + headroom.
+	// CPU at 2 cores keeps multiple concurrent Step Jobs feasible on
+	// a 4-core runner without saturating the host.
+	defaultMemoryBytes = 2 * 1024 * 1024 * 1024 // 2 GB
+	defaultCPUCores    = int64(2)               // 2 cores
+
+	// Tmpfs sizes. /tmp covers general scratch (build artifacts, npm
+	// caches, etc.); /home/agent covers the agentbox runtime install
+	// (npm install -g claude-code lands at $NPM_CONFIG_PREFIX which
+	// is /home/agent/.npm-global — see agentbox Dockerfile).
+	tmpfsTmpOpts  = "rw,size=512m"
+	tmpfsHomeOpts = "rw,size=1g"
+
+	// Env vars on the runner host that override the defaults above.
+	memoryBytesEnvVar = "AGENTBOX_MEMORY_BYTES"
+	cpuCoresEnvVar    = "AGENTBOX_CPU_CORES"
 )
 
 func (rs *RunAgentStep) Run(parameters map[string]interface{}, logsWriter io.Writer) (newParameters map[string]interface{}, err error) {
@@ -223,9 +247,17 @@ func spawnAgentboxAndWait(imageRef, workDirHost string, envVars []string, logsWr
 }
 
 // createAgentboxContainer wires the container config and host config.
-// Phase 5.2 hardening: non-root user, drop all capabilities. Phase 5.4
-// adds: read-only rootfs, tmpfs at /tmp, memory/CPU limits, restricted
-// bridge network. See PLAN_tasks.md for the full hardening list.
+// Hardening applied:
+//   - User=1000:1000 (non-root, matches agentbox Dockerfile's `agent` user)
+//   - CapDrop=ALL (no Linux capabilities)
+//   - ReadonlyRootfs=true (image filesystem can't be modified)
+//   - Tmpfs at /tmp + /home/agent (writable for agentbox's runtime
+//     npm install + general scratch)
+//   - Memory + NanoCPUs limits (env-var-overridable)
+//
+// Phase 5.4b will add NetworkMode set to a restricted bridge with
+// iptables rules allowlisting only GitHub/GitLab/BitBucket APIs,
+// Anthropic API, and registries.
 func createAgentboxContainer(ctx context.Context, cli *client.Client, imageRef, workDirHost string, envVars []string) (string, error) {
 	cfg := &container.Config{
 		Image: imageRef,
@@ -233,21 +265,54 @@ func createAgentboxContainer(ctx context.Context, cli *client.Client, imageRef, 
 		User:  "1000:1000",
 		Tty:   false,
 	}
+	memoryBytes, nanoCPUs := resolveContainerLimits()
 	hostCfg := &container.HostConfig{
 		Mounts: []mount.Mount{{
 			Type:   mount.TypeBind,
 			Source: workDirHost,
 			Target: agentboxWorkDirInContainer,
 		}},
-		CapDrop: []string{"ALL"},
-		// TODO Phase 5.4: ReadonlyRootfs: true + Tmpfs at /tmp + Resources
-		// (Memory, NanoCPUs) + NetworkMode set to restricted bridge.
+		CapDrop:        []string{"ALL"},
+		ReadonlyRootfs: true,
+		Tmpfs: map[string]string{
+			"/tmp":        tmpfsTmpOpts,
+			"/home/agent": tmpfsHomeOpts,
+		},
+		Resources: container.Resources{
+			Memory:   memoryBytes,
+			NanoCPUs: nanoCPUs,
+		},
 	}
 	resp, err := cli.ContainerCreate(ctx, cfg, hostCfg, nil, nil, "")
 	if err != nil {
 		return "", fmt.Errorf("error creating container: %s", err)
 	}
 	return resp.ID, nil
+}
+
+// resolveContainerLimits returns the memory (bytes) and CPU (NanoCPUs)
+// caps for the agentbox container. Reads per-runner env-var overrides
+// before falling back to the defaults — different EC2 instance sizes
+// need different limits without redeploying the runner. Invalid env
+// values fall back to defaults (silently — logging from a const-style
+// helper would obscure the actual runner logs).
+//
+// 1 CPU core = 1e9 NanoCPUs in Docker's accounting.
+func resolveContainerLimits() (memoryBytes int64, nanoCPUs int64) {
+	memoryBytes = defaultMemoryBytes
+	if v := os.Getenv(memoryBytesEnvVar); v != "" {
+		if parsed, err := strconv.ParseInt(v, 10, 64); err == nil && parsed > 0 {
+			memoryBytes = parsed
+		}
+	}
+	cores := defaultCPUCores
+	if v := os.Getenv(cpuCoresEnvVar); v != "" {
+		if parsed, err := strconv.ParseInt(v, 10, 64); err == nil && parsed > 0 {
+			cores = parsed
+		}
+	}
+	nanoCPUs = cores * 1_000_000_000
+	return memoryBytes, nanoCPUs
 }
 
 func streamContainerLogs(ctx context.Context, cli *client.Client, containerID string, logsWriter io.Writer) {
