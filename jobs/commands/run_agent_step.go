@@ -1,0 +1,317 @@
+package commands
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+
+	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
+	"github.com/deployment-io/deployment-runner-kit/jobs"
+	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
+	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/image"
+	"github.com/docker/docker/api/types/mount"
+	"github.com/moby/moby/client"
+)
+
+// RunAgentStep is a Tasks-only runner command. Spawns an agentbox container
+// with the Task's working directory bind-mounted at /work, lets the agent
+// edit files there, parses the agentbox /result.json on exit, and merges
+// the result into the Step Job's accumulated JobOutput.
+//
+// Sits between CheckoutRepo (which populated /work/) and CommitAndPush
+// (which picks up the diff). All three share the bind-mounted dir within
+// the same runner invocation.
+//
+// Phase 5.2 scope: pull image, spawn container with bind mount + env
+// vars, stream logs, wait for exit, parse /result.json. Hardening
+// (read-only rootfs, UID 1000 enforcement, memory/CPU limits, restricted
+// bridge network with iptables rules, ADDITIONAL_ALLOWED_HOSTS) lands in
+// Phase 5.4. Heartbeat-driven mid-run stop wiring lands when the
+// integration tests in Phase 5.5 demonstrate the gap.
+type RunAgentStep struct{}
+
+const (
+	agentboxWorkDirInContainer = "/work"
+	// Where agentbox writes /result.json. We override the agentbox default
+	// (/tmp/result.json) to /work/.agentbox-output/result.json so the file
+	// lands in the bind-mounted dir and the runner can read it post-exit.
+	// The .agentbox-output prefix keeps it out of CommitAndPush's per-repo
+	// iteration (which scans /work/<idx>-<name>/ subdirs).
+	agentboxResultDirRel    = ".agentbox-output"
+	agentboxResultFile      = "result.json"
+	agentboxResultPathInCtr = agentboxWorkDirInContainer + "/" + agentboxResultDirRel + "/" + agentboxResultFile
+)
+
+func (rs *RunAgentStep) Run(parameters map[string]interface{}, logsWriter io.Writer) (newParameters map[string]interface{}, err error) {
+	defer func() {
+		if err != nil {
+			<-MarkStepDone(parameters, err)
+		}
+	}()
+	ctx, err := commandUtils.ParseTaskJobContext(parameters)
+	if err != nil {
+		return parameters, err
+	}
+	imageRef, err := jobs.GetParameterValue[string](parameters, parameters_enums.AgentboxImage)
+	if err != nil {
+		return parameters, fmt.Errorf("agentbox image missing: %s", err)
+	}
+	if err := pullAgentboxImage(imageRef, logsWriter); err != nil {
+		return parameters, fmt.Errorf("error pulling agentbox image: %s", err)
+	}
+	workDirHost := commandUtils.GetTaskRepositoriesBaseDir(ctx.OrganizationID, ctx.TaskID)
+	if err := prepareAgentboxResultDir(workDirHost); err != nil {
+		return parameters, fmt.Errorf("error preparing agent result dir: %s", err)
+	}
+	envVars, err := buildAgentSpawnEnvVars(parameters)
+	if err != nil {
+		return parameters, err
+	}
+	result, err := spawnAgentboxAndWait(imageRef, workDirHost, envVars, logsWriter)
+	if err != nil {
+		return parameters, fmt.Errorf("error running agentbox: %s", err)
+	}
+	if err := mergeAgentResultIntoJobOutput(parameters, result); err != nil {
+		return parameters, fmt.Errorf("error merging agent result: %s", err)
+	}
+	if result.Status != "success" {
+		return parameters, fmt.Errorf("agent step did not succeed: status=%s exit_code=%d", result.Status, result.ExitCode)
+	}
+	return parameters, nil
+}
+
+// agentboxImagePullLock serializes image pulls across concurrent Step Jobs
+// on the same runner. Mirrors the existing imagePullLock in
+// build_static_site.go — Docker's image-pull is idempotent but doing it
+// concurrently for the same image causes wasted bandwidth and occasional
+// layer-extraction conflicts.
+var agentboxImagePullLock sync.Mutex
+
+func pullAgentboxImage(imageRef string, logsWriter io.Writer) error {
+	agentboxImagePullLock.Lock()
+	defer agentboxImagePullLock.Unlock()
+	dockerCtx := context.Background()
+	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		return err
+	}
+	defer cli.Close()
+	io.WriteString(logsWriter, fmt.Sprintf("Pulling agentbox image: %s\n", imageRef))
+	reader, err := cli.ImagePull(dockerCtx, imageRef, image.PullOptions{})
+	if err != nil {
+		return err
+	}
+	defer reader.Close()
+	if _, err := io.Copy(io.Discard, reader); err != nil {
+		return err
+	}
+	return nil
+}
+
+// prepareAgentboxResultDir creates the on-host directory that agentbox
+// writes /result.json into (via the bind mount). Pre-creating ensures the
+// directory exists and is writable before the container starts.
+func prepareAgentboxResultDir(workDirHost string) error {
+	resultDir := filepath.Join(workDirHost, agentboxResultDirRel)
+	return os.MkdirAll(resultDir, 0755)
+}
+
+// buildAgentSpawnEnvVars assembles the env vars passed to the agentbox
+// container. Combines the runtime-injected credentials (AgentEnvVars,
+// populated by deployment-server at Job pickup) with the per-Job spawn
+// parameters (StepPrompt, MaxTurns, etc.) and the fixed agentbox contract
+// vars (WORK_DIR, RESULT_PATH).
+func buildAgentSpawnEnvVars(parameters map[string]interface{}) ([]string, error) {
+	env := map[string]string{
+		"WORK_DIR":    agentboxWorkDirInContainer,
+		"RESULT_PATH": agentboxResultPathInCtr,
+	}
+	if creds, err := jobs.GetParameterValue[map[string]string](parameters, parameters_enums.AgentEnvVars); err == nil {
+		for k, v := range creds {
+			env[k] = v
+		}
+	} else {
+		return nil, fmt.Errorf("agent env vars missing — deployment-server should have injected at pickup: %s", err)
+	}
+	if v, err := jobs.GetParameterValue[string](parameters, parameters_enums.AgentType); err == nil && v != "" {
+		env["AGENT_TYPE"] = v
+	}
+	if v, err := jobs.GetParameterValue[string](parameters, parameters_enums.StepPrompt); err == nil && v != "" {
+		env["STEP_PROMPT"] = v
+	}
+	if v, err := jobs.GetParameterValue[string](parameters, parameters_enums.PreviousStepsSummary); err == nil && v != "" {
+		env["PREVIOUS_STEPS_SUMMARY"] = v
+	}
+	if v, err := jobs.GetParameterValue[string](parameters, parameters_enums.Model); err == nil && v != "" {
+		env["MODEL"] = v
+	}
+	if v, err := jobs.GetParameterValue[int64](parameters, parameters_enums.MaxTurns); err == nil && v > 0 {
+		env["MAX_TURNS"] = strconv.FormatInt(v, 10)
+	}
+	if v, err := jobs.GetParameterValue[int64](parameters, parameters_enums.TokenBudget); err == nil && v > 0 {
+		env["TOKEN_BUDGET"] = strconv.FormatInt(v, 10)
+	}
+	return mapToEnvSlice(env), nil
+}
+
+// mapToEnvSlice converts a string→string env map to Docker's KEY=VALUE
+// slice form. Sorted for deterministic spawn (eases log inspection /
+// reproducibility).
+func mapToEnvSlice(env map[string]string) []string {
+	out := make([]string, 0, len(env))
+	for k, v := range env {
+		out = append(out, k+"="+v)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// spawnAgentboxAndWait creates + starts the container, streams its logs
+// to the runner's job log writer, blocks until the container exits, then
+// reads /result.json from the bind-mounted host dir.
+func spawnAgentboxAndWait(imageRef, workDirHost string, envVars []string, logsWriter io.Writer) (agentResult, error) {
+	dockerCtx := context.Background()
+	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		return agentResult{}, err
+	}
+	defer cli.Close()
+	containerID, err := createAgentboxContainer(dockerCtx, cli, imageRef, workDirHost, envVars)
+	if err != nil {
+		return agentResult{}, err
+	}
+	defer func() { _ = removeContainer(dockerCtx, cli, containerID) }()
+	if err := cli.ContainerStart(dockerCtx, containerID, container.StartOptions{}); err != nil {
+		return agentResult{}, fmt.Errorf("error starting container: %s", err)
+	}
+	go streamContainerLogs(dockerCtx, cli, containerID, logsWriter)
+	if err := waitForContainerExit(dockerCtx, cli, containerID); err != nil {
+		return agentResult{}, err
+	}
+	return readAgentResult(workDirHost)
+}
+
+// createAgentboxContainer wires the container config and host config.
+// Phase 5.2 hardening: non-root user, drop all capabilities. Phase 5.4
+// adds: read-only rootfs, tmpfs at /tmp, memory/CPU limits, restricted
+// bridge network. See PLAN_tasks.md for the full hardening list.
+func createAgentboxContainer(ctx context.Context, cli *client.Client, imageRef, workDirHost string, envVars []string) (string, error) {
+	cfg := &container.Config{
+		Image: imageRef,
+		Env:   envVars,
+		User:  "1000:1000",
+		Tty:   false,
+	}
+	hostCfg := &container.HostConfig{
+		Mounts: []mount.Mount{{
+			Type:   mount.TypeBind,
+			Source: workDirHost,
+			Target: agentboxWorkDirInContainer,
+		}},
+		CapDrop: []string{"ALL"},
+		// TODO Phase 5.4: ReadonlyRootfs: true + Tmpfs at /tmp + Resources
+		// (Memory, NanoCPUs) + NetworkMode set to restricted bridge.
+	}
+	resp, err := cli.ContainerCreate(ctx, cfg, hostCfg, nil, nil, "")
+	if err != nil {
+		return "", fmt.Errorf("error creating container: %s", err)
+	}
+	return resp.ID, nil
+}
+
+func streamContainerLogs(ctx context.Context, cli *client.Client, containerID string, logsWriter io.Writer) {
+	logs, err := cli.ContainerLogs(ctx, containerID, container.LogsOptions{
+		ShowStdout: true,
+		ShowStderr: true,
+		Follow:     true,
+	})
+	if err != nil {
+		io.WriteString(logsWriter, fmt.Sprintf("error attaching to container logs: %s\n", err))
+		return
+	}
+	defer logs.Close()
+	// Docker multiplexes stdout/stderr with an 8-byte header per chunk;
+	// for v1 we don't bother demuxing since both streams are useful in
+	// the unified log view. Just copy through.
+	if _, err := io.Copy(logsWriter, logs); err != nil && err != io.EOF {
+		io.WriteString(logsWriter, fmt.Sprintf("error streaming container logs: %s\n", err))
+	}
+}
+
+func waitForContainerExit(ctx context.Context, cli *client.Client, containerID string) error {
+	statusCh, errCh := cli.ContainerWait(ctx, containerID, container.WaitConditionNotRunning)
+	select {
+	case err := <-errCh:
+		if err != nil {
+			return fmt.Errorf("error waiting for container exit: %s", err)
+		}
+	case <-statusCh:
+		// Container exited; non-zero exit code is signaled via /result.json
+		// status, not as a wait error. Surface that decision to the caller.
+	}
+	return nil
+}
+
+func removeContainer(ctx context.Context, cli *client.Client, containerID string) error {
+	return cli.ContainerRemove(ctx, containerID, container.RemoveOptions{Force: true})
+}
+
+// agentResult mirrors the shape of agentbox's /result.json. Only the
+// fields the runner consumes are pulled out; agentbox can emit
+// additional fields without breaking unmarshal.
+type agentResult struct {
+	Status         string `json:"status"`
+	ExitCode       int    `json:"exit_code"`
+	AgentVersion   string `json:"agent_version,omitempty"`
+	ChangesSummary string `json:"changes_summary,omitempty"`
+	TokenUsage     int64  `json:"token_usage,omitempty"`
+	TurnCount      int    `json:"turn_count,omitempty"`
+	Error          string `json:"error,omitempty"`
+}
+
+func readAgentResult(workDirHost string) (agentResult, error) {
+	resultPath := filepath.Join(workDirHost, agentboxResultDirRel, agentboxResultFile)
+	data, err := os.ReadFile(resultPath)
+	if err != nil {
+		return agentResult{}, fmt.Errorf("error reading %s: %s", resultPath, err)
+	}
+	var result agentResult
+	if err := json.Unmarshal(data, &result); err != nil {
+		return agentResult{}, fmt.Errorf("error unmarshalling agent result: %s", err)
+	}
+	if strings.TrimSpace(result.Status) == "" {
+		return result, fmt.Errorf("agent result missing status field")
+	}
+	return result, nil
+}
+
+// mergeAgentResultIntoJobOutput writes the agent block of the JobOutput
+// envelope. CommitAndPush + OpenPullRequest later extend the same
+// envelope's repositories block; the merge-then-write pattern preserves
+// each command's contribution.
+func mergeAgentResultIntoJobOutput(parameters map[string]interface{}, result agentResult) error {
+	data := jobOutputData{}
+	if existing, err := jobs.GetParameterValue[string](parameters, parameters_enums.JobOutput); err == nil && len(existing) > 0 {
+		_ = json.Unmarshal([]byte(existing), &data)
+	}
+	data.SchemaVersion = jobOutputSchemaVersion
+	data.Agent = &agentOutput{
+		ChangesSummary: result.ChangesSummary,
+		TokenUsage:     result.TokenUsage,
+		ExitCode:       result.ExitCode,
+	}
+	merged, err := json.Marshal(data)
+	if err != nil {
+		return err
+	}
+	jobs.SetParameterValue[string](parameters, parameters_enums.JobOutput, string(merged))
+	return nil
+}
