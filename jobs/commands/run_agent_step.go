@@ -199,7 +199,51 @@ func buildAgentSpawnEnvVars(parameters map[string]interface{}) ([]string, error)
 	if v, err := jobs.GetParameterValue[int64](parameters, parameters_enums.TokenBudget); err == nil && v > 0 {
 		env["TOKEN_BUDGET"] = strconv.FormatInt(v, 10)
 	}
+	// agentbox proxy allowlist additions. Runner can also layer in its own
+	// host-level baseline via the AGENTBOX_ADDITIONAL_ALLOWED_HOSTS env
+	// var on the runner process — useful for ops escape hatch (e.g., an
+	// internal artifact registry every runner needs reachable). Final
+	// value sent to agentbox is the union; agentbox then unions with
+	// the Driver's built-in allowlist inside its CONNECT proxy.
+	allowed := mergeAdditionalAllowedHosts(parameters)
+	if allowed != "" {
+		env["ADDITIONAL_ALLOWED_HOSTS"] = allowed
+	}
 	return mapToEnvSlice(env), nil
+}
+
+// mergeAdditionalAllowedHosts unions:
+//   - Org-level additions (from Job parameters, populated by deployment-server
+//     at pickup from Organization.AdditionalAllowedHosts)
+//   - Runner-host baseline (AGENTBOX_ADDITIONAL_ALLOWED_HOSTS env var on
+//     the runner process — optional ops escape hatch)
+//
+// Returns comma-separated string; empty when neither source has hosts.
+// Deduplicates while preserving first-seen order. Empty when the
+// runner env is unset and the org has no additions — matches the user
+// fallback intent: agentbox proxy uses just the Driver's built-in
+// allowlist, which already covers the common case for Claude Code.
+func mergeAdditionalAllowedHosts(parameters map[string]interface{}) string {
+	seen := make(map[string]struct{})
+	var ordered []string
+	add := func(raw string) {
+		for _, h := range strings.Split(raw, ",") {
+			h = strings.TrimSpace(h)
+			if h == "" {
+				continue
+			}
+			if _, ok := seen[h]; ok {
+				continue
+			}
+			seen[h] = struct{}{}
+			ordered = append(ordered, h)
+		}
+	}
+	if v, err := jobs.GetParameterValue[string](parameters, parameters_enums.AdditionalAllowedHosts); err == nil {
+		add(v)
+	}
+	add(os.Getenv("AGENTBOX_ADDITIONAL_ALLOWED_HOSTS"))
+	return strings.Join(ordered, ",")
 }
 
 // mapToEnvSlice converts a string→string env map to Docker's KEY=VALUE
@@ -254,10 +298,20 @@ func spawnAgentboxAndWait(imageRef, workDirHost string, envVars []string, logsWr
 //   - Tmpfs at /tmp + /home/agent (writable for agentbox's runtime
 //     npm install + general scratch)
 //   - Memory + NanoCPUs limits (env-var-overridable)
+//   - ExtraHosts pin cloud-metadata endpoints to 127.0.0.1 (Phase 5.4b
+//     defense-in-depth alongside agentbox's CONNECT proxy). The proxy
+//     already blocks any host not on the Driver/org allowlist, but
+//     pinning the metadata IPs in /etc/hosts neutralizes any direct-IP
+//     bypass (e.g., a tool that reads `/proc/net/route` to find a
+//     gateway and synthesizes a `169.254.169.254` request without
+//     resolving a hostname). Costs nothing; the agent has no
+//     legitimate reason to talk to either endpoint.
 //
-// Phase 5.4b will add NetworkMode set to a restricted bridge with
-// iptables rules allowlisting only GitHub/GitLab/BitBucket APIs,
-// Anthropic API, and registries.
+// Network-level enforcement (NetworkMode=bridge with iptables rules)
+// is intentionally deferred — the in-container proxy + ExtraHosts
+// covers the reachable threat model and avoids host-firewall blast
+// radius; revisit if cost-runaway or sandbox-escape incidents
+// materialize per PLAN_tasks.md Phase 5.4b notes.
 func createAgentboxContainer(ctx context.Context, cli *client.Client, imageRef, workDirHost string, envVars []string) (string, error) {
 	cfg := &container.Config{
 		Image: imageRef,
@@ -281,6 +335,20 @@ func createAgentboxContainer(ctx context.Context, cli *client.Client, imageRef, 
 		Resources: container.Resources{
 			Memory:   memoryBytes,
 			NanoCPUs: nanoCPUs,
+		},
+		ExtraHosts: []string{
+			// Hostnames known to resolve to cloud-metadata endpoints. Any
+			// gethostbyname-style lookup inside the container returns
+			// 127.0.0.1 instead of the real metadata IP.
+			"metadata.google.internal:127.0.0.1", // GCP metadata
+			"metadata.goog:127.0.0.1",            // GCP metadata (alias)
+			// AWS/Azure/OpenStack IMDS is reached by IP literal
+			// (169.254.169.254). /etc/hosts is mostly ignored for IP
+			// literals — direct-IP defense is the agentbox CONNECT
+			// proxy refusing any CONNECT for hosts not on the allowlist.
+			// We still pin the IP entry for the rare client that
+			// consults nss for IP-literal "hostnames".
+			"169.254.169.254:127.0.0.1",
 		},
 	}
 	resp, err := cli.ContainerCreate(ctx, cfg, hostCfg, nil, nil, "")
