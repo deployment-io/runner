@@ -449,14 +449,20 @@ func removeContainer(ctx context.Context, cli *client.Client, containerID string
 // agentResult mirrors the shape of agentbox's /result.json. Only the
 // fields the runner consumes are pulled out; agentbox can emit
 // additional fields without breaking unmarshal.
+//
+// DeniedHosts lists hostnames the agentbox proxy refused due to the
+// allowlist not covering them. Promoted into JobOutput so the
+// dashboard can surface "add these to your allowlist" suggestions.
+// Empty when no allowlist denies happened during the run.
 type agentResult struct {
-	Status         string `json:"status"`
-	ExitCode       int    `json:"exit_code"`
-	AgentVersion   string `json:"agent_version,omitempty"`
-	ChangesSummary string `json:"changes_summary,omitempty"`
-	TokenUsage     int64  `json:"token_usage,omitempty"`
-	TurnCount      int    `json:"turn_count,omitempty"`
-	Error          string `json:"error,omitempty"`
+	Status         string   `json:"status"`
+	ExitCode       int      `json:"exit_code"`
+	AgentVersion   string   `json:"agent_version,omitempty"`
+	ChangesSummary string   `json:"changes_summary,omitempty"`
+	TokenUsage     int64    `json:"token_usage,omitempty"`
+	TurnCount      int      `json:"turn_count,omitempty"`
+	Error          string   `json:"error,omitempty"`
+	DeniedHosts    []string `json:"denied_hosts,omitempty"`
 }
 
 func readAgentResult(workDirHost string) (agentResult, error) {
@@ -489,6 +495,7 @@ func mergeAgentResultIntoJobOutput(parameters map[string]interface{}, result age
 		ChangesSummary: result.ChangesSummary,
 		TokenUsage:     result.TokenUsage,
 		ExitCode:       result.ExitCode,
+		DeniedHosts:    result.DeniedHosts,
 	}
 	merged, err := json.Marshal(data)
 	if err != nil {

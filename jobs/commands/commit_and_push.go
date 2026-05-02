@@ -290,6 +290,12 @@ type agentOutput struct {
 	ChangesSummary string `json:"changes_summary,omitempty"`
 	TokenUsage     int64  `json:"token_usage,omitempty"`
 	ExitCode       int    `json:"exit_code,omitempty"`
+	// DeniedHosts is the dedup-sorted list of hostnames the agentbox
+	// proxy refused due to allowlist mismatches during this Step run.
+	// Populated by RunAgentStep from agentbox's /result.json. Surfaced
+	// to the dashboard so users can suggest allowlist additions
+	// without parsing container logs. Empty when no denies happened.
+	DeniedHosts []string `json:"denied_hosts,omitempty"`
 }
 
 // mergeRepositoriesIntoJobOutput reads existing JobOutput JSON (any prior
