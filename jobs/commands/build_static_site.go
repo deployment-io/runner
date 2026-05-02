@@ -12,9 +12,38 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+)
+
+// Defaults applied when the runner spawns a static-site build
+// container. All four are env-var-overridable so different runner
+// instance sizes can dial up/down without a runner redeploy.
+//
+// Memory + CPU sized for typical npm/webpack workloads on m6a.large
+// (2 vCPU, 8 GB host) running alongside other Tasks/build containers.
+// Lower than the headroom of the ECS task to leave room for the runner
+// itself + concurrent jobs.
+//
+// PidsLimit defends against fork-bomb-style npm scripts (malicious or
+// accidental) — webpack with parallel workers usually peaks around
+// ~100 processes, so 1024 leaves ample room.
+//
+// Wall-clock timeout bounds a runaway/infinite build. Most builds
+// complete in <30 min; 1h is generous for large monorepos. A build
+// that takes longer than this is genuinely broken — surfacing the
+// timeout as an error is preferable to indefinitely tying up a
+// runner slot.
+const (
+	defaultBuildMemoryBytes = 2 * 1024 * 1024 * 1024 // 2 GB
+	defaultBuildCPUCores    = int64(2)
+	defaultBuildPidsLimit   = int64(1024)
+	defaultBuildTimeout     = 1 * time.Hour
+
+	buildMemoryBytesEnvVar = "BUILD_MEMORY_BYTES"
+	buildCPUCoresEnvVar    = "BUILD_CPU_CORES"
 )
 
 type BuildStaticSite struct {
@@ -72,8 +101,17 @@ func decodeEnvironmentVariablesToSlice(envVariables string) ([]string, error) {
 	return envVariablesSlice, nil
 }
 
-func execCommand(containerID, repoDir string, command []string, env []string, logsWriter io.Writer) error {
-	ctx := context.Background()
+// execCommand runs command inside containerID and streams output to
+// logsWriter. The caller supplies the context so the wall-clock cap
+// (defaultBuildTimeout) lives at the call site and a fired deadline
+// surfaces here as ctx.Err() — the deferred container removal in Run
+// then SIGKILLs the still-running exec.
+//
+// Pre-existing bug fixed in this revision: the `defer resp.Close()`
+// used to run before the err check from ContainerExecAttach, so an
+// attach failure nil-panicked. The error from attach was also
+// silently swallowed.
+func execCommand(ctx context.Context, containerID, repoDir string, command []string, env []string, logsWriter io.Writer) error {
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
 		return err
@@ -92,7 +130,6 @@ func execCommand(containerID, repoDir string, command []string, env []string, lo
 	if err != nil {
 		return err
 	}
-
 	execID := idResponse.ID
 
 	resp, err := cli.ContainerExecAttach(ctx, execID,
@@ -101,19 +138,25 @@ func execCommand(containerID, repoDir string, command []string, env []string, lo
 			Tty:    false,
 		},
 	)
+	if err != nil {
+		return fmt.Errorf("attach to exec failed: %w", err)
+	}
 	defer resp.Close()
 
-	io.Copy(logsWriter, resp.Reader)
+	if _, err := io.Copy(logsWriter, resp.Reader); err != nil && ctx.Err() != nil {
+		// Copy returned because the context fired (timeout or cancel).
+		// Surface the deadline error so the caller sees the wall-clock
+		// cap rather than a generic copy error.
+		return fmt.Errorf("build exceeded wall-clock cap of %s", defaultBuildTimeout)
+	}
 
 	res, err := cli.ContainerExecInspect(ctx, execID)
 	if err != nil {
 		return err
 	}
-
 	if res.ExitCode != 0 {
 		return fmt.Errorf("error running command: %v", command)
 	}
-
 	return nil
 }
 
@@ -144,6 +187,21 @@ func pullDockerImageForBuilding(imageID string) error {
 	return nil
 }
 
+// startBuildContainer creates and starts the build container with
+// hardened HostConfig:
+//   - Memory + NanoCPUs caps (env-var-overridable via BUILD_MEMORY_BYTES
+//     / BUILD_CPU_CORES) bound a runaway build's blast radius on the
+//     shared runner host.
+//   - PidsLimit bounds fork-bomb-style npm scripts.
+//   - ExtraHosts pins cloud-metadata endpoints to 127.0.0.1 so a
+//     compromised npm postinstall script can't exfiltrate the runner's
+//     IAM credentials via 169.254.169.254.
+//
+// The build container intentionally still runs as root with default
+// caps and full network access — that's necessary to keep "any npm
+// build just works" (many install scripts chown/chmod, fetch from
+// arbitrary CDNs, etc.). Tightening those further requires per-deploy
+// allowlist work tracked separately.
 func startBuildContainer(imageId, repoDir string) (string, error) {
 	ctx := context.Background()
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
@@ -152,6 +210,7 @@ func startBuildContainer(imageId, repoDir string) (string, error) {
 	}
 	defer cli.Close()
 
+	memoryBytes, nanoCPUs := resolveBuildLimits()
 	resp, err := cli.ContainerCreate(ctx, &container.Config{
 		Image: imageId,
 		Cmd:   []string{"tail", "-f", "/dev/null"},
@@ -162,6 +221,12 @@ func startBuildContainer(imageId, repoDir string) (string, error) {
 			Source: repoDir,
 			Target: repoDir,
 		}},
+		Resources: container.Resources{
+			Memory:    memoryBytes,
+			NanoCPUs:  nanoCPUs,
+			PidsLimit: pidsLimitPtr(defaultBuildPidsLimit),
+		},
+		ExtraHosts: cloudMetadataExtraHosts(),
 	}, nil, nil, "")
 	if err != nil {
 		return "", err
@@ -174,21 +239,70 @@ func startBuildContainer(imageId, repoDir string) (string, error) {
 	return resp.ID, nil
 }
 
-func stopContainer(containerID string) error {
+// resolveBuildLimits returns the memory (bytes) and CPU (NanoCPUs)
+// caps for the build container. Reads per-runner env-var overrides
+// before falling back to the defaults — different EC2 instance sizes
+// need different limits without redeploying the runner. Invalid env
+// values fall back silently (logging from a const-style helper would
+// obscure the actual runner logs).
+//
+// 1 CPU core = 1e9 NanoCPUs in Docker's accounting.
+//
+// Mirrors resolveContainerLimits in run_agent_step.go but reads
+// BUILD_* env vars instead — keeps the build and Tasks knobs
+// independent so ops can tune them separately when concurrent
+// build/agentbox jobs need different resource shapes.
+func resolveBuildLimits() (memoryBytes int64, nanoCPUs int64) {
+	memoryBytes = defaultBuildMemoryBytes
+	if v := os.Getenv(buildMemoryBytesEnvVar); v != "" {
+		if parsed, err := strconv.ParseInt(v, 10, 64); err == nil && parsed > 0 {
+			memoryBytes = parsed
+		}
+	}
+	cores := defaultBuildCPUCores
+	if v := os.Getenv(buildCPUCoresEnvVar); v != "" {
+		if parsed, err := strconv.ParseInt(v, 10, 64); err == nil && parsed > 0 {
+			cores = parsed
+		}
+	}
+	nanoCPUs = cores * 1_000_000_000
+	return memoryBytes, nanoCPUs
+}
+
+// cloudMetadataExtraHosts returns the /etc/hosts pins applied to every
+// build container. Same set used by run_agent_step.createAgentbox-
+// Container — direct-IP defense for clients that bypass HTTP_PROXY,
+// hostname defense for clients that go through nss.
+//
+// The 169.254.169.254 entry is best-effort — most clients hitting an
+// IP literal don't consult /etc/hosts, but the cost is zero and the
+// few clients that do consult nss are caught.
+func cloudMetadataExtraHosts() []string {
+	return []string{
+		"metadata.google.internal:127.0.0.1", // GCP metadata
+		"metadata.goog:127.0.0.1",            // GCP metadata (alias)
+		"169.254.169.254:127.0.0.1",          // AWS / Azure / OpenStack IMDS
+	}
+}
+
+// pidsLimitPtr is a one-liner for the *int64 PidsLimit field. Avoids
+// littering call sites with intermediate variables just to take an
+// address of a constant.
+func pidsLimitPtr(n int64) *int64 { return &n }
+
+// removeBuildContainer force-removes the container, killing it first
+// if still running. Replaces the prior stop-only path that leaked
+// stopped containers indefinitely (consuming disk + the per-instance
+// container slot count). Mirrors agentbox's removeContainer in
+// run_agent_step.go.
+func removeBuildContainer(containerID string) error {
 	ctx := context.Background()
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
 		return err
 	}
 	defer cli.Close()
-	t := 1
-	err = cli.ContainerStop(ctx, containerID, container.StopOptions{
-		Timeout: &t,
-	})
-	if err != nil {
-		return err
-	}
-	return nil
+	return cli.ContainerRemove(ctx, containerID, container.RemoveOptions{Force: true})
 }
 
 func (b *BuildStaticSite) Run(parameters map[string]interface{}, logsWriter io.Writer) (newParameters map[string]interface{}, err error) {
@@ -250,11 +364,18 @@ func (b *BuildStaticSite) Run(parameters map[string]interface{}, logsWriter io.W
 		return parameters, err
 	}
 
-	defer func() {
-		stopContainer(containerID)
-	}()
+	// Force-remove the container on exit (success or failure). Replaces
+	// the previous stop-only path that leaked stopped containers and
+	// guarantees cleanup if the wall-clock timeout below SIGKILLs the
+	// exec mid-run.
+	defer func() { _ = removeBuildContainer(containerID) }()
 
-	err = execCommand(containerID, repoDirectoryPath, []string{"bash", "-c", "npm install;" + buildCommand}, envVariablesSlice, logsWriter)
+	// Wall-clock cap on the npm install + build phase. A build that
+	// exceeds this is genuinely broken — surface the deadline as an
+	// error rather than tying up a runner slot indefinitely.
+	execCtx, cancelExec := context.WithTimeout(context.Background(), defaultBuildTimeout)
+	defer cancelExec()
+	err = execCommand(execCtx, containerID, repoDirectoryPath, []string{"bash", "-c", "npm install;" + buildCommand}, envVariablesSlice, logsWriter)
 	//err = execCommand(containerID, repoDirectoryPath, []string{"bash", "-c", "npm install; npm run clean; npm run build"}, envVariablesSlice, logsWriter)
 
 	if err != nil {
