@@ -64,6 +64,18 @@ const (
 	// (per PLAN_agentbox.md). After this many seconds, Docker promotes
 	// SIGTERM to SIGKILL.
 	containerStopGraceSec = 10
+	// defaultImagePullTimeout bounds how long pullAgentboxImage will
+	// wait on Docker Hub / GHCR before failing the Step. cli.ImagePull
+	// returns a streaming response that we drain with io.Copy — the
+	// reader respects context cancellation (regular HTTP, not hijacked),
+	// so wrapping the pull in a context.WithTimeout actually fires.
+	// Without this, a slow / rate-limited / network-blipped registry
+	// can hang the runner indefinitely (TCP-level retries can take
+	// many minutes per stuck pull, compounded by imagePullLock
+	// serializing concurrent Step Jobs onto the same upstream wait).
+	// 10m is generous: a fresh agentbox pull over a fast link is
+	// ~30s, ~2-3min on constrained networks.
+	defaultImagePullTimeout = 10 * time.Minute
 
 	// Hardened HostConfig defaults. All four are env-var-overridable
 	// (see resolveContainerLimits) so different runner instance sizes
@@ -138,7 +150,8 @@ var agentboxImagePullLock sync.Mutex
 func pullAgentboxImage(imageRef string, logsWriter io.Writer) error {
 	agentboxImagePullLock.Lock()
 	defer agentboxImagePullLock.Unlock()
-	dockerCtx := context.Background()
+	dockerCtx, cancel := context.WithTimeout(context.Background(), defaultImagePullTimeout)
+	defer cancel()
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
 		return err
@@ -151,6 +164,9 @@ func pullAgentboxImage(imageRef string, logsWriter io.Writer) error {
 	}
 	defer reader.Close()
 	if _, err := io.Copy(io.Discard, reader); err != nil {
+		if dockerCtx.Err() != nil {
+			return fmt.Errorf("image pull exceeded %s timeout for %s", defaultImagePullTimeout, imageRef)
+		}
 		return err
 	}
 	return nil

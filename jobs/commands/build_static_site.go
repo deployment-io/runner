@@ -40,6 +40,14 @@ const (
 	defaultBuildCPUCores    = int64(2)
 	defaultBuildPidsLimit   = int64(1024)
 	defaultBuildTimeout     = 1 * time.Hour
+	// defaultBuildImagePullTimeout bounds how long pullDockerImageFor-
+	// Building waits on Docker Hub before failing the build. Same
+	// rationale as defaultImagePullTimeout in run_agent_step.go: the
+	// ImagePull stream respects context cancellation, but the prior
+	// code passed context.Background() so a stuck pull could hang
+	// indefinitely (compounded by imagePullLock serializing concurrent
+	// builds onto the same upstream wait).
+	defaultBuildImagePullTimeout = 10 * time.Minute
 
 	buildMemoryBytesEnvVar = "BUILD_MEMORY_BYTES"
 	buildCPUCoresEnvVar    = "BUILD_CPU_CORES"
@@ -164,7 +172,8 @@ var imagePullLock = sync.Mutex{}
 func pullDockerImageForBuilding(imageID string) error {
 	imagePullLock.Lock()
 	defer imagePullLock.Unlock()
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), defaultBuildImagePullTimeout)
+	defer cancel()
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
 		return err
@@ -178,8 +187,10 @@ func pullDockerImageForBuilding(imageID string) error {
 
 	defer reader.Close()
 
-	_, err = io.ReadAll(reader)
-	if err != nil {
+	if _, err := io.ReadAll(reader); err != nil {
+		if ctx.Err() != nil {
+			return fmt.Errorf("image pull exceeded %s timeout for %s", defaultBuildImagePullTimeout, imageID)
+		}
 		return err
 	}
 
