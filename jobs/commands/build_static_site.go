@@ -11,7 +11,6 @@ import (
 	"github.com/moby/moby/client"
 	"io"
 	"os"
-	"os/exec"
 	"strconv"
 	"strings"
 	"sync"
@@ -47,27 +46,6 @@ const (
 )
 
 type BuildStaticSite struct {
-}
-
-func (b *BuildStaticSite) executeCommand(logsWriter io.Writer, envVariablesSlice []string, commandAndArgs []string, directoryPath string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-	var cmd *exec.Cmd
-	if len(commandAndArgs) == 1 {
-		cmd = exec.CommandContext(ctx, commandAndArgs[0])
-	} else {
-		cmd = exec.CommandContext(ctx, commandAndArgs[0], commandAndArgs[1:]...)
-	}
-	cmd.Dir = directoryPath
-	cmd.Stdout = logsWriter
-	if len(envVariablesSlice) > 0 {
-		cmd.Env = os.Environ()
-		cmd.Env = append(cmd.Env, envVariablesSlice...)
-	}
-	if err := cmd.Run(); err != nil {
-		return err
-	}
-	return nil
 }
 
 // decodes envVariables map to key=value slice
@@ -376,15 +354,9 @@ func (b *BuildStaticSite) Run(parameters map[string]interface{}, logsWriter io.W
 	execCtx, cancelExec := context.WithTimeout(context.Background(), defaultBuildTimeout)
 	defer cancelExec()
 	err = execCommand(execCtx, containerID, repoDirectoryPath, []string{"bash", "-c", "npm install;" + buildCommand}, envVariablesSlice, logsWriter)
-	//err = execCommand(containerID, repoDirectoryPath, []string{"bash", "-c", "npm install; npm run clean; npm run build"}, envVariablesSlice, logsWriter)
-
 	if err != nil {
 		return parameters, err
 	}
-
-	//if err = b.executeCommand(logsWriter, envVariablesSlice, []string{"bash", "-c", "source $HOME/.nvm/nvm.sh ; nvm install " + nodeVersion + " ; npm install ; " + buildCommand}, repoDirectoryPath); err != nil {
-	//	return parameters, err
-	//}
 
 	return parameters, nil
 }
