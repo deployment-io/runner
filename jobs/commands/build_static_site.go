@@ -121,14 +121,35 @@ func execCommand(ctx context.Context, containerID, repoDir string, command []str
 	}
 	defer resp.Close()
 
+	// Watchdog: close the hijacked conn when ctx cancels so io.Copy
+	// unblocks. ContainerExecAttach hijacks the underlying TCP conn
+	// (see moby/client/hijack.go's setupHijackConn) — the conn is
+	// raw net.Conn after that, with no awareness of the original ctx.
+	// Without this watchdog a wall-clock-timeout firing would not
+	// unblock io.Copy below; we'd hang waiting for the misbehaving
+	// build to produce more output, defeating the timeout entirely.
+	copyDone := make(chan struct{})
+	defer close(copyDone)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = resp.Conn.Close()
+		case <-copyDone:
+		}
+	}()
+
 	if _, err := io.Copy(logsWriter, resp.Reader); err != nil && ctx.Err() != nil {
-		// Copy returned because the context fired (timeout or cancel).
-		// Surface the deadline error so the caller sees the wall-clock
-		// cap rather than a generic copy error.
+		// Copy returned because the watchdog closed the conn after
+		// ctx fired. Surface the deadline error so the caller sees
+		// the wall-clock cap rather than a generic conn-closed error.
 		return fmt.Errorf("build exceeded wall-clock cap of %s", defaultBuildTimeout)
 	}
 
-	res, err := cli.ContainerExecInspect(ctx, execID)
+	// Use a fresh background context for Inspect — ctx may have fired
+	// while io.Copy was running but the exec finished cleanly anyway,
+	// in which case we still want the real exit code instead of
+	// ctx.Err().
+	res, err := cli.ContainerExecInspect(context.Background(), execID)
 	if err != nil {
 		return err
 	}
