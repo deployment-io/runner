@@ -42,9 +42,18 @@ func (opr *OpenPullRequest) Run(parameters map[string]interface{}, logsWriter io
 	if err != nil {
 		return parameters, fmt.Errorf("error reading commit-and-push output: %s", err)
 	}
+	deniedHosts, err := readDeniedHostsFromJobOutput(parameters)
+	if err != nil {
+		// Defensive: a malformed JobOutput here shouldn't fail the PR open
+		// (the PR is the user-facing artifact and we want it to land).
+		// Log and continue with no deny-section in the PR body.
+		io.WriteString(logsWriter, fmt.Sprintf("warning: could not read denied_hosts from job output: %s\n", err))
+		deniedHosts = nil
+	}
 	opener := &taskOpenPR{
-		ctx:        ctx,
-		logsWriter: logsWriter,
+		ctx:         ctx,
+		logsWriter:  logsWriter,
+		deniedHosts: deniedHosts,
 	}
 	prOutputs, err := opener.openAll(hasChangesByIndex)
 	if err != nil {
@@ -60,9 +69,17 @@ func (opr *OpenPullRequest) Run(parameters map[string]interface{}, logsWriter io
 // taskOpenPR bundles the per-Step-Job state for the per-repo loop.
 // Mirrors the taskCheckout / taskCommitPush pattern. No token cache
 // here — token lookup happens server-side in the RPC.
+//
+// deniedHosts carries the agentbox proxy's allowlist-deny set for this
+// Step run (sourced from the agent block of JobOutput, which RunAgentStep
+// populated from /result.json). Surfaced in the PR body so reviewers see
+// what hosts the agent tried to reach but couldn't — closes the
+// feedback loop on org-level allowlist tuning. Empty when no allowlist
+// denies happened during the Step.
 type taskOpenPR struct {
-	ctx        commandUtils.TaskJobContext
-	logsWriter io.Writer
+	ctx         commandUtils.TaskJobContext
+	logsWriter  io.Writer
+	deniedHosts []string
 }
 
 // openAll iterates the Job's repositories. Skips repos where
@@ -121,6 +138,11 @@ func (opr *taskOpenPR) openOne(idx int, entry tasks.RepositoryEntry) (repoOutput
 // the PR description matches the commit. Phase 5 wires in the agent's
 // changes_summary; Phase 4 falls back to the generic format. Trailer
 // block is uniform across both.
+//
+// When the Step had allowlist denies, an additional section lists the
+// blocked hostnames so the PR reviewer can see what the agent tried
+// to reach. Helps diagnose "agent gave up because it couldn't fetch X"
+// scenarios without digging through the runner's container logs.
 func (opr *taskOpenPR) buildPRTitleAndBody() (string, string) {
 	subject := fmt.Sprintf("Tasks Step %d: %s", opr.ctx.StepIndex+1, opr.ctx.TaskTitle)
 	var sb strings.Builder
@@ -128,6 +150,14 @@ func (opr *taskOpenPR) buildPRTitleAndBody() (string, string) {
 	sb.WriteString(fmt.Sprintf("Task: %s\n", opr.ctx.TaskTitle))
 	if len(opr.ctx.DashboardURL) > 0 {
 		sb.WriteString(fmt.Sprintf("Task-URL: %s/tasks/%s\n", strings.TrimRight(opr.ctx.DashboardURL, "/"), opr.ctx.TaskID))
+	}
+	if len(opr.deniedHosts) > 0 {
+		sb.WriteString("\n---\n")
+		sb.WriteString("**Network: blocked hosts during this Step**\n\n")
+		sb.WriteString("The agent attempted to reach the following hostnames but they weren't on the allowlist. Add them to your org's Tasks → Allowed Hosts settings if expected:\n\n")
+		for _, h := range opr.deniedHosts {
+			sb.WriteString(fmt.Sprintf("- `%s`\n", h))
+		}
 	}
 	return subject, sb.String()
 }
@@ -149,6 +179,27 @@ func (opr *taskOpenPR) mergeIntoJobOutput(parameters map[string]interface{}, out
 	}
 	jobs.SetParameterValue[string](parameters, parameters_enums.JobOutput, string(merged))
 	return nil
+}
+
+// readDeniedHostsFromJobOutput pulls the agentbox proxy's allowlist
+// deny set that RunAgentStep wrote to the accumulated JobOutput. Empty
+// slice on missing/malformed payloads — caller treats absence as "no
+// denies" rather than failing the PR open. Mirrors the
+// readHasChangesFromJobOutput shape; both read different fields off
+// the same envelope.
+func readDeniedHostsFromJobOutput(parameters map[string]interface{}) ([]string, error) {
+	existing, err := jobs.GetParameterValue[string](parameters, parameters_enums.JobOutput)
+	if err != nil || len(existing) == 0 {
+		return nil, nil
+	}
+	var data jobOutputData
+	if err := json.Unmarshal([]byte(existing), &data); err != nil {
+		return nil, err
+	}
+	if data.Agent == nil {
+		return nil, nil
+	}
+	return data.Agent.DeniedHosts, nil
 }
 
 // readHasChangesFromJobOutput pulls the per-repo HasChanges flags that
