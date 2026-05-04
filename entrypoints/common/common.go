@@ -135,6 +135,15 @@ func executeJobs(jobsStream <-chan pendingJobType, noOfWorkers int, mode runner_
 									resultsStream <- result
 									return
 								}
+								// Plumb the stop signal into commands that opt in.
+								// Outer loop only checks stopJobSignal between
+								// commands; long-running commands (RunAgentStep,
+								// build steps) need to honor the signal mid-run
+								// to actually preempt their subprocess. Short
+								// commands don't implement and remain unaffected.
+								if stoppable, ok := command.(jobs.StoppableCommand); ok {
+									stoppable.SetStopSignal(stopJobSignal)
+								}
 								parameters, err = command.Run(parameters, logsWriter)
 								if err != nil {
 									handleLogEnd(err, pendingJob.jobID, logsWriter)

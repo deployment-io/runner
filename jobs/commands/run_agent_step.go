@@ -16,6 +16,7 @@ import (
 
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
+	"github.com/deployment-io/deployment-runner-kit/types"
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/image"
@@ -34,11 +35,32 @@ import (
 //
 // Phase 5.2 scope: pull image, spawn container with bind mount + env
 // vars, stream logs, wait for exit, parse /result.json. Hardening
-// (read-only rootfs, UID 1000 enforcement, memory/CPU limits, restricted
-// bridge network with iptables rules, ADDITIONAL_ALLOWED_HOSTS) lands in
-// Phase 5.4. Heartbeat-driven mid-run stop wiring lands when the
-// integration tests in Phase 5.5 demonstrate the gap.
-type RunAgentStep struct{}
+// (read-only rootfs, UID 1000 enforcement, memory/CPU limits,
+// proxy-based hostname allowlist, cloud-metadata pin, image-pull
+// timeout) shipped across Phase 5.4. Heartbeat-driven mid-run stop
+// wiring (Phase 5.5) plumbs the runner's stop signal in via the
+// StoppableCommand interface and honors it inside spawnAgentbox-
+// AndWait by SIGTERM-ing the container with grace; agentbox catches
+// the SIGTERM and writes a partial /result.json (status="cancelled")
+// before SIGKILL.
+type RunAgentStep struct {
+	// stopSignal is set by the runner outer loop via SetStopSignal
+	// before Run is invoked. Receives one value when the server
+	// reports the Job has been moved to the Stopping state — at which
+	// point we SIGTERM the agentbox container with grace. Nil when
+	// the outer loop hasn't called SetStopSignal (defensive — a nil
+	// channel just blocks forever in select, so the stop branch never
+	// fires and behavior matches pre-Phase-5.5).
+	stopSignal <-chan struct{}
+}
+
+// SetStopSignal satisfies jobs.StoppableCommand. The runner's outer
+// loop calls this exactly once per Step Job before Run, sharing the
+// channel its heartbeat poller writes to when the server reports
+// Stopping=true.
+func (rs *RunAgentStep) SetStopSignal(stop <-chan struct{}) {
+	rs.stopSignal = stop
+}
 
 const (
 	agentboxWorkDirInContainer = "/work"
@@ -127,7 +149,17 @@ func (rs *RunAgentStep) Run(parameters map[string]interface{}, logsWriter io.Wri
 	if err != nil {
 		return parameters, err
 	}
-	result, err := spawnAgentboxAndWait(imageRef, workDirHost, envVars, logsWriter)
+	result, err := spawnAgentboxAndWait(imageRef, workDirHost, envVars, logsWriter, rs.stopSignal)
+	// User-stop path: agentbox SIGTERM-handled and wrote a partial
+	// /result.json (status="cancelled" with whatever progress it had).
+	// Merge that partial into JobOutput so token usage / denied hosts /
+	// changes_summary aren't lost — then surface ErrJobStoppedByUser
+	// so the outer loop's stop UX path fires (Step marked cancelled,
+	// PR not opened, working dir cleaned).
+	if errors.Is(err, types.ErrJobStoppedByUser) {
+		_ = mergeAgentResultIntoJobOutput(parameters, result) // best-effort
+		return parameters, err
+	}
 	if err != nil {
 		return parameters, fmt.Errorf("error running agentbox: %s", err)
 	}
@@ -276,13 +308,20 @@ func mapToEnvSlice(env map[string]string) []string {
 
 // spawnAgentboxAndWait creates + starts the container, streams its logs
 // to the runner's job log writer, blocks until the container exits (or
-// the wall-clock cap fires), then reads /result.json from the
-// bind-mounted host dir.
+// the wall-clock cap fires, or the stop signal arrives), then reads
+// /result.json from the bind-mounted host dir.
 //
 // The wall-clock cap scopes to the container-wait phase only — image
 // pull and container creation happen on context.Background() so a slow
 // network pull doesn't eat into the agent's run budget.
-func spawnAgentboxAndWait(imageRef, workDirHost string, envVars []string, logsWriter io.Writer) (agentResult, error) {
+//
+// stopSignal (set by RunAgentStep.SetStopSignal from the runner's
+// outer loop) is honored mid-wait: when it fires we SIGTERM the
+// container with grace, the agent has time to flush a partial
+// /result.json, and waitForContainerExit returns ErrJobStoppedByUser.
+// The partial result is still read + returned so token usage /
+// changes_summary / denied_hosts aren't lost.
+func spawnAgentboxAndWait(imageRef, workDirHost string, envVars []string, logsWriter io.Writer, stopSignal <-chan struct{}) (agentResult, error) {
 	dockerCtx := context.Background()
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
@@ -300,8 +339,16 @@ func spawnAgentboxAndWait(imageRef, workDirHost string, envVars []string, logsWr
 	go streamContainerLogs(dockerCtx, cli, containerID, logsWriter)
 	waitCtx, cancelWait := context.WithTimeout(dockerCtx, defaultWallClockTimeout)
 	defer cancelWait()
-	if err := waitForContainerExit(waitCtx, cli, containerID); err != nil {
-		return agentResult{}, err
+	waitErr := waitForContainerExit(waitCtx, cli, containerID, stopSignal)
+	// On user-stop, return the partial result (caller merges into
+	// JobOutput) plus the stop sentinel error so the caller can route
+	// to the stop UX path. On other errors, propagate as-is.
+	if errors.Is(waitErr, types.ErrJobStoppedByUser) {
+		result, _ := readAgentResult(workDirHost) // best-effort; may be empty if SIGTERM grace expired
+		return result, waitErr
+	}
+	if waitErr != nil {
+		return agentResult{}, waitErr
 	}
 	return readAgentResult(workDirHost)
 }
@@ -418,7 +465,17 @@ func streamContainerLogs(ctx context.Context, cli *client.Client, containerID st
 	}
 }
 
-func waitForContainerExit(ctx context.Context, cli *client.Client, containerID string) error {
+// waitForContainerExit blocks until one of three things happens:
+//   - The container exits naturally (returns nil; non-zero exit codes
+//     are signaled via /result.json status, not as a wait error)
+//   - The wall-clock cap fires (returns a wrapped deadline error)
+//   - The user-stop signal fires (SIGTERM the container with grace,
+//     wait for it to actually exit so /result.json gets written, then
+//     return ErrJobStoppedByUser)
+//
+// stopSignal can be nil — a nil channel never fires in select, so the
+// stop branch is silently skipped. Pre-Phase-5.5 behavior matches.
+func waitForContainerExit(ctx context.Context, cli *client.Client, containerID string, stopSignal <-chan struct{}) error {
 	statusCh, errCh := cli.ContainerWait(ctx, containerID, container.WaitConditionNotRunning)
 	select {
 	case err := <-errCh:
@@ -438,6 +495,21 @@ func waitForContainerExit(ctx context.Context, cli *client.Client, containerID s
 	case <-statusCh:
 		// Container exited; non-zero exit code is signaled via /result.json
 		// status, not as a wait error. Surface that decision to the caller.
+	case <-stopSignal:
+		// User stopped the Job mid-run. SIGTERM the container with grace
+		// so agentbox flushes a partial /result.json (status="cancelled"),
+		// then wait for the actual exit before returning. Without the
+		// follow-up wait, the deferred removeContainer in spawnAgentbox-
+		// AndWait would race a still-flushing agentbox and we'd lose the
+		// partial result.
+		stopCtx := context.Background()
+		grace := containerStopGraceSec
+		_ = cli.ContainerStop(stopCtx, containerID, container.StopOptions{Timeout: &grace})
+		select {
+		case <-statusCh:
+		case <-errCh:
+		}
+		return types.ErrJobStoppedByUser
 	}
 	return nil
 }
