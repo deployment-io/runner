@@ -63,7 +63,13 @@ func (r *RunnerClient) MarkJobsComplete(completingJobs []jobs.CompletingJobDtoV1
 	return nil
 }
 
-func (r *RunnerClient) UpsertJobHeartbeat(jobID string, organizationID string) (bool, error) {
+// UpsertJobHeartbeat keeps the server's view of the Job alive and
+// returns whether the server has flipped the Job to Stopping. The
+// optional progress argument carries the latest in-flight snapshot
+// from a ProgressEmittingCommand (turn count + token usage from
+// agentbox, today). nil for command types that don't emit progress
+// or before the first snapshot has been produced.
+func (r *RunnerClient) UpsertJobHeartbeat(jobID string, organizationID string, progress *jobs.LiveProgressV1) (bool, error) {
 	if !r.isConnected {
 		return false, ErrConnection
 	}
@@ -71,6 +77,7 @@ func (r *RunnerClient) UpsertJobHeartbeat(jobID string, organizationID string) (
 	args.OrganizationID = r.GetComputedOrganizationID(organizationID)
 	args.Token = r.token
 	args.JobID = jobID
+	args.LiveProgress = progress
 	var reply jobs.UpsertJobHeartbeatReplyV1
 	err := r.c.Call("Jobs.UpsertHeartbeatV1", args, &reply)
 	if err != nil {

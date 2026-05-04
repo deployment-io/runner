@@ -7,6 +7,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	goConcurrentPipeline "github.com/ankit-arora/go-utils/go-concurrent-pipeline"
@@ -111,7 +112,15 @@ func executeJobs(jobsStream <-chan pendingJobType, noOfWorkers int, mode runner_
 						defer logsWriter.Close()
 						jobDoneSignal := make(chan struct{})
 						defer close(jobDoneSignal)
-						stopJobSignal := getJobStopSignal(pendingJob, jobDoneSignal, c)
+						// liveProgress is the per-job atomic snapshot a
+						// ProgressEmittingCommand publishes into via the sink
+						// callback installed below. The heartbeat poller reads
+						// it on each call and forwards to the server. nil
+						// pointer = "no progress yet" — runner sends a nil
+						// LiveProgress on the heartbeat, server skips the
+						// progress write.
+						var liveProgress atomic.Pointer[jobs.LiveProgressV1]
+						stopJobSignal := getJobStopSignal(pendingJob, jobDoneSignal, c, &liveProgress)
 						for _, commandEnum := range pendingJob.commandEnums {
 							select {
 							case <-stopJobSignal:
@@ -144,6 +153,20 @@ func executeJobs(jobsStream <-chan pendingJobType, noOfWorkers int, mode runner_
 								if stoppable, ok := command.(jobs.StoppableCommand); ok {
 									stoppable.SetStopSignal(stopJobSignal)
 								}
+								// Plumb the progress sink into commands that opt in.
+								// The sink stores the snapshot into the per-job
+								// atomic; the heartbeat poller reads it on its next
+								// tick. Closure captures liveProgress by reference
+								// so the same atomic survives across the per-Step-
+								// Job command sequence (CheckoutRepo → RunAgentStep
+								// → CommitAndPush → OpenPullRequest); only
+								// RunAgentStep emits progress today, but the others
+								// inherit the same atomic in case they ever do.
+								if emitting, ok := command.(jobs.ProgressEmittingCommand); ok {
+									emitting.SetProgressSink(func(p jobs.LiveProgressV1) {
+										liveProgress.Store(&p)
+									})
+								}
 								parameters, err = command.Run(parameters, logsWriter)
 								if err != nil {
 									handleLogEnd(err, pendingJob.jobID, logsWriter)
@@ -169,9 +192,15 @@ func executeJobs(jobsStream <-chan pendingJobType, noOfWorkers int, mode runner_
 // a channel that is CLOSED when the server reports the Job has been
 // moved to Stopping (or when jobDoneSignal closes, indicating shutdown).
 //
+// Each heartbeat call also forwards the latest live-progress snapshot
+// from the per-job atomic if one has been published by a Progress-
+// EmittingCommand (Phase 5.5b). Pointer is nil for command sequences
+// that don't include any progress-emitting command, or for the first
+// few heartbeats before the agent's parser has produced a snapshot.
+//
 // Closed-channel-as-broadcast (vs. send-then-close) is deliberate:
 //
-//   - The same channel is now read by two consumers — the outer loop's
+//   - The same channel is read by two consumers — the outer loop's
 //     between-commands select AND any StoppableCommand's SetStopSignal
 //     watcher (RunAgentStep, today). Sending a single value to an
 //     unbuffered channel only wakes one reader; the other relies on
@@ -188,7 +217,7 @@ func executeJobs(jobsStream <-chan pendingJobType, noOfWorkers int, mode runner_
 // Consumers don't need to change — `case <-jobStopSignal:` reads the
 // zero value from a closed channel just as it would have read the
 // sent struct{}{}. Both fire the case identically.
-func getJobStopSignal(job pendingJobType, jobDoneSignal <-chan struct{}, c *client.RunnerClient) <-chan struct{} {
+func getJobStopSignal(job pendingJobType, jobDoneSignal <-chan struct{}, c *client.RunnerClient, liveProgress *atomic.Pointer[jobs.LiveProgressV1]) <-chan struct{} {
 	jobStopSignal := make(chan struct{})
 	go func() {
 		defer close(jobStopSignal)
@@ -198,7 +227,7 @@ func getJobStopSignal(job pendingJobType, jobDoneSignal <-chan struct{}, c *clie
 				return
 			default:
 				//ignoring error in client
-				isStopping, _ := c.UpsertJobHeartbeat(job.jobID, job.organizationID)
+				isStopping, _ := c.UpsertJobHeartbeat(job.jobID, job.organizationID, liveProgress.Load())
 				if isStopping {
 					return // deferred close broadcasts to all readers
 				}

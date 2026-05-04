@@ -45,21 +45,40 @@ import (
 // before SIGKILL.
 type RunAgentStep struct {
 	// stopSignal is set by the runner outer loop via SetStopSignal
-	// before Run is invoked. Receives one value when the server
-	// reports the Job has been moved to the Stopping state — at which
-	// point we SIGTERM the agentbox container with grace. Nil when
-	// the outer loop hasn't called SetStopSignal (defensive — a nil
-	// channel just blocks forever in select, so the stop branch never
-	// fires and behavior matches pre-Phase-5.5).
+	// before Run is invoked. Closes when the server reports the Job
+	// has been moved to the Stopping state — at which point we
+	// SIGTERM the agentbox container with grace. Nil when the outer
+	// loop hasn't called SetStopSignal (defensive — a nil channel
+	// just blocks forever in select, so the stop branch never fires
+	// and behavior matches pre-Phase-5.5).
 	stopSignal <-chan struct{}
+
+	// progressSink is set by the runner outer loop via SetProgressSink
+	// before Run is invoked. RunAgentStep polls progress.json from the
+	// bind-mounted agentbox output dir and calls the sink on each
+	// fresh snapshot; the outer loop stores into a per-Job atomic
+	// that the heartbeat poller forwards to the server. Nil when
+	// the outer loop hasn't called SetProgressSink — the polling
+	// goroutine doesn't start in that case (no point reading the
+	// file if no consumer cares about the result).
+	progressSink func(jobs.LiveProgressV1)
 }
 
 // SetStopSignal satisfies jobs.StoppableCommand. The runner's outer
 // loop calls this exactly once per Step Job before Run, sharing the
-// channel its heartbeat poller writes to when the server reports
-// Stopping=true.
+// channel its heartbeat poller's deferred close fires when the server
+// reports Stopping=true.
 func (rs *RunAgentStep) SetStopSignal(stop <-chan struct{}) {
 	rs.stopSignal = stop
+}
+
+// SetProgressSink satisfies jobs.ProgressEmittingCommand. The runner's
+// outer loop calls this exactly once per Step Job before Run with a
+// callback that stores into a per-Job atomic the heartbeat poller
+// reads. RunAgentStep invokes the sink each time the polling goroutine
+// reads a fresh progress.json snapshot from the bind-mounted dir.
+func (rs *RunAgentStep) SetProgressSink(sink func(jobs.LiveProgressV1)) {
+	rs.progressSink = sink
 }
 
 const (
@@ -72,6 +91,16 @@ const (
 	agentboxResultDirRel    = ".agentbox-output"
 	agentboxResultFile      = "result.json"
 	agentboxResultPathInCtr = agentboxWorkDirInContainer + "/" + agentboxResultDirRel + "/" + agentboxResultFile
+	// agentboxProgressFile is the basename of the live snapshot agentbox
+	// writes (Phase 5.5b) next to result.json. Periodic, atomic via
+	// temp+rename, schema in agentbox/internal/progress.Snapshot.
+	agentboxProgressFile = "progress.json"
+	// progressPollInterval is how often the runner re-reads progress.json.
+	// Faster than the heartbeat cadence (5s) so each heartbeat sees a
+	// reasonably fresh snapshot. Slower would risk dropping intermediate
+	// updates, but agentbox's writer is also throttled (~3s) so polling
+	// faster than that wastes file reads with no new data.
+	progressPollInterval = 3 * time.Second
 
 	// defaultWallClockTimeout is the runner-side cap on how long agentbox
 	// can run. Defense in depth — agentbox's own NO_ACTIVITY_TIMEOUT
@@ -149,7 +178,7 @@ func (rs *RunAgentStep) Run(parameters map[string]interface{}, logsWriter io.Wri
 	if err != nil {
 		return parameters, err
 	}
-	result, err := spawnAgentboxAndWait(imageRef, workDirHost, envVars, logsWriter, rs.stopSignal)
+	result, err := rs.spawnAgentboxAndWait(imageRef, workDirHost, envVars, logsWriter)
 	// User-stop path: agentbox SIGTERM-handled and wrote a partial
 	// /result.json (status="cancelled" with whatever progress it had).
 	// Merge that partial into JobOutput so token usage / denied hosts /
@@ -321,7 +350,12 @@ func mapToEnvSlice(env map[string]string) []string {
 // /result.json, and waitForContainerExit returns ErrJobStoppedByUser.
 // The partial result is still read + returned so token usage /
 // changes_summary / denied_hosts aren't lost.
-func spawnAgentboxAndWait(imageRef, workDirHost string, envVars []string, logsWriter io.Writer, stopSignal <-chan struct{}) (agentResult, error) {
+//
+// progressSink (set by RunAgentStep.SetProgressSink from the outer
+// loop) drives a parallel polling goroutine that reads agentbox's
+// progress.json from the bind-mounted dir on its own cadence and
+// forwards each fresh snapshot. Nil sink skips the poller entirely.
+func (rs *RunAgentStep) spawnAgentboxAndWait(imageRef, workDirHost string, envVars []string, logsWriter io.Writer) (agentResult, error) {
 	dockerCtx := context.Background()
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
@@ -337,9 +371,18 @@ func spawnAgentboxAndWait(imageRef, workDirHost string, envVars []string, logsWr
 		return agentResult{}, fmt.Errorf("error starting container: %s", err)
 	}
 	go streamContainerLogs(dockerCtx, cli, containerID, logsWriter)
+	// Phase 5.5b: parallel poller forwards live progress snapshots from
+	// agentbox's progress.json (in the bind-mounted output dir) to the
+	// outer loop's heartbeat path. Stops when stopProgressPoll closes,
+	// which happens at function exit via defer.
+	stopProgressPoll := make(chan struct{})
+	defer close(stopProgressPoll)
+	if rs.progressSink != nil {
+		go pollProgressFile(workDirHost, rs.progressSink, stopProgressPoll)
+	}
 	waitCtx, cancelWait := context.WithTimeout(dockerCtx, defaultWallClockTimeout)
 	defer cancelWait()
-	waitErr := waitForContainerExit(waitCtx, cli, containerID, stopSignal)
+	waitErr := waitForContainerExit(waitCtx, cli, containerID, rs.stopSignal)
 	// On user-stop, return the partial result (caller merges into
 	// JobOutput) plus the stop sentinel error so the caller can route
 	// to the stop UX path. On other errors, propagate as-is.
@@ -444,6 +487,63 @@ func resolveContainerLimits() (memoryBytes int64, nanoCPUs int64) {
 	}
 	nanoCPUs = cores * 1_000_000_000
 	return memoryBytes, nanoCPUs
+}
+
+// pollProgressFile reads agentbox's progress.json from the bind-mounted
+// output dir on a fixed interval and forwards each fresh snapshot via
+// sink. Stops when stopCh closes. Best-effort throughout — any read /
+// unmarshal error is silently dropped because:
+//
+//   - The file is written atomically by agentbox (temp + rename), so
+//     true partial reads aren't possible. A "no such file" error is
+//     normal during the first ~3s before agentbox's first write.
+//
+//   - A transient stat / read error self-heals on the next tick.
+//
+//   - Forwarding a stale or malformed snapshot would be worse than
+//     forwarding none — the dashboard prefers "no live counter" over
+//     "wrong live counter".
+//
+// Dedup: only forwards when UpdatedAtUnix advances. Prevents the
+// heartbeat from spamming identical snapshots when the agent is
+// pausing between turns.
+func pollProgressFile(workDirHost string, sink func(jobs.LiveProgressV1), stopCh <-chan struct{}) {
+	path := filepath.Join(workDirHost, agentboxResultDirRel, agentboxProgressFile)
+	ticker := time.NewTicker(progressPollInterval)
+	defer ticker.Stop()
+	var lastUpdatedAt int64
+	for {
+		select {
+		case <-stopCh:
+			return
+		case <-ticker.C:
+			data, err := os.ReadFile(path)
+			if err != nil {
+				continue
+			}
+			var snap struct {
+				Turns           int   `json:"turns"`
+				InputTokens     int   `json:"input_tokens"`
+				OutputTokens    int   `json:"output_tokens"`
+				CacheReadTokens int   `json:"cache_read_tokens"`
+				UpdatedAtUnix   int64 `json:"updated_at_unix"`
+			}
+			if err := json.Unmarshal(data, &snap); err != nil {
+				continue
+			}
+			if snap.UpdatedAtUnix == lastUpdatedAt {
+				continue // no new write since last poll
+			}
+			lastUpdatedAt = snap.UpdatedAtUnix
+			sink(jobs.LiveProgressV1{
+				Turns:           snap.Turns,
+				InputTokens:     snap.InputTokens,
+				OutputTokens:    snap.OutputTokens,
+				CacheReadTokens: snap.CacheReadTokens,
+				UpdatedAtUnix:   snap.UpdatedAtUnix,
+			})
+		}
+	}
 }
 
 func streamContainerLogs(ctx context.Context, cli *client.Client, containerID string, logsWriter io.Writer) {
