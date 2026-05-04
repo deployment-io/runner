@@ -165,6 +165,29 @@ func executeJobs(jobsStream <-chan pendingJobType, noOfWorkers int, mode runner_
 	return resultsStream
 }
 
+// getJobStopSignal polls UpsertJobHeartbeat every 5 seconds and returns
+// a channel that is CLOSED when the server reports the Job has been
+// moved to Stopping (or when jobDoneSignal closes, indicating shutdown).
+//
+// Closed-channel-as-broadcast (vs. send-then-close) is deliberate:
+//
+//   - The same channel is now read by two consumers — the outer loop's
+//     between-commands select AND any StoppableCommand's SetStopSignal
+//     watcher (RunAgentStep, today). Sending a single value to an
+//     unbuffered channel only wakes one reader; the other relies on
+//     the post-send close. Closing directly wakes ALL current and
+//     future readers atomically and idempotently — the canonical Go
+//     pattern for one-shot broadcast.
+//
+//   - Send-then-close also has a goroutine-leak edge case: if the
+//     consumer side returns via an error path BEFORE reading the
+//     pending send, the producer is wedged on the unbuffered send
+//     (it's not in the select anymore, so jobDoneSignal closing
+//     doesn't free it). Close-only never blocks the producer.
+//
+// Consumers don't need to change — `case <-jobStopSignal:` reads the
+// zero value from a closed channel just as it would have read the
+// sent struct{}{}. Both fire the case identically.
 func getJobStopSignal(job pendingJobType, jobDoneSignal <-chan struct{}, c *client.RunnerClient) <-chan struct{} {
 	jobStopSignal := make(chan struct{})
 	go func() {
@@ -177,8 +200,7 @@ func getJobStopSignal(job pendingJobType, jobDoneSignal <-chan struct{}, c *clie
 				//ignoring error in client
 				isStopping, _ := c.UpsertJobHeartbeat(job.jobID, job.organizationID)
 				if isStopping {
-					jobStopSignal <- struct{}{}
-					return
+					return // deferred close broadcasts to all readers
 				}
 			}
 			time.Sleep(5 * time.Second)
