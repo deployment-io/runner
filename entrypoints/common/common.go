@@ -176,6 +176,20 @@ func executeJobs(jobsStream <-chan pendingJobType, noOfWorkers int, mode runner_
 								}
 							}
 						}
+						// Success path: every command in the sequence ran
+						// without error. For Tasks Step Jobs we still need
+						// to clean up the per-Task working dir under
+						// /tmp/<orgID>/<taskID>/ — the deferred MarkStepDone
+						// in each command only fires on error. Done here
+						// (rather than from inside the last command, e.g.
+						// OpenPullRequest) so the cleanup site doesn't
+						// shift if the command sequence is reordered or
+						// extended. Non-Tasks jobs handle their own
+						// completion bookkeeping inside the build/preview
+						// commands themselves.
+						if commandUtils.IsTasksMode(parameters) {
+							<-commands.MarkStepDone(parameters, nil)
+						}
 						handleLogEnd(nil, pendingJob.jobID, logsWriter)
 						result := getJobResult(pendingJob, "", parameters)
 						resultsStream <- result

@@ -26,8 +26,11 @@ import (
 type OpenPullRequest struct{}
 
 // Run is the runner-side entrypoint. Tasks-only; no non-Tasks branch.
-// MarkStepDone fires both on error (defer) and on success (after merge)
-// since this is the last command in the Step Job's command sequence.
+// MarkStepDone fires on error via the deferred cleanup; the success
+// cleanup is handled by the outer executeJobs loop after the full
+// command sequence completes, so this command stays symmetric with
+// the other Tasks commands and the cleanup site doesn't shift if a
+// new command lands after OpenPullRequest.
 func (opr *OpenPullRequest) Run(parameters map[string]interface{}, logsWriter io.Writer) (newParameters map[string]interface{}, err error) {
 	defer func() {
 		if err != nil {
@@ -63,7 +66,6 @@ func (opr *OpenPullRequest) Run(parameters map[string]interface{}, logsWriter io
 	if err := opener.mergeIntoJobOutput(parameters, prOutputs); err != nil {
 		return parameters, fmt.Errorf("error merging PR results into job output: %s", err)
 	}
-	<-MarkStepDone(parameters, nil)
 	return parameters, nil
 }
 

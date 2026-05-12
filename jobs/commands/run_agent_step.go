@@ -367,11 +367,28 @@ func (rs *RunAgentStep) spawnAgentboxAndWait(imageRef, workDirHost string, envVa
 	if err != nil {
 		return agentResult{}, err
 	}
+	// Defers fire LIFO, so the order at return is:
+	//   1. logsWg.Wait — wait for the log-streaming goroutine to drain
+	//   2. removeContainer — force-remove (registered earlier, runs last)
+	// Wait FIRST is wrong: the goroutine only exits when the log stream
+	// EOFs, which only happens once the container is gone. So we want:
+	//   1. removeContainer (registered LAST below → runs FIRST)
+	//   2. logsWg.Wait     (registered FIRST below → runs LAST,
+	//                       after the container is gone and the stream EOFs)
+	//   3. cli.Close       (registered above → runs after Wait,
+	//                       ensuring the goroutine has already returned
+	//                       its borrow of cli before we close it)
+	var logsWg sync.WaitGroup
+	defer logsWg.Wait()
 	defer func() { _ = removeContainer(dockerCtx, cli, containerID) }()
 	if err := cli.ContainerStart(dockerCtx, containerID, container.StartOptions{}); err != nil {
 		return agentResult{}, fmt.Errorf("error starting container: %s", err)
 	}
-	go streamContainerLogs(dockerCtx, cli, containerID, logsWriter)
+	logsWg.Add(1)
+	go func() {
+		defer logsWg.Done()
+		streamContainerLogs(dockerCtx, cli, containerID, logsWriter)
+	}()
 	// Phase 5.5b: parallel poller forwards live progress snapshots from
 	// agentbox's progress.json (in the bind-mounted output dir) to the
 	// outer loop's heartbeat path. Stops when stopProgressPoll closes,
