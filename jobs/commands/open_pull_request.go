@@ -51,9 +51,10 @@ func (opr *OpenPullRequest) Run(parameters map[string]interface{}, logsWriter io
 		deniedHosts = nil
 	}
 	opener := &taskOpenPR{
-		ctx:         ctx,
-		logsWriter:  logsWriter,
-		deniedHosts: deniedHosts,
+		ctx:          ctx,
+		logsWriter:   logsWriter,
+		deniedHosts:  deniedHosts,
+		agentSummary: readAgentSummaryFromJobOutput(parameters),
 	}
 	prOutputs, err := opener.openAll(hasChangesByIndex)
 	if err != nil {
@@ -77,9 +78,10 @@ func (opr *OpenPullRequest) Run(parameters map[string]interface{}, logsWriter io
 // feedback loop on org-level allowlist tuning. Empty when no allowlist
 // denies happened during the Step.
 type taskOpenPR struct {
-	ctx         commandUtils.TaskJobContext
-	logsWriter  io.Writer
-	deniedHosts []string
+	ctx          commandUtils.TaskJobContext
+	logsWriter   io.Writer
+	deniedHosts  []string
+	agentSummary string // agent.changes_summary from /result.json; "" when missing
 }
 
 // openAll iterates the Job's repositories. Skips repos where
@@ -135,17 +137,27 @@ func (opr *taskOpenPR) openOne(idx int, entry tasks.RepositoryEntry) (repoOutput
 }
 
 // buildPRTitleAndBody mirrors CommitAndPush's commit-message shape so
-// the PR description matches the commit. Phase 5 wires in the agent's
-// changes_summary; Phase 4 falls back to the generic format. Trailer
-// block is uniform across both.
+// the PR description matches the commit:
 //
+//   - When the agent produced a changes_summary, the first line becomes
+//     the PR title and the remainder becomes the PR body lead-in
+//     (matches the commit subject/body split).
+//   - Without a summary, falls back to "Tasks Step <N>: <title>" with no
+//     lead-in (Step ran but didn't produce one, or runtime pre-dates
+//     the RunAgentStep producer).
+//
+// Trailer block + denied-hosts section are uniform across both cases.
 // When the Step had allowlist denies, an additional section lists the
 // blocked hostnames so the PR reviewer can see what the agent tried
 // to reach. Helps diagnose "agent gave up because it couldn't fetch X"
 // scenarios without digging through the runner's container logs.
 func (opr *taskOpenPR) buildPRTitleAndBody() (string, string) {
-	subject := fmt.Sprintf("Tasks Step %d: %s", opr.ctx.StepIndex+1, opr.ctx.TaskTitle)
+	subject, leadIn := opr.subjectAndLeadIn()
 	var sb strings.Builder
+	if len(leadIn) > 0 {
+		sb.WriteString(leadIn)
+		sb.WriteString("\n\n")
+	}
 	sb.WriteString("Generated-By: deployment.io Tasks\n")
 	sb.WriteString(fmt.Sprintf("Task: %s\n", opr.ctx.TaskTitle))
 	if len(opr.ctx.DashboardURL) > 0 {
@@ -160,6 +172,21 @@ func (opr *taskOpenPR) buildPRTitleAndBody() (string, string) {
 		}
 	}
 	return subject, sb.String()
+}
+
+// subjectAndLeadIn mirrors taskCommitPush.subjectAndBody so the PR
+// title/lead-in matches the commit subject/body. Returns the agent's
+// changes_summary first-line as subject and remainder as lead-in when
+// present; falls back to the generic "Tasks Step N: <title>" subject
+// with empty lead-in otherwise.
+func (opr *taskOpenPR) subjectAndLeadIn() (string, string) {
+	if len(opr.agentSummary) > 0 {
+		if idx := strings.Index(opr.agentSummary, "\n"); idx > 0 {
+			return strings.TrimSpace(opr.agentSummary[:idx]), strings.TrimSpace(opr.agentSummary[idx+1:])
+		}
+		return strings.TrimSpace(opr.agentSummary), ""
+	}
+	return fmt.Sprintf("Tasks Step %d: %s", opr.ctx.StepIndex+1, opr.ctx.TaskTitle), ""
 }
 
 // mergeIntoJobOutput reads the existing JobOutput (with CommitAndPush's

@@ -21,6 +21,7 @@ import (
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/mount"
+	"github.com/docker/docker/pkg/stdcopy"
 	"github.com/moby/moby/client"
 )
 
@@ -557,10 +558,13 @@ func streamContainerLogs(ctx context.Context, cli *client.Client, containerID st
 		return
 	}
 	defer logs.Close()
-	// Docker multiplexes stdout/stderr with an 8-byte header per chunk;
-	// for v1 we don't bother demuxing since both streams are useful in
-	// the unified log view. Just copy through.
-	if _, err := io.Copy(logsWriter, logs); err != nil && err != io.EOF {
+	// Container is created with Tty=false, so Docker prepends an 8-byte
+	// header per chunk to multiplex stdout/stderr. Demux via StdCopy so
+	// the dashboard sees readable log text instead of headers leaking
+	// through as control characters. Both streams flow into the same
+	// underlying logsWriter — we don't surface the stdout/stderr split
+	// to users today, but the binary headers MUST be stripped first.
+	if _, err := stdcopy.StdCopy(logsWriter, logsWriter, logs); err != nil && err != io.EOF {
 		io.WriteString(logsWriter, fmt.Sprintf("error streaming container logs: %s\n", err))
 	}
 }

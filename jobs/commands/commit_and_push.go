@@ -34,8 +34,7 @@ type CommitAndPush struct{}
 
 // Run is the runner-side entrypoint. Tasks-only; no non-Tasks branch.
 // MarkStepDone fires on error to clean up the Task working dir; success
-// cleanup happens in the last command of the Step Job (OpenPullRequest
-// in chunk #4).
+// cleanup happens in the last command of the Step Job (OpenPullRequest).
 func (cap *CommitAndPush) Run(parameters map[string]interface{}, logsWriter io.Writer) (newParameters map[string]interface{}, err error) {
 	defer func() {
 		if err != nil {
@@ -47,9 +46,10 @@ func (cap *CommitAndPush) Run(parameters map[string]interface{}, logsWriter io.W
 		return parameters, err
 	}
 	tcp := &taskCommitPush{
-		ctx:        ctx,
-		tokenCache: make(map[string]string),
-		logsWriter: logsWriter,
+		ctx:          ctx,
+		tokenCache:   make(map[string]string),
+		logsWriter:   logsWriter,
+		agentSummary: readAgentSummaryFromJobOutput(parameters),
 	}
 	repoOutputs, err := tcp.commitAndPushAll()
 	if err != nil {
@@ -64,10 +64,16 @@ func (cap *CommitAndPush) Run(parameters map[string]interface{}, logsWriter io.W
 // taskCommitPush bundles the per-Step-Job state. Mirrors the taskCheckout
 // pattern from checkout_repository_for_task.go so multi-repo Tasks sharing
 // one GitHub App installation don't trigger redundant token-refresh RPCs.
+//
+// agentSummary is the agent's changes_summary from /result.json, snapshot
+// at command-Run time (RunAgentStep has already written it into JobOutput
+// by then). Cached on the struct so each per-repo commit gets the same
+// subject/body without repeatedly parsing JobOutput.
 type taskCommitPush struct {
-	ctx        commandUtils.TaskJobContext
-	tokenCache map[string]string
-	logsWriter io.Writer
+	ctx          commandUtils.TaskJobContext
+	tokenCache   map[string]string
+	logsWriter   io.Writer
+	agentSummary string
 }
 
 func (tcp *taskCommitPush) getToken(installationID string) (string, error) {
@@ -189,28 +195,41 @@ func (tcp *taskCommitPush) buildCommitMessage() string {
 	return sb.String()
 }
 
-// subjectAndBody returns (subject, body). Phase 5: split agent's
-// changes_summary at first newline. Phase 4: generic fallback subject,
-// no body.
+// subjectAndBody returns (subject, body) for the commit message.
+// Uses the agent's changes_summary when present — split at the first
+// newline, with the first line as subject and remainder as body.
+// Falls back to "Tasks Step <N>: <title>" with no body when the
+// summary is absent (Step ran but didn't produce one, or runtime
+// older than the Phase-5 RunAgentStep producer).
 func (tcp *taskCommitPush) subjectAndBody() (string, string) {
-	if summary := tcp.readAgentSummary(); len(summary) > 0 {
-		if idx := strings.Index(summary, "\n"); idx > 0 {
-			return strings.TrimSpace(summary[:idx]), strings.TrimSpace(summary[idx+1:])
+	if len(tcp.agentSummary) > 0 {
+		if idx := strings.Index(tcp.agentSummary, "\n"); idx > 0 {
+			return strings.TrimSpace(tcp.agentSummary[:idx]), strings.TrimSpace(tcp.agentSummary[idx+1:])
 		}
-		return strings.TrimSpace(summary), ""
+		return strings.TrimSpace(tcp.agentSummary), ""
 	}
 	return fmt.Sprintf("Tasks Step %d: %s", tcp.ctx.StepIndex+1, tcp.ctx.TaskTitle), ""
 }
 
-// readAgentSummary reads the prior commands' accumulated JobOutput and
-// extracts agent.changes_summary if present. Returns empty string for
-// Phase 4 (no agent yet) or any parsing failure (best-effort).
-func (tcp *taskCommitPush) readAgentSummary() string {
-	// Caller of buildCommitMessage doesn't have parameters in scope —
-	// readAgentSummary is currently a no-op stub returning empty until
-	// Phase 5's RunAgentStep populates the JobOutput. The method exists
-	// so the Phase 5 wiring is a one-line change.
-	return ""
+// readAgentSummaryFromJobOutput pulls the agent.changes_summary field
+// out of the accumulated JobOutput envelope. RunAgentStep populates
+// this before CommitAndPush + OpenPullRequest run; both commands call
+// this once at Run-time and cache the result for the per-repo loop.
+// Best-effort — any unmarshalling failure returns "" so the caller's
+// commit/PR-body fallback path fires.
+func readAgentSummaryFromJobOutput(parameters map[string]interface{}) string {
+	existing, err := jobs.GetParameterValue[string](parameters, parameters_enums.JobOutput)
+	if err != nil || len(existing) == 0 {
+		return ""
+	}
+	var data jobOutputData
+	if err := json.Unmarshal([]byte(existing), &data); err != nil {
+		return ""
+	}
+	if data.Agent == nil {
+		return ""
+	}
+	return data.Agent.ChangesSummary
 }
 
 // pushWithRetry pushes the local Task branch to origin. Refreshes the
@@ -322,6 +341,16 @@ func (tcp *taskCommitPush) mergeRepositoriesIntoJobOutput(parameters map[string]
 // OpenPullRequest's later PR-fields write doesn't clobber CommitAndPush's
 // commit-fields write — and vice-versa for retry scenarios.
 //
+// Per-field preservation policy: when a field on the incoming entry is
+// at its zero value AND the existing entry has a non-zero value, the
+// existing value is kept. This makes the merge commutative across the
+// command sequence: each command writes only the fields it knows about
+// (CommitAndPush writes CommitSHA + Branch + HasChanges; OpenPullRequest
+// writes PRURL + PRNumber + Branch). Without this preservation, the
+// later command's write would silently drop the earlier command's
+// fields and the deployment-server hook would persist an incomplete
+// repository record.
+//
 // Keyed on Index (position in Task.Repositories) rather than Name because
 // repo names can collide across orgs in multi-org Tasks. Output is sorted
 // by Index for deterministic JSON.
@@ -334,8 +363,13 @@ func mergeRepoOutputs(existing, incoming []repoOutput) []repoOutput {
 		byIndex[e.Index] = e
 	}
 	for _, in := range incoming {
-		// Preserve PR fields if existing entry had them and incoming doesn't.
 		if prev, hadPrev := byIndex[in.Index]; hadPrev {
+			if len(in.CommitSHA) == 0 && len(prev.CommitSHA) > 0 {
+				in.CommitSHA = prev.CommitSHA
+			}
+			if len(in.Branch) == 0 && len(prev.Branch) > 0 {
+				in.Branch = prev.Branch
+			}
 			if len(in.PRURL) == 0 && len(prev.PRURL) > 0 {
 				in.PRURL = prev.PRURL
 			}
