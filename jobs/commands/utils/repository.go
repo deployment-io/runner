@@ -1,5 +1,28 @@
 package utils
 
+// TODO(tasks-v1.1): introduce a small interface (GitRepoOpener or
+// similar) around CloneRepository / FetchRepository / PlainOpen so
+// the task-mode clone/fetch/push paths in
+// jobs/commands/checkout_repository_for_task.go,
+// jobs/commands/commit_and_push.go, and the retry-on-401 logic become
+// unit-testable. Today these paths are integration-only because the
+// helpers call go-git directly with concrete *git.Repository return
+// types.
+//
+// Approximate scope: ~30 LoC for the interface, ~50 LoC for a
+// goGitOpener wrapper around the existing functions, ~50-100 LoC of
+// refactor in taskCheckout / taskCommitPush to accept the interface,
+// ~200-300 LoC of memfs-backed tests (storage.NewStorage() +
+// memfs.New() to get a real *git.Repository instance without disk or
+// network). The HTTPS-level auth-retry path additionally needs an
+// httptest.Server fake; that's another ~100 LoC if desired but
+// skippable.
+//
+// The deleted checkout_repository_test.go in PR #51 made real
+// network calls and was the wrong approach. The memfs path is the
+// right one; this TODO captures the design so the next person
+// picking it up doesn't have to re-derive it.
+
 import (
 	"errors"
 	"fmt"
