@@ -57,7 +57,19 @@ func addRootDirectory(parameters map[string]interface{}, repoDirectoryPath strin
 
 // Run clones a specified repository, checks out the designated branch or commit, updates submodules, and updates build or preview status.
 // It takes a map of parameters and a writer for logs, returning a modified set of parameters and an error if any occurs during execution.
+//
+// Tasks-mode: when the Job carries a TaskID, dispatch to the per-repo
+// path (runForTask) and bypass MarkDeploymentDone since Tasks aren't
+// deployments.
 func (cr *CheckoutRepository) Run(parameters map[string]interface{}, logsWriter io.Writer) (newParameters map[string]interface{}, err error) {
+	if commandUtils.IsTasksMode(parameters) {
+		defer func() {
+			if err != nil {
+				<-MarkStepDone(parameters, err)
+			}
+		}()
+		return cr.runForTask(parameters, logsWriter)
+	}
 	defer func() {
 		//_ = loggers.LogBuffer(logBuffer, logger)
 		if err != nil {
