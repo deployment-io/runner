@@ -237,9 +237,20 @@ func pullAgentboxImage(imageRef string, logsWriter io.Writer) error {
 // prepareAgentboxResultDir creates the on-host directory that agentbox
 // writes /result.json into (via the bind mount). Pre-creating ensures the
 // directory exists and is writable before the container starts.
+//
+// Chowns both the work base and the result dir to the agentbox `agent`
+// user so the spawned container (UID 1000) can write through the bind
+// mount. CheckoutRepository chowns the cloned repo subtrees; this
+// function covers the result dir and the base it sits in.
 func prepareAgentboxResultDir(workDirHost string) error {
 	resultDir := filepath.Join(workDirHost, agentboxResultDirRel)
-	return os.MkdirAll(resultDir, 0755)
+	if err := os.MkdirAll(resultDir, 0755); err != nil {
+		return err
+	}
+	if err := os.Chown(workDirHost, commandUtils.AgentboxUID, commandUtils.AgentboxGID); err != nil {
+		return err
+	}
+	return os.Chown(resultDir, commandUtils.AgentboxUID, commandUtils.AgentboxGID)
 }
 
 // buildAgentSpawnEnvVars assembles the env vars passed to the agentbox

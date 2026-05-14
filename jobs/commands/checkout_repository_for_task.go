@@ -3,6 +3,9 @@ package commands
 import (
 	"fmt"
 	"io"
+	"io/fs"
+	"os"
+	"path/filepath"
 
 	"github.com/deployment-io/deployment-runner-kit/tasks"
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
@@ -90,9 +93,32 @@ func (tc *taskCheckout) checkoutOne(repoDir string, entry tasks.RepositoryEntry)
 		return fmt.Errorf("error getting worktree: %s", err)
 	}
 	if tc.ctx.StepIndex == 0 {
-		return checkoutBaseBranchAndCreateTaskBranch(worktree, entry.BaseBranch, tc.ctx.BranchName)
+		if err := checkoutBaseBranchAndCreateTaskBranch(worktree, entry.BaseBranch, tc.ctx.BranchName); err != nil {
+			return err
+		}
+	} else {
+		if err := tc.fetchAndCheckoutTaskBranch(repository, worktree, entry, token); err != nil {
+			return err
+		}
 	}
-	return tc.fetchAndCheckoutTaskBranch(repository, worktree, entry, token)
+	// go-git's PlainClone + Checkout ran as the runner process (root inside
+	// its container). Chown the entire repo tree to the agentbox `agent`
+	// user so the spawned RunAgentStep container can modify these files
+	// through the bind mount.
+	return chownTreeToAgentbox(repoDir)
+}
+
+// chownTreeToAgentbox lchowns every entry under root (including root itself)
+// to the agentbox `agent` user. lchown so symlinks themselves are retargeted
+// rather than whatever they point to (symlinks created by git can point
+// outside the work tree).
+func chownTreeToAgentbox(root string) error {
+	return filepath.WalkDir(root, func(path string, _ fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		return os.Lchown(path, commandUtils.AgentboxUID, commandUtils.AgentboxGID)
+	})
 }
 
 // cloneWithRetry runs the clone, refreshes the token + retries once on

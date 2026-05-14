@@ -30,6 +30,18 @@ func GetTaskRepositoriesBaseDir(orgID, taskID string) string {
 	return fmt.Sprintf("/tmp/%s/%s", orgID, taskID)
 }
 
+// AgentboxUID / AgentboxGID match the non-root `agent` user hardcoded in
+// the agentbox image (useradd -u 1000 in agentbox/Dockerfile). The runner
+// (root inside its own container) creates the on-host work dirs and then
+// chowns to these IDs so the spawned agentbox container's UID-1000
+// process can write through the bind mount. Bind-mount permission checks
+// happen against numeric IDs, so this is the stable cross-container
+// contract.
+const (
+	AgentboxUID = 1000
+	AgentboxGID = 1000
+)
+
 // GetTaskRepositoryDir is the per-repo working directory for index idx
 // in the Task's repo list. Index prefix avoids collisions when two repos
 // share the same name across orgs.
