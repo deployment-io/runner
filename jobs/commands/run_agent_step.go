@@ -282,6 +282,9 @@ func buildAgentSpawnEnvVars(parameters map[string]interface{}) ([]string, error)
 	if v, err := jobs.GetParameterValue[string](parameters, parameters_enums.Model); err == nil && v != "" {
 		env["MODEL"] = v
 	}
+	if v, err := jobs.GetParameterValue[string](parameters, parameters_enums.ClaudeCodeVersion); err == nil && v != "" {
+		env["CLAUDE_CODE_VERSION"] = v
+	}
 	if v, err := jobs.GetParameterValue[int64](parameters, parameters_enums.MaxTurns); err == nil && v > 0 {
 		env["MAX_TURNS"] = strconv.FormatInt(v, 10)
 	}
