@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
@@ -58,6 +59,7 @@ func (opr *OpenPullRequest) Run(parameters map[string]interface{}, logsWriter io
 		logsWriter:   logsWriter,
 		deniedHosts:  deniedHosts,
 		agentSummary: readAgentSummaryFromJobOutput(parameters),
+		agentPRTitle: readAgentPRTitleFromJobOutput(parameters),
 	}
 	prOutputs, err := opener.openAll(hasChangesByIndex)
 	if err != nil {
@@ -84,6 +86,11 @@ type taskOpenPR struct {
 	logsWriter   io.Writer
 	deniedHosts  []string
 	agentSummary string // agent.changes_summary from /result.json; "" when missing
+	// agentPRTitle is the agent-produced short PR title from /result.json
+	// (newer agentbox images that emit pr_title). Empty when the agentbox
+	// image predates the field — subjectAndLeadIn falls through to the
+	// truncated-first-line-of-changes_summary path.
+	agentPRTitle string
 }
 
 // openAll iterates the Job's repositories. Skips repos where
@@ -138,21 +145,16 @@ func (opr *taskOpenPR) openOne(idx int, entry tasks.RepositoryEntry) (repoOutput
 	}, nil
 }
 
-// buildPRTitleAndBody mirrors CommitAndPush's commit-message shape so
-// the PR description matches the commit:
+// buildPRTitleAndBody assembles the PR subject + body. Subject source
+// is decided by subjectAndLeadIn (agent pr_title > changes_summary
+// first line > generic fallback; see that function for the policy).
 //
-//   - When the agent produced a changes_summary, the first line becomes
-//     the PR title and the remainder becomes the PR body lead-in
-//     (matches the commit subject/body split).
-//   - Without a summary, falls back to "Tasks Step <N>: <title>" with no
-//     lead-in (Step ran but didn't produce one, or runtime pre-dates
-//     the RunAgentStep producer).
-//
-// Trailer block + denied-hosts section are uniform across both cases.
-// When the Step had allowlist denies, an additional section lists the
-// blocked hostnames so the PR reviewer can see what the agent tried
-// to reach. Helps diagnose "agent gave up because it couldn't fetch X"
-// scenarios without digging through the runner's container logs.
+// Body composition: lead-in first (when present) so reviewers see the
+// agent's narrative before metadata, then the trailer block, then the
+// optional denied-hosts section. When the Step had allowlist denies,
+// the section lists the blocked hostnames so the PR reviewer can see
+// what the agent tried to reach — helps diagnose "agent gave up
+// because it couldn't fetch X" without digging through container logs.
 func (opr *taskOpenPR) buildPRTitleAndBody() (string, string) {
 	subject, leadIn := opr.subjectAndLeadIn()
 	var sb strings.Builder
@@ -176,19 +178,61 @@ func (opr *taskOpenPR) buildPRTitleAndBody() (string, string) {
 	return subject, sb.String()
 }
 
-// subjectAndLeadIn mirrors taskCommitPush.subjectAndBody so the PR
-// title/lead-in matches the commit subject/body. Returns the agent's
-// changes_summary first-line as subject and remainder as lead-in when
-// present; falls back to the generic "Tasks Step N: <title>" subject
-// with empty lead-in otherwise.
+// subjectAndLeadIn picks the PR subject + body lead-in from whichever
+// source is available, with defensive truncation against agents that
+// ignore the 72-char instruction:
+//
+//   1. Newer agentbox (v1.x+ with pr_title): use agentPRTitle, capped
+//      at 72 chars. Full changes_summary becomes the lead-in body.
+//   2. Older agentbox (no pr_title): split changes_summary at its
+//      first newline. Short first line → use as-is; long first line →
+//      cap AND keep the full narrative as the body so reviewers don't
+//      lose context.
+//   3. No agent output at all: generic "Tasks Step N: <title>".
+//
+// Bug 2 fix: the pre-fix code emitted the entire first line as the PR
+// title regardless of length. A 119-char single-line narrative ended
+// up as the literal PR title. capTitle prevents that recurrence even
+// if the agent doesn't follow the instruction.
 func (opr *taskOpenPR) subjectAndLeadIn() (string, string) {
+	if len(opr.agentPRTitle) > 0 {
+		return capTitle(opr.agentPRTitle, prTitleMaxRunes), strings.TrimSpace(opr.agentSummary)
+	}
 	if len(opr.agentSummary) > 0 {
-		if idx := strings.Index(opr.agentSummary, "\n"); idx > 0 {
-			return strings.TrimSpace(opr.agentSummary[:idx]), strings.TrimSpace(opr.agentSummary[idx+1:])
+		first, rest := splitFirstLine(opr.agentSummary)
+		if utf8.RuneCountInString(first) <= prTitleMaxRunes {
+			return first, rest
 		}
-		return strings.TrimSpace(opr.agentSummary), ""
+		return capTitle(first, prTitleMaxRunes), strings.TrimSpace(opr.agentSummary)
 	}
 	return fmt.Sprintf("Tasks Step %d: %s", opr.ctx.StepIndex+1, opr.ctx.TaskTitle), ""
+}
+
+// prTitleMaxRunes is the defensive cap on PR title length. Matches the
+// instruction agentbox gives the agent in its system prompt (72 chars
+// = Conventional Commits + GitHub PR title soft limit). Counted in
+// runes, not bytes, so multi-byte titles aren't double-counted.
+const prTitleMaxRunes = 72
+
+// capTitle truncates s to at most n runes (not bytes — respects
+// multi-byte chars). Appends "…" when truncation occurred so the title
+// visibly signals that it was clipped.
+func capTitle(s string, n int) string {
+	s = strings.TrimSpace(s)
+	if utf8.RuneCountInString(s) <= n {
+		return s
+	}
+	runes := []rune(s)
+	return string(runes[:n-1]) + "…"
+}
+
+// splitFirstLine returns (firstLine, rest), both trimmed of surrounding
+// whitespace. When s has no newline, returns (trimmed s, "").
+func splitFirstLine(s string) (string, string) {
+	if idx := strings.IndexByte(s, '\n'); idx >= 0 {
+		return strings.TrimSpace(s[:idx]), strings.TrimSpace(s[idx+1:])
+	}
+	return strings.TrimSpace(s), ""
 }
 
 // mergeIntoJobOutput reads the existing JobOutput (with CommitAndPush's
@@ -229,6 +273,26 @@ func readDeniedHostsFromJobOutput(parameters map[string]interface{}) ([]string, 
 		return nil, nil
 	}
 	return data.Agent.DeniedHosts, nil
+}
+
+// readAgentPRTitleFromJobOutput pulls the agent.pr_title field that
+// RunAgentStep populated from agentbox's /result.json. Returns "" on
+// missing/malformed payloads so the caller's fallback path (truncated
+// first line of changes_summary) fires — keeps backward-compat with
+// older agentbox images that didn't emit pr_title.
+func readAgentPRTitleFromJobOutput(parameters map[string]interface{}) string {
+	existing, err := jobs.GetParameterValue[string](parameters, parameters_enums.JobOutput)
+	if err != nil || len(existing) == 0 {
+		return ""
+	}
+	var data jobOutputData
+	if err := json.Unmarshal([]byte(existing), &data); err != nil {
+		return ""
+	}
+	if data.Agent == nil {
+		return ""
+	}
+	return data.Agent.PRTitle
 }
 
 // readHasChangesFromJobOutput pulls the per-repo HasChanges flags that

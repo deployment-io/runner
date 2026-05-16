@@ -315,6 +315,13 @@ type agentOutput struct {
 	// to the dashboard so users can suggest allowlist additions
 	// without parsing container logs. Empty when no denies happened.
 	DeniedHosts []string `json:"denied_hosts,omitempty"`
+	// PRTitle is the agent-produced short title for the resulting PR.
+	// Distinct from ChangesSummary so OpenPullRequest can pick a clean
+	// title instead of taking the first line of a long single-line
+	// narrative. Empty when the agentbox image predates the pr_title
+	// field; OpenPullRequest falls back to truncated first line of
+	// ChangesSummary in that case.
+	PRTitle string `json:"pr_title,omitempty"`
 }
 
 // mergeRepositoriesIntoJobOutput reads existing JobOutput JSON (any prior

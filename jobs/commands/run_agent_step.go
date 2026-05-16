@@ -670,6 +670,12 @@ type agentResult struct {
 	TurnCount      int      `json:"turn_count,omitempty"`
 	Error          string   `json:"error,omitempty"`
 	DeniedHosts    []string `json:"denied_hosts,omitempty"`
+	// PRTitle is the agent-produced short title for the resulting
+	// pull request. Distinct from ChangesSummary (longer, what + why).
+	// Empty when the agentbox image predates the pr_title field —
+	// downstream OpenPullRequest falls back to a truncated first line
+	// of ChangesSummary in that case.
+	PRTitle string `json:"pr_title,omitempty"`
 }
 
 func readAgentResult(workDirHost string) (agentResult, error) {
@@ -703,6 +709,7 @@ func mergeAgentResultIntoJobOutput(parameters map[string]interface{}, result age
 		TokenUsage:     result.TokenUsage,
 		ExitCode:       result.ExitCode,
 		DeniedHosts:    result.DeniedHosts,
+		PRTitle:        result.PRTitle,
 	}
 	merged, err := json.Marshal(data)
 	if err != nil {
