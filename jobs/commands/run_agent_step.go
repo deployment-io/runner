@@ -685,9 +685,19 @@ type agentResult struct {
 	AgentVersion   string     `json:"agent_version,omitempty"`
 	ChangesSummary string     `json:"changes_summary,omitempty"`
 	TokenUsage     tokenUsage `json:"token_usage"`
-	TurnCount      int        `json:"turn_count,omitempty"`
-	Error          string     `json:"error,omitempty"`
-	DeniedHosts    []string   `json:"denied_hosts,omitempty"`
+	// Turns is agentbox's per-run turn count (internal/result.Outcome.Turns,
+	// emitted as "turns"). The runner previously declared this as TurnCount
+	// with json:"turn_count" — neither name matched agentbox's wire shape,
+	// so the field always parsed as zero and the dashboard rendered
+	// "Turn 0" on completed runs even when liveProgress had been replaced
+	// by the final result.json. Carried through to agentOutput by
+	// mergeAgentResultIntoJobOutput so app-server's projection picks it up.
+	Turns       int      `json:"turns,omitempty"`
+	Error       string   `json:"error,omitempty"`
+	DeniedHosts []string `json:"denied_hosts,omitempty"`
+	// PRTitle is the agent-produced short title for the resulting
+	// pull request. Distinct from ChangesSummary (longer, what + why).
+	PRTitle string `json:"pr_title,omitempty"`
 }
 
 // tokenUsage mirrors agentbox's /result.json token_usage object. Agentbox
@@ -708,11 +718,6 @@ type tokenUsage struct {
 // output for 10m; subprocess killed", "cancelled by signal", auth/
 // rate-limit context). Without including it the runner reports only
 // status + exit_code, which is rarely enough to debug.
-//
-// exit_code is currently always 0 because agentbox marks the field as
-// `json:"-"` in result.go — a latent bug on the agentbox side that
-// makes the field meaningless on the wire. Surfacing it here costs
-// nothing and starts paying off the moment agentbox fixes the tag.
 func formatAgentFailure(result agentResult) error {
 	return fmt.Errorf(
 		"agent step did not succeed: status=%s exit_code=%d error=%q",
@@ -749,8 +754,10 @@ func mergeAgentResultIntoJobOutput(parameters map[string]interface{}, result age
 	data.Agent = &agentOutput{
 		ChangesSummary: result.ChangesSummary,
 		TokenUsage:     result.TokenUsage,
+		Turns:          result.Turns,
 		ExitCode:       result.ExitCode,
 		DeniedHosts:    result.DeniedHosts,
+		PRTitle:        result.PRTitle,
 	}
 	merged, err := json.Marshal(data)
 	if err != nil {

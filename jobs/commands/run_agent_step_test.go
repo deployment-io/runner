@@ -1,10 +1,14 @@
 package commands
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
+	"github.com/deployment-io/deployment-runner-kit/jobs"
 )
 
 func TestResolveContainerLimits_Defaults(t *testing.T) {
@@ -85,7 +89,7 @@ func TestReadAgentResult_TokenUsageObjectShape(t *testing.T) {
 		"agent_type": "claude-code",
 		"agent_version": "2.1.141",
 		"changes_summary": "edited 1 file",
-		"turn_count": 3,
+		"turns": 3,
 		"token_usage": {
 			"input_tokens": 1234,
 			"output_tokens": 567,
@@ -103,6 +107,9 @@ func TestReadAgentResult_TokenUsageObjectShape(t *testing.T) {
 	}
 	if got.Status != "success" {
 		t.Errorf("status = %q, want %q", got.Status, "success")
+	}
+	if got.Turns != 3 {
+		t.Errorf("Turns = %d, want 3", got.Turns)
 	}
 	if got.TokenUsage.InputTokens != 1234 {
 		t.Errorf("InputTokens = %d, want 1234", got.TokenUsage.InputTokens)
@@ -180,5 +187,42 @@ func TestReadAgentResult_ZeroValueTokenUsage(t *testing.T) {
 	}
 	if got.TokenUsage != (tokenUsage{}) {
 		t.Errorf("TokenUsage = %+v, want zero value", got.TokenUsage)
+	}
+}
+
+// TestMergeAgentResultIntoJobOutput_TurnsCarryThrough pins that the
+// turn count read from agentbox's result.json lands on the JobOutput
+// envelope's agent block. Earlier the field existed on agentResult
+// but was dropped on the merge — the dashboard then rendered "Turn 0"
+// for completed runs that finished too fast for the LiveProgress
+// heartbeat to land. Mirrors the carry-through assertion the
+// app-server side relies on in extractAgentTurns.
+func TestMergeAgentResultIntoJobOutput_TurnsCarryThrough(t *testing.T) {
+	params := map[string]interface{}{}
+	err := mergeAgentResultIntoJobOutput(params, agentResult{
+		Status:         "success",
+		ChangesSummary: "edited 1 file",
+		Turns:          7,
+		TokenUsage:     tokenUsage{InputTokens: 100, OutputTokens: 50, CacheReadTokens: 25},
+	})
+	if err != nil {
+		t.Fatalf("mergeAgentResultIntoJobOutput: %v", err)
+	}
+	raw, err := jobs.GetParameterValue[string](params, parameters_enums.JobOutput)
+	if err != nil {
+		t.Fatalf("GetParameterValue: %v", err)
+	}
+	var got jobOutputData
+	if err := json.Unmarshal([]byte(raw), &got); err != nil {
+		t.Fatalf("unmarshal envelope: %v", err)
+	}
+	if got.Agent == nil {
+		t.Fatal("agent block missing")
+	}
+	if got.Agent.Turns != 7 {
+		t.Errorf("agent.turns = %d, want 7", got.Agent.Turns)
+	}
+	if got.Agent.TokenUsage.InputTokens != 100 {
+		t.Errorf("agent.token_usage.input_tokens = %d, want 100", got.Agent.TokenUsage.InputTokens)
 	}
 }

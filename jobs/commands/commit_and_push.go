@@ -308,13 +308,27 @@ type jobOutputData struct {
 type agentOutput struct {
 	ChangesSummary string     `json:"changes_summary,omitempty"`
 	TokenUsage     tokenUsage `json:"token_usage"`
-	ExitCode       int        `json:"exit_code,omitempty"`
+	// Turns is the per-run turn count agentbox writes to /result.json.
+	// Surfaced on the JobOutput envelope so app-server's projection
+	// can populate AgentRunSummary.Turns for completed runs — the
+	// dashboard prefers this over LiveProgress when the run is in a
+	// terminal state, because a run that finishes faster than agentbox's
+	// progress.json writer interval (~5s) leaves LiveProgress at zero.
+	Turns    int `json:"turns,omitempty"`
+	ExitCode int `json:"exit_code,omitempty"`
 	// DeniedHosts is the dedup-sorted list of hostnames the agentbox
 	// proxy refused due to allowlist mismatches during this Step run.
 	// Populated by RunAgentStep from agentbox's /result.json. Surfaced
 	// to the dashboard so users can suggest allowlist additions
 	// without parsing container logs. Empty when no denies happened.
 	DeniedHosts []string `json:"denied_hosts,omitempty"`
+	// PRTitle is the agent-produced short title for the resulting PR.
+	// Distinct from ChangesSummary so OpenPullRequest can pick a clean
+	// title instead of taking the first line of a long single-line
+	// narrative. Empty when the agentbox image predates the pr_title
+	// field; OpenPullRequest falls back to truncated first line of
+	// ChangesSummary in that case.
+	PRTitle string `json:"pr_title,omitempty"`
 }
 
 // mergeRepositoriesIntoJobOutput reads existing JobOutput JSON (any prior
