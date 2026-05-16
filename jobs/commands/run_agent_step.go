@@ -204,7 +204,7 @@ func (rs *RunAgentStep) Run(parameters map[string]interface{}, logsWriter io.Wri
 		return parameters, fmt.Errorf("error merging agent result: %s", err)
 	}
 	if result.Status != "success" {
-		return parameters, fmt.Errorf("agent step did not succeed: status=%s exit_code=%d", result.Status, result.ExitCode)
+		return parameters, formatAgentFailure(result)
 	}
 	return parameters, nil
 }
@@ -689,6 +689,24 @@ type tokenUsage struct {
 	InputTokens     int `json:"input_tokens"`
 	OutputTokens    int `json:"output_tokens"`
 	CacheReadTokens int `json:"cache_read_tokens"`
+}
+
+// formatAgentFailure produces the error returned when agentbox reports
+// status != "success". result.Error carries agentbox's classified
+// failure message (e.g., "claude exited with error: ...", "no agent
+// output for 10m; subprocess killed", "cancelled by signal", auth/
+// rate-limit context). Without including it the runner reports only
+// status + exit_code, which is rarely enough to debug.
+//
+// exit_code is currently always 0 because agentbox marks the field as
+// `json:"-"` in result.go — a latent bug on the agentbox side that
+// makes the field meaningless on the wire. Surfacing it here costs
+// nothing and starts paying off the moment agentbox fixes the tag.
+func formatAgentFailure(result agentResult) error {
+	return fmt.Errorf(
+		"agent step did not succeed: status=%s exit_code=%d error=%q",
+		result.Status, result.ExitCode, result.Error,
+	)
 }
 
 func readAgentResult(workDirHost string) (agentResult, error) {

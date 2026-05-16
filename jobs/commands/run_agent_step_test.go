@@ -3,6 +3,7 @@ package commands
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -114,6 +115,38 @@ func TestReadAgentResult_TokenUsageObjectShape(t *testing.T) {
 	}
 	if len(got.DeniedHosts) != 1 || got.DeniedHosts[0] != "evil.example.com" {
 		t.Errorf("DeniedHosts = %v, want [evil.example.com]", got.DeniedHosts)
+	}
+}
+
+// TestFormatAgentFailure_IncludesError pins the requirement that the
+// runner surfaces agentbox's result.Error message in the failure
+// returned upstream. Pre-v0.1.24 the runner only printed status +
+// exit_code, which made debugging Claude API auth failures (and
+// every other agentbox-classified failure) impossible without SSHing
+// into the runner and reading result.json by hand.
+func TestFormatAgentFailure_IncludesError(t *testing.T) {
+	got := formatAgentFailure(agentResult{
+		Status: "failure",
+		Error:  "claude exited with error: API key invalid",
+	}).Error()
+	if !strings.Contains(got, `status=failure`) {
+		t.Errorf("error %q missing status field", got)
+	}
+	if !strings.Contains(got, `error="claude exited with error: API key invalid"`) {
+		t.Errorf("error %q missing agentbox-side error detail", got)
+	}
+}
+
+// TestFormatAgentFailure_EmptyErrorStillReadable covers the edge case
+// where agentbox writes an empty Error (shouldn't happen on the failure
+// path, but the format must not panic or produce a confusing message).
+func TestFormatAgentFailure_EmptyErrorStillReadable(t *testing.T) {
+	got := formatAgentFailure(agentResult{Status: "failure"}).Error()
+	if !strings.Contains(got, `status=failure`) {
+		t.Errorf("error %q missing status field", got)
+	}
+	if !strings.Contains(got, `error=""`) {
+		t.Errorf("error %q should include empty-error sentinel for diagnosability, got: %s", got, got)
 	}
 }
 
