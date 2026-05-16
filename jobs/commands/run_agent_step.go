@@ -153,8 +153,19 @@ const (
 	// mismatch and tries to install into /home/agent/.npm-global.
 	// Pinning to UID 1000 matches the agent user inside the agentbox
 	// image (Dockerfile USER agent, UID 1000).
-	tmpfsTmpOpts  = "rw,size=512m,uid=1000,gid=1000,mode=755"
-	tmpfsHomeOpts = "rw,size=1g,uid=1000,gid=1000,mode=755"
+	//
+	// `exec` is also mandatory: Docker's default tmpfs flags are
+	// `rw,nosuid,nodev,noexec,relatime` and those defaults are
+	// merged with whatever we pass — so `noexec` survives unless we
+	// explicitly override it. Without `exec`, the kernel refuses to
+	// execute any binary that lives in the tmpfs (claude binary
+	// installed at /home/agent/.npm-global/lib/.../claude-code-*-x64/
+	// claude), producing "Permission denied" on the agent subprocess
+	// spawn even though the file's permission bits and ownership are
+	// correct. We deliberately keep nosuid + nodev — they're
+	// security-relevant and we don't need either for the agent.
+	tmpfsTmpOpts  = "rw,exec,size=512m,uid=1000,gid=1000,mode=755"
+	tmpfsHomeOpts = "rw,exec,size=1g,uid=1000,gid=1000,mode=755"
 
 	// Env vars on the runner host that override the defaults above.
 	memoryBytesEnvVar = "AGENTBOX_MEMORY_BYTES"
