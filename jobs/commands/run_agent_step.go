@@ -146,8 +146,26 @@ const (
 	// caches, etc.); /home/agent covers the agentbox runtime install
 	// (npm install -g claude-code lands at $NPM_CONFIG_PREFIX which
 	// is /home/agent/.npm-global — see agentbox Dockerfile).
-	tmpfsTmpOpts  = "rw,size=512m"
-	tmpfsHomeOpts = "rw,size=1g"
+	//
+	// uid/gid/mode are mandatory: Docker mounts tmpfs as root-owned by
+	// default, which makes runtime `npm install -g` fail with EACCES
+	// when agentbox's Driver.Ensure detects a Claude Code version
+	// mismatch and tries to install into /home/agent/.npm-global.
+	// Pinning to UID 1000 matches the agent user inside the agentbox
+	// image (Dockerfile USER agent, UID 1000).
+	//
+	// `exec` is also mandatory: Docker's default tmpfs flags are
+	// `rw,nosuid,nodev,noexec,relatime` and those defaults are
+	// merged with whatever we pass — so `noexec` survives unless we
+	// explicitly override it. Without `exec`, the kernel refuses to
+	// execute any binary that lives in the tmpfs (claude binary
+	// installed at /home/agent/.npm-global/lib/.../claude-code-*-x64/
+	// claude), producing "Permission denied" on the agent subprocess
+	// spawn even though the file's permission bits and ownership are
+	// correct. We deliberately keep nosuid + nodev — they're
+	// security-relevant and we don't need either for the agent.
+	tmpfsTmpOpts  = "rw,exec,size=512m,uid=1000,gid=1000,mode=755"
+	tmpfsHomeOpts = "rw,exec,size=1g,uid=1000,gid=1000,mode=755"
 
 	// Env vars on the runner host that override the defaults above.
 	memoryBytesEnvVar = "AGENTBOX_MEMORY_BYTES"
@@ -197,7 +215,7 @@ func (rs *RunAgentStep) Run(parameters map[string]interface{}, logsWriter io.Wri
 		return parameters, fmt.Errorf("error merging agent result: %s", err)
 	}
 	if result.Status != "success" {
-		return parameters, fmt.Errorf("agent step did not succeed: status=%s exit_code=%d", result.Status, result.ExitCode)
+		return parameters, formatAgentFailure(result)
 	}
 	return parameters, nil
 }
@@ -662,20 +680,42 @@ func removeContainer(ctx context.Context, cli *client.Client, containerID string
 // dashboard can surface "add these to your allowlist" suggestions.
 // Empty when no allowlist denies happened during the run.
 type agentResult struct {
-	Status         string   `json:"status"`
-	ExitCode       int      `json:"exit_code"`
-	AgentVersion   string   `json:"agent_version,omitempty"`
-	ChangesSummary string   `json:"changes_summary,omitempty"`
-	TokenUsage     int64    `json:"token_usage,omitempty"`
-	TurnCount      int      `json:"turn_count,omitempty"`
-	Error          string   `json:"error,omitempty"`
-	DeniedHosts    []string `json:"denied_hosts,omitempty"`
+	Status         string     `json:"status"`
+	ExitCode       int        `json:"exit_code"`
+	AgentVersion   string     `json:"agent_version,omitempty"`
+	ChangesSummary string     `json:"changes_summary,omitempty"`
+	TokenUsage     tokenUsage `json:"token_usage"`
+	TurnCount      int        `json:"turn_count,omitempty"`
+	Error          string     `json:"error,omitempty"`
+	DeniedHosts    []string   `json:"denied_hosts,omitempty"`
 	// PRTitle is the agent-produced short title for the resulting
 	// pull request. Distinct from ChangesSummary (longer, what + why).
-	// Empty when the agentbox image predates the pr_title field —
-	// downstream OpenPullRequest falls back to a truncated first line
-	// of ChangesSummary in that case.
 	PRTitle string `json:"pr_title,omitempty"`
+}
+
+// tokenUsage mirrors agentbox's /result.json token_usage object. Agentbox
+// has emitted this as an object since v1.1.0 (never an int); the runner's
+// earlier int64 typing was a latent mismatch that surfaced the first time
+// a Tasks Step produced a result.json (success OR failure path — agentbox
+// always writes the zero-value object even on early-exit). Fields mirror
+// agentbox's internal/result/result.go::TokenUsage exactly.
+type tokenUsage struct {
+	InputTokens     int `json:"input_tokens"`
+	OutputTokens    int `json:"output_tokens"`
+	CacheReadTokens int `json:"cache_read_tokens"`
+}
+
+// formatAgentFailure produces the error returned when agentbox reports
+// status != "success". result.Error carries agentbox's classified
+// failure message (e.g., "claude exited with error: ...", "no agent
+// output for 10m; subprocess killed", "cancelled by signal", auth/
+// rate-limit context). Without including it the runner reports only
+// status + exit_code, which is rarely enough to debug.
+func formatAgentFailure(result agentResult) error {
+	return fmt.Errorf(
+		"agent step did not succeed: status=%s exit_code=%d error=%q",
+		result.Status, result.ExitCode, result.Error,
+	)
 }
 
 func readAgentResult(workDirHost string) (agentResult, error) {
