@@ -16,11 +16,13 @@ import (
 
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
+	"github.com/deployment-io/deployment-runner-kit/tasks"
 	"github.com/deployment-io/deployment-runner-kit/types"
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/mount"
+	"github.com/docker/docker/api/types/volume"
 	"github.com/docker/docker/pkg/stdcopy"
 	"github.com/moby/moby/client"
 )
@@ -92,6 +94,23 @@ const (
 	agentboxResultDirRel    = ".agentbox-output"
 	agentboxResultFile      = "result.json"
 	agentboxResultPathInCtr = agentboxWorkDirInContainer + "/" + agentboxResultDirRel + "/" + agentboxResultFile
+
+	// agentboxCacheDirInContainer is the shared module-cache + toolchain
+	// shelf — a Docker volume mounted into both the vendor phase (which
+	// populates it with the git token) and the agent phase (which builds /
+	// verifies offline against it). See PLAN_tasks_verification.md.
+	agentboxCacheDirInContainer = "/cache"
+	// agentboxGoModCache is GOMODCACHE on the shared volume — where the
+	// vendor phase's `go mod download` lands the module graph.
+	agentboxGoModCache = agentboxCacheDirInContainer + "/gomod"
+	// agentboxGoBuildCache is GOCACHE on tmpfs (build artifacts, never
+	// shared across phases — kept off the shelf).
+	agentboxGoBuildCache = "/tmp/gocache"
+	// goWorkspaceVersion is the `go` directive written into the generated
+	// /work/go.work. Must be >= every in-Step module's go directive and
+	// track the toolchain baked into the agentbox image (GO_VERSION in
+	// agentbox/Dockerfile) — bump them together.
+	goWorkspaceVersion = "1.24.11"
 	// agentboxProgressFile is the basename of the live snapshot agentbox
 	// writes (Phase 5.5b) next to result.json. Periodic, atomic via
 	// temp+rename, schema in agentbox/internal/progress.Snapshot.
@@ -112,6 +131,10 @@ const (
 	// usage. Phase 6 wires per-Task / per-org overrides via Task model
 	// field + Advanced UI.
 	defaultWallClockTimeout = 4 * time.Hour
+	// defaultVendorTimeout caps the dependency pre-fetch phase. `go mod
+	// download` of a large graph is minutes; 30m is generous headroom
+	// without letting a stuck private-registry fetch hang the Step.
+	defaultVendorTimeout = 30 * time.Minute
 	// containerStopGraceSec mirrors agentbox's own SIGTERM grace window
 	// (per PLAN_agentbox.md). After this many seconds, Docker promotes
 	// SIGTERM to SIGKILL.
@@ -172,6 +195,17 @@ const (
 	cpuCoresEnvVar    = "AGENTBOX_CPU_CORES"
 )
 
+// agentVerifyHosts are added to the agent-phase proxy allowlist so the
+// agent can resolve verify-time PUBLIC deps it newly adds — the Go module
+// proxy and the npm/yarn registries. Private hosts (github.com) are
+// deliberately NOT here: private deps come pre-vendored (Go module cache +
+// node_modules on the shared volume / work dir) and the agent holds no
+// token, so it can't fetch them directly anyway.
+var agentVerifyHosts = []string{
+	"proxy.golang.org", "sum.golang.org", // Go
+	"registry.npmjs.org", "registry.yarnpkg.com", // Node (npm / classic yarn)
+}
+
 func (rs *RunAgentStep) Run(parameters map[string]interface{}, logsWriter io.Writer) (newParameters map[string]interface{}, err error) {
 	defer func() {
 		if err != nil {
@@ -193,11 +227,41 @@ func (rs *RunAgentStep) Run(parameters map[string]interface{}, logsWriter io.Wri
 	if err := prepareAgentboxResultDir(workDirHost); err != nil {
 		return parameters, fmt.Errorf("error preparing agent result dir: %s", err)
 	}
-	envVars, err := buildAgentSpawnEnvVars(parameters)
+	// Two-phase model: a vendor container pre-fetches dependencies into a
+	// shared cache volume using the git token, then the credential-less
+	// agent container builds / verifies offline against it. The volume is
+	// per-Step and ephemeral — removed on the way out. See
+	// PLAN_tasks_verification.md.
+	cacheVolume := cacheVolumeName(ctx)
+	if err := createCacheVolume(cacheVolume); err != nil {
+		return parameters, fmt.Errorf("error creating cache volume: %s", err)
+	}
+	defer removeCacheVolume(cacheVolume)
+	vendorSpec, err := buildVendorSpec(imageRef, workDirHost, cacheVolume, ctx)
 	if err != nil {
 		return parameters, err
 	}
-	result, err := rs.spawnAgentboxAndWait(imageRef, workDirHost, envVars, logsWriter)
+	if err := rs.spawnVendorAndWait(vendorSpec, logsWriter); err != nil {
+		return parameters, fmt.Errorf("error vendoring dependencies: %s", err)
+	}
+	// Generate /work/go.work so the agent's verify resolves edits to one
+	// in-Step Go module against the others' LOCAL source rather than the
+	// pinned cached version. Deterministic + runner-side so it can't be
+	// forgotten. Lives at the /work root (outside any repo tree), so
+	// CommitAndPush — which walks /work/<idx>-<name>/ — never stages it.
+	if err := writeGoWorkspace(workDirHost, ctx.Entries); err != nil {
+		return parameters, fmt.Errorf("error writing go workspace: %s", err)
+	}
+	envVars, err := buildAgentSpawnEnvVars(parameters, ctx)
+	if err != nil {
+		return parameters, err
+	}
+	result, err := rs.spawnAgentboxAndWait(agentboxSpawnSpec{
+		imageRef:    imageRef,
+		workDirHost: workDirHost,
+		cacheVolume: cacheVolume,
+		env:         envVars,
+	}, logsWriter)
 	// User-stop path: agentbox SIGTERM-handled and wrote a partial
 	// /result.json (status="cancelled" with whatever progress it had).
 	// Merge that partial into JobOutput so token usage / denied hosts /
@@ -276,10 +340,17 @@ func prepareAgentboxResultDir(workDirHost string) error {
 // populated by deployment-server at Job pickup) with the per-Job spawn
 // parameters (StepPrompt, MaxTurns, etc.) and the fixed agentbox contract
 // vars (WORK_DIR, RESULT_PATH).
-func buildAgentSpawnEnvVars(parameters map[string]interface{}) ([]string, error) {
+func buildAgentSpawnEnvVars(parameters map[string]interface{}, ctx commandUtils.TaskJobContext) ([]string, error) {
 	env := map[string]string{
 		"WORK_DIR":    agentboxWorkDirInContainer,
 		"RESULT_PATH": agentboxResultPathInCtr,
+		// Offline-verify config: read the pre-vendored module graph from the
+		// shared volume; build artifacts go to tmpfs (off the shelf).
+		"GOMODCACHE": agentboxGoModCache,
+		"GOCACHE":    agentboxGoBuildCache,
+	}
+	if gp := deriveGoPrivate(ctx.Entries); gp != "" {
+		env["GOPRIVATE"] = gp
 	}
 	if creds, err := jobs.GetParameterValue[map[string]string](parameters, parameters_enums.AgentEnvVars); err == nil {
 		for k, v := range creds {
@@ -315,7 +386,7 @@ func buildAgentSpawnEnvVars(parameters map[string]interface{}) ([]string, error)
 	// internal artifact registry every runner needs reachable). Final
 	// value sent to agentbox is the union; agentbox then unions with
 	// the Driver's built-in allowlist inside its CONNECT proxy.
-	allowed := mergeAdditionalAllowedHosts(parameters)
+	allowed := appendHosts(mergeAdditionalAllowedHosts(parameters), agentVerifyHosts...)
 	if allowed != "" {
 		env["ADDITIONAL_ALLOWED_HOSTS"] = allowed
 	}
@@ -388,14 +459,14 @@ func mapToEnvSlice(env map[string]string) []string {
 // loop) drives a parallel polling goroutine that reads agentbox's
 // progress.json from the bind-mounted dir on its own cadence and
 // forwards each fresh snapshot. Nil sink skips the poller entirely.
-func (rs *RunAgentStep) spawnAgentboxAndWait(imageRef, workDirHost string, envVars []string, logsWriter io.Writer) (agentResult, error) {
+func (rs *RunAgentStep) spawnAgentboxAndWait(spec agentboxSpawnSpec, logsWriter io.Writer) (agentResult, error) {
 	dockerCtx := context.Background()
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
 		return agentResult{}, err
 	}
 	defer cli.Close()
-	containerID, err := createAgentboxContainer(dockerCtx, cli, imageRef, workDirHost, envVars)
+	containerID, err := createAgentboxContainer(dockerCtx, cli, spec)
 	if err != nil {
 		return agentResult{}, err
 	}
@@ -428,22 +499,22 @@ func (rs *RunAgentStep) spawnAgentboxAndWait(imageRef, workDirHost string, envVa
 	stopProgressPoll := make(chan struct{})
 	defer close(stopProgressPoll)
 	if rs.progressSink != nil {
-		go pollProgressFile(workDirHost, rs.progressSink, stopProgressPoll)
+		go pollProgressFile(spec.workDirHost, rs.progressSink, stopProgressPoll)
 	}
 	waitCtx, cancelWait := context.WithTimeout(dockerCtx, defaultWallClockTimeout)
 	defer cancelWait()
-	waitErr := waitForContainerExit(waitCtx, cli, containerID, rs.stopSignal)
+	_, waitErr := waitForContainerExit(waitCtx, cli, containerID, rs.stopSignal)
 	// On user-stop, return the partial result (caller merges into
 	// JobOutput) plus the stop sentinel error so the caller can route
 	// to the stop UX path. On other errors, propagate as-is.
 	if errors.Is(waitErr, types.ErrJobStoppedByUser) {
-		result, _ := readAgentResult(workDirHost) // best-effort; may be empty if SIGTERM grace expired
+		result, _ := readAgentResult(spec.workDirHost) // best-effort; may be empty if SIGTERM grace expired
 		return result, waitErr
 	}
 	if waitErr != nil {
 		return agentResult{}, waitErr
 	}
-	return readAgentResult(workDirHost)
+	return readAgentResult(spec.workDirHost)
 }
 
 // createAgentboxContainer wires the container config and host config.
@@ -468,20 +539,33 @@ func (rs *RunAgentStep) spawnAgentboxAndWait(imageRef, workDirHost string, envVa
 // covers the reachable threat model and avoids host-firewall blast
 // radius; revisit if cost-runaway or sandbox-escape incidents
 // materialize per PLAN_tasks.md Phase 5.4b notes.
-func createAgentboxContainer(ctx context.Context, cli *client.Client, imageRef, workDirHost string, envVars []string) (string, error) {
+func createAgentboxContainer(ctx context.Context, cli *client.Client, spec agentboxSpawnSpec) (string, error) {
 	cfg := &container.Config{
-		Image: imageRef,
-		Env:   envVars,
+		Image: spec.imageRef,
+		Env:   spec.env,
 		User:  "1000:1000",
 		Tty:   false,
 	}
+	// Empty Cmd → the image ENTRYPOINT runs agent mode; ["vendor"] selects
+	// the dependency pre-fetch subcommand.
+	if len(spec.cmd) > 0 {
+		cfg.Cmd = spec.cmd
+	}
 	memoryBytes, nanoCPUs := resolveContainerLimits()
+	mounts := []mount.Mount{{
+		Type:   mount.TypeBind,
+		Source: spec.workDirHost,
+		Target: agentboxWorkDirInContainer,
+	}}
+	if spec.cacheVolume != "" {
+		mounts = append(mounts, mount.Mount{
+			Type:   mount.TypeVolume,
+			Source: spec.cacheVolume,
+			Target: agentboxCacheDirInContainer,
+		})
+	}
 	hostCfg := &container.HostConfig{
-		Mounts: []mount.Mount{{
-			Type:   mount.TypeBind,
-			Source: workDirHost,
-			Target: agentboxWorkDirInContainer,
-		}},
+		Mounts: mounts,
 		CapDrop:        []string{"ALL"},
 		ReadonlyRootfs: true,
 		Tmpfs: map[string]string{
@@ -619,8 +703,8 @@ func streamContainerLogs(ctx context.Context, cli *client.Client, containerID st
 }
 
 // waitForContainerExit blocks until one of three things happens:
-//   - The container exits naturally (returns nil; non-zero exit codes
-//     are signaled via /result.json status, not as a wait error)
+//   - The container exits naturally (returns its exit code; for the agent
+//     phase the code is advisory since status flows via /result.json)
 //   - The wall-clock cap fires (returns a wrapped deadline error)
 //   - The user-stop signal fires (SIGTERM the container with grace,
 //     wait for it to actually exit so /result.json gets written, then
@@ -628,7 +712,7 @@ func streamContainerLogs(ctx context.Context, cli *client.Client, containerID st
 //
 // stopSignal can be nil — a nil channel never fires in select, so the
 // stop branch is silently skipped. Pre-Phase-5.5 behavior matches.
-func waitForContainerExit(ctx context.Context, cli *client.Client, containerID string, stopSignal <-chan struct{}) error {
+func waitForContainerExit(ctx context.Context, cli *client.Client, containerID string, stopSignal <-chan struct{}) (int, error) {
 	statusCh, errCh := cli.ContainerWait(ctx, containerID, container.WaitConditionNotRunning)
 	select {
 	case err := <-errCh:
@@ -640,14 +724,16 @@ func waitForContainerExit(ctx context.Context, cli *client.Client, containerID s
 			stopCtx := context.Background() // ContainerStop on a fresh context — the wait ctx is already done
 			grace := containerStopGraceSec
 			_ = cli.ContainerStop(stopCtx, containerID, container.StopOptions{Timeout: &grace})
-			return fmt.Errorf("agentbox exceeded wall-clock cap of %s — SIGTERM sent", defaultWallClockTimeout)
+			return 0, fmt.Errorf("agentbox exceeded wall-clock cap of %s — SIGTERM sent", defaultWallClockTimeout)
 		}
 		if err != nil {
-			return fmt.Errorf("error waiting for container exit: %s", err)
+			return 0, fmt.Errorf("error waiting for container exit: %s", err)
 		}
-	case <-statusCh:
-		// Container exited; non-zero exit code is signaled via /result.json
-		// status, not as a wait error. Surface that decision to the caller.
+	case status := <-statusCh:
+		// Container exited. Agent phase: the exit code is advisory (status
+		// flows via /result.json). Vendor phase: the caller treats a
+		// non-zero code as a dependency-fetch failure.
+		return int(status.StatusCode), nil
 	case <-stopSignal:
 		// User stopped the Job mid-run. SIGTERM the container with grace
 		// so agentbox flushes a partial /result.json (status="cancelled"),
@@ -662,9 +748,9 @@ func waitForContainerExit(ctx context.Context, cli *client.Client, containerID s
 		case <-statusCh:
 		case <-errCh:
 		}
-		return types.ErrJobStoppedByUser
+		return 0, types.ErrJobStoppedByUser
 	}
-	return nil
+	return 0, nil
 }
 
 func removeContainer(ctx context.Context, cli *client.Client, containerID string) error {
@@ -765,4 +851,228 @@ func mergeAgentResultIntoJobOutput(parameters map[string]interface{}, result age
 	}
 	jobs.SetParameterValue[string](parameters, parameters_enums.JobOutput, string(merged))
 	return nil
+}
+
+// agentboxSpawnSpec is the per-phase container configuration. An empty Cmd
+// runs the image's default agent mode; cacheVolume (when set) mounts the
+// shared module cache at /cache. Grouped into a struct to keep
+// createAgentboxContainer within the parameter limit.
+type agentboxSpawnSpec struct {
+	imageRef    string
+	workDirHost string
+	cacheVolume string
+	cmd         []string
+	env         []string
+}
+
+// spawnVendorAndWait runs the vendor container to completion, streaming its
+// logs. Honors the user-stop signal and a vendor-phase wall-clock cap.
+// Returns an error when the container exits non-zero — a dependency-fetch
+// failure that fails the Step before the agent runs (distinct from an
+// agent / verify failure). See PLAN_tasks_verification.md.
+func (rs *RunAgentStep) spawnVendorAndWait(spec agentboxSpawnSpec, logsWriter io.Writer) error {
+	io.WriteString(logsWriter, "Vendoring dependencies into shared cache\n")
+	dockerCtx := context.Background()
+	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		return err
+	}
+	defer cli.Close()
+	containerID, err := createAgentboxContainer(dockerCtx, cli, spec)
+	if err != nil {
+		return err
+	}
+	var logsWg sync.WaitGroup
+	defer logsWg.Wait()
+	defer func() { _ = removeContainer(dockerCtx, cli, containerID) }()
+	if err := cli.ContainerStart(dockerCtx, containerID, container.StartOptions{}); err != nil {
+		return fmt.Errorf("error starting vendor container: %s", err)
+	}
+	logsWg.Add(1)
+	go func() {
+		defer logsWg.Done()
+		streamContainerLogs(dockerCtx, cli, containerID, logsWriter)
+	}()
+	waitCtx, cancelWait := context.WithTimeout(dockerCtx, defaultVendorTimeout)
+	defer cancelWait()
+	code, waitErr := waitForContainerExit(waitCtx, cli, containerID, rs.stopSignal)
+	if waitErr != nil {
+		return waitErr
+	}
+	if code != 0 {
+		return fmt.Errorf("vendor phase exited with code %d", code)
+	}
+	return nil
+}
+
+// buildVendorSpec assembles the vendor-phase container spec: the `vendor`
+// subcommand, the shared cache mount, and the env it needs — WORK_DIR, the
+// Go module-cache path on the shared volume, the git token (consumed by
+// `agentbox vendor` to authenticate private fetches), and GOPRIVATE so the
+// Go toolchain fetches private modules via direct git rather than the
+// public proxy.
+func buildVendorSpec(imageRef, workDirHost, cacheVolume string, ctx commandUtils.TaskJobContext) (agentboxSpawnSpec, error) {
+	token, err := vendorGitToken(ctx)
+	if err != nil {
+		return agentboxSpawnSpec{}, fmt.Errorf("error getting installation token: %s", err)
+	}
+	env := map[string]string{
+		"WORK_DIR":   agentboxWorkDirInContainer,
+		"GOMODCACHE": agentboxGoModCache,
+		"GOCACHE":    agentboxGoBuildCache,
+	}
+	if token != "" {
+		env["GIT_TOKEN"] = token
+	}
+	if gp := deriveGoPrivate(ctx.Entries); gp != "" {
+		env["GOPRIVATE"] = gp
+	}
+	return agentboxSpawnSpec{
+		imageRef:    imageRef,
+		workDirHost: workDirHost,
+		cacheVolume: cacheVolume,
+		cmd:         []string{"vendor"},
+		env:         mapToEnvSlice(env),
+	}, nil
+}
+
+// vendorGitToken mints an installation token for the Step's repos. v1
+// assumes a single GitHub App installation (the deployment.io dogfood
+// shape); repos spanning multiple installations would each need their own
+// token, which the agentbox vendor phase's single github.com rewrite does
+// not yet support.
+func vendorGitToken(ctx commandUtils.TaskJobContext) (string, error) {
+	if len(ctx.Entries) == 0 {
+		return "", nil
+	}
+	return commandUtils.RefreshGitTokenForInstallation(ctx.Entries[0].InstallationID, ctx.OrganizationID)
+}
+
+// cacheVolumeName is the per-Step-Job Docker volume holding the shared
+// module cache. Scoped to (taskID, stepIndex) so concurrent Steps don't
+// collide and cleanup is unambiguous.
+func cacheVolumeName(ctx commandUtils.TaskJobContext) string {
+	return fmt.Sprintf("agentbox-cache-%s-%d", ctx.TaskID, ctx.StepIndex)
+}
+
+func createCacheVolume(name string) error {
+	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		return err
+	}
+	defer cli.Close()
+	_, err = cli.VolumeCreate(context.Background(), volume.CreateOptions{Name: name})
+	return err
+}
+
+// removeCacheVolume best-effort deletes the per-Step cache volume. Called
+// via defer; a leaked volume is reclaimable out of band, so failures here
+// are swallowed rather than masking the Step's real outcome.
+func removeCacheVolume(name string) {
+	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		return
+	}
+	defer cli.Close()
+	_ = cli.VolumeRemove(context.Background(), name, true)
+}
+
+// deriveGoPrivate returns a comma-separated GOPRIVATE covering the
+// host/owner of every in-Step repo, so the Go toolchain treats those
+// modules (and same-owner private deps) as private — fetched via direct
+// git with the vendor token rather than the public proxy. Empty when no
+// owner parses.
+func deriveGoPrivate(entries []tasks.RepositoryEntry) string {
+	seen := map[string]struct{}{}
+	var prefixes []string
+	for _, e := range entries {
+		p := hostOwnerFromCloneURL(e.CloneURL)
+		if p == "" {
+			continue
+		}
+		if _, ok := seen[p]; ok {
+			continue
+		}
+		seen[p] = struct{}{}
+		prefixes = append(prefixes, p)
+	}
+	return strings.Join(prefixes, ",")
+}
+
+// hostOwnerFromCloneURL extracts "host/owner" from an https or ssh clone
+// URL (e.g. https://github.com/acme/svc.git or git@github.com:acme/svc.git
+// → github.com/acme). Returns "" when the shape is unrecognized.
+func hostOwnerFromCloneURL(cloneURL string) string {
+	s := strings.TrimSpace(cloneURL)
+	s = strings.TrimSuffix(s, ".git")
+	if i := strings.Index(s, "://"); i >= 0 {
+		s = s[i+3:]
+		if at := strings.Index(s, "@"); at >= 0 {
+			s = s[at+1:] // strip userinfo
+		}
+	} else if at := strings.Index(s, "@"); at >= 0 {
+		s = s[at+1:]
+		s = strings.Replace(s, ":", "/", 1) // scp-like form → path form
+	}
+	parts := strings.Split(s, "/")
+	if len(parts) >= 2 && parts[0] != "" && parts[1] != "" {
+		return parts[0] + "/" + parts[1]
+	}
+	return ""
+}
+
+// appendHosts merges a comma-separated host list with extras, trimming and
+// de-duplicating while preserving first-seen order.
+func appendHosts(csv string, extra ...string) string {
+	seen := map[string]struct{}{}
+	var ordered []string
+	add := func(h string) {
+		h = strings.TrimSpace(h)
+		if h == "" {
+			return
+		}
+		if _, ok := seen[h]; ok {
+			return
+		}
+		seen[h] = struct{}{}
+		ordered = append(ordered, h)
+	}
+	for _, h := range strings.Split(csv, ",") {
+		add(h)
+	}
+	for _, h := range extra {
+		add(h)
+	}
+	return strings.Join(ordered, ",")
+}
+
+// writeGoWorkspace generates /work/go.work listing every in-Step repo that
+// is a Go module, so the agent's verify resolves cross-module edits against
+// local source. Only written when 2+ Go modules are present (coherence is
+// moot for a single module); non-Go repos (e.g. a TypeScript dashboard) are
+// excluded since `go` rejects a `use` directive for a dir without a go.mod.
+// The file sits at the /work root, outside any repo's git tree, so
+// CommitAndPush never stages it.
+func writeGoWorkspace(workDirHost string, entries []tasks.RepositoryEntry) error {
+	var uses []string
+	for idx, e := range entries {
+		rel := fmt.Sprintf("%d-%s", idx, e.Name)
+		if _, err := os.Stat(filepath.Join(workDirHost, rel, "go.mod")); err == nil {
+			uses = append(uses, "./"+rel)
+		}
+	}
+	if len(uses) < 2 {
+		return nil
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "go %s\n\nuse (\n", goWorkspaceVersion)
+	for _, u := range uses {
+		fmt.Fprintf(&b, "\t%s\n", u)
+	}
+	b.WriteString(")\n")
+	path := filepath.Join(workDirHost, "go.work")
+	if err := os.WriteFile(path, []byte(b.String()), 0o644); err != nil {
+		return err
+	}
+	return os.Chown(path, commandUtils.AgentboxUID, commandUtils.AgentboxGID)
 }
