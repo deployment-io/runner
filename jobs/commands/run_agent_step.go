@@ -281,6 +281,14 @@ func (rs *RunAgentStep) Run(parameters map[string]interface{}, logsWriter io.Wri
 	if result.Status != "success" {
 		return parameters, formatAgentFailure(result)
 	}
+	// Gate the commit on the agent's self-verification. Failing here stops
+	// the command chain before CommitAndPush, so code that failed build/test
+	// never reaches a commit or PR. ran==false is deliberately NOT gated — a
+	// docs-only or no-build change legitimately skips verify, and CI on PR
+	// open remains the backstop (see PLAN_tasks_verification.md Open Q6).
+	if vr := result.VerifyResult; vr != nil && vr.Ran && !vr.Passed {
+		return parameters, formatVerifyFailure(vr)
+	}
 	return parameters, nil
 }
 
@@ -784,6 +792,20 @@ type agentResult struct {
 	// PRTitle is the agent-produced short title for the resulting
 	// pull request. Distinct from ChangesSummary (longer, what + why).
 	PRTitle string `json:"pr_title,omitempty"`
+	// VerifyResult is the agent's self-reported build/test outcome. The
+	// runner gates the Step's commit on it (ran && !passed → fail before
+	// CommitAndPush). Nil when the agent reported none.
+	VerifyResult *verifyResult `json:"verify_result,omitempty"`
+}
+
+// verifyResult mirrors the fields of agentbox's result.json verify_result
+// that the runner consumes for the commit gate. agentbox also emits
+// duration/stdout/stderr tails; the runner doesn't need them here.
+type verifyResult struct {
+	Ran           bool   `json:"ran"`
+	Passed        bool   `json:"passed"`
+	Command       string `json:"command,omitempty"`
+	SkippedReason string `json:"skipped_reason,omitempty"`
 }
 
 // tokenUsage mirrors agentbox's /result.json token_usage object. Agentbox
@@ -809,6 +831,18 @@ func formatAgentFailure(result agentResult) error {
 		"agent step did not succeed: status=%s exit_code=%d error=%q",
 		result.Status, result.ExitCode, result.Error,
 	)
+}
+
+// formatVerifyFailure is returned when the agent's self-verification ran and
+// failed — failing the Step before CommitAndPush so broken code never lands.
+// The agent's changes_summary (already merged into JobOutput) carries the
+// narrative; this names the command for the Re-run-with-feedback signal.
+func formatVerifyFailure(vr *verifyResult) error {
+	cmd := vr.Command
+	if cmd == "" {
+		cmd = "(unspecified command)"
+	}
+	return fmt.Errorf("agent self-verification failed: %s", cmd)
 }
 
 func readAgentResult(workDirHost string) (agentResult, error) {
