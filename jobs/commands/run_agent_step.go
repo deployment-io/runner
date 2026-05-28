@@ -16,7 +16,6 @@ import (
 
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
-	"github.com/deployment-io/deployment-runner-kit/tasks"
 	"github.com/deployment-io/deployment-runner-kit/types"
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
 	"github.com/docker/docker/api/types/container"
@@ -98,19 +97,10 @@ const (
 	// agentboxCacheDirInContainer is the shared module-cache + toolchain
 	// shelf — a Docker volume mounted into both the vendor phase (which
 	// populates it with the git token) and the agent phase (which builds /
-	// verifies offline against it). See PLAN_tasks_verification.md.
+	// verifies offline against it). Passed to agentbox as AGENTBOX_CACHE_DIR;
+	// agentbox maps it per language (GOMODCACHE, etc.) so the runner stays
+	// language-agnostic. See PLAN_tasks_verification.md.
 	agentboxCacheDirInContainer = "/cache"
-	// agentboxGoModCache is GOMODCACHE on the shared volume — where the
-	// vendor phase's `go mod download` lands the module graph.
-	agentboxGoModCache = agentboxCacheDirInContainer + "/gomod"
-	// agentboxGoBuildCache is GOCACHE on tmpfs (build artifacts, never
-	// shared across phases — kept off the shelf).
-	agentboxGoBuildCache = "/tmp/gocache"
-	// goWorkspaceVersion is the `go` directive written into the generated
-	// /work/go.work. Must be >= every in-Step module's go directive and
-	// track the toolchain baked into the agentbox image (GO_VERSION in
-	// agentbox/Dockerfile) — bump them together.
-	goWorkspaceVersion = "1.24.11"
 	// agentboxProgressFile is the basename of the live snapshot agentbox
 	// writes (Phase 5.5b) next to result.json. Periodic, atomic via
 	// temp+rename, schema in agentbox/internal/progress.Snapshot.
@@ -195,17 +185,6 @@ const (
 	cpuCoresEnvVar    = "AGENTBOX_CPU_CORES"
 )
 
-// agentVerifyHosts are added to the agent-phase proxy allowlist so the
-// agent can resolve verify-time PUBLIC deps it newly adds — the Go module
-// proxy and the npm/yarn registries. Private hosts (github.com) are
-// deliberately NOT here: private deps come pre-vendored (Go module cache +
-// node_modules on the shared volume / work dir) and the agent holds no
-// token, so it can't fetch them directly anyway.
-var agentVerifyHosts = []string{
-	"proxy.golang.org", "sum.golang.org", // Go
-	"registry.npmjs.org", "registry.yarnpkg.com", // Node (npm / classic yarn)
-}
-
 func (rs *RunAgentStep) Run(parameters map[string]interface{}, logsWriter io.Writer) (newParameters map[string]interface{}, err error) {
 	defer func() {
 		if err != nil {
@@ -244,15 +223,7 @@ func (rs *RunAgentStep) Run(parameters map[string]interface{}, logsWriter io.Wri
 	if err := rs.spawnVendorAndWait(vendorSpec, logsWriter); err != nil {
 		return parameters, fmt.Errorf("error vendoring dependencies: %s", err)
 	}
-	// Generate /work/go.work so the agent's verify resolves edits to one
-	// in-Step Go module against the others' LOCAL source rather than the
-	// pinned cached version. Deterministic + runner-side so it can't be
-	// forgotten. Lives at the /work root (outside any repo tree), so
-	// CommitAndPush — which walks /work/<idx>-<name>/ — never stages it.
-	if err := writeGoWorkspace(workDirHost, ctx.Entries); err != nil {
-		return parameters, fmt.Errorf("error writing go workspace: %s", err)
-	}
-	envVars, err := buildAgentSpawnEnvVars(parameters, ctx)
+	envVars, err := buildAgentSpawnEnvVars(parameters)
 	if err != nil {
 		return parameters, err
 	}
@@ -348,17 +319,13 @@ func prepareAgentboxResultDir(workDirHost string) error {
 // populated by deployment-server at Job pickup) with the per-Job spawn
 // parameters (StepPrompt, MaxTurns, etc.) and the fixed agentbox contract
 // vars (WORK_DIR, RESULT_PATH).
-func buildAgentSpawnEnvVars(parameters map[string]interface{}, ctx commandUtils.TaskJobContext) ([]string, error) {
+func buildAgentSpawnEnvVars(parameters map[string]interface{}) ([]string, error) {
 	env := map[string]string{
 		"WORK_DIR":    agentboxWorkDirInContainer,
 		"RESULT_PATH": agentboxResultPathInCtr,
-		// Offline-verify config: read the pre-vendored module graph from the
-		// shared volume; build artifacts go to tmpfs (off the shelf).
-		"GOMODCACHE": agentboxGoModCache,
-		"GOCACHE":    agentboxGoBuildCache,
-	}
-	if gp := deriveGoPrivate(ctx.Entries); gp != "" {
-		env["GOPRIVATE"] = gp
+		// The shared cache mount. agentbox maps it per language (GOMODCACHE,
+		// etc.) — the runner stays language-agnostic.
+		"AGENTBOX_CACHE_DIR": agentboxCacheDirInContainer,
 	}
 	if creds, err := jobs.GetParameterValue[map[string]string](parameters, parameters_enums.AgentEnvVars); err == nil {
 		for k, v := range creds {
@@ -394,7 +361,7 @@ func buildAgentSpawnEnvVars(parameters map[string]interface{}, ctx commandUtils.
 	// internal artifact registry every runner needs reachable). Final
 	// value sent to agentbox is the union; agentbox then unions with
 	// the Driver's built-in allowlist inside its CONNECT proxy.
-	allowed := appendHosts(mergeAdditionalAllowedHosts(parameters), agentVerifyHosts...)
+	allowed := mergeAdditionalAllowedHosts(parameters)
 	if allowed != "" {
 		env["ADDITIONAL_ALLOWED_HOSTS"] = allowed
 	}
@@ -940,26 +907,20 @@ func (rs *RunAgentStep) spawnVendorAndWait(spec agentboxSpawnSpec, logsWriter io
 }
 
 // buildVendorSpec assembles the vendor-phase container spec: the `vendor`
-// subcommand, the shared cache mount, and the env it needs — WORK_DIR, the
-// Go module-cache path on the shared volume, the git token (consumed by
-// `agentbox vendor` to authenticate private fetches), and GOPRIVATE so the
-// Go toolchain fetches private modules via direct git rather than the
-// public proxy.
+// subcommand, the shared cache mount (AGENTBOX_CACHE_DIR), and the git token
+// `agentbox vendor` uses to authenticate private fetches. Language-specific
+// env (GOMODCACHE/GOPRIVATE/etc.) is set inside agentbox, not here.
 func buildVendorSpec(imageRef, workDirHost, cacheVolume string, ctx commandUtils.TaskJobContext) (agentboxSpawnSpec, error) {
 	token, err := vendorGitToken(ctx)
 	if err != nil {
 		return agentboxSpawnSpec{}, fmt.Errorf("error getting installation token: %s", err)
 	}
 	env := map[string]string{
-		"WORK_DIR":   agentboxWorkDirInContainer,
-		"GOMODCACHE": agentboxGoModCache,
-		"GOCACHE":    agentboxGoBuildCache,
+		"WORK_DIR":           agentboxWorkDirInContainer,
+		"AGENTBOX_CACHE_DIR": agentboxCacheDirInContainer,
 	}
 	if token != "" {
 		env["GIT_TOKEN"] = token
-	}
-	if gp := deriveGoPrivate(ctx.Entries); gp != "" {
-		env["GOPRIVATE"] = gp
 	}
 	return agentboxSpawnSpec{
 		imageRef:    imageRef,
@@ -1011,102 +972,6 @@ func removeCacheVolume(name string) {
 	_ = cli.VolumeRemove(context.Background(), name, true)
 }
 
-// deriveGoPrivate returns a comma-separated GOPRIVATE covering the
-// host/owner of every in-Step repo, so the Go toolchain treats those
-// modules (and same-owner private deps) as private — fetched via direct
-// git with the vendor token rather than the public proxy. Empty when no
-// owner parses.
-func deriveGoPrivate(entries []tasks.RepositoryEntry) string {
-	seen := map[string]struct{}{}
-	var prefixes []string
-	for _, e := range entries {
-		p := hostOwnerFromCloneURL(e.CloneURL)
-		if p == "" {
-			continue
-		}
-		if _, ok := seen[p]; ok {
-			continue
-		}
-		seen[p] = struct{}{}
-		prefixes = append(prefixes, p)
-	}
-	return strings.Join(prefixes, ",")
-}
-
-// hostOwnerFromCloneURL extracts "host/owner" from an https or ssh clone
-// URL (e.g. https://github.com/acme/svc.git or git@github.com:acme/svc.git
-// → github.com/acme). Returns "" when the shape is unrecognized.
-func hostOwnerFromCloneURL(cloneURL string) string {
-	s := strings.TrimSpace(cloneURL)
-	s = strings.TrimSuffix(s, ".git")
-	if i := strings.Index(s, "://"); i >= 0 {
-		s = s[i+3:]
-		if at := strings.Index(s, "@"); at >= 0 {
-			s = s[at+1:] // strip userinfo
-		}
-	} else if at := strings.Index(s, "@"); at >= 0 {
-		s = s[at+1:]
-		s = strings.Replace(s, ":", "/", 1) // scp-like form → path form
-	}
-	parts := strings.Split(s, "/")
-	if len(parts) >= 2 && parts[0] != "" && parts[1] != "" {
-		return parts[0] + "/" + parts[1]
-	}
-	return ""
-}
-
-// appendHosts merges a comma-separated host list with extras, trimming and
-// de-duplicating while preserving first-seen order.
-func appendHosts(csv string, extra ...string) string {
-	seen := map[string]struct{}{}
-	var ordered []string
-	add := func(h string) {
-		h = strings.TrimSpace(h)
-		if h == "" {
-			return
-		}
-		if _, ok := seen[h]; ok {
-			return
-		}
-		seen[h] = struct{}{}
-		ordered = append(ordered, h)
-	}
-	for _, h := range strings.Split(csv, ",") {
-		add(h)
-	}
-	for _, h := range extra {
-		add(h)
-	}
-	return strings.Join(ordered, ",")
-}
-
-// writeGoWorkspace generates /work/go.work listing every in-Step repo that
-// is a Go module, so the agent's verify resolves cross-module edits against
-// local source. Only written when 2+ Go modules are present (coherence is
-// moot for a single module); non-Go repos (e.g. a TypeScript dashboard) are
-// excluded since `go` rejects a `use` directive for a dir without a go.mod.
-// The file sits at the /work root, outside any repo's git tree, so
-// CommitAndPush never stages it.
-func writeGoWorkspace(workDirHost string, entries []tasks.RepositoryEntry) error {
-	var uses []string
-	for idx, e := range entries {
-		rel := fmt.Sprintf("%d-%s", idx, e.Name)
-		if _, err := os.Stat(filepath.Join(workDirHost, rel, "go.mod")); err == nil {
-			uses = append(uses, "./"+rel)
-		}
-	}
-	if len(uses) < 2 {
-		return nil
-	}
-	var b strings.Builder
-	fmt.Fprintf(&b, "go %s\n\nuse (\n", goWorkspaceVersion)
-	for _, u := range uses {
-		fmt.Fprintf(&b, "\t%s\n", u)
-	}
-	b.WriteString(")\n")
-	path := filepath.Join(workDirHost, "go.work")
-	if err := os.WriteFile(path, []byte(b.String()), 0o644); err != nil {
-		return err
-	}
-	return os.Chown(path, commandUtils.AgentboxUID, commandUtils.AgentboxGID)
-}
+// (Language-specific helpers — GOPRIVATE derivation, go.work generation,
+// per-language verify hosts — now live in agentbox's detector registry, so
+// the runner stays language-agnostic. See PLAN_tasks_verification.md.)
