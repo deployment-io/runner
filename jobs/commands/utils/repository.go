@@ -109,7 +109,6 @@ func FetchRepository(repository *git.Repository, repoProviderToken, repoGitProvi
 			Password: repoProviderToken,
 		},
 		RemoteName: "origin",
-		Progress:   logsWriter,
 		Force:      true,
 	})
 
@@ -214,8 +213,7 @@ func CloneRepository(repoDirectoryPath, repoCloneUrlWithToken, repoProviderToken
 	username := GetUsernameForProvider(repoGitProvider)
 
 	repository, err := git.PlainClone(repoDirectoryPath, false, &git.CloneOptions{
-		URL:      repoCloneUrlWithToken,
-		Progress: logsWriter,
+		URL: repoCloneUrlWithToken,
 		Auth: &http.BasicAuth{
 			Username: username,
 			Password: repoProviderToken,
