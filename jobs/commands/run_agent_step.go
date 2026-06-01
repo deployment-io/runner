@@ -199,7 +199,7 @@ func (rs *RunAgentStep) Run(parameters map[string]interface{}, logsWriter io.Wri
 	if err != nil {
 		return parameters, fmt.Errorf("agentbox image missing: %s", err)
 	}
-	if err := pullAgentboxImage(imageRef, logsWriter); err != nil {
+	if err := pullAgentboxImage(imageRef); err != nil {
 		return parameters, fmt.Errorf("error pulling agentbox image: %s", err)
 	}
 	workDirHost := commandUtils.GetTaskRepositoriesBaseDir(ctx.OrganizationID, ctx.TaskID)
@@ -270,7 +270,7 @@ func (rs *RunAgentStep) Run(parameters map[string]interface{}, logsWriter io.Wri
 // layer-extraction conflicts.
 var agentboxImagePullLock sync.Mutex
 
-func pullAgentboxImage(imageRef string, logsWriter io.Writer) error {
+func pullAgentboxImage(imageRef string) error {
 	agentboxImagePullLock.Lock()
 	defer agentboxImagePullLock.Unlock()
 	dockerCtx, cancel := context.WithTimeout(context.Background(), defaultImagePullTimeout)
@@ -280,7 +280,6 @@ func pullAgentboxImage(imageRef string, logsWriter io.Writer) error {
 		return err
 	}
 	defer cli.Close()
-	io.WriteString(logsWriter, fmt.Sprintf("Pulling agentbox image: %s\n", imageRef))
 	reader, err := cli.ImagePull(dockerCtx, imageRef, image.PullOptions{})
 	if err != nil {
 		return err
