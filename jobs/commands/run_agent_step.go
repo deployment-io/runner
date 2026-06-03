@@ -348,6 +348,9 @@ func buildAgentSpawnEnvVars(parameters map[string]interface{}) ([]string, error)
 	if v, err := jobs.GetParameterValue[string](parameters, parameters_enums.ClaudeCodeVersion); err == nil && v != "" {
 		env["CLAUDE_CODE_VERSION"] = v
 	}
+	if v, err := jobs.GetParameterValue[string](parameters, parameters_enums.CodexVersion); err == nil && v != "" {
+		env["CODEX_VERSION"] = v
+	}
 	if v, err := jobs.GetParameterValue[int64](parameters, parameters_enums.MaxTurns); err == nil && v > 0 {
 		env["MAX_TURNS"] = strconv.FormatInt(v, 10)
 	}
@@ -539,7 +542,7 @@ func createAgentboxContainer(ctx context.Context, cli *client.Client, spec agent
 		})
 	}
 	hostCfg := &container.HostConfig{
-		Mounts: mounts,
+		Mounts:         mounts,
 		CapDrop:        []string{"ALL"},
 		ReadonlyRootfs: true,
 		Tmpfs: map[string]string{
