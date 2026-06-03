@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 
 	"github.com/deployment-io/deployment-runner-kit/tasks"
+	"github.com/deployment-io/deployment-runner/client"
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
@@ -77,6 +78,36 @@ func (tc *taskCheckout) refreshToken(installationID string) (string, error) {
 	return token, nil
 }
 
+// shouldUseExistingTaskBranch decides whether the first Step of a Task
+// should iterate on an existing PR (Q15) or branch off base from scratch.
+// Asks deployment-server for the most recent PR matching this repo's
+// task branch:
+//   - Open PR exists → true (caller should fetchAndCheckoutTaskBranch,
+//     so the agent's commits stack on the PR's existing tip and the
+//     push fast-forwards).
+//   - Merged PR     → returns an error (re-running a merged Task is
+//     semantically nonsense; the work is already in base).
+//   - Closed-unmerged or never-existed PR → false (caller should
+//     branch off base — true first-run path).
+//
+// Any RPC failure (deployment-server older than this PR's deploy,
+// provider not supporting the optional interface, transient network)
+// degrades gracefully to false. Same effective behavior as before Q15,
+// just less informative. Logged so the runner-side ops can see when
+// the new path falls back.
+func (tc *taskCheckout) shouldUseExistingTaskBranch(entry tasks.RepositoryEntry) (bool, error) {
+	result, err := client.Get().GetOpenPullRequestForBranch(tc.ctx.OrganizationID, entry.InstallationID, entry.Name, tc.ctx.BranchName)
+	if err != nil {
+		io.WriteString(tc.logsWriter, fmt.Sprintf("Could not check existing PR for %s (falling back to base): %s\n", entry.Name, err))
+		return false, nil
+	}
+	if result.Found && result.State == "closed" && result.Merged {
+		return false, fmt.Errorf("cannot re-run task: PR #%d for %s is merged (%s); create a new task to extend it further",
+			result.PRNumber, entry.Name, result.URL)
+	}
+	return result.Found && result.State == "open", nil
+}
+
 // checkoutOne clones one repo and positions it on the right branch for the
 // current Step.
 func (tc *taskCheckout) checkoutOne(repoDir string, entry tasks.RepositoryEntry) error {
@@ -93,8 +124,26 @@ func (tc *taskCheckout) checkoutOne(repoDir string, entry tasks.RepositoryEntry)
 		return fmt.Errorf("error getting worktree: %s", err)
 	}
 	if tc.ctx.StepIndex == 0 {
-		if err := checkoutBaseBranchAndCreateTaskBranch(worktree, entry.BaseBranch, tc.ctx.BranchName); err != nil {
+		// First-Step path. For a fresh first run, branch off base and
+		// create the task branch locally. For a re-run, the dashboard
+		// has already pushed a PR for the task branch — the agent
+		// should iterate on it, not start over from base (Q15 in
+		// PLAN_tasks_verification.md). Branching from base when an
+		// open PR exists leads to sibling commits and a
+		// non-fast-forward push that silently drops the agent's
+		// verified work.
+		useExisting, err := tc.shouldUseExistingTaskBranch(entry)
+		if err != nil {
 			return err
+		}
+		if useExisting {
+			if err := tc.fetchAndCheckoutTaskBranch(repository, worktree, entry, token); err != nil {
+				return err
+			}
+		} else {
+			if err := checkoutBaseBranchAndCreateTaskBranch(worktree, entry.BaseBranch, tc.ctx.BranchName); err != nil {
+				return err
+			}
 		}
 	} else {
 		if err := tc.fetchAndCheckoutTaskBranch(repository, worktree, entry, token); err != nil {
