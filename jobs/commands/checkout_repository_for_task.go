@@ -198,15 +198,31 @@ func (tc *taskCheckout) cloneWithRetry(repoDir string, entry tasks.RepositoryEnt
 	return repository, token, err
 }
 
-// fetchAndCheckoutTaskBranch is the StepIndex>0 path: pull the shared Task
-// branch (where prior Steps pushed) and check it out so this Step's commits
-// stack on top.
+// fetchAndCheckoutTaskBranch is the StepIndex>0 / Q15-re-run path: pull the
+// shared Task branch (where prior Steps or the dashboard's first PR push
+// landed) and check it out so this Step's commits stack on top.
+//
+// Materializes the fetched remote ref as a local branch ref before
+// checking out. Without this step we'd be checking out refs/remotes/origin/<branch>
+// directly, which puts HEAD in detached state. The agent's commits
+// would advance detached HEAD but not refs/heads/<branch>, and
+// commit_and_push.go's push refspec ("refs/heads/<branch>:refs/heads/<branch>")
+// would find no new local commits to send — go-git reports "already
+// up-to-date" and the verified work is silently dropped on the floor.
 func (tc *taskCheckout) fetchAndCheckoutTaskBranch(repository *git.Repository, worktree *git.Worktree, entry tasks.RepositoryEntry, token string) error {
 	if err := tc.fetchWithRetry(repository, entry, token); err != nil {
 		return err
 	}
-	taskBranchRef := plumbing.NewRemoteReferenceName("origin", tc.ctx.BranchName)
-	if err := worktree.Checkout(&git.CheckoutOptions{Branch: taskBranchRef}); err != nil {
+	remoteRefName := plumbing.NewRemoteReferenceName("origin", tc.ctx.BranchName)
+	remoteRef, err := repository.Reference(remoteRefName, true)
+	if err != nil {
+		return fmt.Errorf("error resolving fetched ref for task branch %s: %s", tc.ctx.BranchName, err)
+	}
+	localRefName := plumbing.NewBranchReferenceName(tc.ctx.BranchName)
+	if err := repository.Storer.SetReference(plumbing.NewHashReference(localRefName, remoteRef.Hash())); err != nil {
+		return fmt.Errorf("error creating local task branch %s: %s", tc.ctx.BranchName, err)
+	}
+	if err := worktree.Checkout(&git.CheckoutOptions{Branch: localRefName}); err != nil {
 		return fmt.Errorf("error checking out task branch %s: %s", tc.ctx.BranchName, err)
 	}
 	return nil
