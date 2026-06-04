@@ -126,7 +126,11 @@ func executeJobs(jobsStream <-chan pendingJobType, noOfWorkers int, mode runner_
 							case <-stopJobSignal:
 								errStoppedByUser := types.ErrJobStoppedByUser
 								handleLogEnd(errStoppedByUser, pendingJob.jobID, logsWriter)
-								result := getJobResult(pendingJob, errStoppedByUser.Error(), nil)
+								// Pass parameters (not nil) so any JobOutput merged by
+								// prior commands — e.g. RunAgentStep's partial agent
+								// block with token usage / cost — is persisted for the
+								// stopped Job rather than silently dropped.
+								result := getJobResult(pendingJob, errStoppedByUser.Error(), parameters)
 								resultsStream <- result
 								//if job is a deployment/build/preview type, this will be marked them done;
 								//if it's a Task Step Job, the per-Task working dir is cleaned up instead
@@ -140,7 +144,7 @@ func executeJobs(jobsStream <-chan pendingJobType, noOfWorkers int, mode runner_
 								command, err := commands.Get(commandEnum)
 								if err != nil {
 									handleLogEnd(err, pendingJob.jobID, logsWriter)
-									result := getJobResult(pendingJob, err.Error(), nil)
+									result := getJobResult(pendingJob, err.Error(), parameters)
 									resultsStream <- result
 									return
 								}
@@ -170,7 +174,11 @@ func executeJobs(jobsStream <-chan pendingJobType, noOfWorkers int, mode runner_
 								parameters, err = command.Run(parameters, logsWriter)
 								if err != nil {
 									handleLogEnd(err, pendingJob.jobID, logsWriter)
-									result := getJobResult(pendingJob, err.Error(), nil)
+									// Pass parameters (not nil): RunAgentStep merges its
+									// partial result (token usage / cost / changes summary)
+									// into JobOutput before returning a failure or stop, so
+									// preserve it for the failed/stopped Job's projection.
+									result := getJobResult(pendingJob, err.Error(), parameters)
 									resultsStream <- result
 									return
 								}
