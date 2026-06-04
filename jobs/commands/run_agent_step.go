@@ -755,7 +755,12 @@ type agentResult struct {
 	// "Turn 0" on completed runs even when liveProgress had been replaced
 	// by the final result.json. Carried through to agentOutput by
 	// mergeAgentResultIntoJobOutput so app-server's projection picks it up.
-	Turns       int      `json:"turns,omitempty"`
+	Turns int `json:"turns,omitempty"`
+	// CostUSD is the agent's self-reported total run cost in USD (agentbox
+	// Outcome.CostUSD, emitted as "cost_usd"). Present for Claude Code; nil
+	// for Codex (token usage only). Carried through to agentOutput by
+	// mergeAgentResultIntoJobOutput so app-server's projection can show it.
+	CostUSD     *float64 `json:"cost_usd,omitempty"`
 	Error       string   `json:"error,omitempty"`
 	DeniedHosts []string `json:"denied_hosts,omitempty"`
 	// PRTitle is the agent-produced short title for the resulting
@@ -844,6 +849,7 @@ func mergeAgentResultIntoJobOutput(parameters map[string]interface{}, result age
 		ChangesSummary: result.ChangesSummary,
 		TokenUsage:     result.TokenUsage,
 		Turns:          result.Turns,
+		CostUSD:        result.CostUSD,
 		ExitCode:       result.ExitCode,
 		DeniedHosts:    result.DeniedHosts,
 		PRTitle:        result.PRTitle,
