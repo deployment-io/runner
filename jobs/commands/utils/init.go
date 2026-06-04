@@ -15,11 +15,13 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner-kit/notifications"
 	"github.com/deployment-io/deployment-runner-kit/previews"
+	"github.com/deployment-io/deployment-runner-kit/tasks"
 	"github.com/deployment-io/deployment-runner-kit/vpcs"
 	"github.com/deployment-io/deployment-runner/client"
 )
 
 var UpdateBuildsPipeline *goPipeline.Pipeline[string, builds.UpdateBuildDtoV1]
+var UpdateTasksPipeline *goPipeline.Pipeline[string, tasks.UpdateTaskStepRunningDtoV1]
 var UpdatePreviewsPipeline *goPipeline.Pipeline[string, previews.UpdatePreviewDtoV1]
 var SendNotificationPipeline *goPipeline.Pipeline[string, notifications.SendNotificationDtoV1]
 var UpdateDeploymentsPipeline *goPipeline.Pipeline[string, deployments.UpdateDeploymentDtoV1]
@@ -31,6 +33,7 @@ var UpdateAutomationOutputPipeline *goPipeline.Pipeline[string, automations.Upda
 var UpdateAgentOutputPipeline *goPipeline.Pipeline[string, agentTypes.UpdateResponseDtoV1]
 
 func Shutdown() {
+	UpdateTasksPipeline.Shutdown()
 	UpdateBuildsPipeline.Shutdown()
 	UpdatePreviewsPipeline.Shutdown()
 	UpdateDeploymentsPipeline.Shutdown()
@@ -45,6 +48,19 @@ func Shutdown() {
 
 func Init() {
 	c := client.Get()
+	UpdateTasksPipeline, _ = goPipeline.NewPipeline(5, 10*time.Second,
+		func(organizationId string, updates []tasks.UpdateTaskStepRunningDtoV1) {
+			e := true
+			for e {
+				err := c.UpdateTasks(updates, organizationId)
+				if err != nil {
+					fmt.Println(err)
+					time.Sleep(2 * time.Second)
+					continue
+				}
+				e = false
+			}
+		})
 	UpdateBuildsPipeline, _ = goPipeline.NewPipeline(5, 10*time.Second,
 		func(organizationId string, builds []builds.UpdateBuildDtoV1) {
 			e := true

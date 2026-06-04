@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
+	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner-kit/tasks"
 	"github.com/deployment-io/deployment-runner/client"
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
@@ -27,6 +29,17 @@ func (cr *CheckoutRepository) runForTask(parameters map[string]interface{}, logs
 	if err != nil {
 		return parameters, err
 	}
+	// Report the Step as started — the runner has begun this Step, so flip the
+	// Task -> Running and Step -> StepRunning now (mirrors how builds report
+	// build_enums.Running at checkout), replacing the premature "Running at job
+	// creation". Best-effort + batched; the control-plane update is gated, so a
+	// no-op (already advanced / cancelled) is harmless.
+	jobID, _ := jobs.GetParameterValue[string](parameters, parameters_enums.JobID)
+	commandUtils.UpdateTasksPipeline.Add(ctx.OrganizationID, tasks.UpdateTaskStepRunningDtoV1{
+		TaskID:    ctx.TaskID,
+		StepIndex: int(ctx.StepIndex),
+		JobID:     jobID,
+	})
 	tc := &taskCheckout{
 		ctx:        ctx,
 		tokenCache: make(map[string]string),
