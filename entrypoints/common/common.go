@@ -120,7 +120,7 @@ func executeJobs(jobsStream <-chan pendingJobType, noOfWorkers int, mode runner_
 						// LiveProgress on the heartbeat, server skips the
 						// progress write.
 						var liveProgress atomic.Pointer[jobs.LiveProgressV1]
-						stopJobSignal := getJobStopSignal(pendingJob, jobDoneSignal, c, &liveProgress)
+						stopJobSignal := getJobStopSignal(pendingJob, jobDoneSignal, c, &liveProgress, logsWriter)
 						for _, commandEnum := range pendingJob.commandEnums {
 							select {
 							case <-stopJobSignal:
@@ -239,7 +239,7 @@ func executeJobs(jobsStream <-chan pendingJobType, noOfWorkers int, mode runner_
 // Consumers don't need to change — `case <-jobStopSignal:` reads the
 // zero value from a closed channel just as it would have read the
 // sent struct{}{}. Both fire the case identically.
-func getJobStopSignal(job pendingJobType, jobDoneSignal <-chan struct{}, c *client.RunnerClient, liveProgress *atomic.Pointer[jobs.LiveProgressV1]) <-chan struct{} {
+func getJobStopSignal(job pendingJobType, jobDoneSignal <-chan struct{}, c *client.RunnerClient, liveProgress *atomic.Pointer[jobs.LiveProgressV1], logsWriter io.Writer) <-chan struct{} {
 	jobStopSignal := make(chan struct{})
 	go func() {
 		defer close(jobStopSignal)
@@ -251,6 +251,11 @@ func getJobStopSignal(job pendingJobType, jobDoneSignal <-chan struct{}, c *clie
 				//ignoring error in client
 				isStopping, _ := c.UpsertJobHeartbeat(job.jobID, job.organizationID, liveProgress.Load())
 				if isStopping {
+					// Surface the stop in the job's log stream so the user sees
+					// the runner acting on their request (a Task Step SIGTERMs
+					// its agent; a build aborts) instead of the stream going
+					// quiet until the cancelled result lands.
+					io.WriteString(logsWriter, "Stop requested by user. Stopping...\n")
 					return // deferred close broadcasts to all readers
 				}
 			}
