@@ -46,6 +46,16 @@ func (rs *RunAssistantSession) SetStopSignal(stop <-chan struct{}) {
 const (
 	sessionPromptInContainer = agentboxWorkDirInContainer + "/.agentbox-input/system-prompt.txt"
 	sessionPollInterval      = 750 * time.Millisecond
+	// sessionWallClockHardCap is the runner-side backstop on a session
+	// container's lifetime. The REAL wall-clock enforcement is the
+	// deployment-server idle/wall-clock cron (default 4h, honors the session's
+	// WallClockMaxHours), which MarkStopping's the Job → a clean, graceful end.
+	// This cap is deliberately well above that so the cron always wins; it only
+	// fires if the server never stops the session (server unreachable / broken
+	// heartbeat) — a genuinely orphaned container, where reporting failed is
+	// acceptable. Equal caps would race and mislabel a normal time-limit end as
+	// Failed, so keep this strictly larger than the server's max.
+	sessionWallClockHardCap = 8 * time.Hour
 )
 
 // planModePrompt instructs the agent for a read-only, plan-mode session. Kept
@@ -205,7 +215,7 @@ func (rs *RunAssistantSession) runSession(orgID, jobID, imageRef, workDirHost st
 	}
 	ip := &inputPump{
 		dir:   filepath.Join(workDirHost, ".agentbox-input", "messages"),
-		orgID: orgID, jobID: jobID, logsWriter: logsWriter,
+		orgID: orgID, jobID: jobID, logsWriter: logsWriter, seen: map[string]bool{},
 	}
 	sf := &specForwarder{
 		path:  filepath.Join(workDirHost, ".agentbox-output", "task-spec.json"),
@@ -218,7 +228,7 @@ func (rs *RunAssistantSession) runSession(orgID, jobID, imageRef, workDirHost st
 	go func() { defer bridgeWg.Done(); runSessionTicker(stopBridge, ip.tick) }()
 	go func() { defer bridgeWg.Done(); runSessionTicker(stopBridge, sf.tick) }()
 
-	waitCtx, cancelWait := context.WithTimeout(dockerCtx, defaultWallClockTimeout)
+	waitCtx, cancelWait := context.WithTimeout(dockerCtx, sessionWallClockHardCap)
 	defer cancelWait()
 	exitCode, waitErr := waitForContainerExit(waitCtx, cli, containerID, rs.stopSignal)
 	close(stopBridge)
@@ -305,41 +315,62 @@ func (mf *messageForwarder) tick() {
 		}
 	}
 	sort.Strings(names)
+	if len(names) == 0 {
+		return
+	}
+	// Build the batch over a COPY of the rotation cursor (msgID) and a local
+	// consumed list, committing neither mf.seen nor mf.currentMsgID until the
+	// forward succeeds — so a failed forward is retried verbatim next tick
+	// (at-least-once) rather than dropped. Dropping a batch that held the "final"
+	// would otherwise lose the whole assistant message (it would never persist).
+	// The server persists idempotently, so a redelivered final is a no-op.
+	msgID := mf.currentMsgID
 	var batch []sessions.AppendMessageDtoV1
+	var consumed []string
 	for _, n := range names {
-		mf.seen[n] = true
 		b, err := os.ReadFile(filepath.Join(mf.dir, n))
 		if err != nil {
-			continue
+			break // transient read error — stop here, preserve order, retry from n next tick
 		}
 		var rec struct {
 			Type string `json:"type"`
 			Text string `json:"text"`
 		}
-		if json.Unmarshal(b, &rec) != nil {
-			continue
-		}
-		switch rec.Type {
-		case "chunk":
-			if mf.currentMsgID == "" {
-				mf.currentMsgID = primitive.NewObjectID().Hex()
+		if json.Unmarshal(b, &rec) == nil {
+			switch rec.Type {
+			case "chunk":
+				if msgID == "" {
+					msgID = primitive.NewObjectID().Hex()
+				}
+				batch = append(batch, sessions.AppendMessageDtoV1{JobID: mf.jobID, MessageID: msgID, Content: rec.Text})
+			case "final":
+				if msgID != "" {
+					batch = append(batch, sessions.AppendMessageDtoV1{JobID: mf.jobID, MessageID: msgID, IsDone: true})
+					msgID = ""
+				}
 			}
-			batch = append(batch, sessions.AppendMessageDtoV1{JobID: mf.jobID, MessageID: mf.currentMsgID, Content: rec.Text})
-		case "final":
-			if mf.currentMsgID != "" {
-				batch = append(batch, sessions.AppendMessageDtoV1{JobID: mf.jobID, MessageID: mf.currentMsgID, IsDone: true})
-				mf.currentMsgID = ""
-			}
 		}
+		// A readable file is consumed whether it yielded a delta, an unknown
+		// type, or corrupt JSON (agentbox writes atomically, so a parse failure
+		// is permanent corruption — don't re-read it forever).
+		consumed = append(consumed, n)
 	}
 	if len(batch) == 0 {
+		// Only unknown/corrupt files this pass; still advance seen so we don't
+		// re-scan them every tick.
+		for _, n := range consumed {
+			mf.seen[n] = true
+		}
 		return
 	}
 	if err := runnerclient.Get().UpdateSessionMessages(batch, mf.orgID); err != nil {
 		io.WriteString(mf.logsWriter, fmt.Sprintf("session: error forwarding messages: %s\n", err))
-		// keep the names marked seen — a failed batch is dropped rather than
-		// replayed, matching the live-stream "prefer a gap over a dup" stance.
+		return // do NOT advance seen or currentMsgID — retry the whole batch next tick
 	}
+	for _, n := range consumed {
+		mf.seen[n] = true
+	}
+	mf.currentMsgID = msgID
 }
 
 // inputPump pulls the user's new turns from deployment-server and writes them
@@ -350,6 +381,7 @@ type inputPump struct {
 	logsWriter   io.Writer
 	afterTs      int64
 	seq          int
+	seen         map[string]bool // delivered message ids — dedup the inclusive ($gte) AfterTs boundary
 }
 
 func (ip *inputPump) tick() {
@@ -360,8 +392,12 @@ func (ip *inputPump) tick() {
 	}
 	sort.Slice(msgs, func(i, j int) bool { return msgs[i].Ts < msgs[j].Ts })
 	for _, m := range msgs {
+		if ip.seen[m.ID] {
+			continue // already delivered (the server re-returns same-second turns via $gte)
+		}
 		ip.seq++
 		ip.write(m)
+		ip.seen[m.ID] = true
 		if m.Ts > ip.afterTs {
 			ip.afterTs = m.Ts
 		}
