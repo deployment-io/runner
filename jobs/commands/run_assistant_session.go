@@ -139,6 +139,12 @@ func buildSessionSpawnEnvVars(parameters map[string]interface{}) ([]string, erro
 		"WORK_DIR":                  agentboxWorkDirInContainer,
 		"RESULT_PATH":               agentboxResultPathInCtr,
 		"APPEND_SYSTEM_PROMPT_FILE": sessionPromptInContainer,
+		// Disable agentbox's stdout no-activity watchdog for sessions: an
+		// interactive agent is idle by design between user turns, so the
+		// watchdog (built for batch — detect a hung subprocess) would kill a
+		// session whenever the user pauses longer than its timeout to think.
+		// The server-side idle cron (user-message-based) is the idle-killer.
+		"NO_ACTIVITY_TIMEOUT": "0",
 	}
 	if creds, err := jobs.GetParameterValue[map[string]string](parameters, parameters_enums.AgentEnvVars); err == nil {
 		for k, v := range creds {
@@ -214,16 +220,53 @@ func (rs *RunAssistantSession) runSession(orgID, jobID, imageRef, workDirHost st
 
 	waitCtx, cancelWait := context.WithTimeout(dockerCtx, defaultWallClockTimeout)
 	defer cancelWait()
-	_, waitErr := waitForContainerExit(waitCtx, cli, containerID, rs.stopSignal)
+	exitCode, waitErr := waitForContainerExit(waitCtx, cli, containerID, rs.stopSignal)
 	close(stopBridge)
 	bridgeWg.Wait()
 	mf.tick() // final drain of any buffered output
 	sf.tick() // final spec snapshot
 	logSessionOutcome(workDirHost, logsWriter)
-	if waitErr != nil && !errors.Is(waitErr, types.ErrJobStoppedByUser) {
-		return waitErr
+	if errors.Is(waitErr, types.ErrJobStoppedByUser) {
+		return nil // user / cron / convert stop — the normal session end
+	}
+	if waitErr != nil {
+		return waitErr // wall-clock cap or a wait error
+	}
+	// Natural container exit. A healthy interactive session agent doesn't exit
+	// on its own — a non-zero code means it failed (API credits/auth exhausted,
+	// a fatal rate-limit, or a crash). Surface the reason to the chat so the
+	// user sees why it stopped, and return an error so the Job is reported
+	// failed (deployment-server then marks the session Failed).
+	if exitCode != 0 {
+		failMsg := sessionAgentFailureMessage(workDirHost)
+		rs.forwardSessionFailure(orgID, jobID, failMsg, logsWriter)
+		return fmt.Errorf("session agent exited with code %d: %s", exitCode, failMsg)
 	}
 	return nil
+}
+
+// sessionAgentFailureMessage builds a user-facing reason for a failed session
+// agent, preferring agentbox's classified error from result.json (auth / credit
+// / rate-limit context) when present.
+func sessionAgentFailureMessage(workDirHost string) string {
+	if result, err := readAgentResult(workDirHost); err == nil && strings.TrimSpace(result.Error) != "" {
+		return result.Error
+	}
+	return "the agent stopped unexpectedly — it may have run out of API credits, hit an auth or rate-limit error, or crashed"
+}
+
+// forwardSessionFailure posts a final assistant message to the session thread so
+// the chat shows why the agent stopped instead of going silent.
+func (rs *RunAssistantSession) forwardSessionFailure(orgID, jobID, msg string, logsWriter io.Writer) {
+	err := runnerclient.Get().UpdateSessionMessages([]sessions.AppendMessageDtoV1{{
+		JobID:     jobID,
+		MessageID: primitive.NewObjectID().Hex(),
+		Content:   "⚠️ " + msg,
+		IsDone:    true,
+	}}, orgID)
+	if err != nil {
+		io.WriteString(logsWriter, fmt.Sprintf("session: error forwarding failure message: %s\n", err))
+	}
 }
 
 // runSessionTicker calls fn every sessionPollInterval until stop closes.
