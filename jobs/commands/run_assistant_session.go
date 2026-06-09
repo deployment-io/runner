@@ -318,43 +318,28 @@ func (mf *messageForwarder) tick() {
 	if len(names) == 0 {
 		return
 	}
-	// Build the batch over a COPY of the rotation cursor (msgID) and a local
-	// consumed list, committing neither mf.seen nor mf.currentMsgID until the
-	// forward succeeds — so a failed forward is retried verbatim next tick
-	// (at-least-once) rather than dropped. Dropping a batch that held the "final"
-	// would otherwise lose the whole assistant message (it would never persist).
-	// The server persists idempotently, so a redelivered final is a no-op.
-	msgID := mf.currentMsgID
-	var batch []sessions.AppendMessageDtoV1
+	// Read unseen files in order. A readable file is consumed even if its JSON
+	// is corrupt (agentbox writes atomically, so a parse failure is permanent —
+	// don't re-read it). Stop on a transient read error to preserve order.
+	var records []outputRec
 	var consumed []string
 	for _, n := range names {
 		b, err := os.ReadFile(filepath.Join(mf.dir, n))
 		if err != nil {
-			break // transient read error — stop here, preserve order, retry from n next tick
+			break // retry from n next tick
 		}
-		var rec struct {
-			Type string `json:"type"`
-			Text string `json:"text"`
-		}
+		var rec outputRec
 		if json.Unmarshal(b, &rec) == nil {
-			switch rec.Type {
-			case "chunk":
-				if msgID == "" {
-					msgID = primitive.NewObjectID().Hex()
-				}
-				batch = append(batch, sessions.AppendMessageDtoV1{JobID: mf.jobID, MessageID: msgID, Content: rec.Text})
-			case "final":
-				if msgID != "" {
-					batch = append(batch, sessions.AppendMessageDtoV1{JobID: mf.jobID, MessageID: msgID, IsDone: true})
-					msgID = ""
-				}
-			}
+			records = append(records, rec)
 		}
-		// A readable file is consumed whether it yielded a delta, an unknown
-		// type, or corrupt JSON (agentbox writes atomically, so a parse failure
-		// is permanent corruption — don't re-read it forever).
 		consumed = append(consumed, n)
 	}
+	// Rotate over a COPY of the cursor; commit neither mf.seen nor
+	// mf.currentMsgID until the forward succeeds, so a failed forward is retried
+	// verbatim next tick (at-least-once) rather than dropped. Dropping a batch
+	// that held the "final" would lose the whole assistant message. The server
+	// persists idempotently, so a redelivered final is a no-op.
+	batch, endMsgID := rotateOutputBatch(records, mf.jobID, mf.currentMsgID)
 	if len(batch) == 0 {
 		// Only unknown/corrupt files this pass; still advance seen so we don't
 		// re-scan them every tick.
@@ -370,7 +355,37 @@ func (mf *messageForwarder) tick() {
 	for _, n := range consumed {
 		mf.seen[n] = true
 	}
-	mf.currentMsgID = msgID
+	mf.currentMsgID = endMsgID
+}
+
+// outputRec is one parsed agentbox output record (.agentbox-output/messages).
+type outputRec struct {
+	Type string `json:"type"` // "chunk" | "final"
+	Text string `json:"text"`
+}
+
+// rotateOutputBatch turns a run of parsed output records into assistant-message
+// deltas: consecutive "chunk"s share one MessageID and "final" closes it.
+// startMsgID continues an in-flight message across ticks ("" mints a new id at
+// the first chunk); endMsgID is the cursor to carry to the next call. Pure (no
+// fs / client) so the chunk/final grouping is unit-testable.
+func rotateOutputBatch(records []outputRec, jobID, startMsgID string) (batch []sessions.AppendMessageDtoV1, endMsgID string) {
+	msgID := startMsgID
+	for _, rec := range records {
+		switch rec.Type {
+		case "chunk":
+			if msgID == "" {
+				msgID = primitive.NewObjectID().Hex()
+			}
+			batch = append(batch, sessions.AppendMessageDtoV1{JobID: jobID, MessageID: msgID, Content: rec.Text})
+		case "final":
+			if msgID != "" {
+				batch = append(batch, sessions.AppendMessageDtoV1{JobID: jobID, MessageID: msgID, IsDone: true})
+				msgID = ""
+			}
+		}
+	}
+	return batch, msgID
 }
 
 // inputPump pulls the user's new turns from deployment-server and writes them
@@ -391,10 +406,7 @@ func (ip *inputPump) tick() {
 		return
 	}
 	sort.Slice(msgs, func(i, j int) bool { return msgs[i].Ts < msgs[j].Ts })
-	for _, m := range msgs {
-		if ip.seen[m.ID] {
-			continue // already delivered (the server re-returns same-second turns via $gte)
-		}
+	for _, m := range filterUndelivered(msgs, ip.seen) {
 		ip.seq++
 		ip.write(m)
 		ip.seen[m.ID] = true
@@ -402,6 +414,19 @@ func (ip *inputPump) tick() {
 			ip.afterTs = m.Ts
 		}
 	}
+}
+
+// filterUndelivered drops messages already delivered (by id), so the server's
+// inclusive ($gte AfterTs) input query can re-return same-second turns without
+// the runner replaying them to the agent. Pure.
+func filterUndelivered(msgs []sessions.UserMessageDtoV1, seen map[string]bool) []sessions.UserMessageDtoV1 {
+	out := make([]sessions.UserMessageDtoV1, 0, len(msgs))
+	for _, m := range msgs {
+		if !seen[m.ID] {
+			out = append(out, m)
+		}
+	}
+	return out
 }
 
 func (ip *inputPump) write(m sessions.UserMessageDtoV1) {
