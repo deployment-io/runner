@@ -75,6 +75,14 @@ func (rs *RunAssistantSession) Run(parameters map[string]interface{}, logsWriter
 	if err != nil {
 		return parameters, fmt.Errorf("job id missing: %s", err)
 	}
+	// The work dir is keyed by OrganizationIDNamespace — the same param
+	// CheckoutRepo's runForSession used to clone the repo. That differs from
+	// OrganizationIdFromJob (the real org used for the message-stream bridge)
+	// under saas-runner mode, where the namespace is rewritten to the global org.
+	workDirOrg, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIDNamespace)
+	if err != nil {
+		return parameters, fmt.Errorf("organization id namespace missing: %s", err)
+	}
 	imageRef, err := jobs.GetParameterValue[string](parameters, parameters_enums.AgentboxImage)
 	if err != nil {
 		return parameters, fmt.Errorf("agentbox image missing: %s", err)
@@ -82,7 +90,7 @@ func (rs *RunAssistantSession) Run(parameters map[string]interface{}, logsWriter
 	if err := pullAgentboxImage(imageRef); err != nil {
 		return parameters, fmt.Errorf("error pulling agentbox image: %s", err)
 	}
-	workDirHost := commandUtils.GetSessionRepositoriesBaseDir(orgID, jobID)
+	workDirHost := commandUtils.GetSessionRepositoriesBaseDir(workDirOrg, jobID)
 	if err := prepareSessionDirs(workDirHost); err != nil {
 		return parameters, fmt.Errorf("error preparing session dirs: %s", err)
 	}
