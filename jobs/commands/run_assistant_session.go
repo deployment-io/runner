@@ -201,11 +201,16 @@ func (rs *RunAssistantSession) runSession(orgID, jobID, imageRef, workDirHost st
 		dir:   filepath.Join(workDirHost, ".agentbox-input", "messages"),
 		orgID: orgID, jobID: jobID, logsWriter: logsWriter,
 	}
+	sf := &specForwarder{
+		path:  filepath.Join(workDirHost, ".agentbox-output", "task-spec.json"),
+		orgID: orgID, jobID: jobID, logsWriter: logsWriter,
+	}
 	stopBridge := make(chan struct{})
 	var bridgeWg sync.WaitGroup
-	bridgeWg.Add(2)
+	bridgeWg.Add(3)
 	go func() { defer bridgeWg.Done(); runSessionTicker(stopBridge, mf.tick) }()
 	go func() { defer bridgeWg.Done(); runSessionTicker(stopBridge, ip.tick) }()
+	go func() { defer bridgeWg.Done(); runSessionTicker(stopBridge, sf.tick) }()
 
 	waitCtx, cancelWait := context.WithTimeout(dockerCtx, defaultWallClockTimeout)
 	defer cancelWait()
@@ -213,6 +218,7 @@ func (rs *RunAssistantSession) runSession(orgID, jobID, imageRef, workDirHost st
 	close(stopBridge)
 	bridgeWg.Wait()
 	mf.tick() // final drain of any buffered output
+	sf.tick() // final spec snapshot
 	logSessionOutcome(workDirHost, logsWriter)
 	if waitErr != nil && !errors.Is(waitErr, types.ErrJobStoppedByUser) {
 		return waitErr
@@ -344,4 +350,56 @@ func logSessionOutcome(workDirHost string, logsWriter io.Writer) {
 	if b, err := os.ReadFile(specPath); err == nil && len(b) > 0 {
 		io.WriteString(logsWriter, "session produced a task spec\n")
 	}
+}
+
+// specForwarder reads agentbox's task-spec.json each tick and forwards it to
+// deployment-server (which persists it to Session.StructuredSpec) whenever the
+// content changes — the planning agent refines the spec across turns. The
+// convert flow reads the persisted spec. Best-effort: a failed forward leaves
+// lastContent unchanged so the next tick retries.
+type specForwarder struct {
+	path         string
+	orgID, jobID string
+	logsWriter   io.Writer
+	lastContent  string
+}
+
+func (sf *specForwarder) tick() {
+	b, err := os.ReadFile(sf.path)
+	if err != nil {
+		return // not written yet
+	}
+	if string(b) == sf.lastContent {
+		return // unchanged since the last successful forward
+	}
+	var rec struct {
+		Title       string   `json:"title"`
+		Goal        string   `json:"goal"`
+		Context     string   `json:"context"`
+		Acceptance  []string `json:"acceptance_criteria"`
+		Assumptions []string `json:"assumptions"`
+		OutOfScope  []string `json:"out_of_scope"`
+		Complexity  string   `json:"complexity"`
+		Readiness   string   `json:"readiness"`
+		Notes       string   `json:"readiness_notes"`
+	}
+	if json.Unmarshal(b, &rec) != nil {
+		return
+	}
+	if err := runnerclient.Get().UpdateSessionSpec(sessions.UpdateSpecDtoV1{
+		JobID:       sf.jobID,
+		Title:       rec.Title,
+		Goal:        rec.Goal,
+		Context:     rec.Context,
+		Acceptance:  rec.Acceptance,
+		Assumptions: rec.Assumptions,
+		OutOfScope:  rec.OutOfScope,
+		Complexity:  rec.Complexity,
+		Readiness:   rec.Readiness,
+		Notes:       rec.Notes,
+	}, sf.orgID); err != nil {
+		io.WriteString(sf.logsWriter, fmt.Sprintf("session: error forwarding spec: %s\n", err))
+		return // keep lastContent unchanged → retry next tick
+	}
+	sf.lastContent = string(b)
 }

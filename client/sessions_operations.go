@@ -47,3 +47,23 @@ func (r *RunnerClient) GetSessionInput(jobID string, afterTs int64, organization
 	}
 	return reply.Messages, nil
 }
+
+// UpdateSessionSpec forwards the latest structured task-spec the planning agent
+// emitted to deployment-server, which persists it to Session.StructuredSpec.
+func (r *RunnerClient) UpdateSessionSpec(spec sessions.UpdateSpecDtoV1, organizationID string) error {
+	if !r.isConnected {
+		return ErrConnection
+	}
+	args := sessions.UpdateSpecArgsV1{Spec: spec}
+	args.OrganizationID = r.GetComputedOrganizationID(organizationID)
+	args.Token = r.token
+	var reply sessions.UpdateSpecReplyV1
+	err := r.c.Call("Sessions.UpdateSpecV1", args, &reply)
+	if err != nil {
+		return err
+	}
+	if !reply.Done {
+		return fmt.Errorf("error receiving done from the server")
+	}
+	return nil
+}
