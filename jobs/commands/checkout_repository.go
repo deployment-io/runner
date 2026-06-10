@@ -62,6 +62,12 @@ func addRootDirectory(parameters map[string]interface{}, repoDirectoryPath strin
 // path (runForTask) and bypass MarkDeploymentDone since Tasks aren't
 // deployments.
 func (cr *CheckoutRepository) Run(parameters map[string]interface{}, logsWriter io.Writer) (newParameters map[string]interface{}, err error) {
+	if commandUtils.IsSessionMode(parameters) {
+		// Interactive Assistant session: read-only single-repo clone. No
+		// MarkDeploymentDone / MarkStepDone — a session is neither a deployment
+		// nor a Task Step; the outer loop cleans up the session work dir.
+		return cr.runForSession(parameters, logsWriter)
+	}
 	if commandUtils.IsTasksMode(parameters) {
 		defer func() {
 			if err != nil {

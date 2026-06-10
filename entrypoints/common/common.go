@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"runtime"
 	"strings"
 	"sync"
@@ -96,7 +97,9 @@ func executeJobs(jobsStream <-chan pendingJobType, noOfWorkers int, mode runner_
 							})
 							//if job is a build type it will be marked done; if it's a Task
 							//Step Job the per-Task working dir is cleaned up instead
-							if commandUtils.IsTasksMode(parameters) {
+							if commandUtils.IsSessionMode(parameters) {
+								cleanupSessionWorkDir(parameters)
+							} else if commandUtils.IsTasksMode(parameters) {
 								<-commands.MarkStepDone(parameters, err)
 							} else {
 								<-commands.MarkDeploymentDone(parameters, err)
@@ -134,7 +137,9 @@ func executeJobs(jobsStream <-chan pendingJobType, noOfWorkers int, mode runner_
 								resultsStream <- result
 								//if job is a deployment/build/preview type, this will be marked them done;
 								//if it's a Task Step Job, the per-Task working dir is cleaned up instead
-								if commandUtils.IsTasksMode(parameters) {
+								if commandUtils.IsSessionMode(parameters) {
+									cleanupSessionWorkDir(parameters)
+								} else if commandUtils.IsTasksMode(parameters) {
 									<-commands.MarkStepDone(parameters, errStoppedByUser)
 								} else {
 									<-commands.MarkDeploymentDone(parameters, errStoppedByUser)
@@ -195,7 +200,9 @@ func executeJobs(jobsStream <-chan pendingJobType, noOfWorkers int, mode runner_
 						// extended. Non-Tasks jobs handle their own
 						// completion bookkeeping inside the build/preview
 						// commands themselves.
-						if commandUtils.IsTasksMode(parameters) {
+						if commandUtils.IsSessionMode(parameters) {
+							cleanupSessionWorkDir(parameters)
+						} else if commandUtils.IsTasksMode(parameters) {
 							<-commands.MarkStepDone(parameters, nil)
 						}
 						handleLogEnd(nil, pendingJob.jobID, logsWriter)
@@ -208,6 +215,20 @@ func executeJobs(jobsStream <-chan pendingJobType, noOfWorkers int, mode runner_
 		wg.Wait()
 	}()
 	return resultsStream
+}
+
+// cleanupSessionWorkDir removes an interactive Assistant session's cloned repo
+// and agentbox IO dirs under /tmp/<org>/sessions/<jobID>. A session is neither a
+// deployment nor a Task Step, so neither MarkDeploymentDone nor MarkStepDone
+// applies; this is the session analog of MarkStepDone's per-Task cleanup, keyed
+// by OrganizationIDNamespace to match where runForSession cloned.
+func cleanupSessionWorkDir(parameters map[string]interface{}) {
+	orgID, _ := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIDNamespace)
+	jobID, _ := jobs.GetParameterValue[string](parameters, parameters_enums.JobID)
+	if len(orgID) == 0 || len(jobID) == 0 {
+		return
+	}
+	_ = os.RemoveAll(commandUtils.GetSessionRepositoriesBaseDir(orgID, jobID))
 }
 
 // getJobStopSignal polls UpsertJobHeartbeat every 5 seconds and returns
