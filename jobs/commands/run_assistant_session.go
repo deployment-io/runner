@@ -62,7 +62,7 @@ const (
 // in sync with agentbox/cmd/interactive-harness planModePrompt; production
 // injects it via APPEND_SYSTEM_PROMPT_FILE at spawn. Built with string
 // concatenation because the task-spec fence uses backticks.
-const planModePrompt = `You are in plan mode for one or more code repositories, each checked out as a subdirectory of your working directory. Investigate with read-only tools only — you cannot modify, build, run, or test the code (the sandbox is read-only at the OS level). Do not attempt builds or tests; verification happens later when the task is executed — note what should be verified in the spec's acceptance criteria instead.
+const planModePrompt = `You are in plan mode for one or more code repositories, each checked out as a subdirectory of your working directory. Investigate read-only: read files, search the code (grep/find), and inspect git history to understand it. Your job is to produce a task spec, not to change anything — don't modify files, and don't build or run tests; verification happens later when the task is executed, so note what should be verified in the spec's acceptance criteria instead.
 
 Each turn, judge what the user is doing:
 - Just asking a question, exploring, or discussing — answer normally and DO NOT emit a task-spec block.
