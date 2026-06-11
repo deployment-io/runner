@@ -81,7 +81,32 @@ func cloneSessionRepoReadOnly(repoDir string, entry tasks.RepositoryEntry, orgID
 	if err := worktree.Checkout(&git.CheckoutOptions{Branch: baseRef}); err != nil {
 		return fmt.Errorf("error checking out base branch %s: %s", entry.BaseBranch, err)
 	}
+	if err := scrubRemoteToken(repository, entry.CloneURL); err != nil {
+		return err
+	}
 	return chownTreeToAgentbox(repoDir)
+}
+
+// scrubRemoteToken resets origin's URL to the tokenless clone URL, removing the
+// installation token go-git persists into .git/config from a tokenized clone.
+// The in-container agent can read .git/config, but a session is read-only and
+// never fetches or pushes again (and the network proxy blocks GitHub anyway),
+// so the credential is pure liability — strip it. Best-effort by design: a
+// missing origin is not an error.
+func scrubRemoteToken(repository *git.Repository, tokenlessURL string) error {
+	cfg, err := repository.Config()
+	if err != nil {
+		return fmt.Errorf("error reading repo config to scrub token: %s", err)
+	}
+	remote, ok := cfg.Remotes["origin"]
+	if !ok {
+		return nil
+	}
+	remote.URLs = []string{tokenlessURL}
+	if err := repository.Storer.SetConfig(cfg); err != nil {
+		return fmt.Errorf("error setting scrubbed remote config: %s", err)
+	}
+	return nil
 }
 
 // sessionToken returns a token for the installation, minting + caching on a miss
