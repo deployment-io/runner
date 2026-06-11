@@ -81,7 +81,33 @@ func cloneSessionRepoReadOnly(repoDir string, entry tasks.RepositoryEntry, orgID
 	if err := worktree.Checkout(&git.CheckoutOptions{Branch: baseRef}); err != nil {
 		return fmt.Errorf("error checking out base branch %s: %s", entry.BaseBranch, err)
 	}
+	if err := scrubRemoteToken(repository, entry.CloneURL); err != nil {
+		return err
+	}
 	return chownTreeToAgentbox(repoDir)
+}
+
+// scrubRemoteToken resets origin's URL to the tokenless clone URL, removing the
+// installation token go-git persists into .git/config from a tokenized clone.
+// Call it at the end of a checkout, after the runner's own clone/fetch, so the
+// in-container agent never sees a credential it doesn't need. Safe for both
+// flows: a session never pushes, and a Task pushes via commit_and_push, which
+// authenticates with its own freshly-minted token through PushOptions.Auth —
+// independent of the remote URL. Best-effort: a missing origin is not an error.
+func scrubRemoteToken(repository *git.Repository, tokenlessURL string) error {
+	cfg, err := repository.Config()
+	if err != nil {
+		return fmt.Errorf("error reading repo config to scrub token: %s", err)
+	}
+	remote, ok := cfg.Remotes["origin"]
+	if !ok {
+		return nil
+	}
+	remote.URLs = []string{tokenlessURL}
+	if err := repository.Storer.SetConfig(cfg); err != nil {
+		return fmt.Errorf("error setting scrubbed remote config: %s", err)
+	}
+	return nil
 }
 
 // sessionToken returns a token for the installation, minting + caching on a miss

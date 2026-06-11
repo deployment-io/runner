@@ -163,6 +163,14 @@ func (tc *taskCheckout) checkoutOne(repoDir string, entry tasks.RepositoryEntry)
 			return err
 		}
 	}
+	// Strip the installation token from .git/config before the agent runs:
+	// the runner's own git ops (clone, and the Step>0 fetch above) are done,
+	// and commit_and_push later authenticates with its own freshly-minted
+	// token via PushOptions.Auth — so the embedded credential is not needed
+	// downstream, and the RunAgentStep container shouldn't be able to read it.
+	if err := scrubRemoteToken(repository, entry.CloneURL); err != nil {
+		return err
+	}
 	// go-git's PlainClone + Checkout ran as the runner process (root inside
 	// its container). Chown the entire repo tree to the agentbox `agent`
 	// user so the spawned RunAgentStep container can modify these files
