@@ -89,10 +89,11 @@ func cloneSessionRepoReadOnly(repoDir string, entry tasks.RepositoryEntry, orgID
 
 // scrubRemoteToken resets origin's URL to the tokenless clone URL, removing the
 // installation token go-git persists into .git/config from a tokenized clone.
-// The in-container agent can read .git/config, but a session is read-only and
-// never fetches or pushes again (and the network proxy blocks GitHub anyway),
-// so the credential is pure liability — strip it. Best-effort by design: a
-// missing origin is not an error.
+// Call it at the end of a checkout, after the runner's own clone/fetch, so the
+// in-container agent never sees a credential it doesn't need. Safe for both
+// flows: a session never pushes, and a Task pushes via commit_and_push, which
+// authenticates with its own freshly-minted token through PushOptions.Auth —
+// independent of the remote URL. Best-effort: a missing origin is not an error.
 func scrubRemoteToken(repository *git.Repository, tokenlessURL string) error {
 	cfg, err := repository.Config()
 	if err != nil {
