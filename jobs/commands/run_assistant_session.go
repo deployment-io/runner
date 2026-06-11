@@ -266,13 +266,21 @@ func sessionAgentFailureMessage(workDirHost string) string {
 }
 
 // forwardSessionFailure posts a final assistant message to the session thread so
-// the chat shows why the agent stopped instead of going silent.
+// the chat shows why the agent stopped instead of going silent. A turn-end
+// follows it: a dead agent never sends its own boundary, and without one the
+// UI's composer (gated on the turn boundary) would stay locked until the
+// session goes terminal.
 func (rs *RunAssistantSession) forwardSessionFailure(orgID, jobID, msg string, logsWriter io.Writer) {
 	err := runnerclient.Get().UpdateSessionMessages([]sessions.AppendMessageDtoV1{{
 		JobID:     jobID,
 		MessageID: primitive.NewObjectID().Hex(),
 		Content:   "⚠️ " + msg,
 		IsDone:    true,
+	}, {
+		JobID:     jobID,
+		MessageID: primitive.NewObjectID().Hex(),
+		IsDone:    true,
+		TurnEnd:   true,
 	}}, orgID)
 	if err != nil {
 		io.WriteString(logsWriter, fmt.Sprintf("session: error forwarding failure message: %s\n", err))
@@ -360,12 +368,13 @@ func (mf *messageForwarder) tick() {
 
 // outputRec is one parsed agentbox output record (.agentbox-output/messages).
 type outputRec struct {
-	Type string `json:"type"` // "chunk" | "final"
+	Type string `json:"type"` // "chunk" | "final" | "turn_end"
 	Text string `json:"text"`
 }
 
 // rotateOutputBatch turns a run of parsed output records into assistant-message
-// deltas: consecutive "chunk"s share one MessageID and "final" closes it.
+// deltas: consecutive "chunk"s share one MessageID, "final" closes it, and
+// "turn_end" forwards the agent's turn boundary as its own control update.
 // startMsgID continues an in-flight message across ticks ("" mints a new id at
 // the first chunk); endMsgID is the cursor to carry to the next call. Pure (no
 // fs / client) so the chunk/final grouping is unit-testable.
@@ -383,6 +392,14 @@ func rotateOutputBatch(records []outputRec, jobID, startMsgID string) (batch []s
 				batch = append(batch, sessions.AppendMessageDtoV1{JobID: jobID, MessageID: msgID, IsDone: true})
 				msgID = ""
 			}
+		case "turn_end":
+			if msgID != "" {
+				// Defensive: agentbox always finalizes a message before the
+				// boundary, but never let one ride past it half-open.
+				batch = append(batch, sessions.AppendMessageDtoV1{JobID: jobID, MessageID: msgID, IsDone: true})
+				msgID = ""
+			}
+			batch = append(batch, sessions.AppendMessageDtoV1{JobID: jobID, MessageID: primitive.NewObjectID().Hex(), IsDone: true, TurnEnd: true})
 		}
 	}
 	return batch, msgID

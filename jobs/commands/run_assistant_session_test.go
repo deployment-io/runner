@@ -85,6 +85,49 @@ func TestRotateOutputBatch_LoneFinalIgnored(t *testing.T) {
 	}
 }
 
+// TestRotateOutputBatch_TurnEnd covers the turn boundary: it forwards as its
+// own control update (fresh MessageID, IsDone, TurnEnd, no content) after the
+// turn's messages.
+func TestRotateOutputBatch_TurnEnd(t *testing.T) {
+	batch, end := rotateOutputBatch([]outputRec{
+		{Type: "chunk", Text: "answer"}, {Type: "final"}, {Type: "turn_end"},
+	}, "j", "")
+	if len(batch) != 3 {
+		t.Fatalf("want 3 deltas, got %d", len(batch))
+	}
+	te := batch[2]
+	if !te.TurnEnd || !te.IsDone || te.Content != "" {
+		t.Errorf("turn-end delta wrong: %+v", te)
+	}
+	if te.MessageID == "" || te.MessageID == batch[0].MessageID {
+		t.Error("turn-end must carry its own fresh MessageID")
+	}
+	if end != "" {
+		t.Errorf("no in-flight id expected after a turn end, got %q", end)
+	}
+}
+
+// TestRotateOutputBatch_TurnEndClosesHalfOpenMessage pins the defensive close:
+// a turn_end arriving while a message is mid-stream (no final yet) finalizes
+// it first so it isn't lost past the boundary.
+func TestRotateOutputBatch_TurnEndClosesHalfOpenMessage(t *testing.T) {
+	batch, end := rotateOutputBatch([]outputRec{
+		{Type: "chunk", Text: "orphan"}, {Type: "turn_end"},
+	}, "j", "")
+	if len(batch) != 3 {
+		t.Fatalf("want chunk + synthesized final + turn-end, got %d: %+v", len(batch), batch)
+	}
+	if !batch[1].IsDone || batch[1].MessageID != batch[0].MessageID || batch[1].TurnEnd {
+		t.Errorf("half-open message should be closed before the boundary: %+v", batch[1])
+	}
+	if !batch[2].TurnEnd {
+		t.Errorf("boundary should follow the synthesized final: %+v", batch[2])
+	}
+	if end != "" {
+		t.Errorf("no carry-over expected, got %q", end)
+	}
+}
+
 // TestFilterUndelivered covers the inputPump dedupe that makes the server's
 // inclusive ($gte) input query safe to re-return same-second turns.
 func TestFilterUndelivered(t *testing.T) {
