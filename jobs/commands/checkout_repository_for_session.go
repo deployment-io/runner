@@ -73,18 +73,42 @@ func cloneSessionRepoReadOnly(repoDir string, entry tasks.RepositoryEntry, orgID
 	if err != nil {
 		return err
 	}
-	worktree, err := repository.Worktree()
-	if err != nil {
-		return fmt.Errorf("error getting worktree: %s", err)
-	}
-	baseRef := plumbing.NewRemoteReferenceName("origin", entry.BaseBranch)
-	if err := worktree.Checkout(&git.CheckoutOptions{Branch: baseRef}); err != nil {
-		return fmt.Errorf("error checking out base branch %s: %s", entry.BaseBranch, err)
+	if err := checkoutSessionBaseBranch(repository, entry.BaseBranch); err != nil {
+		return err
 	}
 	if err := scrubRemoteToken(repository, entry.CloneURL); err != nil {
 		return err
 	}
 	return chownTreeToAgentbox(repoDir)
+}
+
+// checkoutSessionBaseBranch positions the worktree on baseBranch as a LOCAL
+// branch — creating refs/heads/<base> from origin/<base> when the clone didn't
+// already materialize it. Checking out the remote-tracking ref directly
+// (refs/remotes/origin/<base>) leaves HEAD detached, which a session agent
+// reads as a repo-hygiene problem and tells the user to "fix" (git checkout
+// main): a false finding about our own ephemeral clone, not their repo.
+func checkoutSessionBaseBranch(repository *git.Repository, baseBranch string) error {
+	worktree, err := repository.Worktree()
+	if err != nil {
+		return fmt.Errorf("error getting worktree: %s", err)
+	}
+	localRef := plumbing.NewBranchReferenceName(baseBranch)
+	opts := &git.CheckoutOptions{Branch: localRef}
+	if _, err := repository.Reference(localRef, false); err != nil {
+		// No local branch yet (base != the clone's default branch): create it
+		// at the remote ref and switch to it.
+		remoteRef, rerr := repository.Reference(plumbing.NewRemoteReferenceName("origin", baseBranch), true)
+		if rerr != nil {
+			return fmt.Errorf("error resolving base branch %s: %s", baseBranch, rerr)
+		}
+		opts.Hash = remoteRef.Hash()
+		opts.Create = true
+	}
+	if err := worktree.Checkout(opts); err != nil {
+		return fmt.Errorf("error checking out base branch %s: %s", baseBranch, err)
+	}
+	return nil
 }
 
 // scrubRemoteToken resets origin's URL to the tokenless clone URL, removing the
