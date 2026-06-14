@@ -2,8 +2,10 @@ package commands
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"regexp"
 	"strings"
 	"time"
@@ -17,6 +19,7 @@ import (
 	elbTypes "github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2/types"
 	"github.com/aws/aws-sdk-go-v2/service/servicediscovery"
 	sd_types "github.com/aws/aws-sdk-go-v2/service/servicediscovery/types"
+	"github.com/aws/smithy-go"
 	"github.com/deployment-io/deployment-runner-kit/builds"
 	"github.com/deployment-io/deployment-runner-kit/cloud_api_clients"
 	"github.com/deployment-io/deployment-runner-kit/deployments"
@@ -85,6 +88,19 @@ func getDefaultVpcSecurityGroupIngressRuleNameForPort(parameters map[string]inte
 		return "", err
 	}
 	return fmt.Sprintf("sgin-%d", port), nil
+}
+
+// isDuplicateSecurityGroupRuleError reports whether err is the EC2
+// InvalidPermission.Duplicate API error. EC2 returns it from
+// AuthorizeSecurityGroupIngress/AuthorizeSecurityGroupEgress when the rule we are
+// trying to add already exists. For our deploys that means the desired rule is
+// already in place, so the caller can treat it as success and continue.
+func isDuplicateSecurityGroupRuleError(err error) bool {
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		return apiErr.ErrorCode() == "InvalidPermission.Duplicate"
+	}
+	return false
 }
 
 func addIngressRuleToDefaultVpcSecurityGroupForPortIfNeeded(parameters map[string]interface{}, ec2Client *ec2.Client) error {
@@ -159,7 +175,9 @@ func addIngressRuleToDefaultVpcSecurityGroupForPortIfNeeded(parameters map[strin
 			ToPort: aws.Int32(int32(port)),
 		}
 		_, err = ec2Client.AuthorizeSecurityGroupIngress(context.TODO(), authorizeSecurityGroupIngressInput)
-		if err != nil {
+		//if the rule already exists EC2 returns InvalidPermission.Duplicate. The desired rule is
+		//already present, so we treat it as success and continue (idempotent ingress setup).
+		if err != nil && !isDuplicateSecurityGroupRuleError(err) {
 			return err
 		}
 
@@ -327,9 +345,14 @@ func createAlbSecurityGroupIfNeeded(parameters map[string]interface{}, ec2Client
 		}
 		authorizeSecurityGroupIngressOutput, err := ec2Client.AuthorizeSecurityGroupIngress(context.TODO(), authorizeSecurityGroupIngressInput)
 		if err != nil {
-			return "", err
+			//InvalidPermission.Duplicate means the rule already exists - treat as success and continue
+			if !isDuplicateSecurityGroupRuleError(err) {
+				return "", err
+			}
+			log.Printf("alb security group ingress rule %s already exists, continuing", albSecurityGroupIngressRuleName)
+		} else {
+			albSecurityGroupIngressRuleId = aws.ToString(authorizeSecurityGroupIngressOutput.SecurityGroupRules[0].SecurityGroupRuleId)
 		}
-		albSecurityGroupIngressRuleId = aws.ToString(authorizeSecurityGroupIngressOutput.SecurityGroupRules[0].SecurityGroupRuleId)
 	}
 
 	albSecurityGroupEgressRuleName, err := getAlbSecurityGroupEgressRuleName(parameters)
@@ -403,9 +426,14 @@ func createAlbSecurityGroupIfNeeded(parameters map[string]interface{}, ec2Client
 
 		authorizeSecurityGroupEgressOutput, err := ec2Client.AuthorizeSecurityGroupEgress(context.TODO(), authorizeSecurityGroupEgressInput)
 		if err != nil {
-			return "", err
+			//InvalidPermission.Duplicate means the rule already exists - treat as success and continue
+			if !isDuplicateSecurityGroupRuleError(err) {
+				return "", err
+			}
+			log.Printf("alb security group egress rule %s already exists, continuing", albSecurityGroupEgressRuleName)
+		} else {
+			albSecurityGroupEgressRuleId = aws.ToString(authorizeSecurityGroupEgressOutput.SecurityGroupRules[0].SecurityGroupRuleId)
 		}
-		albSecurityGroupEgressRuleId = aws.ToString(authorizeSecurityGroupEgressOutput.SecurityGroupRules[0].SecurityGroupRuleId)
 	}
 
 	//TODO can sync both sg ingress ids later
