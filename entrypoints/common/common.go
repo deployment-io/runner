@@ -81,10 +81,6 @@ func executeJobs(jobsStream <-chan pendingJobType, noOfWorkers int, mode runner_
 						_ = jobs.SetParameterValue(parameters, parameters_enums.JobID, pendingJob.jobID)
 						//add organization id from job in parameters
 						_ = jobs.SetParameterValue(parameters, parameters_enums.OrganizationIdFromJob, pendingJob.organizationID)
-						if mode == runner_enums.Saas {
-							//rewrite to global org id for saas mode
-							_ = jobs.SetParameterValue[string](parameters, parameters_enums.OrganizationIDNamespace, globalOrganizationIdFromEnv)
-						}
 						logger, err := loggers.Get(parameters)
 						if err != nil {
 							result := getJobResult(pendingJob, err.Error(), nil)
@@ -375,47 +371,24 @@ func GetAndRunJobs(c *client.RunnerClient, mode runner_enums.Mode, globalOrganiz
 		case <-shutdownSignal:
 			shutdown = true
 		default:
-			if mode == runner_enums.Saas {
-				pendingJobsForSaas, err := c.GetPendingJobsForSaas(globalOrganizationIdFromEnv)
-				if len(pendingJobsForSaas) == 0 {
-					if printPendingJobsMessage {
-						log.Println("Waiting for new deployment jobs. You can create them at https://app.deployment.io ......")
-						printPendingJobsMessage = false
-					}
-					if err != nil {
-						time.Sleep(10 * time.Second)
-						continue
-					}
-				} else {
-					for _, pendingJob := range pendingJobsForSaas {
-						executePendingJobsConcurrentPipeline.Add("executeJob", pendingJobType{
-							jobID:          pendingJob.JobID,
-							organizationID: pendingJob.OrganizationID,
-							commandEnums:   pendingJob.CommandEnums,
-							parameters:     pendingJob.Parameters,
-						})
-					}
+			pendingJobs, err := c.GetPendingJobs(globalOrganizationIdFromEnv)
+			if len(pendingJobs) == 0 {
+				if printPendingJobsMessage {
+					log.Println("Waiting for new deployment jobs. You can create them at https://app.deployment.io ......")
+					printPendingJobsMessage = false
+				}
+				if err != nil {
+					time.Sleep(10 * time.Second)
+					continue
 				}
 			} else {
-				pendingJobs, err := c.GetPendingJobs(globalOrganizationIdFromEnv)
-				if len(pendingJobs) == 0 {
-					if printPendingJobsMessage {
-						log.Println("Waiting for new deployment jobs. You can create them at https://app.deployment.io ......")
-						printPendingJobsMessage = false
-					}
-					if err != nil {
-						time.Sleep(10 * time.Second)
-						continue
-					}
-				} else {
-					for _, pendingJob := range pendingJobs {
-						executePendingJobsConcurrentPipeline.Add("executeJob", pendingJobType{
-							jobID:          pendingJob.JobID,
-							organizationID: globalOrganizationIdFromEnv,
-							commandEnums:   pendingJob.CommandEnums,
-							parameters:     pendingJob.Parameters,
-						})
-					}
+				for _, pendingJob := range pendingJobs {
+					executePendingJobsConcurrentPipeline.Add("executeJob", pendingJobType{
+						jobID:          pendingJob.JobID,
+						organizationID: globalOrganizationIdFromEnv,
+						commandEnums:   pendingJob.CommandEnums,
+						parameters:     pendingJob.Parameters,
+					})
 				}
 			}
 			time.Sleep(10 * time.Second)

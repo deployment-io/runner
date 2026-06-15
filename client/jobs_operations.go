@@ -25,25 +25,6 @@ func (r *RunnerClient) GetPendingJobs(organizationID string) ([]jobs.PendingJobD
 	return jobsDto.Jobs, nil
 }
 
-func (r *RunnerClient) GetPendingJobsForSaas(organizationID string) ([]jobs.PendingJobForSaasDtoV1, error) {
-	if !r.isConnected {
-		return nil, ErrConnection
-	}
-	args := jobs.PendingJobsForSaasArgsV1{}
-	args.OrganizationID = r.GetComputedOrganizationID(organizationID)
-	args.Token = r.token
-	args.CloudAccountID = r.cloudAccountID
-	args.RunnerRegion = r.runnerRegion
-	args.GoArch = runtime.GOARCH
-	args.GoOS = runtime.GOOS
-	var jobsDto jobs.PendingJobsForSaasDtoV1
-	err := r.c.Call("Jobs.GetPendingForSaasV1", args, &jobsDto)
-	if err != nil {
-		return nil, err
-	}
-	return jobsDto.Jobs, nil
-}
-
 func (r *RunnerClient) MarkJobsComplete(completingJobs []jobs.CompletingJobDtoV1, organizationID string) error {
 	if !r.isConnected {
 		return ErrConnection
