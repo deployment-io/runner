@@ -84,6 +84,8 @@ func Get(p commands_enums.Type) (jobs.Command, error) {
 		return &CommitAndPush{}, nil
 	case commands_enums.OpenPullRequest:
 		return &OpenPullRequest{}, nil
+	case commands_enums.BuildInfraContext:
+		return &BuildInfraContext{}, nil
 	}
 	return nil, fmt.Errorf("error getting command for %s", p)
 }
