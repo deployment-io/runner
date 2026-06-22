@@ -34,6 +34,17 @@ func (b *BuildInfraContext) Run(parameters map[string]interface{}, logsWriter io
 	byScope := map[context_pack.Scope]*context_pack.Pack{}
 	var order []context_pack.Scope // deterministic emit order
 
+	// Org-wide content is keyed by the org id (its owning entity); finer scopes carry their own
+	// env/cluster id. Read the org id once and normalize Org-level scopes to it, so all org
+	// content groups into a single record.
+	orgID, _ := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIDNamespace)
+	normalize := func(s context_pack.Scope) context_pack.Scope {
+		if s.Level == context_pack_enums.Org {
+			s.ID = orgID
+		}
+		return s
+	}
+
 	ensure := func(scope context_pack.Scope) *context_pack.Pack {
 		pack := byScope[scope]
 		if pack == nil {
@@ -51,12 +62,12 @@ func (b *BuildInfraContext) Run(parameters map[string]interface{}, logsWriter io
 		if err != nil {
 			// A source failure degrades the pack (recorded as an org-scoped gap) rather than
 			// failing the whole build — partial context beats none.
-			orgPack := ensure(context_pack.Scope{Level: context_pack_enums.Org})
+			orgPack := ensure(normalize(context_pack.Scope{Level: context_pack_enums.Org}))
 			orgPack.Manifest.Gaps = append(orgPack.Manifest.Gaps, fmt.Sprintf("%s: %v", src.Name(), err))
 			io.WriteString(logsWriter, fmt.Sprintf("  source %s failed: %v\n", src.Name(), err))
 			continue
 		}
-		pack := ensure(result.Scope)
+		pack := ensure(normalize(result.Scope))
 		pack.Artifacts = append(pack.Artifacts, result.Artifacts...)
 		pack.Manifest.Files = append(pack.Manifest.Files, result.Entries...)
 		pack.Manifest.Gaps = append(pack.Manifest.Gaps, result.Gaps...)
