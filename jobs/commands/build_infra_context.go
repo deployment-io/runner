@@ -58,7 +58,6 @@ func (b *BuildInfraContext) Run(parameters map[string]interface{}, logsWriter io
 		}
 		pack := ensure(result.Scope)
 		pack.Artifacts = append(pack.Artifacts, result.Artifacts...)
-		pack.Markdown = append(pack.Markdown, result.Markdown...)
 		pack.Manifest.Files = append(pack.Manifest.Files, result.Entries...)
 		pack.Manifest.Gaps = append(pack.Manifest.Gaps, result.Gaps...)
 	}
