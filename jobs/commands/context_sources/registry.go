@@ -12,8 +12,11 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/context_pack"
 )
 
-// Result is one source's contribution to a context pack.
+// Result is one source's contribution to a context pack. Scope declares the breadth the
+// content applies to (Org for the repo catalog, a specific Cluster for K8s infra, …); the
+// command groups results by scope into one stored record per (org, scope).
 type Result struct {
+	Scope     context_pack.Scope          // breadth this content applies to
 	Artifacts []context_pack.Artifact     // structured-canonical (queryable once persisted)
 	Markdown  []context_pack.MarkdownFile // derived projection the agent reads
 	Entries   []context_pack.ManifestEntry
