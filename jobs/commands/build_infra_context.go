@@ -23,6 +23,12 @@ const contextPackVersion = 1
 // JobOutput. deployment-server persists one context_packs record per (org, scope), so
 // org-wide content is stored once rather than duplicated per environment.
 //
+// Failure posture (last-good wins, error != gap): a connector error is logged and skipped,
+// never folded into the pack. Only scopes rebuilt cleanly this run are emitted, so a failed
+// connector leaves its scope's last-good record untouched rather than overwriting it with a
+// degraded snapshot — the cron/user retry refreshes it. (Manifest gaps are blind spots a
+// *successful* run determined, e.g. an `auth can-i` denial — not connector errors.)
+//
 // It's an ordinary command: running_jobs registration + heartbeat are handled by the runner's
 // outer execution loop, so the heartbeat-timeout cron covers it like any other job.
 type BuildInfraContext struct{}
@@ -60,13 +66,18 @@ func (b *BuildInfraContext) Run(parameters map[string]interface{}, logsWriter io
 	for _, src := range sources {
 		result, err := src.Build(parameters, logsWriter)
 		if err != nil {
-			// A source failure degrades the pack (recorded as an org-scoped gap) rather than
-			// failing the whole build — partial context beats none.
-			orgPack := ensure(normalize(context_pack.Scope{Level: context_pack_enums.Org}))
-			orgPack.Manifest.Gaps = append(orgPack.Manifest.Gaps, fmt.Sprintf("%s: %v", src.Name(), err))
-			io.WriteString(logsWriter, fmt.Sprintf("  source %s failed: %v\n", src.Name(), err))
+			// A connector error is transient plumbing failure, not knowledge about the infra:
+			// log it and skip. We deliberately do NOT fold it into the pack as a gap (gaps are
+			// blind spots a *successful* run determined), and we do NOT emit a degraded pack for
+			// its scope — the scope is left un-rebuilt this run, so its last-good record stands
+			// (deployment-server's per-scope upsert only touches scopes we emit). The cron/user
+			// retry refreshes it; a persistent failure shows up in logs, not by overwriting good
+			// context with a worse snapshot.
+			io.WriteString(logsWriter, fmt.Sprintf("  source %s failed (skipping; last-good context retained): %v\n", src.Name(), err))
 			continue
 		}
+		// Success path: artifacts + any gaps the connector *determined* (real can-i-style blind
+		// spots, never errors) join the pack for its scope.
 		pack := ensure(normalize(result.Scope))
 		pack.Artifacts = append(pack.Artifacts, result.Artifacts...)
 		pack.Manifest.Files = append(pack.Manifest.Files, result.Entries...)
