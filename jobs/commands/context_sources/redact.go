@@ -1,6 +1,8 @@
 package context_sources
 
 import (
+	"encoding/json"
+	"fmt"
 	"strings"
 
 	"github.com/deployment-io/deployment-runner-kit/context_pack"
@@ -28,13 +30,39 @@ const redactedPlaceholder = "[redacted]"
 // the structured Artifacts.
 func Redact(pack *context_pack.Pack) error {
 	for i := range pack.Artifacts {
-		pack.Artifacts[i].Data = scrub(pack.Artifacts[i].Data)
+		// Redact runs before the pack is JSON-marshaled, so Data is still the source's native
+		// Go value — often a typed struct or []struct, which scrub's map/slice switch would
+		// skip. Normalize it to its generic wire shape first so scrub can actually walk it,
+		// whatever the source's type.
+		generic, err := toGeneric(pack.Artifacts[i].Data)
+		if err != nil {
+			return fmt.Errorf("redact: normalize artifact %q: %w", pack.Artifacts[i].Name, err)
+		}
+		pack.Artifacts[i].Data = scrub(generic)
 	}
 	return nil
 }
 
-// scrub recursively walks structured data, replacing the value under any secret-ish key with a
-// placeholder. It operates on the generic map/slice shapes that JSON round-trips into.
+// toGeneric round-trips a (possibly typed) value through JSON into the generic
+// map[string]interface{} / []interface{} / scalar shape scrub understands — the same form the
+// value takes on the wire and after the server unmarshals it.
+func toGeneric(v interface{}) (interface{}, error) {
+	if v == nil {
+		return nil, nil
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		return nil, err
+	}
+	var g interface{}
+	if err := json.Unmarshal(b, &g); err != nil {
+		return nil, err
+	}
+	return g, nil
+}
+
+// scrub recursively walks the generic map/slice/scalar shape (produced by toGeneric), replacing
+// the value under any secret-ish key with a placeholder.
 func scrub(v interface{}) interface{} {
 	switch t := v.(type) {
 	case map[string]interface{}:
