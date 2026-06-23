@@ -75,19 +75,22 @@ func (m *MaterializeContext) Run(parameters map[string]interface{}, logsWriter i
 // contextDirFor returns the host path that bind-mounts to /work/context for a Task or Session
 // run, and whether this is such a run.
 func contextDirFor(orgID string, parameters map[string]interface{}) (string, bool) {
-	if commandUtils.IsTasksMode(parameters) {
+	var base string
+	switch {
+	case commandUtils.IsTasksMode(parameters):
 		taskID, err := jobs.GetParameterValue[string](parameters, parameters_enums.TaskID)
 		if err != nil {
 			return "", false
 		}
-		return filepath.Join(commandUtils.GetTaskRepositoriesBaseDir(orgID, taskID), "context"), true
-	}
-	if commandUtils.IsSessionMode(parameters) {
+		base = commandUtils.GetTaskRepositoriesBaseDir(orgID, taskID)
+	case commandUtils.IsSessionMode(parameters):
 		jobID, err := jobs.GetParameterValue[string](parameters, parameters_enums.JobID)
 		if err != nil {
 			return "", false
 		}
-		return filepath.Join(commandUtils.GetSessionRepositoriesBaseDir(orgID, jobID), "context"), true
+		base = commandUtils.GetSessionRepositoriesBaseDir(orgID, jobID)
+	default:
+		return "", false
 	}
-	return "", false
+	return filepath.Join(base, "context"), true
 }
