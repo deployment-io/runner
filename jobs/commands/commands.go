@@ -86,6 +86,8 @@ func Get(p commands_enums.Type) (jobs.Command, error) {
 		return &OpenPullRequest{}, nil
 	case commands_enums.BuildInfraContext:
 		return &BuildInfraContext{}, nil
+	case commands_enums.MaterializeContext:
+		return &MaterializeContext{}, nil
 	}
 	return nil, fmt.Errorf("error getting command for %s", p)
 }
