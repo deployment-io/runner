@@ -6,8 +6,6 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/deployment-io/deployment-runner-kit/context_pack"
-	"github.com/deployment-io/deployment-runner-kit/enums/context_pack_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner/client"
@@ -33,10 +31,12 @@ func (m *MaterializeContext) Run(parameters map[string]interface{}, logsWriter i
 		return parameters, nil
 	}
 
-	// v1: org-wide context only (the repo catalog). The server owns the Org scope's id, so an
-	// empty/best-effort id here is fine. Environment/cluster scopes ride in with the infra source.
-	scopes := []context_pack.Scope{{Level: context_pack_enums.Org, ID: orgID}}
-	files, err := client.Get().MaterializeContext(orgID, scopes)
+	// Materialize the org's whole context. We send no explicit scopes: the server resolves them
+	// (the Org pack + every Cluster/Account pack the connectors built), because the runner can't
+	// enumerate the cluster scopes — the connectors discover them live, server-side. Each file
+	// arrives namespaced under its scope's path (context_pack.ScopePath), which the write loop below
+	// honors transparently via filepath.Join + MkdirAll.
+	files, err := client.Get().MaterializeContext(orgID, nil)
 	if err != nil {
 		io.WriteString(logsWriter, fmt.Sprintf("Context unavailable, continuing without it: %s\n", err))
 		return parameters, nil

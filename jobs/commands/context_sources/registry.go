@@ -29,8 +29,11 @@ type Result struct {
 type Source interface {
 	// Name is the connector identifier recorded in manifest entries (e.g. "repo-catalog").
 	Name() string
-	// Build runs the connector against the job parameters and returns its contribution.
-	Build(parameters map[string]interface{}, logsWriter io.Writer) (Result, error)
+	// Build runs the connector against the job parameters and returns its contributions — ONE Result
+	// per scope it observed. A connector commonly spans several scopes (the AWS source emits one
+	// Cluster-scoped Result per ECS cluster); a single-scope connector returns a one-element slice.
+	// Return a nil/empty slice for "ran cleanly, nothing to record". Metadata/structure only.
+	Build(parameters map[string]interface{}, logsWriter io.Writer) ([]Result, error)
 }
 
 var registry []Source
