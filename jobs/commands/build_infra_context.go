@@ -11,8 +11,8 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner/jobs/commands/context_sources"
-	// Register context sources here (blank imports run their init()), e.g.:
-	// _ "github.com/deployment-io/deployment-runner/jobs/commands/context_sources/repo_catalog"
+	// Register context sources here (blank imports run their init()).
+	_ "github.com/deployment-io/deployment-runner/jobs/commands/context_sources/aws_ecs"
 )
 
 const contextPackVersion = 1
@@ -64,7 +64,7 @@ func (b *BuildInfraContext) Run(parameters map[string]interface{}, logsWriter io
 	sources := context_sources.All()
 	io.WriteString(logsWriter, fmt.Sprintf("Running %d context source(s)...\n", len(sources)))
 	for _, src := range sources {
-		result, err := src.Build(parameters, logsWriter)
+		results, err := src.Build(parameters, logsWriter)
 		if err != nil {
 			// A connector error is transient plumbing failure, not knowledge about the infra:
 			// log it and skip. We deliberately do NOT fold it into the pack as a gap (gaps are
@@ -76,12 +76,16 @@ func (b *BuildInfraContext) Run(parameters map[string]interface{}, logsWriter io
 			io.WriteString(logsWriter, fmt.Sprintf("  source %s failed (skipping; last-good context retained): %v\n", src.Name(), err))
 			continue
 		}
-		// Success path: artifacts + any gaps the connector *determined* (real can-i-style blind
-		// spots, never errors) join the pack for its scope.
-		pack := ensure(normalize(result.Scope))
-		pack.Artifacts = append(pack.Artifacts, result.Artifacts...)
-		pack.Manifest.Files = append(pack.Manifest.Files, result.Entries...)
-		pack.Manifest.Gaps = append(pack.Manifest.Gaps, result.Gaps...)
+		// Success path: each Result is one scope's contribution — artifacts + any gaps the connector
+		// *determined* (real can-i-style blind spots, never errors) join that scope's pack. A
+		// connector spanning several scopes (e.g. one Result per ECS cluster) groups into one pack
+		// per scope here.
+		for _, result := range results {
+			pack := ensure(normalize(result.Scope))
+			pack.Artifacts = append(pack.Artifacts, result.Artifacts...)
+			pack.Manifest.Files = append(pack.Manifest.Files, result.Entries...)
+			pack.Manifest.Gaps = append(pack.Manifest.Gaps, result.Gaps...)
+		}
 	}
 
 	// Runner-side redaction invariant: every scope's pack passes through here before it's
