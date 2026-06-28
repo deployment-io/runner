@@ -18,7 +18,7 @@ import (
 const contextPackVersion = 1
 
 // BuildInfraContext is the deterministic context-pack builder. It iterates the registered
-// context sources, groups their output by scope (Org / Environment / Cluster), runs the
+// context sources, groups their output by scope (Org / Cluster), runs the
 // runner-side redaction backstop per scope, and writes the resulting []ScopedPack to
 // JobOutput. deployment-server persists one context_packs record per (org, scope), so
 // org-wide content is stored once rather than duplicated per environment.
