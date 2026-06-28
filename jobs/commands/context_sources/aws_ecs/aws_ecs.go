@@ -55,7 +55,7 @@ type observedService struct {
 // the policy self-grant is what makes this work without a prior deployment; on an already-deployed
 // runner it is a no-op. Region comes from the job parameters (set by the trigger to the runner's
 // region); the cluster ARN carries account+region, so records stay unambiguous across runners.
-func (s *source) Build(parameters map[string]interface{}, logsWriter io.Writer) ([]context_sources.Result, error) {
+func (s *source) Build(ctx context.Context, parameters map[string]interface{}, logsWriter io.Writer) ([]context_sources.Result, error) {
 	runnerData := utils.RunnerData.Get()
 	if err := ensurePolicy(parameters, runnerData); err != nil {
 		return nil, err
@@ -77,7 +77,6 @@ func (s *source) Build(parameters map[string]interface{}, logsWriter io.Writer) 
 	}
 	io.WriteString(logsWriter, fmt.Sprintf("aws-ecs: scanning region %s (account %s)\n", runnerData.RunnerRegion, runnerData.AWSAccountID))
 
-	ctx := context.TODO()
 	clusterArns, err := listClusters(ctx, ecsClient)
 	if err != nil {
 		return nil, err

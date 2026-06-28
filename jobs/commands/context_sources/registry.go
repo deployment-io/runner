@@ -7,6 +7,7 @@
 package context_sources
 
 import (
+	"context"
 	"io"
 
 	"github.com/deployment-io/deployment-runner-kit/context_pack"
@@ -33,7 +34,8 @@ type Source interface {
 	// per scope it observed. A connector commonly spans several scopes (the AWS source emits one
 	// Cluster-scoped Result per ECS cluster); a single-scope connector returns a one-element slice.
 	// Return a nil/empty slice for "ran cleanly, nothing to record". Metadata/structure only.
-	Build(parameters map[string]interface{}, logsWriter io.Writer) ([]Result, error)
+	// ctx carries the per-build wall-clock deadline — honor it on all I/O (BuildInfraContext bounds it).
+	Build(ctx context.Context, parameters map[string]interface{}, logsWriter io.Writer) ([]Result, error)
 }
 
 var registry []Source

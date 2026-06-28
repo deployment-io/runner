@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -17,6 +18,11 @@ import (
 
 const contextPackVersion = 1
 
+// infraBuildTimeout is a generous wall-clock bound on the whole source-build pass, passed into every
+// source's Build. The heartbeat is a separate ticker that keeps beating even if a source blocks, so
+// it can't reclaim a hung command; this deadline is what bounds a pathological cloud-API hang.
+const infraBuildTimeout = 15 * time.Minute
+
 // BuildInfraContext is the deterministic context-pack builder. It iterates the registered
 // context sources, groups their output by scope (Org / Cluster), runs the
 // runner-side redaction backstop per scope, and writes the resulting []ScopedPack to
@@ -29,8 +35,10 @@ const contextPackVersion = 1
 // degraded snapshot — the cron/user retry refreshes it. (Manifest gaps are blind spots a
 // *successful* run determined, e.g. an `auth can-i` denial — not connector errors.)
 //
-// It's an ordinary command: running_jobs registration + heartbeat are handled by the runner's
-// outer execution loop, so the heartbeat-timeout cron covers it like any other job.
+// running_jobs registration + heartbeat are handled by the runner's outer execution loop, so a dead
+// runner is reclaimed by the heartbeat-timeout cron like any other job. The heartbeat is a separate
+// ticker, though, so it does NOT bound a hung command — the source builds run under a wall-clock
+// deadline (infraBuildTimeout) so a pathological cloud-API hang can't tie up a job slot.
 type BuildInfraContext struct{}
 
 func (b *BuildInfraContext) Run(parameters map[string]interface{}, logsWriter io.Writer) (map[string]interface{}, error) {
@@ -61,10 +69,12 @@ func (b *BuildInfraContext) Run(parameters map[string]interface{}, logsWriter io
 		return pack
 	}
 
+	ctx, cancel := context.WithTimeout(context.Background(), infraBuildTimeout)
+	defer cancel()
 	sources := context_sources.All()
 	io.WriteString(logsWriter, fmt.Sprintf("Running %d context source(s)...\n", len(sources)))
 	for _, src := range sources {
-		results, err := src.Build(parameters, logsWriter)
+		results, err := src.Build(ctx, parameters, logsWriter)
 		if err != nil {
 			// A connector error is transient plumbing failure, not knowledge about the infra:
 			// log it and skip. We deliberately do NOT fold it into the pack as a gap (gaps are
