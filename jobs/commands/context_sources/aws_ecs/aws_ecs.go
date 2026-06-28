@@ -159,6 +159,12 @@ func observeCluster(ctx context.Context, c *ecs.Client, clusterArn string, logsW
 			return nil, err
 		}
 		for _, svc := range out.Services {
+			// Only steady-state services: skip DRAINING/INACTIVE ones (being torn down) — they aren't
+			// what's running. (DescribeServices can also return Failures for services deleted between
+			// the list and describe; those simply don't appear in out.Services, so they're skipped.)
+			if aws.ToString(svc.Status) != "ACTIVE" {
+				continue
+			}
 			taskDef := aws.ToString(svc.TaskDefinition)
 			if taskDef == "" {
 				continue
@@ -190,12 +196,13 @@ func observeCluster(ctx context.Context, c *ecs.Client, clusterArn string, logsW
 	return observed, nil
 }
 
-// listServices returns every service ARN in a cluster, following pagination.
+// listServices returns every service ARN in a cluster, following pagination. MaxResults is set to
+// the max (100); ECS's ListServices default is only 10, which would 10x the page (call) count.
 func listServices(ctx context.Context, c *ecs.Client, clusterArn string) ([]string, error) {
 	var arns []string
 	var next *string
 	for {
-		out, err := c.ListServices(ctx, &ecs.ListServicesInput{Cluster: aws.String(clusterArn), NextToken: next})
+		out, err := c.ListServices(ctx, &ecs.ListServicesInput{Cluster: aws.String(clusterArn), MaxResults: aws.Int32(100), NextToken: next})
 		if err != nil {
 			return nil, err
 		}
