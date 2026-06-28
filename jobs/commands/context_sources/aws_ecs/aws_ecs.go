@@ -56,14 +56,26 @@ type observedService struct {
 // runner it is a no-op. Region comes from the job parameters (set by the trigger to the runner's
 // region); the cluster ARN carries account+region, so records stay unambiguous across runners.
 func (s *source) Build(parameters map[string]interface{}, logsWriter io.Writer) ([]context_sources.Result, error) {
-	if err := ensurePolicy(parameters); err != nil {
+	runnerData := utils.RunnerData.Get()
+	if err := ensurePolicy(parameters, runnerData); err != nil {
 		return nil, err
 	}
 
-	ecsClient, err := cloud_api_clients.GetEcsClient(parameters)
+	// Scan the runner's OWN install region. A runner is installed per region and its default
+	// credential chain is its own account, so the clusters it can see are exactly its region+account's
+	// — precisely the slice of infra this runner is responsible for. Self-sourced from RunnerData, NOT
+	// a job parameter: the trigger needn't pass a region and can't pass a wrong one. An org spanning
+	// regions/accounts installs a runner per region/account, and each builds its own slice; the packs
+	// compose by scope (cluster ARN carries account+region).
+	if runnerData.RunnerRegion == "" {
+		io.WriteString(logsWriter, "aws-ecs: runner has no region; skipping\n")
+		return nil, nil
+	}
+	ecsClient, err := cloud_api_clients.GetEcsClientFromRegion(runnerData.RunnerRegion)
 	if err != nil {
 		return nil, err
 	}
+	io.WriteString(logsWriter, fmt.Sprintf("aws-ecs: scanning region %s (account %s)\n", runnerData.RunnerRegion, runnerData.AWSAccountID))
 
 	ctx := context.TODO()
 	clusterArns, err := listClusters(ctx, ecsClient)
@@ -97,8 +109,7 @@ func (s *source) Build(parameters map[string]interface{}, logsWriter io.Writer) 
 // ensurePolicy self-grants the infra-context read bundle (ecs:*) on the runner's own task role,
 // mirroring every other command's policy self-grant. Idempotent; a no-op on a runner that already
 // has ecs:* from a prior deployment.
-func ensurePolicy(parameters map[string]interface{}) error {
-	runnerData := utils.RunnerData.Get()
+func ensurePolicy(parameters map[string]interface{}, runnerData utils.RunnerDataType) error {
 	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIDNamespace)
 	if err != nil {
 		return err
