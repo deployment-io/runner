@@ -103,6 +103,59 @@ func isDuplicateSecurityGroupRuleError(err error) bool {
 	return false
 }
 
+// recoverAndTagAlbSecurityGroupRule finds the id of the existing rule in the ALB
+// security group matching the given direction, tcp port and cidr, and re-applies our
+// Name tags to it so future deploys find the rule with the tag-based describe again.
+// Called after EC2 reports InvalidPermission.Duplicate for a rule the tag-based
+// describe missed (rule created by an older runner or with its tags stripped).
+// Recovery is best effort - the security group is already in the desired state at
+// this point - so failures are logged and an empty id is returned instead of
+// failing the deploy.
+func recoverAndTagAlbSecurityGroupRule(ec2Client *ec2.Client, albSecurityGroupId, ruleName string, isEgress bool, port int32, cidr string) string {
+	describeOutput, err := ec2Client.DescribeSecurityGroupRules(context.TODO(), &ec2.DescribeSecurityGroupRulesInput{
+		DryRun: aws.Bool(false),
+		Filters: []ec2Types.Filter{{
+			Name:   aws.String("group-id"),
+			Values: []string{albSecurityGroupId},
+		}},
+	})
+	if err != nil {
+		log.Printf("recovering rule %s: error describing rules for security group %s: %s", ruleName, albSecurityGroupId, err)
+		return ""
+	}
+	for _, rule := range describeOutput.SecurityGroupRules {
+		if aws.ToBool(rule.IsEgress) != isEgress || aws.ToString(rule.IpProtocol) != "tcp" ||
+			aws.ToInt32(rule.FromPort) != port || aws.ToInt32(rule.ToPort) != port ||
+			aws.ToString(rule.CidrIpv4) != cidr {
+			continue
+		}
+		ruleId := aws.ToString(rule.SecurityGroupRuleId)
+		_, err = ec2Client.CreateTags(context.TODO(), &ec2.CreateTagsInput{
+			Resources: []string{ruleId},
+			Tags: []ec2Types.Tag{
+				{
+					Key:   aws.String("Name"),
+					Value: aws.String(ruleName),
+				},
+				{
+					Key:   aws.String("created by"),
+					Value: aws.String("deployment.io"),
+				},
+				{
+					Key:   aws.String("alb-security-group-id"),
+					Value: aws.String(albSecurityGroupId),
+				},
+			},
+		})
+		if err != nil {
+			log.Printf("recovering rule %s: error tagging rule %s: %s", ruleName, ruleId, err)
+		}
+		return ruleId
+	}
+	log.Printf("recovering rule %s: no matching rule found in security group %s", ruleName, albSecurityGroupId)
+	return ""
+}
+
 func addIngressRuleToDefaultVpcSecurityGroupForPortIfNeeded(parameters map[string]interface{}, ec2Client *ec2.Client) error {
 	vpcId, err := jobs.GetParameterValue[string](parameters, parameters_enums.VpcID)
 	if err != nil {
@@ -345,11 +398,18 @@ func createAlbSecurityGroupIfNeeded(parameters map[string]interface{}, ec2Client
 		}
 		authorizeSecurityGroupIngressOutput, err := ec2Client.AuthorizeSecurityGroupIngress(context.TODO(), authorizeSecurityGroupIngressInput)
 		if err != nil {
-			//InvalidPermission.Duplicate means the rule already exists - treat as success and continue
+			//InvalidPermission.Duplicate means the rule already exists - treat as success,
+			//recover the existing rule id and re-tag the rule so future deploys find it by tag
 			if !isDuplicateSecurityGroupRuleError(err) {
 				return "", err
 			}
-			log.Printf("alb security group ingress rule %s already exists, continuing", albSecurityGroupIngressRuleName)
+			log.Printf("alb security group ingress rule %s already exists, recovering rule id", albSecurityGroupIngressRuleName)
+			for _, internetPort := range []int32{443, 80} {
+				ruleId := recoverAndTagAlbSecurityGroupRule(ec2Client, albSecurityGroupId, albSecurityGroupIngressRuleName, false, internetPort, "0.0.0.0/0")
+				if len(albSecurityGroupIngressRuleId) == 0 {
+					albSecurityGroupIngressRuleId = ruleId
+				}
+			}
 		} else {
 			albSecurityGroupIngressRuleId = aws.ToString(authorizeSecurityGroupIngressOutput.SecurityGroupRules[0].SecurityGroupRuleId)
 		}
@@ -426,11 +486,13 @@ func createAlbSecurityGroupIfNeeded(parameters map[string]interface{}, ec2Client
 
 		authorizeSecurityGroupEgressOutput, err := ec2Client.AuthorizeSecurityGroupEgress(context.TODO(), authorizeSecurityGroupEgressInput)
 		if err != nil {
-			//InvalidPermission.Duplicate means the rule already exists - treat as success and continue
+			//InvalidPermission.Duplicate means the rule already exists - treat as success,
+			//recover the existing rule id and re-tag the rule so future deploys find it by tag
 			if !isDuplicateSecurityGroupRuleError(err) {
 				return "", err
 			}
-			log.Printf("alb security group egress rule %s already exists, continuing", albSecurityGroupEgressRuleName)
+			log.Printf("alb security group egress rule %s already exists, recovering rule id", albSecurityGroupEgressRuleName)
+			albSecurityGroupEgressRuleId = recoverAndTagAlbSecurityGroupRule(ec2Client, albSecurityGroupId, albSecurityGroupEgressRuleName, true, int32(port), vpcCidr)
 		} else {
 			albSecurityGroupEgressRuleId = aws.ToString(authorizeSecurityGroupEgressOutput.SecurityGroupRules[0].SecurityGroupRuleId)
 		}
