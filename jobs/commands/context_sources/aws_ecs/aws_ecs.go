@@ -5,7 +5,7 @@
 // app-server derives from each repo's deploy-config: same shape, different source of truth, so the
 // agent can reconcile "what's wired up" against "what's actually running".
 //
-// Source name "aws-ecs", SourceKind Discovered. Self-registers via init(); BuildInfraContext
+// Source name "aws-ecs", SourceKind Observed. Self-registers via init(); BuildInfraContext
 // blank-imports this package. Metadata/structure only — never secret values.
 package aws_ecs
 
@@ -246,7 +246,7 @@ func scopedResult(clusterArn string, observed []observedService, builtTs int64) 
 	entry := context_pack.ManifestEntry{
 		Path:       file,
 		Source:     context_pack.SourceAwsEcs,
-		SourceKind: context_pack_enums.Discovered,
+		SourceKind: context_pack_enums.Observed,
 		SyncedTs:   builtTs,
 		Confidence: context_pack_enums.ConfidenceHigh, // the services + images are directly observed; the repo join is qualified per-record by RecoveredBy
 		Summary: fmt.Sprintf("%d service(s) observed on cluster %s; %d repo-matched",
