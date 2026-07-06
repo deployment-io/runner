@@ -111,12 +111,19 @@ func (s *source) Build(ctx context.Context, parameters map[string]interface{}, l
 			io.WriteString(logsWriter, fmt.Sprintf("aws-ecs: cluster %s failed (skipping): %v\n", nameFromArn(clusterArn), err))
 			continue
 		}
+		// Emit even when empty. aws-ecs is the SOLE writer of this cluster's observed layer, and
+		// merge-by-source only REPLACES a source that's present in the incoming pack — so a cluster that
+		// went from having services to none must still write an (empty) aws-ecs.json, or the previous
+		// scan's services linger forever (e.g. the last service scaled to zero + dropped, emptying the
+		// cluster). A scan *error* skips above (last-good stands); a confirmed-empty is authoritative and
+		// clears. Normalize an empty result (nil or empty) to a non-nil slice so the artifact serializes
+		// as [] (an empty layer), not null.
 		if len(observed) == 0 {
-			continue // empty cluster: nothing to record (no degraded/empty pack)
+			observed = []observedService{}
 		}
 		results = append(results, scopedResult(clusterArn, observed, builtTs))
 	}
-	io.WriteString(logsWriter, fmt.Sprintf("aws-ecs: observed %d cluster(s) with services\n", len(results)))
+	io.WriteString(logsWriter, fmt.Sprintf("aws-ecs: recorded %d cluster(s) (empty ones write an empty layer to clear stale data)\n", len(results)))
 	return results, nil
 }
 
