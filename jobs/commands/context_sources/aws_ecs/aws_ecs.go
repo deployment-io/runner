@@ -48,6 +48,11 @@ type observedService struct {
 	Repo        string `json:"repo,omitempty"`        // recovered repo (best-effort; see recoverRepo)
 	RecoveredBy string `json:"recoveredBy,omitempty"` // how Repo was derived, e.g. "image-name"
 	Cloud       string `json:"cloud"`                 // "aws"
+	// Arn is the ECS service ARN — the exact join key server-side reconciliation uses to RECOGNIZE a
+	// running service as one deployment.io already manages (match against Deployment.EcsServiceArn),
+	// so it enriches to the managed record instead of showing a rediscovered image-name row. Not a
+	// secret (a resource identifier), so it rides through the redaction backstop unchanged.
+	Arn string `json:"arn,omitempty"`
 }
 
 // Build self-provisions ECS read access, then emits one Cluster-scoped Result per ECS cluster in
@@ -188,6 +193,7 @@ func observeCluster(ctx context.Context, c *ecs.Client, clusterArn string, logsW
 					Repo:        repo,
 					RecoveredBy: by,
 					Cloud:       "aws",
+					Arn:         aws.ToString(svc.ServiceArn),
 				})
 			}
 		}
