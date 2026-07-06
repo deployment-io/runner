@@ -169,6 +169,13 @@ func observeCluster(ctx context.Context, c *ecs.Client, clusterArn string, logsW
 			if aws.ToString(svc.Status) != "ACTIVE" {
 				continue
 			}
+			// Scaled to zero — the service exists but serves nothing, so it isn't "running": drop it.
+			// BOTH must be zero: desired > 0 with running 0 is an OUTAGE (meant to run, isn't), which we
+			// deliberately keep visible. (A managed service scaled to zero still surfaces via the
+			// managed-deployments source, correctly reading "managed, not observed" rather than running.)
+			if svc.DesiredCount == 0 && svc.RunningCount == 0 {
+				continue
+			}
 			taskDef := aws.ToString(svc.TaskDefinition)
 			if taskDef == "" {
 				continue
