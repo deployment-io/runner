@@ -94,6 +94,16 @@ func (s *source) Build(ctx context.Context, parameters map[string]interface{}, l
 	builtTs := time.Now().Unix()
 	var results []context_sources.Result
 	for _, clusterArn := range clusterArns {
+		// Skip deployment.io's OWN runner infrastructure. The runner and its AWS controller run in a
+		// "dr-*" cluster (our deployment-runner naming convention — cf. dr-task-role / dr-policy in
+		// iam_policies), which is separate from user-deployment clusters ("ecs-<orgID>") and from
+		// foreign clusters. They're our platform, not a user service, so surfacing them as observed
+		// services is noise — and the runner appears in EVERY BYO account, not just dogfood. Skipping at
+		// the cluster level drops both the runner and the controller together.
+		if strings.HasPrefix(nameFromArn(clusterArn), "dr-") {
+			io.WriteString(logsWriter, fmt.Sprintf("aws-ecs: skipping deployment.io runner cluster %s\n", nameFromArn(clusterArn)))
+			continue
+		}
 		observed, err := observeCluster(ctx, ecsClient, clusterArn, logsWriter)
 		if err != nil {
 			// One cluster failing shouldn't sink the others — log + skip. The scope's last-good
@@ -167,6 +177,13 @@ func observeCluster(ctx context.Context, c *ecs.Client, clusterArn string, logsW
 			// what's running. (DescribeServices can also return Failures for services deleted between
 			// the list and describe; those simply don't appear in out.Services, so they're skipped.)
 			if aws.ToString(svc.Status) != "ACTIVE" {
+				continue
+			}
+			// Scaled to zero — the service exists but serves nothing, so it isn't "running": drop it.
+			// BOTH must be zero: desired > 0 with running 0 is an OUTAGE (meant to run, isn't), which we
+			// deliberately keep visible. (A managed service scaled to zero still surfaces via the
+			// managed-deployments source, correctly reading "managed, not observed" rather than running.)
+			if svc.DesiredCount == 0 && svc.RunningCount == 0 {
 				continue
 			}
 			taskDef := aws.ToString(svc.TaskDefinition)
