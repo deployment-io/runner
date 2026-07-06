@@ -94,6 +94,16 @@ func (s *source) Build(ctx context.Context, parameters map[string]interface{}, l
 	builtTs := time.Now().Unix()
 	var results []context_sources.Result
 	for _, clusterArn := range clusterArns {
+		// Skip deployment.io's OWN runner infrastructure. The runner and its AWS controller run in a
+		// "dr-*" cluster (our deployment-runner naming convention — cf. dr-task-role / dr-policy in
+		// iam_policies), which is separate from user-deployment clusters ("ecs-<orgID>") and from
+		// foreign clusters. They're our platform, not a user service, so surfacing them as observed
+		// services is noise — and the runner appears in EVERY BYO account, not just dogfood. Skipping at
+		// the cluster level drops both the runner and the controller together.
+		if strings.HasPrefix(nameFromArn(clusterArn), "dr-") {
+			io.WriteString(logsWriter, fmt.Sprintf("aws-ecs: skipping deployment.io runner cluster %s\n", nameFromArn(clusterArn)))
+			continue
+		}
 		observed, err := observeCluster(ctx, ecsClient, clusterArn, logsWriter)
 		if err != nil {
 			// One cluster failing shouldn't sink the others — log + skip. The scope's last-good
