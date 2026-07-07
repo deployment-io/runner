@@ -17,6 +17,7 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner-kit/types"
+	agentmcp "github.com/deployment-io/deployment-runner/agent_mcp"
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/image"
@@ -93,6 +94,15 @@ const (
 	agentboxResultDirRel    = ".agentbox-output"
 	agentboxResultFile      = "result.json"
 	agentboxResultPathInCtr = agentboxWorkDirInContainer + "/" + agentboxResultDirRel + "/" + agentboxResultFile
+
+	// agentboxMCPSocketInContainer is where the per-task MCP tool socket is
+	// bind-mounted inside the agent container; agentbox reads its path from
+	// MCP_TOOL_RPC_SOCKET and bridges the agent's stdio MCP client to it. Tools
+	// execute on the runner side (agent_mcp), so credentials never enter the
+	// container. C0: a ping tool only.
+	agentboxMCPSocketInContainer = "/run/agentbox/tool-rpc.sock"
+	agentMCPSocketEnvVar         = "MCP_TOOL_RPC_SOCKET"
+	agentMCPServerVersion        = "0.1.0"
 
 	// agentboxCacheDirInContainer is the shared module-cache + toolchain
 	// shelf — a Docker volume mounted into both the vendor phase (which
@@ -227,11 +237,16 @@ func (rs *RunAgentStep) Run(parameters map[string]interface{}, logsWriter io.Wri
 	if err != nil {
 		return parameters, err
 	}
+	// Per-task MCP tool socket: the runner serves runner-executed tools on a
+	// host socket (sibling of the work dir, so it never lands in /work or a
+	// commit diff) bind-mounted into the agent container. C0 = ping only.
+	envVars = append(envVars, agentMCPSocketEnvVar+"="+agentboxMCPSocketInContainer)
 	result, err := rs.spawnAgentboxAndWait(agentboxSpawnSpec{
-		imageRef:    imageRef,
-		workDirHost: workDirHost,
-		cacheVolume: cacheVolume,
-		env:         envVars,
+		imageRef:      imageRef,
+		workDirHost:   workDirHost,
+		cacheVolume:   cacheVolume,
+		env:           envVars,
+		mcpSocketHost: agentMCPSocketHostPath(workDirHost),
 	}, logsWriter)
 	// User-stop path: agentbox SIGTERM-handled and wrote a partial
 	// /result.json (status="cancelled" with whatever progress it had).
@@ -443,6 +458,26 @@ func (rs *RunAgentStep) spawnAgentboxAndWait(spec agentboxSpawnSpec, logsWriter 
 		return agentResult{}, err
 	}
 	defer cli.Close()
+	// Bring the per-task MCP tool socket up BEFORE the container is created —
+	// Docker turns a missing bind source into a directory, so the socket file
+	// must already exist. Served on the runner side (agent_mcp) so credentials
+	// never enter the container; torn down on the way out (LIFO defer order runs
+	// this after the container is removed).
+	if spec.mcpSocketHost != "" {
+		mcpSrv := agentmcp.New("deployment-io-runner", agentMCPServerVersion)
+		agentmcp.RegisterPing(mcpSrv)
+		ln, lerr := mcpSrv.Listen(spec.mcpSocketHost)
+		if lerr != nil {
+			return agentResult{}, fmt.Errorf("error opening agent tool socket: %w", lerr)
+		}
+		mcpCtx, cancelMCP := context.WithCancel(dockerCtx)
+		defer func() {
+			cancelMCP()
+			_ = ln.Close()
+			_ = os.Remove(spec.mcpSocketHost)
+		}()
+		go func() { _ = mcpSrv.ServeListener(mcpCtx, ln) }()
+	}
 	containerID, err := createAgentboxContainer(dockerCtx, cli, spec)
 	if err != nil {
 		return agentResult{}, err
@@ -539,6 +574,13 @@ func createAgentboxContainer(ctx context.Context, cli *client.Client, spec agent
 			Type:   mount.TypeVolume,
 			Source: spec.cacheVolume,
 			Target: agentboxCacheDirInContainer,
+		})
+	}
+	if spec.mcpSocketHost != "" {
+		mounts = append(mounts, mount.Mount{
+			Type:   mount.TypeBind,
+			Source: spec.mcpSocketHost,
+			Target: agentboxMCPSocketInContainer,
 		})
 	}
 	hostCfg := &container.HostConfig{
@@ -872,6 +914,18 @@ type agentboxSpawnSpec struct {
 	cacheVolume string
 	cmd         []string
 	env         []string
+	// mcpSocketHost, set for the agent phase only, is the host path of the
+	// per-task MCP tool socket. The runner serves tools on it and bind-mounts
+	// it into the container at agentboxMCPSocketInContainer. Empty for the
+	// vendor phase (no agent, no tools).
+	mcpSocketHost string
+}
+
+// agentMCPSocketHostPath returns the host path for a task's MCP tool socket: a
+// sibling of the work dir (NOT inside it) so the socket never appears in /work
+// — keeping it out of the agent's file view and CommitAndPush's diff.
+func agentMCPSocketHostPath(workDirHost string) string {
+	return strings.TrimRight(workDirHost, "/") + "-agent-mcp.sock"
 }
 
 // spawnVendorAndWait runs the vendor container to completion, streaming its
