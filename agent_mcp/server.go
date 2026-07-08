@@ -20,7 +20,6 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"sync"
 )
 
 // defaultProtocolVersion is the MCP version advertised when the client doesn't
@@ -42,13 +41,16 @@ type Tool struct {
 	Handler     func(ctx context.Context, args json.RawMessage) (string, error)
 }
 
-// Server is a registry of tools served over a Unix socket. Construct with New,
-// register tools, then Serve. Safe for concurrent Register and serving.
+// Server is a registry of tools served over a Unix socket. Register all tools
+// BEFORE calling Serve/Listen: the serving goroutines read the registry without
+// synchronization, which is safe only because the go-statement that starts them
+// happens-after registration. Registration is NOT safe to interleave with
+// serving. If tools ever need to change at runtime, guard the maps with a mutex
+// and emit notifications/tools/list_changed.
 type Server struct {
 	name    string
 	version string
 
-	mu    sync.RWMutex
 	tools map[string]Tool
 	order []string // registration order, for a stable tools/list
 }
@@ -60,10 +62,8 @@ func New(name, version string) *Server {
 }
 
 // Register adds (or replaces, last-wins) a tool, preserving first-registration
-// order in tools/list.
+// order in tools/list. Call before Serve/Listen — see the Server doc.
 func (s *Server) Register(t Tool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if _, exists := s.tools[t.Name]; !exists {
 		s.order = append(s.order, t.Name)
 	}
@@ -213,8 +213,6 @@ func (s *Server) initializeResult(params json.RawMessage) map[string]interface{}
 }
 
 func (s *Server) toolsList() map[string]interface{} {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 	tools := make([]map[string]interface{}, 0, len(s.order))
 	for _, name := range s.order {
 		t := s.tools[name]
@@ -239,9 +237,7 @@ func (s *Server) toolsCall(ctx context.Context, params json.RawMessage) (map[str
 	if err := json.Unmarshal(params, &p); err != nil {
 		return nil, &rpcError{Code: -32602, Message: "invalid params: " + err.Error()}
 	}
-	s.mu.RLock()
 	t, ok := s.tools[p.Name]
-	s.mu.RUnlock()
 	if !ok {
 		return nil, &rpcError{Code: -32602, Message: "unknown tool: " + p.Name}
 	}
