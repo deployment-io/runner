@@ -14,6 +14,7 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner-kit/previews"
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
+	"github.com/deployment-io/deployment-runner/utils/aws_utils"
 
 	"io"
 	"time"
@@ -130,7 +131,7 @@ func (d *DeleteAwsStaticSite) Run(parameters map[string]interface{}, logsWriter 
 	}
 
 	io.WriteString(logsWriter, fmt.Sprintf("Deleting all files in S3 bucket: %s\n", bucketName))
-	err = deleteAllS3Files(s3Client, bucketName)
+	err = aws_utils.DeleteAllS3Files(s3Client, bucketName)
 	if err != nil {
 		return parameters, err
 	}

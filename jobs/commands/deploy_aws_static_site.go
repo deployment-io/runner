@@ -2,11 +2,8 @@ package commands
 
 import (
 	"context"
-	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"strconv"
 	"strings"
@@ -15,9 +12,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/cloudfront"
 	cloudfrontTypes "github.com/aws/aws-sdk-go-v2/service/cloudfront/types"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
-	s3Types "github.com/aws/aws-sdk-go-v2/service/s3/types"
-	"github.com/aws/smithy-go"
 	"github.com/deployment-io/deployment-runner-kit/cloud_api_clients"
 	"github.com/deployment-io/deployment-runner-kit/deployments"
 	"github.com/deployment-io/deployment-runner-kit/enums/iam_policy_enums"
@@ -29,68 +23,11 @@ import (
 	"github.com/deployment-io/deployment-runner/client"
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
 	"github.com/deployment-io/deployment-runner/utils"
-	awsS3Uploads "github.com/deployment-io/deployment-runner/utils/uploads/aws-s3"
+	"github.com/deployment-io/deployment-runner/utils/aws_utils"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
 type DeployAwsStaticSite struct {
-}
-
-func createCachePolicy(cachePolicyName string, cloudFrontClient *cloudfront.Client) (*string, error) {
-	//can be used to forward any other cloudfront specific headers
-	cachePolicyConfig := &cloudfrontTypes.CachePolicyConfig{
-		MinTTL: aws.Int64(31536000),
-		Name:   aws.String(cachePolicyName),
-		ParametersInCacheKeyAndForwardedToOrigin: &cloudfrontTypes.ParametersInCacheKeyAndForwardedToOrigin{
-			CookiesConfig: &cloudfrontTypes.CachePolicyCookiesConfig{
-				CookieBehavior: cloudfrontTypes.CachePolicyCookieBehaviorNone,
-			},
-			EnableAcceptEncodingGzip: aws.Bool(true),
-			HeadersConfig: &cloudfrontTypes.CachePolicyHeadersConfig{
-				HeaderBehavior: cloudfrontTypes.CachePolicyHeaderBehaviorWhitelist,
-				Headers: &cloudfrontTypes.Headers{
-					Quantity: aws.Int32(1),
-					Items: []string{
-						"CloudFront-Forwarded-Proto",
-					},
-				},
-			},
-			QueryStringsConfig: &cloudfrontTypes.CachePolicyQueryStringsConfig{
-				QueryStringBehavior: cloudfrontTypes.CachePolicyQueryStringBehaviorNone,
-			},
-			EnableAcceptEncodingBrotli: aws.Bool(true),
-		},
-	}
-
-	cachePolicyOutput, err := cloudFrontClient.CreateCachePolicy(context.TODO(), &cloudfront.CreateCachePolicyInput{CachePolicyConfig: cachePolicyConfig})
-
-	if err != nil {
-		return nil, err
-	}
-
-	return cachePolicyOutput.CachePolicy.Id, nil
-}
-
-func createOriginAccessControl(name string, cloudFrontClient *cloudfront.Client) (*string, error) {
-	originAccessControlConfig := &cloudfrontTypes.OriginAccessControlConfig{
-		Name:                          aws.String(name),
-		OriginAccessControlOriginType: cloudfrontTypes.OriginAccessControlOriginTypesS3,
-		SigningBehavior:               cloudfrontTypes.OriginAccessControlSigningBehaviorsAlways,
-		SigningProtocol:               cloudfrontTypes.OriginAccessControlSigningProtocolsSigv4,
-		Description:                   aws.String("access control config for " + name),
-	}
-
-	originAccessControl, err := cloudFrontClient.CreateOriginAccessControl(context.TODO(), &cloudfront.CreateOriginAccessControlInput{
-		OriginAccessControlConfig: originAccessControlConfig,
-	})
-
-	if err != nil {
-		return nil, err
-	}
-
-	originAccessControlId := originAccessControl.OriginAccessControl.Id
-
-	return originAccessControlId, nil
 }
 
 func getBucketName(parameters map[string]interface{}) (string, error) {
@@ -123,66 +60,6 @@ func getDistDirectory(parameters map[string]interface{}) (string, error) {
 		return "", fmt.Errorf("publish directory path is same as the root directory")
 	}
 	return fmt.Sprintf("%s/%s", repoDirectory, publishDirectory), nil
-}
-
-func uploadToS3(directory, s3Region, s3Bucket string, s3Client *s3.Client, logsWriter io.Writer) error {
-	uploader, err := awsS3Uploads.NewUploader(s3Region, s3Bucket, s3Client)
-	if err != nil {
-		return err
-	}
-	err = uploader.UploadDirectory(directory, logsWriter)
-	if err != nil {
-		return err
-	}
-	return nil
-}
-
-func bucketExists(s3Client *s3.Client, s3Bucket string) bool {
-	_, err := s3Client.HeadBucket(context.TODO(), &s3.HeadBucketInput{
-		Bucket: aws.String(s3Bucket),
-	})
-
-	if err != nil {
-		return false
-	}
-
-	return true
-}
-
-func createS3BucketIfNeeded(s3Client *s3.Client, s3Bucket, s3Region string) (*string, bool, error) {
-	exists := bucketExists(s3Client, s3Bucket)
-
-	if exists {
-		return aws.String(fmt.Sprintf("/%s", s3Bucket)), false, nil
-	}
-
-	// Create S3 bucket
-	createBucketInput := &s3.CreateBucketInput{
-		Bucket: aws.String(s3Bucket),
-	}
-	if s3Region != "us-east-1" {
-		//weird AWS gives error with location constraint for us-east-1
-		createBucketConfiguration := &s3Types.CreateBucketConfiguration{
-			LocationConstraint: s3Types.BucketLocationConstraint(s3Region),
-		}
-		createBucketInput.CreateBucketConfiguration = createBucketConfiguration
-	}
-
-	response, err := s3Client.CreateBucket(context.TODO(), createBucketInput)
-	if err != nil {
-		//var bne *types.BucketAlreadyExists
-		var ae smithy.APIError
-		if errors.As(err, &ae) {
-			log.Printf("code: %s, message: %s, fault: %s", ae.ErrorCode(), ae.ErrorMessage(), ae.ErrorFault().String())
-		}
-		return nil, false, err
-	}
-	bucketLocation := response.Location
-	//log.Println("created bucket info")
-	//log.Println(aws.ToString(bucketLocation))
-	//log.Println(response.ResultMetadata)
-	//log.Println("------------------------")
-	return bucketLocation, true, nil
 }
 
 func getCommentForCloudfront(parameters map[string]interface{}) (string, error) {
@@ -231,24 +108,6 @@ func getOriginAccessName(parameters map[string]interface{}) (string, error) {
 		return "", err
 	}
 	return fmt.Sprintf("%s-%s", organizationID, deploymentID), nil
-}
-
-func createDefaultCacheBehavior(bucketLocation, cachePolicyId *string) *cloudfrontTypes.DefaultCacheBehavior {
-	allowedMethods := &cloudfrontTypes.AllowedMethods{
-		Items: []cloudfrontTypes.Method{
-			cloudfrontTypes.MethodGet,
-			cloudfrontTypes.MethodHead,
-		},
-		Quantity: aws.Int32(2),
-	}
-
-	defaultCacheBehavior := &cloudfrontTypes.DefaultCacheBehavior{
-		TargetOriginId:       bucketLocation,
-		ViewerProtocolPolicy: cloudfrontTypes.ViewerProtocolPolicyAllowAll,
-		AllowedMethods:       allowedMethods,
-		CachePolicyId:        cachePolicyId,
-	}
-	return defaultCacheBehavior
 }
 
 func createDistributionConfigForNewCloudfront(parameters map[string]interface{}, bucketLocation, originAccessControlId *string, callerReference, comment,
@@ -315,27 +174,6 @@ func createDistributionConfigForNewCloudfront(parameters map[string]interface{},
 	return distributionConfig, nil
 }
 
-type bucketPolicyStatement struct {
-	Sid       string `json:"Sid"`
-	Effect    string `json:"Effect"`
-	Principal struct {
-		Service string `json:"Service"`
-	} `json:"Principal"`
-	Action    string `json:"Action"`
-	Resource  string `json:"Resource"`
-	Condition struct {
-		StringEquals struct {
-			AWSSourceArn string `json:"AWS:SourceArn"`
-		} `json:"StringEquals"`
-	} `json:"Condition"`
-}
-
-type bucketPolicyDto struct {
-	Version   string                  `json:"Version"`
-	Id        string                  `json:"Id"`
-	Statement []bucketPolicyStatement `json:"Statement"`
-}
-
 func getBucketPolicySid(parameters map[string]interface{}) (string, error) {
 	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIDNamespace)
 	if err != nil {
@@ -358,56 +196,6 @@ func getBucketPolicyId(parameters map[string]interface{}) (string, error) {
 		return "", err
 	}
 	return fmt.Sprintf("PolicyForCloudFrontPrivateContent-%s-%s", organizationID, deploymentID), nil
-}
-
-func attachPolicyToS3Bucket(distributionArn *string, s3BucketName, policySid, policyId string, s3Client *s3.Client) error {
-	policyStatement := bucketPolicyStatement{
-		Sid:    policySid,
-		Effect: "Allow",
-		Principal: struct {
-			Service string `json:"Service"`
-		}{
-			Service: "cloudfront.amazonaws.com",
-		},
-		Action:   "s3:GetObject",
-		Resource: "arn:aws:s3:::" + s3BucketName + "/*",
-		Condition: struct {
-			StringEquals struct {
-				AWSSourceArn string `json:"AWS:SourceArn"`
-			} `json:"StringEquals"`
-		}{
-			StringEquals: struct {
-				AWSSourceArn string `json:"AWS:SourceArn"`
-			}{
-				AWSSourceArn: aws.ToString(distributionArn),
-			},
-		},
-	}
-
-	policyDto := bucketPolicyDto{
-		Version: "2008-10-17",
-		Id:      policyId,
-		Statement: []bucketPolicyStatement{
-			policyStatement,
-		},
-	}
-
-	policyInJsonBytes, err := json.Marshal(policyDto)
-	if err != nil {
-		return err
-	}
-
-	bucketPolicyInput := &s3.PutBucketPolicyInput{
-		Bucket: aws.String(s3BucketName),
-		Policy: aws.String(string(policyInJsonBytes)),
-	}
-
-	_, err = s3Client.PutBucketPolicy(context.TODO(), bucketPolicyInput)
-
-	if err != nil {
-		return err
-	}
-	return nil
 }
 
 func (d *DeployAwsStaticSite) Run(parameters map[string]interface{}, logsWriter io.Writer) (newParameters map[string]interface{}, err error) {
@@ -458,7 +246,7 @@ func (d *DeployAwsStaticSite) Run(parameters map[string]interface{}, logsWriter 
 		return parameters, err
 	}
 
-	bucketLocation, isNewBucketCreated, err := createS3BucketIfNeeded(s3Client, bucketName, region_enums.Type(region).String())
+	bucketLocation, isNewBucketCreated, err := aws_utils.CreateS3BucketIfNeeded(s3Client, bucketName, region_enums.Type(region).String())
 	if err != nil {
 		return parameters, err
 	}
@@ -528,14 +316,14 @@ func (d *DeployAwsStaticSite) Run(parameters map[string]interface{}, logsWriter 
 		}
 	}
 
-	err = deleteAllS3Files(s3Client, bucketName)
+	err = aws_utils.DeleteAllS3Files(s3Client, bucketName)
 	if err != nil {
 		return parameters, err
 	}
 
 	io.WriteString(logsWriter, fmt.Sprintf("Uploading site to S3 bucket: %s\n", bucketName))
 
-	err = uploadToS3(distDirectory, region_enums.Type(region).String(), bucketName, s3Client, logsWriter)
+	err = aws_utils.UploadToS3(distDirectory, region_enums.Type(region).String(), bucketName, s3Client, logsWriter)
 	if err != nil {
 		io.WriteString(logsWriter, fmt.Sprintf("Error uploading site to S3 bucket: %s\n", bucketName))
 		return parameters, err
@@ -556,7 +344,7 @@ func (d *DeployAwsStaticSite) Run(parameters map[string]interface{}, logsWriter 
 		if !ignoreErrorsTillCF && err != nil {
 			return parameters, err
 		}
-		originAccessControlId, err = createOriginAccessControl(originAccessName, cloudfrontClient)
+		originAccessControlId, err = aws_utils.CreateOriginAccessControl(originAccessName, cloudfrontClient)
 		if !ignoreErrorsTillCF && err != nil {
 			return parameters, err
 		}
@@ -568,13 +356,13 @@ func (d *DeployAwsStaticSite) Run(parameters map[string]interface{}, logsWriter 
 
 		// Create cache policy
 		var cachePolicyId *string
-		cachePolicyId, err = createCachePolicy(cachePolicyName, cloudfrontClient)
+		cachePolicyId, err = aws_utils.CreateCachePolicy(cachePolicyName, cloudfrontClient)
 		if !ignoreErrorsTillCF && err != nil {
 			return parameters, err
 		}
 
 		// Create default cache behavior
-		defaultCacheBehavior := createDefaultCacheBehavior(bucketLocation, cachePolicyId)
+		defaultCacheBehavior := aws_utils.CreateDefaultCacheBehavior(bucketLocation, cachePolicyId)
 
 		// Create distribution config
 		domainName := bucketName + ".s3." + region_enums.Type(region).String() + ".amazonaws.com"
@@ -624,7 +412,7 @@ func (d *DeployAwsStaticSite) Run(parameters map[string]interface{}, logsWriter 
 		if err != nil {
 			return parameters, err
 		}
-		err = attachPolicyToS3Bucket(createDistributionOutput.Distribution.ARN, bucketName, bucketPolicySid, bucketPolicyId, s3Client)
+		err = aws_utils.AttachPolicyToS3Bucket(createDistributionOutput.Distribution.ARN, bucketName, bucketPolicySid, bucketPolicyId, s3Client)
 		if err != nil {
 			return parameters, err
 		}

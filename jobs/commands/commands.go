@@ -1,14 +1,10 @@
 package commands
 
 import (
-	"context"
 	"fmt"
 	"os"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
-	s3Types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/deployment-io/deployment-runner-kit/builds"
 	"github.com/deployment-io/deployment-runner-kit/deployments"
 	"github.com/deployment-io/deployment-runner-kit/enums/build_enums"
@@ -189,62 +185,6 @@ func MarkDeploymentDone(parameters map[string]interface{}, err error) <-chan str
 		})
 	}()
 	return done
-}
-
-func listAllS3Objects(s3Client *s3.Client, bucketName string) ([]s3Types.Object, error) {
-	params := &s3.ListObjectsV2Input{
-		Bucket: aws.String(bucketName),
-	}
-
-	listObjectsPaginator := s3.NewListObjectsV2Paginator(s3Client, params)
-
-	var i int
-	//log.Println("Objects:")
-	var objects []s3Types.Object
-	for listObjectsPaginator.HasMorePages() {
-		i++
-		page, err := listObjectsPaginator.NextPage(context.TODO())
-		if err != nil {
-			return nil, fmt.Errorf("failed to get page %v, %v", i, err)
-		}
-		for _, obj := range page.Contents {
-			objects = append(objects, obj)
-		}
-	}
-	return objects, nil
-}
-
-func deleteAllS3Files(s3Client *s3.Client, bucketName string) error {
-	allS3Objects, err := listAllS3Objects(s3Client, bucketName)
-	if err != nil {
-		return err
-	}
-	var objectIds []s3Types.ObjectIdentifier
-	for _, object := range allS3Objects {
-		objectIds = append(objectIds, s3Types.ObjectIdentifier{Key: object.Key})
-		if len(objectIds) == 9000 {
-			//delete 9000 at a time. Limit is 10000
-			_, err = s3Client.DeleteObjects(context.TODO(), &s3.DeleteObjectsInput{
-				Bucket: aws.String(bucketName),
-				Delete: &s3Types.Delete{Objects: objectIds},
-			})
-			if err != nil {
-				return fmt.Errorf("error deleting objects from bucket %s : %s", bucketName, err)
-			}
-			objectIds = nil
-		}
-	}
-	if len(objectIds) > 0 {
-		_, err = s3Client.DeleteObjects(context.TODO(), &s3.DeleteObjectsInput{
-			Bucket: aws.String(bucketName),
-			Delete: &s3Types.Delete{Objects: objectIds},
-		})
-		if err != nil {
-			return fmt.Errorf("error deleting objects from bucket %s : %s", bucketName, err)
-		}
-	}
-
-	return nil
 }
 
 func getDockerImageNameAndTag(parameters map[string]interface{}) (string, error) {

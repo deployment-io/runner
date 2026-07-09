@@ -1,4 +1,10 @@
-package commands
+// Package agenttools holds the implementations behind the agent-invoked MCP tools
+// (deploy_preview, verify_preview, …). These are NOT job Commands — they don't
+// implement Run and aren't dispatched sequentially by the job engine; they're
+// called in-process by the runner's per-task agent_mcp tool handlers. Keeping them
+// out of jobs/commands avoids implying they're part of the job command chain, and
+// lets them depend on the leaf aws_utils package without an import cycle.
+package agenttools
 
 import (
 	"context"
@@ -11,6 +17,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/cloudfront"
 	cloudfrontTypes "github.com/aws/aws-sdk-go-v2/service/cloudfront/types"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/deployment-io/deployment-runner/utils/aws_utils"
 )
 
 // StaticPreviewDeployInput is the request for DeployStaticSitePreview.
@@ -48,8 +55,7 @@ type StaticPreviewDeployResult struct {
 // Self-contained + blocking: invoked in-process by the deploy_preview tool handler,
 // deliberately NOT deploy_aws_static_site.Run (which is coupled to the Job params
 // map, deployment-server RPCs, and MarkDeploymentDone). It reuses that command's
-// arg-based AWS helpers (createS3BucketIfNeeded / uploadToS3 / createOriginAccessControl /
-// createCachePolicy / createDefaultCacheBehavior / attachPolicyToS3Bucket).
+// arg-based AWS primitives, now shared via the aws_utils package.
 //
 // Known edge (C1 walking-skeleton scope): a first deploy that fails after creating
 // the OAC/cache-policy but before the distribution would collide on those
@@ -62,17 +68,17 @@ func DeployStaticSitePreview(in StaticPreviewDeployInput, logsWriter io.Writer) 
 		return StaticPreviewDeployResult{}, fmt.Errorf("no index.html in build dir %s: %w", in.DistDirectory, err)
 	}
 
-	bucketLocation, _, err := createS3BucketIfNeeded(in.S3Client, bucketName, in.Region)
+	bucketLocation, _, err := aws_utils.CreateS3BucketIfNeeded(in.S3Client, bucketName, in.Region)
 	if err != nil {
 		return StaticPreviewDeployResult{}, fmt.Errorf("ensure preview bucket: %w", err)
 	}
 
 	// Re-upload the freshly built site (clear stale objects first).
-	if err = deleteAllS3Files(in.S3Client, bucketName); err != nil {
+	if err = aws_utils.DeleteAllS3Files(in.S3Client, bucketName); err != nil {
 		return StaticPreviewDeployResult{}, fmt.Errorf("clear preview bucket: %w", err)
 	}
 	io.WriteString(logsWriter, fmt.Sprintf("Uploading preview to S3 bucket: %s\n", bucketName))
-	if err = uploadToS3(in.DistDirectory, in.Region, bucketName, in.S3Client, logsWriter); err != nil {
+	if err = aws_utils.UploadToS3(in.DistDirectory, in.Region, bucketName, in.S3Client, logsWriter); err != nil {
 		return StaticPreviewDeployResult{}, fmt.Errorf("upload preview: %w", err)
 	}
 
@@ -102,15 +108,15 @@ func DeployStaticSitePreview(in StaticPreviewDeployInput, logsWriter io.Writer) 
 	}
 
 	// First deploy: stand up the distribution.
-	oacID, err := createOriginAccessControl("preview-"+in.PreviewID, cf)
+	oacID, err := aws_utils.CreateOriginAccessControl("preview-"+in.PreviewID, cf)
 	if err != nil {
 		return StaticPreviewDeployResult{}, fmt.Errorf("create OAC: %w", err)
 	}
-	cachePolicyID, err := createCachePolicy("preview-"+in.PreviewID, cf)
+	cachePolicyID, err := aws_utils.CreateCachePolicy("preview-"+in.PreviewID, cf)
 	if err != nil {
 		return StaticPreviewDeployResult{}, fmt.Errorf("create cache policy: %w", err)
 	}
-	behavior := createDefaultCacheBehavior(bucketLocation, cachePolicyID)
+	behavior := aws_utils.CreateDefaultCacheBehavior(bucketLocation, cachePolicyID)
 	s3Domain := bucketName + ".s3." + in.Region + ".amazonaws.com"
 	distConfig := buildPreviewDistributionConfig(bucketLocation, oacID, in.PreviewID, s3Domain, behavior, in.IsSPA)
 
@@ -121,7 +127,7 @@ func DeployStaticSitePreview(in StaticPreviewDeployInput, logsWriter io.Writer) 
 	}
 	dist := out.Distribution
 
-	if err = attachPolicyToS3Bucket(dist.ARN, bucketName,
+	if err = aws_utils.AttachPolicyToS3Bucket(dist.ARN, bucketName,
 		"AllowCloudFrontServicePrincipal-"+in.PreviewID, "PolicyForCloudFrontPrivateContent-"+in.PreviewID, in.S3Client); err != nil {
 		return StaticPreviewDeployResult{}, fmt.Errorf("attach bucket policy: %w", err)
 	}
