@@ -187,6 +187,11 @@ func buildPreviewDistributionConfig(bucketLocation, oacID *string, previewID, s3
 		Origins:              origins,
 		CustomErrorResponses: errorResponses,
 		DefaultRootObject:    aws.String("index.html"),
-		PriceClass:           cloudfrontTypes.PriceClassPriceClass100, // US/EU only — previews are low-traffic + throwaway
+		// PriceClassAll: doesn't gate access — it picks which edge locations serve the
+		// content. A BYO customer's viewers + origin can be in ANY region, and with
+		// CachingDisabled every request hits the origin, so edge locality directly costs
+		// latency. The cost delta vs 100/200 is negligible for low-traffic previews, so
+		// a local edge everywhere is the right default.
+		PriceClass: cloudfrontTypes.PriceClassPriceClassAll,
 	}
 }
