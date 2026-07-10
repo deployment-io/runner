@@ -21,10 +21,17 @@ import (
 )
 
 // cachingDisabledPolicyID is CloudFront's AWS-managed "CachingDisabled" cache
-// policy. Previews use it instead of a custom policy: a preview iterates constantly
-// (the opposite of a production site), so we want ZERO CDN caching — the freshly
-// re-uploaded content is served immediately with no invalidation, and we don't burn
-// one of the account's ~20 cache-policy slots per preview.
+// policy. Because it's AWS-managed (not account-created), this ID is a GLOBAL AWS
+// constant — identical in every commercial-partition account and region — which is
+// exactly what makes it safe to hardcode in the BYO multi-account model (AWS's own
+// CDK hardcodes the same literal as CachePolicy.CACHING_DISABLED). GovCloud/China
+// are separate partitions where CloudFront is limited/absent and this may not apply.
+//
+// Previews use it instead of a custom policy: a preview iterates constantly (the
+// opposite of a production site), so we want ZERO CDN caching — the freshly
+// re-uploaded content is served immediately with no invalidation, and we don't
+// create a per-preview custom policy that would burn one of the account's ~20
+// cache-policy slots.
 const cachingDisabledPolicyID = "4135ea2d-6df8-44a3-9df3-4b5a84be39ad"
 
 // StaticPreviewDeployInput is the request for DeployStaticSitePreview.
