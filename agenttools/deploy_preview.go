@@ -6,12 +6,22 @@ package agenttools
 //
 // C2 (thin walking skeleton): entirely runner-side. The preview is keyed by the
 // Task id, deployed via DeployStaticSitePreview using the runner's own IAM role +
-// region — no control-plane record, no deployment-server round trip. Distribution
-// reuse across calls is remembered in an in-memory cache (per agent container),
-// seeded on a cache miss by a one-time CloudFront lookup so a later Step doesn't
-// create a duplicate distribution for the same bucket. C4 replaces both the keying
-// and that lookup with a persisted ephemeral-Environment + Deployment record
-// (kit #194), which also makes previews visible in the dashboard.
+// region — no control-plane record, no deployment-server round trip.
+//
+// Cross-run distribution reuse is STATELESS: the source of truth is the CloudFront
+// account itself, found on the first call per process by matching the distribution
+// Comment (discoverExistingPreviewDist). That is what makes reuse correct across
+// horizontally-scaled runners — every BYO runner shares the org's cloud account, so
+// any of them finds the task's existing distribution. The in-memory cache below is
+// ONLY a within-process fast-path (empty on every other runner and on this runner's
+// next Step) — it never carries reuse across processes.
+//
+// This is thin, not final: the self-discovery is best-effort — if
+// cloudfront:ListDistributions is denied or eventually-consistent and misses, the
+// create path re-runs and collides on the account-global OAC/cache-policy names.
+// C4 replaces both the taskID keying and the lookup with a persisted
+// ephemeral-Environment + Deployment record (kit #194) — authoritative shared state
+// every runner reads — which also surfaces previews in the dashboard.
 
 import (
 	"bytes"
@@ -127,11 +137,22 @@ func handleDeployPreview(ctx context.Context, deps DeployPreviewDeps, mu *sync.M
 	}
 
 	// Resolve the existing distribution to reuse (empty => first deploy creates one).
+	// The cache is a per-process fast-path; discoverExistingPreviewDist is the actual
+	// cross-runner reuse mechanism (it reads the shared cloud account).
 	mu.Lock()
 	known, ok := cache[previewID]
 	mu.Unlock()
 	if !ok {
-		if distID, domain, derr := discoverExistingPreviewDist(ctx, cfClient, previewID); derr == nil && distID != "" {
+		distID, domain, derr := discoverExistingPreviewDist(ctx, cfClient, previewID)
+		switch {
+		case derr != nil:
+			// The lookup is the ONLY cross-process reuse mechanism, so a failure here
+			// (e.g. cloudfront:ListDistributions denied, or eventual consistency) means
+			// a later Step can't find this distribution and will collide on the
+			// account-global OAC name when it recreates. Surface it, don't swallow it.
+			io.WriteString(deps.LogsWriter, fmt.Sprintf(
+				"warning: could not check for an existing preview distribution (%v); treating as first deploy — a later redeploy may fail if one already exists\n", derr))
+		case distID != "":
 			known = previewDist{distID: distID, domain: domain}
 		}
 	}
