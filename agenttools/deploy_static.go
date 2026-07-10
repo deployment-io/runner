@@ -20,6 +20,13 @@ import (
 	"github.com/deployment-io/deployment-runner/utils/aws_utils"
 )
 
+// cachingDisabledPolicyID is CloudFront's AWS-managed "CachingDisabled" cache
+// policy. Previews use it instead of a custom policy: a preview iterates constantly
+// (the opposite of a production site), so we want ZERO CDN caching — the freshly
+// re-uploaded content is served immediately with no invalidation, and we don't burn
+// one of the account's ~20 cache-policy slots per preview.
+const cachingDisabledPolicyID = "4135ea2d-6df8-44a3-9df3-4b5a84be39ad"
+
 // StaticPreviewDeployInput is the request for DeployStaticSitePreview.
 type StaticPreviewDeployInput struct {
 	OrgID         string // organization id (for resource naming)
@@ -37,7 +44,7 @@ type StaticPreviewDeployInput struct {
 
 	// ExistingDistID is the CloudFront distribution id from a prior iteration.
 	// Empty on the first preview of a task (create the distribution); set on
-	// reuse (just re-upload + invalidate).
+	// reuse (just re-upload — the CachingDisabled policy serves it immediately).
 	ExistingDistID string
 
 	S3Client         *s3.Client
@@ -65,9 +72,9 @@ type StaticPreviewDeployResult struct {
 // arg-based AWS primitives, now shared via the aws_utils package.
 //
 // Known edge (C1 walking-skeleton scope): a first deploy that fails after creating
-// the OAC/cache-policy but before the distribution would collide on those
-// account-global names when retried — harden later (describe-or-create), as the
-// existing Run does via its ignoreErrorsTillCF path.
+// the OAC but before the distribution would collide on that account-global name when
+// retried — harden later (describe-or-create). The cache policy is the AWS-managed
+// CachingDisabled one, so it's no longer a per-preview resource that can orphan.
 func DeployStaticSitePreview(in StaticPreviewDeployInput, logsWriter io.Writer) (StaticPreviewDeployResult, error) {
 	bucketName := in.OrgID + "-" + in.PreviewID // matches deploy_aws_static_site's <org>-<deploymentID> scheme
 
@@ -91,41 +98,21 @@ func DeployStaticSitePreview(in StaticPreviewDeployInput, logsWriter io.Writer) 
 
 	cf := in.CloudfrontClient
 
-	// Reuse path: the distribution already serves this bucket — invalidate so the
-	// re-uploaded content shows.
+	// Reuse path: the distribution already serves this bucket. It uses the managed
+	// CachingDisabled policy, so the re-uploaded content is served immediately — no
+	// invalidation needed.
 	if in.ExistingDistID != "" {
-		io.WriteString(logsWriter, fmt.Sprintf("Invalidating preview distribution: %s\n", in.ExistingDistID))
-		inv, invErr := cf.CreateInvalidation(context.TODO(), &cloudfront.CreateInvalidationInput{
-			DistributionId: aws.String(in.ExistingDistID),
-			InvalidationBatch: &cloudfrontTypes.InvalidationBatch{
-				CallerReference: aws.String(fmt.Sprintf("preview-%s-%d", in.PreviewID, time.Now().Unix())),
-				Paths:           &cloudfrontTypes.Paths{Quantity: aws.Int32(1), Items: []string{"/*"}},
-			},
-		})
-		if invErr != nil {
-			return StaticPreviewDeployResult{}, fmt.Errorf("invalidate preview: %w", invErr)
-		}
-		if !in.SkipDeployWait {
-			if err = cloudfront.NewInvalidationCompletedWaiter(cf).Wait(context.TODO(), &cloudfront.GetInvalidationInput{
-				DistributionId: aws.String(in.ExistingDistID),
-				Id:             inv.Invalidation.Id,
-			}, 20*time.Minute); err != nil {
-				return StaticPreviewDeployResult{}, fmt.Errorf("wait preview invalidation: %w", err)
-			}
-		}
+		io.WriteString(logsWriter, fmt.Sprintf("Redeployed preview to existing distribution: %s\n", in.ExistingDistID))
 		return StaticPreviewDeployResult{DistributionID: in.ExistingDistID}, nil
 	}
 
-	// First deploy: stand up the distribution.
+	// First deploy: stand up the distribution. Uses the managed CachingDisabled
+	// policy (cachingDisabledPolicyID) rather than creating a per-preview one.
 	oacID, err := aws_utils.CreateOriginAccessControl("preview-"+in.PreviewID, cf)
 	if err != nil {
 		return StaticPreviewDeployResult{}, fmt.Errorf("create OAC: %w", err)
 	}
-	cachePolicyID, err := aws_utils.CreateCachePolicy("preview-"+in.PreviewID, cf)
-	if err != nil {
-		return StaticPreviewDeployResult{}, fmt.Errorf("create cache policy: %w", err)
-	}
-	behavior := aws_utils.CreateDefaultCacheBehavior(bucketLocation, cachePolicyID)
+	behavior := aws_utils.CreateDefaultCacheBehavior(bucketLocation, aws.String(cachingDisabledPolicyID))
 	s3Domain := bucketName + ".s3." + in.Region + ".amazonaws.com"
 	distConfig := buildPreviewDistributionConfig(bucketLocation, oacID, in.PreviewID, s3Domain, behavior, in.IsSPA)
 
@@ -176,9 +163,11 @@ func buildPreviewDistributionConfig(bucketLocation, oacID *string, previewID, s3
 
 	errorResponses := &cloudfrontTypes.CustomErrorResponses{Quantity: aws.Int32(0)}
 	if isSPA {
+		// ErrorCachingMinTTL 0 so a redeploy's changes show immediately (the default
+		// is 300s), matching the no-cache CachingDisabled policy on the behavior.
 		items := []cloudfrontTypes.CustomErrorResponse{
-			{ErrorCode: aws.Int32(403), ResponsePagePath: aws.String("/index.html"), ResponseCode: aws.String("200")},
-			{ErrorCode: aws.Int32(404), ResponsePagePath: aws.String("/index.html"), ResponseCode: aws.String("200")},
+			{ErrorCode: aws.Int32(403), ResponsePagePath: aws.String("/index.html"), ResponseCode: aws.String("200"), ErrorCachingMinTTL: aws.Int64(0)},
+			{ErrorCode: aws.Int32(404), ResponsePagePath: aws.String("/index.html"), ResponseCode: aws.String("200"), ErrorCachingMinTTL: aws.Int64(0)},
 		}
 		errorResponses = &cloudfrontTypes.CustomErrorResponses{Quantity: aws.Int32(int32(len(items))), Items: items}
 	}
@@ -191,6 +180,6 @@ func buildPreviewDistributionConfig(bucketLocation, oacID *string, previewID, s3
 		Origins:              origins,
 		CustomErrorResponses: errorResponses,
 		DefaultRootObject:    aws.String("index.html"),
-		PriceClass:           cloudfrontTypes.PriceClassPriceClassAll,
+		PriceClass:           cloudfrontTypes.PriceClassPriceClass100, // US/EU only — previews are low-traffic + throwaway
 	}
 }
