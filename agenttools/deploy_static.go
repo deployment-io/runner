@@ -28,6 +28,13 @@ type StaticPreviewDeployInput struct {
 	Region        string // AWS region string, e.g. region_enums.Type(r).String()
 	IsSPA         bool   // rewrite 403/404 -> /index.html so client-side routes resolve
 
+	// SkipDeployWait returns as soon as the distribution is created/invalidated
+	// (content uploaded, config applied) WITHOUT blocking on CloudFront's global
+	// propagation waiter (up to 20 min). The preview tool sets this so an agent's
+	// synchronous tool call returns promptly; the URL goes live as the CDN
+	// propagates (typically 1–5 min). Verification (C3) polls the URL until live.
+	SkipDeployWait bool
+
 	// ExistingDistID is the CloudFront distribution id from a prior iteration.
 	// Empty on the first preview of a task (create the distribution); set on
 	// reuse (just re-upload + invalidate).
@@ -98,11 +105,13 @@ func DeployStaticSitePreview(in StaticPreviewDeployInput, logsWriter io.Writer) 
 		if invErr != nil {
 			return StaticPreviewDeployResult{}, fmt.Errorf("invalidate preview: %w", invErr)
 		}
-		if err = cloudfront.NewInvalidationCompletedWaiter(cf).Wait(context.TODO(), &cloudfront.GetInvalidationInput{
-			DistributionId: aws.String(in.ExistingDistID),
-			Id:             inv.Invalidation.Id,
-		}, 20*time.Minute); err != nil {
-			return StaticPreviewDeployResult{}, fmt.Errorf("wait preview invalidation: %w", err)
+		if !in.SkipDeployWait {
+			if err = cloudfront.NewInvalidationCompletedWaiter(cf).Wait(context.TODO(), &cloudfront.GetInvalidationInput{
+				DistributionId: aws.String(in.ExistingDistID),
+				Id:             inv.Invalidation.Id,
+			}, 20*time.Minute); err != nil {
+				return StaticPreviewDeployResult{}, fmt.Errorf("wait preview invalidation: %w", err)
+			}
 		}
 		return StaticPreviewDeployResult{DistributionID: in.ExistingDistID}, nil
 	}
@@ -132,10 +141,14 @@ func DeployStaticSitePreview(in StaticPreviewDeployInput, logsWriter io.Writer) 
 		return StaticPreviewDeployResult{}, fmt.Errorf("attach bucket policy: %w", err)
 	}
 
-	io.WriteString(logsWriter, fmt.Sprintf("Waiting for preview distribution to deploy: %s\n", aws.ToString(dist.Id)))
-	if err = cloudfront.NewDistributionDeployedWaiter(cf).Wait(context.TODO(),
-		&cloudfront.GetDistributionInput{Id: dist.Id}, 20*time.Minute); err != nil {
-		return StaticPreviewDeployResult{}, fmt.Errorf("wait preview distribution: %w", err)
+	if in.SkipDeployWait {
+		io.WriteString(logsWriter, fmt.Sprintf("Preview distribution created: %s (propagating)\n", aws.ToString(dist.Id)))
+	} else {
+		io.WriteString(logsWriter, fmt.Sprintf("Waiting for preview distribution to deploy: %s\n", aws.ToString(dist.Id)))
+		if err = cloudfront.NewDistributionDeployedWaiter(cf).Wait(context.TODO(),
+			&cloudfront.GetDistributionInput{Id: dist.Id}, 20*time.Minute); err != nil {
+			return StaticPreviewDeployResult{}, fmt.Errorf("wait preview distribution: %w", err)
+		}
 	}
 
 	return StaticPreviewDeployResult{
