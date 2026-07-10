@@ -14,11 +14,17 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/service/cloudfront"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/deployment-io/deployment-runner-kit/cloud_api_clients"
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
+	"github.com/deployment-io/deployment-runner-kit/enums/region_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner-kit/types"
 	agentmcp "github.com/deployment-io/deployment-runner/agent_mcp"
+	"github.com/deployment-io/deployment-runner/agenttools"
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
+	"github.com/deployment-io/deployment-runner/utils"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/mount"
@@ -239,14 +245,17 @@ func (rs *RunAgentStep) Run(parameters map[string]interface{}, logsWriter io.Wri
 	}
 	// Per-task MCP tool socket: the runner serves runner-executed tools on a
 	// host socket (sibling of the work dir, so it never lands in /work or a
-	// commit diff) bind-mounted into the agent container. C0 = ping only.
+	// commit diff) bind-mounted into the agent container. Tools: ping (C0) +
+	// deploy_preview (C2).
 	envVars = append(envVars, agentMCPSocketEnvVar+"="+agentboxMCPSocketInContainer)
+	previewDeps := buildPreviewDeps(ctx, parameters, workDirHost, logsWriter)
 	result, err := rs.spawnAgentboxAndWait(agentboxSpawnSpec{
 		imageRef:      imageRef,
 		workDirHost:   workDirHost,
 		cacheVolume:   cacheVolume,
 		env:           envVars,
 		mcpSocketHost: agentMCPSocketHostPath(workDirHost),
+		previewDeps:   previewDeps,
 	}, logsWriter)
 	// User-stop path: agentbox SIGTERM-handled and wrote a partial
 	// /result.json (status="cancelled" with whatever progress it had).
@@ -466,6 +475,9 @@ func (rs *RunAgentStep) spawnAgentboxAndWait(spec agentboxSpawnSpec, logsWriter 
 	if spec.mcpSocketHost != "" {
 		mcpSrv := agentmcp.New("deployment-io-runner", agentMCPServerVersion)
 		agentmcp.RegisterPing(mcpSrv)
+		if spec.previewDeps != nil {
+			agenttools.RegisterDeployPreview(mcpSrv, *spec.previewDeps)
+		}
 		ln, lerr := mcpSrv.Listen(spec.mcpSocketHost)
 		if lerr != nil {
 			return agentResult{}, fmt.Errorf("error opening agent tool socket: %w", lerr)
@@ -919,6 +931,9 @@ type agentboxSpawnSpec struct {
 	// it into the container at agentboxMCPSocketInContainer. Empty for the
 	// vendor phase (no agent, no tools).
 	mcpSocketHost string
+	// previewDeps, set for the agent phase only, is the task-scoped context the
+	// deploy_preview MCP tool closes over. Nil for the vendor phase.
+	previewDeps *agenttools.DeployPreviewDeps
 }
 
 // agentMCPSocketHostPath returns the host path for a task's MCP tool socket: a
@@ -926,6 +941,37 @@ type agentboxSpawnSpec struct {
 // — keeping it out of the agent's file view and CommitAndPush's diff.
 func agentMCPSocketHostPath(workDirHost string) string {
 	return strings.TrimRight(workDirHost, "/") + "-agent-mcp.sock"
+}
+
+// buildPreviewDeps assembles the task-scoped context the deploy_preview MCP tool
+// closes over. The preview deploys to the runner's OWN cloud via its IAM role in
+// the runner's region — so the only wiring needed is setting the Region job-param
+// the cloud_api_clients builders read (a Tasks job doesn't carry one today) and
+// handing the tool a lazy client factory + the task scope. See PLAN_agent_driven_
+// preview_verify.md (C2, thin: runner-only, no control-plane record yet).
+func buildPreviewDeps(ctx commandUtils.TaskJobContext, parameters map[string]interface{}, workDirHost string, logsWriter io.Writer) *agenttools.DeployPreviewDeps {
+	runnerRegion := utils.RunnerData.Get().RunnerRegion
+	if rt, err := region_enums.GetType(runnerRegion); err == nil {
+		jobs.SetParameterValue[int64](parameters, parameters_enums.Region, int64(rt))
+	}
+	return &agenttools.DeployPreviewDeps{
+		OrgID:       ctx.OrganizationID,
+		TaskID:      ctx.TaskID,
+		Region:      runnerRegion,
+		WorkDirHost: workDirHost,
+		LogsWriter:  logsWriter,
+		BuildClients: func() (*s3.Client, *cloudfront.Client, error) {
+			s3Client, err := cloud_api_clients.GetS3Client(parameters)
+			if err != nil {
+				return nil, nil, err
+			}
+			cfClient, err := cloud_api_clients.GetCloudfrontClient(parameters, cloudfrontRegion)
+			if err != nil {
+				return nil, nil, err
+			}
+			return s3Client, cfClient, nil
+		},
+	}
 }
 
 // spawnVendorAndWait runs the vendor container to completion, streaming its
