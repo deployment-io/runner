@@ -163,12 +163,15 @@ const (
 	// can dial up/down without a runner redeploy. Phase 6 wires per-org
 	// overrides via Settings UI.
 	//
-	// Memory + CPU sized for typical Tasks workloads. Memory accounts
-	// for Claude Code's working set during large-repo analysis (~1GB)
-	// + npm/pip install during agentbox startup (~500MB) + headroom.
-	// CPU at 2 cores keeps multiple concurrent Step Jobs feasible on
-	// a 4-core runner without saturating the host.
-	defaultMemoryBytes = 2 * 1024 * 1024 * 1024 // 2 GB
+	// Memory + CPU sized for typical Tasks workloads. The real ceiling is
+	// the production BUILD, not the agent's analysis working set (~1GB) or
+	// npm/pip install (~500MB): a Vite/webpack build of a real app
+	// (observed: the dashboard) gets OOM-killed at 2GB during chunk
+	// rendering — exit 137 (cgroup SIGKILL) / 134 (Node heap abort). 4GB
+	// covers typical builds; unusually heavy ones can raise it further via
+	// AGENTBOX_MEMORY_BYTES without a runner redeploy. CPU at 2 cores keeps
+	// multiple concurrent Step Jobs feasible on a 4-core runner.
+	defaultMemoryBytes = 4 * 1024 * 1024 * 1024 // 4 GB
 	defaultCPUCores    = int64(2)               // 2 cores
 
 	// Tmpfs sizes. /tmp covers general scratch (build artifacts, npm
