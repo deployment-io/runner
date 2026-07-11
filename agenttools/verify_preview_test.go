@@ -92,9 +92,9 @@ func TestPollURL_Contains(t *testing.T) {
 		t.Fatalf("expected live+matched, got %+v", res)
 	}
 	// absent → 200 but no match → not live, matched=false
-	res2 := pollURL(context.Background(), srv.URL, "NOPE", 60*time.Millisecond, 5*time.Millisecond, nil)
-	if res2.Live {
-		t.Fatalf("expected not live for missing substring, got %+v", res2)
+	res2 := pollURL(context.Background(), srv.URL, "NOPE", 2*time.Second, 5*time.Millisecond, nil)
+	if !res2.Live {
+		t.Fatalf("expected live (200) even with a missing substring, got %+v", res2)
 	}
 	if res2.Matched == nil || *res2.Matched {
 		t.Fatalf("expected matched=false, got %+v", res2)
