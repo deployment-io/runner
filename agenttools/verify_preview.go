@@ -27,8 +27,8 @@ import (
 )
 
 const (
-	verifyPreviewDefaultMaxWait = 120 * time.Second
-	verifyPreviewMaxWaitCap     = 240 * time.Second
+	verifyPreviewDefaultMaxWait = 240 * time.Second
+	verifyPreviewMaxWaitCap     = 300 * time.Second
 	verifyPreviewPollInterval   = 5 * time.Second
 	verifyPreviewPerRequestTO   = 10 * time.Second
 	verifyPreviewSnippetRunes   = 500
@@ -44,11 +44,11 @@ const verifyPreviewInputSchema = `{
     },
     "contains": {
       "type": "string",
-      "description": "Optional substring to require in the served response body. NOTE: an SPA's body is the HTML shell, so client-rendered text will NOT be present — use this for shell/asset markers (e.g. the <title>), not rendered UI."
+      "description": "Optional ADVISORY substring check against the response body. It does NOT affect liveness — a 200 is always live — and is reported separately as matched. An SPA's body is the HTML shell, so client-rendered text will NOT be found here; for an SPA omit this and confirm the change in the built bundle instead."
     },
     "max_wait_seconds": {
       "type": "integer",
-      "description": "How long to poll for the URL to go live before giving up (default 120, max 240). A first-time distribution may still be propagating."
+      "description": "How long to poll for the URL to first return 200 before giving up (default 240, max 300). The call returns as soon as it's live, so a larger value only pushes out the give-up point. A first-time distribution can take a few minutes to propagate."
     }
   },
   "required": ["url"]
@@ -70,11 +70,11 @@ type verifyPreviewResult struct {
 func RegisterVerifyPreview(s *agentmcp.Server, logsWriter io.Writer) {
 	s.Register(agentmcp.Tool{
 		Name: "verify_preview",
-		Description: "Confirm a deployed preview URL is live and serving. Polls it until it returns HTTP 200 " +
-			"(a first-time distribution may take a few minutes to propagate — call again if it times out). Runs on the " +
-			"runner, so it works even though your sandbox can't reach the URL directly. Only *.cloudfront.net preview " +
-			"URLs are accepted. For an SPA the response is the HTML shell, so client-rendered text won't appear in the " +
-			"body — check the built bundle for that.",
+		Description: "Confirm a deployed preview URL is live. Polls it until it returns HTTP 200 (a first-time " +
+			"distribution can take a few minutes to propagate), and returns live=true as soon as it does — that 200 is " +
+			"your success signal. Runs on the runner, so it works even though your sandbox can't reach the URL directly. " +
+			"Only *.cloudfront.net preview URLs are accepted. Do NOT pass `contains` expecting rendered SPA text — an " +
+			"SPA's body is the HTML shell, so verify the change in the built bundle instead.",
 		InputSchema: json.RawMessage(verifyPreviewInputSchema),
 		Handler: func(ctx context.Context, args json.RawMessage) (string, error) {
 			return handleVerifyPreview(ctx, logsWriter, args)
@@ -155,14 +155,17 @@ func pollURL(ctx context.Context, target, contains string, maxWait, interval tim
 	for {
 		attempts++
 		status, body, _ := fetchOnce(ctx, client, target)
-		matched := !wantContains || strings.Contains(body, contains)
 		// Record only a real HTTP response — a network error (status 0), e.g. the
 		// final fetch racing the deadline, must not clobber the last observed status.
 		if status != 0 {
 			lastStatus = status
 			lastSnippet = snippet(body, verifyPreviewSnippetRunes)
 		}
-		if status == http.StatusOK && matched {
+		// A 200 means the URL is reachable → LIVE. `contains` is a separate content
+		// assertion, reported but NOT a gate: we do NOT keep polling a live URL hoping
+		// a substring appears (the served body is already the deployed content, and
+		// for an SPA the visible text is client-rendered so it's never in the shell).
+		if status == http.StatusOK {
 			res := verifyPreviewResult{
 				Live:           true,
 				StatusCode:     status,
@@ -172,33 +175,28 @@ func pollURL(ctx context.Context, target, contains string, maxWait, interval tim
 				Message:        "preview is live",
 			}
 			if wantContains {
-				t := true
-				res.Matched = &t
+				matched := strings.Contains(body, contains)
+				res.Matched = &matched
+				if !matched {
+					res.Message = "preview is LIVE (HTTP 200), but the expected substring was not found in the response body. For an SPA this is expected — the page text is client-rendered, not in the HTML shell — so treat the 200 as success and confirm the change in the built bundle."
+				}
 			}
 			return res
 		}
-		if logsWriter != nil {
-			io.WriteString(logsWriter, fmt.Sprintf("verify_preview: attempt %d — status=%d, not live yet, retrying...\n", attempts, status))
+		// Not reachable yet (status 0 / non-200). Log periodically, not every tick.
+		if logsWriter != nil && (attempts == 1 || attempts%6 == 0) {
+			io.WriteString(logsWriter, fmt.Sprintf("verify_preview: attempt %d — status=%d, not reachable yet, still polling...\n", attempts, status))
 		}
 		select {
 		case <-ctx.Done():
-			msg := "timed out waiting for the preview to go live"
-			if wantContains && lastStatus == http.StatusOK {
-				msg = "preview responded 200 but the body did not contain the expected string (an SPA's body is the shell — client-rendered text won't be here)"
-			}
-			res := verifyPreviewResult{
+			return verifyPreviewResult{
 				Live:           false,
 				StatusCode:     lastStatus,
 				Attempts:       attempts,
 				ElapsedSeconds: int(time.Since(start).Seconds()),
 				BodySnippet:    lastSnippet,
-				Message:        msg,
+				Message:        "timed out waiting for the preview to become reachable — a first-time distribution can take a few minutes to propagate; call again (optionally with a larger max_wait_seconds).",
 			}
-			if wantContains {
-				f := false
-				res.Matched = &f
-			}
-			return res
 		case <-time.After(interval):
 		}
 	}
