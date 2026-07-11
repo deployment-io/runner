@@ -27,8 +27,13 @@ import (
 )
 
 const (
-	verifyPreviewDefaultMaxWait = 240 * time.Second
-	verifyPreviewMaxWaitCap     = 300 * time.Second
+	// Kept UNDER the agent's MCP client tool-call timeout (~120s observed for codex).
+	// If a single verify call ran longer, the client abandons it — a messy client-side
+	// timeout plus an orphaned server-side poll — instead of getting our clean
+	// "not live yet, call again" result. First-deploy CloudFront propagation (~130s)
+	// therefore takes two calls: the tool returns cleanly and the agent retries.
+	verifyPreviewDefaultMaxWait = 90 * time.Second
+	verifyPreviewMaxWaitCap     = 110 * time.Second
 	verifyPreviewPollInterval   = 5 * time.Second
 	verifyPreviewPerRequestTO   = 10 * time.Second
 	verifyPreviewSnippetRunes   = 500
@@ -48,7 +53,7 @@ const verifyPreviewInputSchema = `{
     },
     "max_wait_seconds": {
       "type": "integer",
-      "description": "How long to poll for the URL to first return 200 before giving up (default 240, max 300). The call returns as soon as it's live, so a larger value only pushes out the give-up point. A first-time distribution can take a few minutes to propagate."
+      "description": "How long to poll for the URL to first return 200 before returning (default 90, max 110). Kept under the agent tool-call timeout so the call returns cleanly; if it's not live yet, just call verify_preview again — a first-time distribution can take ~2 calls to catch."
     }
   },
   "required": ["url"]
@@ -195,7 +200,7 @@ func pollURL(ctx context.Context, target, contains string, maxWait, interval tim
 				Attempts:       attempts,
 				ElapsedSeconds: int(time.Since(start).Seconds()),
 				BodySnippet:    lastSnippet,
-				Message:        "timed out waiting for the preview to become reachable — a first-time distribution can take a few minutes to propagate; call again (optionally with a larger max_wait_seconds).",
+				Message:        "not reachable yet — a first-time CloudFront distribution takes a couple of minutes to start serving. This is normal; call verify_preview again to keep waiting (it returns as soon as it's live).",
 			}
 		case <-time.After(interval):
 		}
