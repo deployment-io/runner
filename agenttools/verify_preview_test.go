@@ -100,3 +100,20 @@ func TestPollURL_Contains(t *testing.T) {
 		t.Fatalf("expected matched=false, got %+v", res2)
 	}
 }
+
+func TestPollURL_ZeroIntervalDoesNotSpin(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	// interval 0 must be floored, not turned into a tight spin. With the floor the
+	// loop makes only a handful of attempts before maxWait expires.
+	res := pollURL(context.Background(), srv.URL, "", 100*time.Millisecond, 0, nil)
+	if res.Live {
+		t.Fatalf("expected not live, got %+v", res)
+	}
+	if res.Attempts > 20 {
+		t.Fatalf("interval=0 spun: %d attempts (expected it to be floored)", res.Attempts)
+	}
+}

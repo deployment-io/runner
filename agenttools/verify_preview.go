@@ -137,6 +137,12 @@ func isAllowedPreviewURL(raw string) bool {
 // holds it) or maxWait elapses. Host-agnostic — the handler applies the SSRF
 // allowlist before calling this.
 func pollURL(ctx context.Context, target, contains string, maxWait, interval time.Duration, logsWriter io.Writer) verifyPreviewResult {
+	// Floor the interval. The guaranteed sleep between attempts is what caps the
+	// attempt count (together with the maxWait deadline); a non-positive interval
+	// would turn the loop into a tight spin, so never allow that regardless of caller.
+	if interval <= 0 {
+		interval = verifyPreviewPollInterval
+	}
 	ctx, cancel := context.WithTimeout(ctx, maxWait)
 	defer cancel()
 	client := &http.Client{Timeout: verifyPreviewPerRequestTO}
