@@ -103,8 +103,10 @@ func RegisterDeployPreview(s *agentmcp.Server, deps DeployPreviewDeps) {
 	s.Register(agentmcp.Tool{
 		Name: "deploy_preview",
 		Description: "Deploy the built static site to a live preview URL on the project's cloud and return the URL. " +
-			"Call this AFTER the site is built — publish_dir (relative to /work) must contain index.html. " +
-			"Set is_spa=true for single-page apps with client-side routing. Re-call to redeploy after changes; the same preview URL is reused.",
+			"Call this AFTER a successful build — publish_dir (relative to /work) must be the output of your REAL build " +
+			"command and contain index.html. NEVER hand-create files to deploy; if the build fails, report that instead " +
+			"of deploying a placeholder. Set is_spa=true for single-page apps with client-side routing. Re-call to " +
+			"redeploy after changes (the same preview URL is reused), then use verify_preview to confirm it's live.",
 		InputSchema: json.RawMessage(deployPreviewInputSchema),
 		Handler: func(ctx context.Context, args json.RawMessage) (string, error) {
 			return handleDeployPreview(ctx, deps, &mu, cache, args)
