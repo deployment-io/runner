@@ -17,12 +17,16 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/cloudfront"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/deployment-io/deployment-runner-kit/cloud_api_clients"
+	"github.com/deployment-io/deployment-runner-kit/deployments"
+	"github.com/deployment-io/deployment-runner-kit/enums/build_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/region_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
+	"github.com/deployment-io/deployment-runner-kit/task_previews"
 	"github.com/deployment-io/deployment-runner-kit/types"
 	agentmcp "github.com/deployment-io/deployment-runner/agent_mcp"
 	"github.com/deployment-io/deployment-runner/agenttools"
+	runnerclient "github.com/deployment-io/deployment-runner/client"
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
 	"github.com/deployment-io/deployment-runner/utils"
 	"github.com/docker/docker/api/types/container"
@@ -952,15 +956,16 @@ func agentMCPSocketHostPath(workDirHost string) string {
 // the runner's region — so the only wiring needed is setting the Region job-param
 // the cloud_api_clients builders read (a Tasks job doesn't carry one today) and
 // handing the tool a lazy client factory + the task scope. See PLAN_agent_driven_
-// preview_verify.md (C2, thin: runner-only, no control-plane record yet).
+// preview_verify.md (C4: previews are persisted via the TaskPreviews.EnsureV1 RPC).
 func buildPreviewDeps(ctx commandUtils.TaskJobContext, parameters map[string]interface{}, workDirHost string, logsWriter io.Writer) *agenttools.DeployPreviewDeps {
 	runnerRegion := utils.RunnerData.Get().RunnerRegion
 	if rt, err := region_enums.GetType(runnerRegion); err == nil {
 		jobs.SetParameterValue[int64](parameters, parameters_enums.Region, int64(rt))
 	}
+	orgID := ctx.OrganizationID
+	taskID := ctx.TaskID
 	return &agenttools.DeployPreviewDeps{
-		OrgID:       ctx.OrganizationID,
-		TaskID:      ctx.TaskID,
+		OrgID:       orgID,
 		Region:      runnerRegion,
 		WorkDirHost: workDirHost,
 		LogsWriter:  logsWriter,
@@ -974,6 +979,21 @@ func buildPreviewDeps(ctx commandUtils.TaskJobContext, parameters map[string]int
 				return nil, nil, err
 			}
 			return s3Client, cfClient, nil
+		},
+		// Persisted-preview wiring (C4): find-or-create the control-plane record, and
+		// save a fresh distribution back onto it. The runner has no control-plane DB,
+		// so both go through deployment-server.
+		EnsurePreview: func(serviceName string) (string, string, string, error) {
+			return runnerclient.Get().EnsureTaskPreview(orgID, taskID, serviceName, task_previews.ServiceTypeStaticSite)
+		},
+		SaveDistribution: func(previewID, distID, arn, domain string) {
+			commandUtils.UpdateDeploymentsPipeline.Add(orgID, deployments.UpdateDeploymentDtoV1{
+				ID:                               previewID,
+				CloudfrontDistributionID:         distID,
+				CloudfrontDistributionArn:        arn,
+				CloudfrontDistributionDomainName: domain,
+				Status:                           build_enums.Success,
+			})
 		},
 	}
 }
