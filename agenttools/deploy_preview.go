@@ -81,7 +81,7 @@ const deployPreviewInputSchema = `{
     },
     "name": {
       "type": "string",
-      "description": "Optional service name within this task's preview (default \"static-site\"). Use distinct names when a task previews more than one static service."
+      "description": "Optional service name within this task's preview. Defaults to the repo + build-dir derived from publish_dir (which already distinguishes multiple services) — only set this to override."
     }
   },
   "required": ["publish_dir"]
@@ -119,7 +119,7 @@ func handleDeployPreview(ctx context.Context, deps DeployPreviewDeps, rawArgs js
 	}
 	serviceName := strings.TrimSpace(args.Name)
 	if serviceName == "" {
-		serviceName = defaultPreviewServiceName
+		serviceName = deriveServiceName(args.PublishDir)
 	}
 	distDir := resolvePublishDir(deps.WorkDirHost, args.PublishDir)
 
@@ -189,6 +189,57 @@ func resolvePublishDir(workDirHost, publishDir string) string {
 	p = strings.TrimPrefix(p, containerWorkDir) // "/work/dist" -> "/dist"; "dist" unchanged
 	rel := strings.TrimPrefix(filepath.Clean("/"+p), "/")
 	return filepath.Join(workDirHost, rel)
+}
+
+// deriveServiceName builds a deterministic, repo-aware service key from publish_dir
+// when the agent doesn't pass an explicit name. A /work-relative publish path is
+// "<idx>-<org>/<repo>/<subdir>"; strip the numeric repo-index prefix and sanitize to
+// "<org>-<repo>-<subdir>", so two same-type services (different repos/subdirs) get
+// distinct keys and each reuses correctly across steps. Falls back to the fixed
+// default only if nothing usable remains.
+func deriveServiceName(publishDir string) string {
+	p := strings.TrimSpace(publishDir)
+	p = strings.TrimPrefix(p, containerWorkDir)
+	rel := strings.TrimPrefix(filepath.Clean("/"+p), "/")
+	// Strip a leading numeric "<idx>-" repo-index prefix (keeps the key stable even
+	// if the task's repo ordering ever changes).
+	if i := strings.IndexByte(rel, '-'); i > 0 && isAllDigits(rel[:i]) {
+		rel = rel[i+1:]
+	}
+	if key := sanitizeServiceKey(rel); key != "" {
+		return key
+	}
+	return defaultPreviewServiceName
+}
+
+func isAllDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// sanitizeServiceKey collapses each run of non-alphanumeric characters (path
+// separators included) into a single '-', trimming leading/trailing dashes.
+func sanitizeServiceKey(s string) string {
+	var b strings.Builder
+	lastDash := false
+	for _, r := range s {
+		switch {
+		case (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9'):
+			b.WriteRune(r)
+			lastDash = false
+		case !lastDash:
+			b.WriteByte('-')
+			lastDash = true
+		}
+	}
+	return strings.Trim(b.String(), "-")
 }
 
 // tailString returns the last max bytes of b as a string, prefixed with an ellipsis

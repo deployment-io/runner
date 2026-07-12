@@ -43,3 +43,21 @@ func TestTailString(t *testing.T) {
 		t.Fatalf("clean boundary: got %q, want %q", got, "…é")
 	}
 }
+
+// TestDeriveServiceName covers the repo-aware key: strip the numeric idx prefix,
+// keep org/repo/subdir, sanitize to dashes; same-type services get distinct keys.
+func TestDeriveServiceName(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"0-deployment-io/dashboard/dist", "deployment-io-dashboard-dist"},
+		{"/work/0-deployment-io/dashboard/dist", "deployment-io-dashboard-dist"},
+		{"0-org/app/build", "org-app-build"},   // monorepo service A
+		{"0-org/admin/dist", "org-admin-dist"}, // monorepo service B — distinct key
+		{"dist", "dist"},                       // no idx/repo prefix
+		{"", "static-site"},                    // nothing usable → fallback
+	}
+	for _, c := range cases {
+		if got := deriveServiceName(c.in); got != c.want {
+			t.Errorf("deriveServiceName(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
