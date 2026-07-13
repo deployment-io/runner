@@ -4,14 +4,14 @@ package agenttools
 // coding agent, after building a static site inside its /work tree, calls this to
 // stand up (or refresh) a live preview on the project's cloud and get back a URL.
 //
-// C4: the preview is a persisted control-plane record. On each call the tool asks
-// deployment-server (via EnsurePreview) to find-or-create the task's ephemeral
-// Environment + the lean static Deployment for this service, and hands back that
-// Deployment's id (bucket/resource naming) + the distribution id/domain persisted
-// from a prior deploy. So distribution reuse is stateless and correct ACROSS runners
-// — the record is the source of truth, no in-memory cache and no CloudFront
-// self-discovery. After a first deploy the tool persists the new distribution back
-// via SaveDistribution so later calls/steps/runners reuse it.
+// C4: the preview is a persisted control-plane record. On each call the tool asks the
+// injected PreviewStore to find-or-create the task's ephemeral Environment + the lean
+// static Deployment for this service, and hands back that Deployment's id (bucket/
+// resource naming) + the resources (distribution id/domain) persisted from a prior
+// deploy. So reuse is stateless and correct ACROSS runners — the record is the source
+// of truth, no in-memory cache and no CloudFront self-discovery. After a first deploy
+// the tool persists the new resources back through the store so later calls/steps/
+// runners reuse them.
 
 import (
 	"bytes"
@@ -48,15 +48,10 @@ type DeployPreviewDeps struct {
 	// BuildClients lazily constructs the AWS clients (runner IAM role + region).
 	BuildClients func() (*s3.Client, *cloudfront.Client, error)
 
-	// EnsurePreview resolves (creating if needed) the persisted preview identity for
-	// the named service under this task's ephemeral env: the Deployment id (bucket +
-	// resource naming) and the distribution id/domain persisted from a prior deploy
-	// (empty on the first). Idempotent — round-trips deployment-server.
-	EnsurePreview func(serviceName string) (previewID, existingDistID, existingDomain string, err error)
-
-	// SaveDistribution persists a freshly created distribution back onto the preview
-	// Deployment record so the next call/step/runner reuses it.
-	SaveDistribution func(previewID, distID, arn, domain string)
+	// Store find-or-creates the persisted preview record and saves resources back onto
+	// it — the control-plane seam. Bound to one serviceType by the commands layer, so a
+	// web-service or database preview tool reuses this same struct with its own store.
+	Store PreviewStore
 }
 
 // deployPreviewResult is the JSON the agent receives from a tools/call.
@@ -119,7 +114,7 @@ func handleDeployPreview(ctx context.Context, deps DeployPreviewDeps, rawArgs js
 
 	// Resolve the persisted preview identity (find-or-create). The record is the
 	// source of truth for the deployment id + any existing distribution.
-	previewID, existingDistID, existingDomain, err := deps.EnsurePreview(serviceName)
+	previewID, existing, err := deps.Store.EnsurePreview(serviceName)
 	if err != nil {
 		return "", fmt.Errorf("ensure preview record: %w", err)
 	}
@@ -137,7 +132,7 @@ func handleDeployPreview(ctx context.Context, deps DeployPreviewDeps, rawArgs js
 		DistDirectory:    distDir,
 		Region:           deps.Region,
 		IsSPA:            args.IsSPA,
-		ExistingDistID:   existingDistID,
+		ExistingDistID:   existing.CloudFrontDistributionID,
 		S3Client:         s3Client,
 		CloudfrontClient: cfClient,
 		SkipDeployWait:   true, // return promptly; the CDN propagates async (verify_preview polls)
@@ -150,14 +145,18 @@ func handleDeployPreview(ctx context.Context, deps DeployPreviewDeps, rawArgs js
 	// only the id (nothing new to save), so fall back to the persisted domain.
 	distID := res.DistributionID
 	if distID == "" {
-		distID = existingDistID
+		distID = existing.CloudFrontDistributionID
 	}
 	domain := res.DomainName
 	if domain == "" {
-		domain = existingDomain
+		domain = existing.CloudFrontDomainName
 	}
-	if res.DomainName != "" && deps.SaveDistribution != nil {
-		deps.SaveDistribution(previewID, res.DistributionID, res.DistributionArn, res.DomainName)
+	if res.DomainName != "" {
+		deps.Store.SavePreview(previewID, PreviewState{
+			CloudFrontDistributionID:  res.DistributionID,
+			CloudFrontDistributionArn: res.DistributionArn,
+			CloudFrontDomainName:      res.DomainName,
+		})
 	}
 
 	out := deployPreviewResult{

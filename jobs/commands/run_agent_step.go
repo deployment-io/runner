@@ -957,6 +957,38 @@ func agentMCPSocketHostPath(workDirHost string) string {
 // the cloud_api_clients builders read (a Tasks job doesn't carry one today) and
 // handing the tool a lazy client factory + the task scope. See PLAN_agent_driven_
 // preview_verify.md (C4: previews are persisted via the TaskPreviews.EnsureV1 RPC).
+// taskPreviewStore implements agenttools.PreviewStore for one task + serviceType. It
+// bridges the preview tool to deployment-server (EnsureTaskPreview RPC) and the update
+// pipeline, mapping agenttools' neutral PreviewState to/from the deployment DTO — so
+// agenttools imports neither the RPC client nor the DTO. A web-service or database
+// preview tool constructs the same store with its own serviceType.
+type taskPreviewStore struct {
+	orgID       string
+	taskID      string
+	serviceType string
+}
+
+func (s taskPreviewStore) EnsurePreview(serviceName string) (string, agenttools.PreviewState, error) {
+	previewID, existingDistID, existingDomain, err := runnerclient.Get().EnsureTaskPreview(s.orgID, s.taskID, serviceName, s.serviceType)
+	if err != nil {
+		return "", agenttools.PreviewState{}, err
+	}
+	return previewID, agenttools.PreviewState{
+		CloudFrontDistributionID: existingDistID,
+		CloudFrontDomainName:     existingDomain,
+	}, nil
+}
+
+func (s taskPreviewStore) SavePreview(previewID string, r agenttools.PreviewState) {
+	commandUtils.UpdateDeploymentsPipeline.Add(s.orgID, deployments.UpdateDeploymentDtoV1{
+		ID:                               previewID,
+		CloudfrontDistributionID:         r.CloudFrontDistributionID,
+		CloudfrontDistributionArn:        r.CloudFrontDistributionArn,
+		CloudfrontDistributionDomainName: r.CloudFrontDomainName,
+		Status:                           build_enums.Success,
+	})
+}
+
 func buildPreviewDeps(ctx commandUtils.TaskJobContext, parameters map[string]interface{}, workDirHost string, logsWriter io.Writer) *agenttools.DeployPreviewDeps {
 	runnerRegion := utils.RunnerData.Get().RunnerRegion
 	if rt, err := region_enums.GetType(runnerRegion); err == nil {
@@ -980,20 +1012,13 @@ func buildPreviewDeps(ctx commandUtils.TaskJobContext, parameters map[string]int
 			}
 			return s3Client, cfClient, nil
 		},
-		// Persisted-preview wiring (C4): find-or-create the control-plane record, and
-		// save a fresh distribution back onto it. The runner has no control-plane DB,
-		// so both go through deployment-server.
-		EnsurePreview: func(serviceName string) (string, string, string, error) {
-			return runnerclient.Get().EnsureTaskPreview(orgID, taskID, serviceName, task_previews.ServiceTypeStaticSite)
-		},
-		SaveDistribution: func(previewID, distID, arn, domain string) {
-			commandUtils.UpdateDeploymentsPipeline.Add(orgID, deployments.UpdateDeploymentDtoV1{
-				ID:                               previewID,
-				CloudfrontDistributionID:         distID,
-				CloudfrontDistributionArn:        arn,
-				CloudfrontDistributionDomainName: domain,
-				Status:                           build_enums.Success,
-			})
+		// Persisted-preview seam (C4): find-or-create the record and save resources back
+		// onto it, via deployment-server (the runner has no control-plane DB). Bound to
+		// StaticSite; a web-service/database tool builds a store with its own type.
+		Store: taskPreviewStore{
+			orgID:       orgID,
+			taskID:      taskID,
+			serviceType: task_previews.ServiceTypeStaticSite,
 		},
 	}
 }
