@@ -1,5 +1,5 @@
 // Package agenttools holds the implementations behind the agent-invoked MCP tools
-// (deploy_preview, verify_preview, …). These are NOT job Commands — they don't
+// (deploy_static_site_preview, verify_preview_reachable, …). These are NOT job Commands — they don't
 // implement Run and aren't dispatched sequentially by the job engine; they're
 // called in-process by the runner's per-task agent_mcp tool handlers. Keeping them
 // out of jobs/commands avoids implying they're part of the job command chain, and
@@ -73,7 +73,7 @@ type StaticPreviewDeployResult struct {
 // with absolute asset paths + client routing — works with zero path-prefix corner
 // cases.
 //
-// Self-contained + blocking: invoked in-process by the deploy_preview tool handler,
+// Self-contained + blocking: invoked in-process by the deploy_static_site_preview tool handler,
 // deliberately NOT deploy_aws_static_site.Run (which is coupled to the Job params
 // map, deployment-server RPCs, and MarkDeploymentDone). It reuses that command's
 // arg-based AWS primitives, now shared via the aws_utils package.

@@ -3,7 +3,7 @@
 // runner-executed tools. The runner holds all credentials and performs the work;
 // the agent only speaks MCP over a bind-mounted socket (bridged to its stdio MCP
 // client). This is the C0 transport skeleton: a generic tool registry plus a
-// `ping` tool. Later capabilities (deploy_preview, verify_preview, and
+// `ping` tool. Later capabilities (deploy_static_site_preview, verify_preview_reachable, and
 // eventually Fetched-context connectors) register as tools here.
 //
 // Framing matches MCP's stdio transport — newline-delimited JSON-RPC 2.0 — so a

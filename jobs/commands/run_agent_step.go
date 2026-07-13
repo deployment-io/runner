@@ -17,12 +17,16 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/cloudfront"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/deployment-io/deployment-runner-kit/cloud_api_clients"
+	"github.com/deployment-io/deployment-runner-kit/deployments"
+	"github.com/deployment-io/deployment-runner-kit/enums/build_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/region_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
+	"github.com/deployment-io/deployment-runner-kit/task_previews"
 	"github.com/deployment-io/deployment-runner-kit/types"
 	agentmcp "github.com/deployment-io/deployment-runner/agent_mcp"
 	"github.com/deployment-io/deployment-runner/agenttools"
+	runnerclient "github.com/deployment-io/deployment-runner/client"
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
 	"github.com/deployment-io/deployment-runner/utils"
 	"github.com/docker/docker/api/types/container"
@@ -249,9 +253,9 @@ func (rs *RunAgentStep) Run(parameters map[string]interface{}, logsWriter io.Wri
 	// Per-task MCP tool socket: the runner serves runner-executed tools on a
 	// host socket (sibling of the work dir, so it never lands in /work or a
 	// commit diff) bind-mounted into the agent container. Tools: ping (C0) +
-	// deploy_preview (C2).
+	// deploy_static_site_preview (C2).
 	envVars = append(envVars, agentMCPSocketEnvVar+"="+agentboxMCPSocketInContainer)
-	previewDeps := buildPreviewDeps(ctx, parameters, workDirHost, logsWriter)
+	previewDeps := buildStaticSitePreviewDeps(ctx, parameters, workDirHost, logsWriter)
 	result, err := rs.spawnAgentboxAndWait(agentboxSpawnSpec{
 		imageRef:      imageRef,
 		workDirHost:   workDirHost,
@@ -479,8 +483,8 @@ func (rs *RunAgentStep) spawnAgentboxAndWait(spec agentboxSpawnSpec, logsWriter 
 		mcpSrv := agentmcp.New("deployment-io-runner", agentMCPServerVersion)
 		agentmcp.RegisterPing(mcpSrv)
 		if spec.previewDeps != nil {
-			agenttools.RegisterDeployPreview(mcpSrv, *spec.previewDeps)
-			agenttools.RegisterVerifyPreview(mcpSrv, spec.previewDeps.LogsWriter)
+			agenttools.RegisterDeployStaticSitePreview(mcpSrv, *spec.previewDeps)
+			agenttools.RegisterVerifyPreviewReachable(mcpSrv, spec.previewDeps.LogsWriter)
 		}
 		ln, lerr := mcpSrv.Listen(spec.mcpSocketHost)
 		if lerr != nil {
@@ -936,8 +940,8 @@ type agentboxSpawnSpec struct {
 	// vendor phase (no agent, no tools).
 	mcpSocketHost string
 	// previewDeps, set for the agent phase only, is the task-scoped context the
-	// deploy_preview MCP tool closes over. Nil for the vendor phase.
-	previewDeps *agenttools.DeployPreviewDeps
+	// deploy_static_site_preview MCP tool closes over. Nil for the vendor phase.
+	previewDeps *agenttools.DeployStaticSitePreviewDeps
 }
 
 // agentMCPSocketHostPath returns the host path for a task's MCP tool socket: a
@@ -947,20 +951,53 @@ func agentMCPSocketHostPath(workDirHost string) string {
 	return strings.TrimRight(workDirHost, "/") + "-agent-mcp.sock"
 }
 
-// buildPreviewDeps assembles the task-scoped context the deploy_preview MCP tool
+// buildStaticSitePreviewDeps assembles the task-scoped context the deploy_static_site_preview MCP tool
 // closes over. The preview deploys to the runner's OWN cloud via its IAM role in
 // the runner's region — so the only wiring needed is setting the Region job-param
 // the cloud_api_clients builders read (a Tasks job doesn't carry one today) and
 // handing the tool a lazy client factory + the task scope. See PLAN_agent_driven_
-// preview_verify.md (C2, thin: runner-only, no control-plane record yet).
-func buildPreviewDeps(ctx commandUtils.TaskJobContext, parameters map[string]interface{}, workDirHost string, logsWriter io.Writer) *agenttools.DeployPreviewDeps {
+// preview_verify.md (C4: previews are persisted via the TaskPreviews.EnsureV1 RPC).
+// taskPreviewStore implements agenttools.PreviewStore for one task + serviceType. It
+// bridges the preview tool to deployment-server (EnsureTaskPreview RPC) and the update
+// pipeline, mapping agenttools' neutral PreviewState to/from the deployment DTO — so
+// agenttools imports neither the RPC client nor the DTO. A web-service or database
+// preview tool constructs the same store with its own serviceType.
+type taskPreviewStore struct {
+	orgID       string
+	taskID      string
+	serviceType string
+}
+
+func (s taskPreviewStore) EnsurePreview(serviceName string) (string, agenttools.PreviewState, error) {
+	previewID, existingDistID, existingDomain, err := runnerclient.Get().EnsureTaskPreview(s.orgID, s.taskID, serviceName, s.serviceType)
+	if err != nil {
+		return "", agenttools.PreviewState{}, err
+	}
+	return previewID, agenttools.PreviewState{
+		CloudFrontDistributionID: existingDistID,
+		CloudFrontDomainName:     existingDomain,
+	}, nil
+}
+
+func (s taskPreviewStore) SavePreview(previewID string, r agenttools.PreviewState) {
+	commandUtils.UpdateDeploymentsPipeline.Add(s.orgID, deployments.UpdateDeploymentDtoV1{
+		ID:                               previewID,
+		CloudfrontDistributionID:         r.CloudFrontDistributionID,
+		CloudfrontDistributionArn:        r.CloudFrontDistributionArn,
+		CloudfrontDistributionDomainName: r.CloudFrontDomainName,
+		Status:                           build_enums.Success,
+	})
+}
+
+func buildStaticSitePreviewDeps(ctx commandUtils.TaskJobContext, parameters map[string]interface{}, workDirHost string, logsWriter io.Writer) *agenttools.DeployStaticSitePreviewDeps {
 	runnerRegion := utils.RunnerData.Get().RunnerRegion
 	if rt, err := region_enums.GetType(runnerRegion); err == nil {
 		jobs.SetParameterValue[int64](parameters, parameters_enums.Region, int64(rt))
 	}
-	return &agenttools.DeployPreviewDeps{
-		OrgID:       ctx.OrganizationID,
-		TaskID:      ctx.TaskID,
+	orgID := ctx.OrganizationID
+	taskID := ctx.TaskID
+	return &agenttools.DeployStaticSitePreviewDeps{
+		OrgID:       orgID,
 		Region:      runnerRegion,
 		WorkDirHost: workDirHost,
 		LogsWriter:  logsWriter,
@@ -974,6 +1011,14 @@ func buildPreviewDeps(ctx commandUtils.TaskJobContext, parameters map[string]int
 				return nil, nil, err
 			}
 			return s3Client, cfClient, nil
+		},
+		// Persisted-preview seam (C4): find-or-create the record and save resources back
+		// onto it, via deployment-server (the runner has no control-plane DB). Bound to
+		// StaticSite; a web-service/database tool builds a store with its own type.
+		Store: taskPreviewStore{
+			orgID:       orgID,
+			taskID:      taskID,
+			serviceType: task_previews.ServiceTypeStaticSite,
 		},
 	}
 }

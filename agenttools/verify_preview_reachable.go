@@ -1,6 +1,6 @@
 package agenttools
 
-// verify_preview.go implements the agent-invoked `verify_preview` MCP tool: after
+// verify_preview_reachable.go implements the agent-invoked `verify_preview_reachable` MCP tool: after
 // deploying a preview, the agent calls this to confirm the URL is actually live and
 // serving. It runs on the RUNNER, not the agent — the agentbox proxy allowlist
 // blocks arbitrary outbound hosts, so the agent can't reach the CloudFront URL
@@ -9,7 +9,7 @@ package agenttools
 // SECURITY: the runner fetches an agent-supplied URL, which is an SSRF vector — a
 // prompt-injected agent could ask it to fetch cloud-metadata (169.254.169.254) or
 // an internal host and exfiltrate the response through the tool result. So
-// verify_preview ONLY fetches hosts under *.cloudfront.net (every preview is a
+// verify_preview_reachable ONLY fetches hosts under *.cloudfront.net (every preview is a
 // CloudFront distribution). That allowlist is the whole SSRF defense; widen it
 // deliberately when custom preview domains land (Cw).
 
@@ -32,20 +32,20 @@ const (
 	// timeout plus an orphaned server-side poll — instead of getting our clean
 	// "not live yet, call again" result. First-deploy CloudFront propagation (~130s)
 	// therefore takes two calls: the tool returns cleanly and the agent retries.
-	verifyPreviewDefaultMaxWait = 90 * time.Second
-	verifyPreviewMaxWaitCap     = 110 * time.Second
-	verifyPreviewPollInterval   = 5 * time.Second
-	verifyPreviewPerRequestTO   = 10 * time.Second
-	verifyPreviewSnippetRunes   = 500
-	verifyPreviewReadLimitBytes = 64 * 1024
+	verifyPreviewReachableDefaultMaxWait = 90 * time.Second
+	verifyPreviewReachableMaxWaitCap     = 110 * time.Second
+	verifyPreviewReachablePollInterval   = 5 * time.Second
+	verifyPreviewReachablePerRequestTO   = 10 * time.Second
+	verifyPreviewReachableSnippetRunes   = 500
+	verifyPreviewReachableReadLimitBytes = 64 * 1024
 )
 
-const verifyPreviewInputSchema = `{
+const verifyPreviewReachableInputSchema = `{
   "type": "object",
   "properties": {
     "url": {
       "type": "string",
-      "description": "The preview URL returned by deploy_preview (an https://*.cloudfront.net URL). Only CloudFront preview hosts are accepted."
+      "description": "The preview URL returned by deploy_static_site_preview (an https://*.cloudfront.net URL). Only CloudFront preview hosts are accepted."
     },
     "contains": {
       "type": "string",
@@ -53,14 +53,14 @@ const verifyPreviewInputSchema = `{
     },
     "max_wait_seconds": {
       "type": "integer",
-      "description": "How long to poll for the URL to first return 200 before returning (default 90, max 110). Kept under the agent tool-call timeout so the call returns cleanly; if it's not live yet, just call verify_preview again — a first-time distribution can take ~2 calls to catch."
+      "description": "How long to poll for the URL to first return 200 before returning (default 90, max 110). Kept under the agent tool-call timeout so the call returns cleanly; if it's not live yet, just call verify_preview_reachable again — a first-time distribution can take ~2 calls to catch."
     }
   },
   "required": ["url"]
 }`
 
-// verifyPreviewResult is the JSON the agent receives.
-type verifyPreviewResult struct {
+// verifyPreviewReachableResult is the JSON the agent receives.
+type verifyPreviewReachableResult struct {
 	Live           bool   `json:"live"`
 	StatusCode     int    `json:"status_code"`
 	Attempts       int    `json:"attempts"`
@@ -70,24 +70,24 @@ type verifyPreviewResult struct {
 	Message        string `json:"message,omitempty"`
 }
 
-// RegisterVerifyPreview registers the verify_preview tool. logsWriter is the Step
+// RegisterVerifyPreviewReachable registers the verify_preview_reachable tool. logsWriter is the Step
 // Job's log writer; poll progress streams there.
-func RegisterVerifyPreview(s *agentmcp.Server, logsWriter io.Writer) {
+func RegisterVerifyPreviewReachable(s *agentmcp.Server, logsWriter io.Writer) {
 	s.Register(agentmcp.Tool{
-		Name: "verify_preview",
+		Name: "verify_preview_reachable",
 		Description: "Confirm a deployed preview URL is live. Polls it until it returns HTTP 200 (a first-time " +
 			"distribution can take a few minutes to propagate), and returns live=true as soon as it does — that 200 is " +
 			"your success signal. Runs on the runner, so it works even though your sandbox can't reach the URL directly. " +
 			"Only *.cloudfront.net preview URLs are accepted. Do NOT pass `contains` expecting rendered SPA text — an " +
 			"SPA's body is the HTML shell, so verify the change in the built bundle instead.",
-		InputSchema: json.RawMessage(verifyPreviewInputSchema),
+		InputSchema: json.RawMessage(verifyPreviewReachableInputSchema),
 		Handler: func(ctx context.Context, args json.RawMessage) (string, error) {
-			return handleVerifyPreview(ctx, logsWriter, args)
+			return handleVerifyPreviewReachable(ctx, logsWriter, args)
 		},
 	})
 }
 
-func handleVerifyPreview(ctx context.Context, logsWriter io.Writer, rawArgs json.RawMessage) (string, error) {
+func handleVerifyPreviewReachable(ctx context.Context, logsWriter io.Writer, rawArgs json.RawMessage) (string, error) {
 	var args struct {
 		URL            string `json:"url"`
 		Contains       string `json:"contains"`
@@ -103,18 +103,18 @@ func handleVerifyPreview(ctx context.Context, logsWriter io.Writer, rawArgs json
 		return "", fmt.Errorf("url is required")
 	}
 	if !isAllowedPreviewURL(target) {
-		return "", fmt.Errorf("url must be an https://*.cloudfront.net preview URL (got %q) — verify_preview only fetches CloudFront preview hosts", target)
+		return "", fmt.Errorf("url must be an https://*.cloudfront.net preview URL (got %q) — verify_preview_reachable only fetches CloudFront preview hosts", target)
 	}
 
-	maxWait := verifyPreviewDefaultMaxWait
+	maxWait := verifyPreviewReachableDefaultMaxWait
 	if args.MaxWaitSeconds > 0 {
 		maxWait = time.Duration(args.MaxWaitSeconds) * time.Second
-		if maxWait > verifyPreviewMaxWaitCap {
-			maxWait = verifyPreviewMaxWaitCap
+		if maxWait > verifyPreviewReachableMaxWaitCap {
+			maxWait = verifyPreviewReachableMaxWaitCap
 		}
 	}
 
-	res := pollURL(ctx, target, args.Contains, maxWait, verifyPreviewPollInterval, logsWriter)
+	res := pollURL(ctx, target, args.Contains, maxWait, verifyPreviewReachablePollInterval, logsWriter)
 	b, err := json.Marshal(res)
 	if err != nil {
 		return "", err
@@ -141,16 +141,16 @@ func isAllowedPreviewURL(raw string) bool {
 // pollURL GETs target until it returns 200 (and, when contains != "", the body
 // holds it) or maxWait elapses. Host-agnostic — the handler applies the SSRF
 // allowlist before calling this.
-func pollURL(ctx context.Context, target, contains string, maxWait, interval time.Duration, logsWriter io.Writer) verifyPreviewResult {
+func pollURL(ctx context.Context, target, contains string, maxWait, interval time.Duration, logsWriter io.Writer) verifyPreviewReachableResult {
 	// Floor the interval. The guaranteed sleep between attempts is what caps the
 	// attempt count (together with the maxWait deadline); a non-positive interval
 	// would turn the loop into a tight spin, so never allow that regardless of caller.
 	if interval <= 0 {
-		interval = verifyPreviewPollInterval
+		interval = verifyPreviewReachablePollInterval
 	}
 	ctx, cancel := context.WithTimeout(ctx, maxWait)
 	defer cancel()
-	client := &http.Client{Timeout: verifyPreviewPerRequestTO}
+	client := &http.Client{Timeout: verifyPreviewReachablePerRequestTO}
 	start := time.Now()
 	wantContains := contains != ""
 
@@ -164,14 +164,14 @@ func pollURL(ctx context.Context, target, contains string, maxWait, interval tim
 		// final fetch racing the deadline, must not clobber the last observed status.
 		if status != 0 {
 			lastStatus = status
-			lastSnippet = snippet(body, verifyPreviewSnippetRunes)
+			lastSnippet = snippet(body, verifyPreviewReachableSnippetRunes)
 		}
 		// A 200 means the URL is reachable → LIVE. `contains` is a separate content
 		// assertion, reported but NOT a gate: we do NOT keep polling a live URL hoping
 		// a substring appears (the served body is already the deployed content, and
 		// for an SPA the visible text is client-rendered so it's never in the shell).
 		if status == http.StatusOK {
-			res := verifyPreviewResult{
+			res := verifyPreviewReachableResult{
 				Live:           true,
 				StatusCode:     status,
 				Attempts:       attempts,
@@ -190,17 +190,17 @@ func pollURL(ctx context.Context, target, contains string, maxWait, interval tim
 		}
 		// Not reachable yet (status 0 / non-200). Log periodically, not every tick.
 		if logsWriter != nil && (attempts == 1 || attempts%6 == 0) {
-			io.WriteString(logsWriter, fmt.Sprintf("verify_preview: attempt %d — status=%d, not reachable yet, still polling...\n", attempts, status))
+			io.WriteString(logsWriter, fmt.Sprintf("verify_preview_reachable: attempt %d — status=%d, not reachable yet, still polling...\n", attempts, status))
 		}
 		select {
 		case <-ctx.Done():
-			return verifyPreviewResult{
+			return verifyPreviewReachableResult{
 				Live:           false,
 				StatusCode:     lastStatus,
 				Attempts:       attempts,
 				ElapsedSeconds: int(time.Since(start).Seconds()),
 				BodySnippet:    lastSnippet,
-				Message:        "not reachable yet — a first-time CloudFront distribution takes a couple of minutes to start serving. This is normal; call verify_preview again to keep waiting (it returns as soon as it's live).",
+				Message:        "not reachable yet — a first-time CloudFront distribution takes a couple of minutes to start serving. This is normal; call verify_preview_reachable again to keep waiting (it returns as soon as it's live).",
 			}
 		case <-time.After(interval):
 		}
@@ -218,7 +218,7 @@ func fetchOnce(ctx context.Context, client *http.Client, target string) (int, st
 		return 0, "", err
 	}
 	defer resp.Body.Close()
-	b, _ := io.ReadAll(io.LimitReader(resp.Body, verifyPreviewReadLimitBytes))
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, verifyPreviewReachableReadLimitBytes))
 	return resp.StatusCode, string(b), nil
 }
 
