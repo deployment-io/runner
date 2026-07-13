@@ -484,7 +484,7 @@ func (rs *RunAgentStep) spawnAgentboxAndWait(spec agentboxSpawnSpec, logsWriter 
 		agentmcp.RegisterPing(mcpSrv)
 		if spec.previewDeps != nil {
 			agenttools.RegisterDeployStaticSitePreview(mcpSrv, *spec.previewDeps)
-			agenttools.RegisterVerifyPreview(mcpSrv, spec.previewDeps.LogsWriter)
+			agenttools.RegisterVerifyPreviewReachable(mcpSrv, spec.previewDeps.LogsWriter)
 		}
 		ln, lerr := mcpSrv.Listen(spec.mcpSocketHost)
 		if lerr != nil {

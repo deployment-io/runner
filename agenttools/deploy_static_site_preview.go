@@ -84,7 +84,7 @@ func RegisterDeployStaticSitePreview(s *agentmcp.Server, deps DeployStaticSitePr
 			"Call this AFTER a successful build — publish_dir (relative to /work) must be the output of your REAL build " +
 			"command and contain index.html. NEVER hand-create files to deploy; if the build fails, report that instead " +
 			"of deploying a placeholder. Set is_spa=true for single-page apps with client-side routing. Re-call to " +
-			"redeploy after changes (the same preview URL is reused), then use verify_preview to confirm it's live.",
+			"redeploy after changes (the same preview URL is reused), then use verify_preview_reachable to confirm it's live.",
 		InputSchema: json.RawMessage(deployStaticSitePreviewInputSchema),
 		Handler: func(ctx context.Context, args json.RawMessage) (string, error) {
 			return handleDeployStaticSitePreview(ctx, deps, args)
@@ -137,7 +137,7 @@ func handleDeployStaticSitePreview(ctx context.Context, deps DeployStaticSitePre
 		ExistingDistID:   existing.CloudFrontDistributionID,
 		S3Client:         s3Client,
 		CloudfrontClient: cfClient,
-		SkipDeployWait:   true, // return promptly; the CDN propagates async (verify_preview polls)
+		SkipDeployWait:   true, // return promptly; the CDN propagates async (verify_preview_reachable polls)
 	}, logs)
 	if err != nil {
 		return "", fmt.Errorf("deploy preview: %w", err)

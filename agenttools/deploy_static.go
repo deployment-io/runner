@@ -1,5 +1,5 @@
 // Package agenttools holds the implementations behind the agent-invoked MCP tools
-// (deploy_static_site_preview, verify_preview, …). These are NOT job Commands — they don't
+// (deploy_static_site_preview, verify_preview_reachable, …). These are NOT job Commands — they don't
 // implement Run and aren't dispatched sequentially by the job engine; they're
 // called in-process by the runner's per-task agent_mcp tool handlers. Keeping them
 // out of jobs/commands avoids implying they're part of the job command chain, and
