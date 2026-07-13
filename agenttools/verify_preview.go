@@ -45,7 +45,7 @@ const verifyPreviewInputSchema = `{
   "properties": {
     "url": {
       "type": "string",
-      "description": "The preview URL returned by deploy_preview (an https://*.cloudfront.net URL). Only CloudFront preview hosts are accepted."
+      "description": "The preview URL returned by deploy_static_site_preview (an https://*.cloudfront.net URL). Only CloudFront preview hosts are accepted."
     },
     "contains": {
       "type": "string",

@@ -1,6 +1,6 @@
 package agenttools
 
-// deploy_preview.go implements the agent-invoked `deploy_preview` MCP tool: the
+// deploy_static_site_preview.go implements the agent-invoked `deploy_static_site_preview` MCP tool: the
 // coding agent, after building a static site inside its /work tree, calls this to
 // stand up (or refresh) a live preview on the project's cloud and get back a URL.
 //
@@ -37,9 +37,9 @@ const (
 	defaultPreviewServiceName = "static-site"
 )
 
-// DeployPreviewDeps is the task-scoped context the deploy_preview handler closes
+// DeployStaticSitePreviewDeps is the task-scoped context the deploy_static_site_preview handler closes
 // over, built once per RunAgentStep.
-type DeployPreviewDeps struct {
+type DeployStaticSitePreviewDeps struct {
 	OrgID       string    // organization id (bucket naming)
 	Region      string    // the runner's region string, e.g. "us-east-1"
 	WorkDirHost string    // host path of the bind-mounted /work; publish_dir resolves under it
@@ -54,8 +54,8 @@ type DeployPreviewDeps struct {
 	Store PreviewStore
 }
 
-// deployPreviewResult is the JSON the agent receives from a tools/call.
-type deployPreviewResult struct {
+// deployStaticSitePreviewResult is the JSON the agent receives from a tools/call.
+type deployStaticSitePreviewResult struct {
 	URL            string `json:"url"`
 	Status         string `json:"status"`
 	DistributionID string `json:"distribution_id"`
@@ -63,7 +63,7 @@ type deployPreviewResult struct {
 	LogTail        string `json:"log_tail,omitempty"`
 }
 
-const deployPreviewInputSchema = `{
+const deployStaticSitePreviewInputSchema = `{
   "type": "object",
   "properties": {
     "publish_dir": {
@@ -78,23 +78,23 @@ const deployPreviewInputSchema = `{
   "required": ["publish_dir"]
 }`
 
-// RegisterDeployPreview registers the deploy_preview tool.
-func RegisterDeployPreview(s *agentmcp.Server, deps DeployPreviewDeps) {
+// RegisterDeployStaticSitePreview registers the deploy_static_site_preview tool.
+func RegisterDeployStaticSitePreview(s *agentmcp.Server, deps DeployStaticSitePreviewDeps) {
 	s.Register(agentmcp.Tool{
-		Name: "deploy_preview",
+		Name: "deploy_static_site_preview",
 		Description: "Deploy the built static site to a live preview URL on the project's cloud and return the URL. " +
 			"Call this AFTER a successful build — publish_dir (relative to /work) must be the output of your REAL build " +
 			"command and contain index.html. NEVER hand-create files to deploy; if the build fails, report that instead " +
 			"of deploying a placeholder. Set is_spa=true for single-page apps with client-side routing. Re-call to " +
 			"redeploy after changes (the same preview URL is reused), then use verify_preview to confirm it's live.",
-		InputSchema: json.RawMessage(deployPreviewInputSchema),
+		InputSchema: json.RawMessage(deployStaticSitePreviewInputSchema),
 		Handler: func(ctx context.Context, args json.RawMessage) (string, error) {
-			return handleDeployPreview(ctx, deps, args)
+			return handleDeployStaticSitePreview(ctx, deps, args)
 		},
 	})
 }
 
-func handleDeployPreview(ctx context.Context, deps DeployPreviewDeps, rawArgs json.RawMessage) (string, error) {
+func handleDeployStaticSitePreview(ctx context.Context, deps DeployStaticSitePreviewDeps, rawArgs json.RawMessage) (string, error) {
 	var args struct {
 		PublishDir string `json:"publish_dir"`
 		IsSPA      bool   `json:"is_spa"`
@@ -159,7 +159,7 @@ func handleDeployPreview(ctx context.Context, deps DeployPreviewDeps, rawArgs js
 		})
 	}
 
-	out := deployPreviewResult{
+	out := deployStaticSitePreviewResult{
 		URL:            "https://" + domain,
 		Status:         "deployed",
 		DistributionID: distID,
