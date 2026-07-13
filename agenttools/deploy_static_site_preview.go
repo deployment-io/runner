@@ -33,8 +33,6 @@ const (
 	containerWorkDir = "/work"
 	// logTailMaxBytes caps the deploy log echoed back to the agent in the result.
 	logTailMaxBytes = 2000
-	// defaultPreviewServiceName names the static service when the agent doesn't.
-	defaultPreviewServiceName = "static-site"
 )
 
 // DeployStaticSitePreviewDeps is the task-scoped context the deploy_static_site_preview handler closes
@@ -108,8 +106,12 @@ func handleDeployStaticSitePreview(ctx context.Context, deps DeployStaticSitePre
 		return "", fmt.Errorf("publish_dir is required")
 	}
 	// The reuse key is derived solely from publish_dir (repo + build-dir) — deterministic
-	// and reproducible across steps/runners, with no name for the agent to remember.
-	serviceName := deriveServiceName(args.PublishDir)
+	// and reproducible across steps/runners, with no name for the agent to remember. A
+	// publish_dir that yields no usable key is rejected (not collapsed to a shared name).
+	serviceName, ok := deriveServiceName(args.PublishDir)
+	if !ok {
+		return "", fmt.Errorf("could not derive a service name from publish_dir %q — point it at the built output inside your repo (e.g. %q)", args.PublishDir, "<repo>/dist")
+	}
 	distDir := resolvePublishDir(deps.WorkDirHost, args.PublishDir)
 
 	// Resolve the persisted preview identity (find-or-create). The record is the
@@ -188,9 +190,11 @@ func resolvePublishDir(workDirHost, publishDir string) string {
 // the sole source of the preview's reuse identity. A /work-relative publish path is
 // "<idx>-<org>/<repo>/<subdir>"; strip the numeric repo-index prefix and sanitize to
 // "<org>-<repo>-<subdir>", so two same-type services (different repos/subdirs) get
-// distinct keys and each reuses correctly across steps/runners. Falls back to the fixed
-// default only if nothing usable remains.
-func deriveServiceName(publishDir string) string {
+// distinct keys and each reuses correctly across steps/runners. Returns ok=false when
+// nothing usable remains (a degenerate publish_dir with no alphanumerics — which also
+// wouldn't contain index.html), so the caller rejects it rather than collapse to a
+// shared name that two services could then clobber.
+func deriveServiceName(publishDir string) (string, bool) {
 	p := strings.TrimSpace(publishDir)
 	p = strings.TrimPrefix(p, containerWorkDir)
 	rel := strings.TrimPrefix(filepath.Clean("/"+p), "/")
@@ -199,10 +203,11 @@ func deriveServiceName(publishDir string) string {
 	if i := strings.IndexByte(rel, '-'); i > 0 && isAllDigits(rel[:i]) {
 		rel = rel[i+1:]
 	}
-	if key := sanitizeServiceKey(rel); key != "" {
-		return key
+	key := sanitizeServiceKey(rel)
+	if key == "" {
+		return "", false
 	}
-	return defaultPreviewServiceName
+	return key, true
 }
 
 func isAllDigits(s string) bool {

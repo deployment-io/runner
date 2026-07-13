@@ -47,17 +47,22 @@ func TestTailString(t *testing.T) {
 // TestDeriveServiceName covers the repo-aware key: strip the numeric idx prefix,
 // keep org/repo/subdir, sanitize to dashes; same-type services get distinct keys.
 func TestDeriveServiceName(t *testing.T) {
-	cases := []struct{ in, want string }{
-		{"0-deployment-io/dashboard/dist", "deployment-io-dashboard-dist"},
-		{"/work/0-deployment-io/dashboard/dist", "deployment-io-dashboard-dist"},
-		{"0-org/app/build", "org-app-build"},   // monorepo service A
-		{"0-org/admin/dist", "org-admin-dist"}, // monorepo service B — distinct key
-		{"dist", "dist"},                       // no idx/repo prefix
-		{"", "static-site"},                    // nothing usable → fallback
+	cases := []struct {
+		in, want string
+		ok       bool
+	}{
+		{"0-deployment-io/dashboard/dist", "deployment-io-dashboard-dist", true},
+		{"/work/0-deployment-io/dashboard/dist", "deployment-io-dashboard-dist", true},
+		{"0-org/app/build", "org-app-build", true},   // monorepo service A
+		{"0-org/admin/dist", "org-admin-dist", true}, // monorepo service B — distinct key
+		{"dist", "dist", true}, // no idx/repo prefix
+		{"", "", false},        // nothing usable → rejected, not a shared name
+		{"/work", "", false},   // resolves to /work root → rejected
 	}
 	for _, c := range cases {
-		if got := deriveServiceName(c.in); got != c.want {
-			t.Errorf("deriveServiceName(%q) = %q, want %q", c.in, got, c.want)
+		got, ok := deriveServiceName(c.in)
+		if got != c.want || ok != c.ok {
+			t.Errorf("deriveServiceName(%q) = (%q, %v), want (%q, %v)", c.in, got, ok, c.want, c.ok)
 		}
 	}
 }
