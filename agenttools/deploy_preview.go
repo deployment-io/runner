@@ -78,10 +78,6 @@ const deployPreviewInputSchema = `{
     "is_spa": {
       "type": "boolean",
       "description": "True for a single-page app with client-side routing (unknown paths serve index.html). Default false."
-    },
-    "name": {
-      "type": "string",
-      "description": "Optional service name within this task's preview. Defaults to the repo + build-dir derived from publish_dir (which already distinguishes multiple services) — only set this to override."
     }
   },
   "required": ["publish_dir"]
@@ -107,7 +103,6 @@ func handleDeployPreview(ctx context.Context, deps DeployPreviewDeps, rawArgs js
 	var args struct {
 		PublishDir string `json:"publish_dir"`
 		IsSPA      bool   `json:"is_spa"`
-		Name       string `json:"name"`
 	}
 	if len(rawArgs) > 0 {
 		if err := json.Unmarshal(rawArgs, &args); err != nil {
@@ -117,10 +112,9 @@ func handleDeployPreview(ctx context.Context, deps DeployPreviewDeps, rawArgs js
 	if strings.TrimSpace(args.PublishDir) == "" {
 		return "", fmt.Errorf("publish_dir is required")
 	}
-	serviceName := strings.TrimSpace(args.Name)
-	if serviceName == "" {
-		serviceName = deriveServiceName(args.PublishDir)
-	}
+	// The reuse key is derived solely from publish_dir (repo + build-dir) — deterministic
+	// and reproducible across steps/runners, with no name for the agent to remember.
+	serviceName := deriveServiceName(args.PublishDir)
 	distDir := resolvePublishDir(deps.WorkDirHost, args.PublishDir)
 
 	// Resolve the persisted preview identity (find-or-create). The record is the
@@ -191,11 +185,11 @@ func resolvePublishDir(workDirHost, publishDir string) string {
 	return filepath.Join(workDirHost, rel)
 }
 
-// deriveServiceName builds a deterministic, repo-aware service key from publish_dir
-// when the agent doesn't pass an explicit name. A /work-relative publish path is
+// deriveServiceName builds a deterministic, repo-aware service key from publish_dir —
+// the sole source of the preview's reuse identity. A /work-relative publish path is
 // "<idx>-<org>/<repo>/<subdir>"; strip the numeric repo-index prefix and sanitize to
 // "<org>-<repo>-<subdir>", so two same-type services (different repos/subdirs) get
-// distinct keys and each reuses correctly across steps. Falls back to the fixed
+// distinct keys and each reuses correctly across steps/runners. Falls back to the fixed
 // default only if nothing usable remains.
 func deriveServiceName(publishDir string) string {
 	p := strings.TrimSpace(publishDir)
