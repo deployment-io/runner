@@ -4,6 +4,9 @@ import (
 	"io"
 	"strings"
 	"testing"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	cloudfrontTypes "github.com/aws/aws-sdk-go-v2/service/cloudfront/types"
 )
 
 // TestWebServiceResourceNames pins the naming scheme and, critically, guards the
@@ -28,6 +31,75 @@ func TestWebServiceResourceNames(t *testing.T) {
 	// Target-group names must stay <= 32 chars (AWS limit) for a 24-char id.
 	if got := targetGroupName(previewID); len(got) > 32 {
 		t.Errorf("targetGroupName %q is %d chars, exceeds AWS 32-char limit", got, len(got))
+	}
+
+	// ALB names must also stay <= 32 chars; the org id is hashed to fixed width.
+	if got := albName(org); len(got) > 32 {
+		t.Errorf("albName %q is %d chars, exceeds AWS 32-char limit", got, len(got))
+	}
+	if albName("a") == albName("b") {
+		t.Errorf("albName must differ per org")
+	}
+	if albName(org) != albName(org) {
+		t.Errorf("albName must be deterministic")
+	}
+	if got := orgHash(org); len(got) != 16 {
+		t.Errorf("orgHash = %q, want 16 hex chars", got)
+	}
+}
+
+// TestBuildPreviewWebServiceDistributionConfig pins the CloudFront config that
+// makes the shared-ALB routing work: an HTTP-only custom origin at the ALB DNS
+// carrying the X-Preview-Target routing header, caching off, full request
+// forwarded.
+func TestBuildPreviewWebServiceDistributionConfig(t *testing.T) {
+	const albDns = "pv-alb-abc.us-east-1.elb.amazonaws.com"
+	const previewID = "64f0c2a1b3d4e5f6a7b8c9d0"
+	cfg := buildPreviewWebServiceDistributionConfig(albDns, previewID)
+
+	if !aws.ToBool(cfg.Enabled) {
+		t.Errorf("distribution not enabled")
+	}
+	if aws.ToInt32(cfg.Origins.Quantity) != 1 || len(cfg.Origins.Items) != 1 {
+		t.Fatalf("want exactly one origin, got %d", len(cfg.Origins.Items))
+	}
+	origin := cfg.Origins.Items[0]
+	if aws.ToString(origin.DomainName) != albDns {
+		t.Errorf("origin domain = %q, want the ALB DNS %q", aws.ToString(origin.DomainName), albDns)
+	}
+	if origin.CustomOriginConfig == nil {
+		t.Fatalf("want a CustomOriginConfig (ALB origin), got nil")
+	}
+	if origin.CustomOriginConfig.OriginProtocolPolicy != cloudfrontTypes.OriginProtocolPolicyHttpOnly {
+		t.Errorf("origin protocol = %v, want http-only", origin.CustomOriginConfig.OriginProtocolPolicy)
+	}
+	if origin.S3OriginConfig != nil {
+		t.Errorf("web-service origin must not be an S3/OAC origin")
+	}
+
+	// The X-Preview-Target origin custom header is the ALB routing key.
+	if origin.CustomHeaders == nil || aws.ToInt32(origin.CustomHeaders.Quantity) != 1 {
+		t.Fatalf("want exactly one origin custom header")
+	}
+	h := origin.CustomHeaders.Items[0]
+	if aws.ToString(h.HeaderName) != previewTargetHeader || aws.ToString(h.HeaderValue) != previewID {
+		t.Errorf("custom header = %q:%q, want %q:%q",
+			aws.ToString(h.HeaderName), aws.ToString(h.HeaderValue), previewTargetHeader, previewID)
+	}
+
+	b := cfg.DefaultCacheBehavior
+	if aws.ToString(b.TargetOriginId) != aws.ToString(origin.Id) {
+		t.Errorf("behavior target origin %q != origin id %q", aws.ToString(b.TargetOriginId), aws.ToString(origin.Id))
+	}
+	if aws.ToString(b.CachePolicyId) != cachingDisabledPolicyID {
+		t.Errorf("cache policy = %q, want CachingDisabled", aws.ToString(b.CachePolicyId))
+	}
+	if aws.ToString(b.OriginRequestPolicyId) != allViewerOriginRequestPolicyID {
+		t.Errorf("origin request policy = %q, want AllViewer", aws.ToString(b.OriginRequestPolicyId))
+	}
+	// A web service needs write methods, not just GET/HEAD.
+	if aws.ToInt32(b.AllowedMethods.Quantity) != 7 {
+		t.Errorf("allowed methods = %d, want all 7", aws.ToInt32(b.AllowedMethods.Quantity))
 	}
 }
 

@@ -33,6 +33,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strconv"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -660,4 +661,177 @@ func WaitForRunningTask(ecsClient *ecs.Client, clusterArn, serviceName string, t
 		}
 		time.Sleep(10 * time.Second)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Shared ALB + header-routed listener rule (ingress half)
+// ---------------------------------------------------------------------------
+
+// SharedAlbInput describes the one-per-org+region ALB that fronts every
+// web-service preview.
+type SharedAlbInput struct {
+	AlbName   string
+	AlbSgName string
+	VpcID     string
+	SubnetIDs []string
+}
+
+// SharedAlbResult carries the shared ALB's resources.
+type SharedAlbResult struct {
+	LoadBalancerArn string
+	LoadBalancerDns string
+	ListenerArn     string // the HTTP:80 listener
+	SecurityGroupID string
+}
+
+// EnsureSharedAlb find-or-creates the shared, internet-facing ALB + its security
+// group (inbound 80 from anywhere — CloudFront reaches the origin over HTTP) + an
+// HTTP:80 listener whose DEFAULT action is a fixed 404 (a request without a
+// matching X-Preview-Target header belongs to no preview). Per-preview target
+// groups attach to this one listener via header-routed rules
+// (EnsurePreviewListenerRule). One ALB serves every preview in the org+region,
+// which is why it's found-or-created by a stable name rather than per preview.
+func EnsureSharedAlb(elbClient *elb.Client, ec2Client *ec2.Client, in SharedAlbInput) (SharedAlbResult, error) {
+	var res SharedAlbResult
+
+	albSgID, err := EnsureSecurityGroup(ec2Client, in.AlbSgName, "deployment.io preview shared ALB", in.VpcID)
+	if err != nil {
+		return res, fmt.Errorf("ensure ALB security group: %w", err)
+	}
+	if err := AuthorizeTCPIngressFromCIDR(ec2Client, albSgID, "0.0.0.0/0", 80, 80); err != nil {
+		return res, fmt.Errorf("authorize ALB ingress: %w", err)
+	}
+	res.SecurityGroupID = albSgID
+
+	// Find-or-create the ALB.
+	descOut, err := elbClient.DescribeLoadBalancers(context.TODO(), &elb.DescribeLoadBalancersInput{Names: []string{in.AlbName}})
+	if err == nil && descOut != nil && len(descOut.LoadBalancers) > 0 {
+		res.LoadBalancerArn = aws.ToString(descOut.LoadBalancers[0].LoadBalancerArn)
+		res.LoadBalancerDns = aws.ToString(descOut.LoadBalancers[0].DNSName)
+	} else if err != nil && !apiErrCodeIs(err, "LoadBalancerNotFound") {
+		return res, err
+	}
+	if res.LoadBalancerArn == "" {
+		createOut, err := elbClient.CreateLoadBalancer(context.TODO(), &elb.CreateLoadBalancerInput{
+			Name:           aws.String(in.AlbName),
+			Type:           elbTypes.LoadBalancerTypeEnumApplication,
+			Scheme:         elbTypes.LoadBalancerSchemeEnumInternetFacing,
+			IpAddressType:  elbTypes.IpAddressTypeIpv4,
+			SecurityGroups: []string{albSgID},
+			Subnets:        in.SubnetIDs,
+			Tags: []elbTypes.Tag{
+				{Key: aws.String("Name"), Value: aws.String(in.AlbName)},
+				{Key: aws.String("created by"), Value: aws.String(awsCreatedByTag)},
+			},
+		})
+		if err != nil {
+			return res, err
+		}
+		res.LoadBalancerArn = aws.ToString(createOut.LoadBalancers[0].LoadBalancerArn)
+		res.LoadBalancerDns = aws.ToString(createOut.LoadBalancers[0].DNSName)
+		if err := elb.NewLoadBalancerAvailableWaiter(elbClient).Wait(context.TODO(),
+			&elb.DescribeLoadBalancersInput{LoadBalancerArns: []string{res.LoadBalancerArn}}, 5*time.Minute); err != nil {
+			return res, fmt.Errorf("wait ALB available: %w", err)
+		}
+	}
+
+	// Find-or-create the HTTP:80 listener with a default 404.
+	listenersOut, err := elbClient.DescribeListeners(context.TODO(), &elb.DescribeListenersInput{LoadBalancerArn: aws.String(res.LoadBalancerArn)})
+	if err != nil {
+		return res, err
+	}
+	for _, l := range listenersOut.Listeners {
+		if aws.ToInt32(l.Port) == 80 {
+			res.ListenerArn = aws.ToString(l.ListenerArn)
+			break
+		}
+	}
+	if res.ListenerArn == "" {
+		createListenerOut, err := elbClient.CreateListener(context.TODO(), &elb.CreateListenerInput{
+			LoadBalancerArn: aws.String(res.LoadBalancerArn),
+			Port:            aws.Int32(80),
+			Protocol:        elbTypes.ProtocolEnumHttp,
+			DefaultActions: []elbTypes.Action{{
+				Type: elbTypes.ActionTypeEnumFixedResponse,
+				FixedResponseConfig: &elbTypes.FixedResponseActionConfig{
+					StatusCode:  aws.String("404"),
+					ContentType: aws.String("text/plain"),
+					MessageBody: aws.String("No matching preview"),
+				},
+			}},
+		})
+		if err != nil {
+			return res, err
+		}
+		res.ListenerArn = aws.ToString(createListenerOut.Listeners[0].ListenerArn)
+	}
+	return res, nil
+}
+
+// EnsurePreviewListenerRule find-or-creates the header-routed rule that forwards
+// requests carrying `<headerName>: <previewID>` to the preview's target group,
+// returning the rule ARN. Idempotent: an existing rule for this previewID is
+// reused; otherwise the lowest free priority is taken (retrying if a concurrent
+// deploy grabs it first). The X-Preview-Target header is injected by the
+// preview's CloudFront distribution as an origin custom header, so only that
+// preview's own CloudFront can reach its target group through the shared ALB.
+func EnsurePreviewListenerRule(elbClient *elb.Client, listenerArn, headerName, previewID, targetGroupArn string) (string, error) {
+	rulesOut, err := elbClient.DescribeRules(context.TODO(), &elb.DescribeRulesInput{ListenerArn: aws.String(listenerArn)})
+	if err != nil {
+		return "", err
+	}
+	used := map[int]bool{}
+	for _, r := range rulesOut.Rules {
+		for _, c := range r.Conditions {
+			if aws.ToString(c.Field) == "http-header" && c.HttpHeaderConfig != nil &&
+				aws.ToString(c.HttpHeaderConfig.HttpHeaderName) == headerName {
+				for _, v := range c.HttpHeaderConfig.Values {
+					if v == previewID {
+						return aws.ToString(r.RuleArn), nil
+					}
+				}
+			}
+		}
+		if p, perr := strconv.Atoi(aws.ToString(r.Priority)); perr == nil {
+			used[p] = true
+		}
+	}
+
+	condition := elbTypes.RuleCondition{
+		Field: aws.String("http-header"),
+		HttpHeaderConfig: &elbTypes.HttpHeaderConditionConfig{
+			HttpHeaderName: aws.String(headerName),
+			Values:         []string{previewID},
+		},
+	}
+	action := elbTypes.Action{Type: elbTypes.ActionTypeEnumForward, TargetGroupArn: aws.String(targetGroupArn)}
+
+	priority := 1
+	for attempt := 0; attempt < 50; attempt++ {
+		for used[priority] {
+			priority++
+		}
+		if priority > 50000 { // ALB max rule priority
+			return "", fmt.Errorf("no free ALB listener-rule priority available")
+		}
+		out, err := elbClient.CreateRule(context.TODO(), &elb.CreateRuleInput{
+			ListenerArn: aws.String(listenerArn),
+			Priority:    aws.Int32(int32(priority)),
+			Conditions:  []elbTypes.RuleCondition{condition},
+			Actions:     []elbTypes.Action{action},
+			Tags: []elbTypes.Tag{
+				{Key: aws.String("created by"), Value: aws.String(awsCreatedByTag)},
+				{Key: aws.String("preview"), Value: aws.String(previewID)},
+			},
+		})
+		if err == nil {
+			return aws.ToString(out.Rules[0].RuleArn), nil
+		}
+		if apiErrCodeIs(err, "PriorityInUse") {
+			used[priority] = true
+			continue
+		}
+		return "", err
+	}
+	return "", fmt.Errorf("could not allocate a listener-rule priority after retries")
 }

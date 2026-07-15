@@ -3,8 +3,8 @@ package agenttools
 // deploy_web_service_preview.go is the arg-based, self-contained web-service preview
 // deploy core — the twin of deploy_static.go's DeployStaticSitePreview. Where the
 // static preview stands up S3 + CloudFront, a web-service preview builds/pushes a
-// container image, runs it as a Fargate service behind a target group, and (Cw1b)
-// fronts it with a shared ALB + a per-preview CloudFront distribution.
+// container image, runs it as a Fargate service behind a target group, and fronts
+// it with a shared ALB + a per-preview CloudFront distribution.
 //
 // Like the static core it is invoked in-process by the (future, Cw2)
 // deploy_web_service_preview MCP tool handler and is deliberately NOT the
@@ -13,14 +13,17 @@ package agenttools
 // calls but is written fresh so the preview can use a shared, cost-optimized
 // ingress. The AWS primitives live in the leaf utils/aws_utils package.
 //
-// Cw1a (this slice) covers the ECS half: image build+push, cluster, execution
-// role, VPC/subnets, task security group, task definition, target group, and the
-// Fargate service. Cw1b appends the ingress half (shared ALB + header-routed
-// listener rule + CloudFront) and populates the URL.
+// The core was built in two slices: Cw1a (the ECS half — image build+push,
+// cluster, execution role, VPC/subnets, task security group, task definition,
+// target group, and the Fargate service) and Cw1b (the ingress half — the shared
+// ALB + header-routed listener rule + per-preview CloudFront, which populate the
+// public URL).
 
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -28,7 +31,9 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/cloudfront"
+	cloudfrontTypes "github.com/aws/aws-sdk-go-v2/service/cloudfront/types"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
 	"github.com/aws/aws-sdk-go-v2/service/ecr"
 	"github.com/aws/aws-sdk-go-v2/service/ecs"
@@ -41,6 +46,18 @@ import (
 	"github.com/moby/moby/client"
 	"github.com/moby/moby/pkg/archive"
 )
+
+// previewTargetHeader is the origin custom header the preview's CloudFront
+// distribution injects and the shared ALB's listener rule matches — the routing
+// key that fans one shared ALB out to many previews' target groups.
+const previewTargetHeader = "X-Preview-Target"
+
+// allViewerOriginRequestPolicyID is CloudFront's AWS-managed "AllViewer" origin
+// request policy: it forwards all viewer headers, cookies, and query strings to
+// the origin. A web service (unlike a static site) needs the full request, and
+// like cachingDisabledPolicyID this is a global AWS-managed id, safe to hardcode
+// in the BYO multi-account model.
+const allViewerOriginRequestPolicyID = "216adef6-5c7f-47e4-b989-5492eafa07d3"
 
 // Fargate defaults for a preview: the smallest valid CPU/memory combo (0.25 vCPU
 // / 0.5 GB) — cheapest for a short-lived, low-traffic preview.
@@ -79,6 +96,11 @@ type WebServicePreviewDeployInput struct {
 	ExistingExecutionRoleArn string
 	ExistingTargetGroupArn   string
 	ExistingEcsServiceArn    string
+	// ExistingDistID is the per-preview CloudFront distribution from a prior
+	// iteration. The distribution fronts the (stable) shared ALB, so on reuse
+	// there's nothing to recreate — the same URL keeps serving. The shared ALB +
+	// header rule are found-or-created by identity, so they need no reuse handle.
+	ExistingDistID string
 
 	// --- Clients (built by the caller from the runner's IAM role + region) ---
 	EcrClient        *ecr.Client
@@ -128,10 +150,12 @@ type WebServicePreviewDeployResult struct {
 // resource ids are passed back via the Existing* fields and a redeploy registers
 // a fresh task-definition revision + updates the service.
 //
-// Cw1a scope: this returns after the ECS service is created/updated and (best
-// effort) a task reaches RUNNING. The shared ALB + listener rule + CloudFront
-// that make the service publicly reachable — and populate the URL — arrive in
-// Cw1b.
+// Full flow: build+push image -> shared cluster -> execution role -> VPC/subnets
+// -> task security group -> task definition -> target group -> shared ALB +
+// header-routed listener rule -> Fargate service -> per-preview CloudFront
+// distribution. Returns the public https://<x>.cloudfront.net URL. Like the
+// static preview it does not block on CloudFront propagation (SkipServiceStableWait
+// also skips the ECS stable wait) — the agent's verify step polls the URL.
 func DeployWebServicePreview(in WebServicePreviewDeployInput, logsWriter io.Writer) (WebServicePreviewDeployResult, error) {
 	// Defaults.
 	dockerfile := in.DockerfilePath
@@ -255,7 +279,31 @@ func DeployWebServicePreview(in WebServicePreviewDeployInput, logsWriter io.Writ
 	}
 	res.TargetGroupArn = targetGroupArn
 
-	// 8. Create/update the Fargate service, wired to the target group.
+	// 8. Shared ingress: the one-per-org ALB + a header-routed listener rule that
+	// forwards this preview's X-Preview-Target header to its target group.
+	// Creating the rule associates the target group with the ALB, so the
+	// service's targets start getting health-checked (and the service can reach a
+	// stable state below).
+	alb, err := aws_utils.EnsureSharedAlb(in.ElbClient, in.Ec2Client, aws_utils.SharedAlbInput{
+		AlbName:   albName(in.OrgID),
+		AlbSgName: albSecurityGroupName(in.OrgID),
+		VpcID:     network.VpcID,
+		SubnetIDs: network.SubnetIDs,
+	})
+	if err != nil {
+		return res, fmt.Errorf("ensure shared ALB: %w", err)
+	}
+	res.LoadBalancerArn = alb.LoadBalancerArn
+	res.LoadBalancerDns = alb.LoadBalancerDns
+	res.ListenerArn = alb.ListenerArn
+
+	ruleArn, err := aws_utils.EnsurePreviewListenerRule(in.ElbClient, alb.ListenerArn, previewTargetHeader, in.PreviewID, targetGroupArn)
+	if err != nil {
+		return res, fmt.Errorf("ensure listener rule: %w", err)
+	}
+	res.ListenerRuleArn = ruleArn
+
+	// 9. Create/update the Fargate service, wired to the target group.
 	serviceArn, err := aws_utils.CreateOrUpdateEcsService(in.EcsClient, aws_utils.EcsServiceInput{
 		ClusterArn:        clusterArn,
 		ServiceName:       ecsServiceName(in.PreviewID),
@@ -273,22 +321,123 @@ func DeployWebServicePreview(in WebServicePreviewDeployInput, logsWriter io.Writ
 	}
 	res.EcsServiceArn = serviceArn
 
-	// Cw1a confirmation: without an ALB the stable waiter can't run, so poll for a
-	// RUNNING task (best effort — a slow first image pull just returns false).
 	if in.SkipServiceStableWait {
+		// Returned promptly (the agent's verify step polls the URL until live); a
+		// best-effort check still reports whether a task already launched.
 		running, werr := aws_utils.WaitForRunningTask(in.EcsClient, clusterArn, ecsServiceName(in.PreviewID), 5*time.Minute)
 		if werr != nil {
 			return res, fmt.Errorf("await running task: %w", werr)
 		}
 		res.TaskRunning = running
-		if running {
-			io.WriteString(logsWriter, "Preview task is running and registered with the target group\n")
-		} else {
-			io.WriteString(logsWriter, "Preview service created; task not yet running (still pulling/starting)\n")
-		}
+	} else {
+		res.TaskRunning = true // the stable waiter already confirmed healthy targets
+	}
+
+	// 10. Per-preview CloudFront distribution fronting the shared ALB — the public
+	// https://<x>.cloudfront.net surface (free managed cert to the viewer; reaches
+	// the ALB over HTTP with the X-Preview-Target origin header). Reused across
+	// iterations via ExistingDistID.
+	distID, distArn, domain, err := ensurePreviewDistribution(in.CloudfrontClient, alb.LoadBalancerDns, in.PreviewID, in.ExistingDistID, logsWriter)
+	if err != nil {
+		return res, fmt.Errorf("ensure preview distribution: %w", err)
+	}
+	res.CloudFrontDistributionID = distID
+	res.CloudFrontDistributionArn = distArn
+	res.CloudFrontDomainName = domain
+	if domain != "" {
+		res.URL = "https://" + domain
 	}
 
 	return res, nil
+}
+
+// ensurePreviewDistribution creates (or, on reuse, re-reads) the per-preview
+// CloudFront distribution that fronts the shared ALB, returning its id, ARN, and
+// domain. Like the static preview it does NOT block on CloudFront propagation
+// (the agent's verify step polls the URL until it serves).
+func ensurePreviewDistribution(cf *cloudfront.Client, albDns, previewID, existingDistID string, logsWriter io.Writer) (id, arn, domain string, err error) {
+	if existingDistID != "" {
+		// Reuse: the distribution already fronts the (stable) shared ALB. Re-read it
+		// so the result still carries a usable URL.
+		out, gerr := cf.GetDistribution(context.TODO(), &cloudfront.GetDistributionInput{Id: aws.String(existingDistID)})
+		if gerr != nil {
+			return "", "", "", gerr
+		}
+		io.WriteString(logsWriter, fmt.Sprintf("Reusing preview distribution: %s\n", existingDistID))
+		return aws.ToString(out.Distribution.Id), aws.ToString(out.Distribution.ARN), aws.ToString(out.Distribution.DomainName), nil
+	}
+	io.WriteString(logsWriter, "Creating preview CloudFront distribution (ALB origin)\n")
+	out, cerr := cf.CreateDistribution(context.TODO(), &cloudfront.CreateDistributionInput{
+		DistributionConfig: buildPreviewWebServiceDistributionConfig(albDns, previewID),
+	})
+	if cerr != nil {
+		return "", "", "", cerr
+	}
+	d := out.Distribution
+	return aws.ToString(d.Id), aws.ToString(d.ARN), aws.ToString(d.DomainName), nil
+}
+
+// buildPreviewWebServiceDistributionConfig is the CloudFront config for a
+// web-service preview: a CustomOrigin pointing at the shared ALB's DNS name over
+// HTTP-only, with the X-Preview-Target origin custom header that routes this
+// preview through the ALB's listener rule. Caching is disabled (a preview
+// iterates constantly) and the AllViewer origin-request policy forwards the full
+// request so the app sees real headers/cookies/query. cf. the static twin
+// buildPreviewDistributionConfig (S3-OAC origin, GET/HEAD only).
+func buildPreviewWebServiceDistributionConfig(albDns, previewID string) *cloudfrontTypes.DistributionConfig {
+	const originID = "alb-origin"
+	origins := &cloudfrontTypes.Origins{
+		Quantity: aws.Int32(1),
+		Items: []cloudfrontTypes.Origin{{
+			Id:         aws.String(originID),
+			DomainName: aws.String(albDns),
+			CustomOriginConfig: &cloudfrontTypes.CustomOriginConfig{
+				HTTPPort:             aws.Int32(80),
+				HTTPSPort:            aws.Int32(443),
+				OriginProtocolPolicy: cloudfrontTypes.OriginProtocolPolicyHttpOnly,
+				OriginSslProtocols: &cloudfrontTypes.OriginSslProtocols{
+					Quantity: aws.Int32(1),
+					Items:    []cloudfrontTypes.SslProtocol{cloudfrontTypes.SslProtocolTLSv12},
+				},
+			},
+			CustomHeaders: &cloudfrontTypes.CustomHeaders{
+				Quantity: aws.Int32(1),
+				Items: []cloudfrontTypes.OriginCustomHeader{{
+					HeaderName:  aws.String(previewTargetHeader),
+					HeaderValue: aws.String(previewID),
+				}},
+			},
+		}},
+	}
+
+	allMethods := []cloudfrontTypes.Method{
+		cloudfrontTypes.MethodGet, cloudfrontTypes.MethodHead, cloudfrontTypes.MethodOptions,
+		cloudfrontTypes.MethodPut, cloudfrontTypes.MethodPost, cloudfrontTypes.MethodPatch,
+		cloudfrontTypes.MethodDelete,
+	}
+	behavior := &cloudfrontTypes.DefaultCacheBehavior{
+		TargetOriginId:       aws.String(originID),
+		ViewerProtocolPolicy: cloudfrontTypes.ViewerProtocolPolicyAllowAll,
+		AllowedMethods: &cloudfrontTypes.AllowedMethods{
+			Quantity: aws.Int32(int32(len(allMethods))),
+			Items:    allMethods,
+			CachedMethods: &cloudfrontTypes.CachedMethods{
+				Quantity: aws.Int32(2),
+				Items:    []cloudfrontTypes.Method{cloudfrontTypes.MethodGet, cloudfrontTypes.MethodHead},
+			},
+		},
+		CachePolicyId:         aws.String(cachingDisabledPolicyID),
+		OriginRequestPolicyId: aws.String(allViewerOriginRequestPolicyID),
+	}
+
+	return &cloudfrontTypes.DistributionConfig{
+		CallerReference:      aws.String(fmt.Sprintf("preview-ws-%s-%d", previewID, time.Now().Unix())),
+		Comment:              aws.String("Preview distribution for " + previewID),
+		DefaultCacheBehavior: behavior,
+		Enabled:              aws.Bool(true),
+		Origins:              origins,
+		PriceClass:           cloudfrontTypes.PriceClassPriceClassAll,
+	}
 }
 
 // buildAndPushImage builds the image from the agent's build context and pushes it
@@ -418,3 +567,13 @@ func containerName(previewID string) string        { return "pv-c-" + previewID 
 func targetGroupName(previewID string) string      { return "pv-tg-" + previewID } // <=32 chars
 func ecsServiceName(previewID string) string       { return "pv-es-" + previewID }
 func logGroupName(orgID, previewID string) string  { return "pv/" + orgID + "/" + previewID }
+
+// albName is the shared, one-per-org+region ALB name. It must be <=32 chars and
+// alphanumeric/hyphen, so the (variable-length) org id is hashed to fixed width.
+func albName(orgID string) string              { return "pv-alb-" + orgHash(orgID) } // 7+16 = 23 chars
+func albSecurityGroupName(orgID string) string { return "pv-albsg-" + orgID }
+
+func orgHash(orgID string) string {
+	sum := sha256.Sum256([]byte(orgID))
+	return hex.EncodeToString(sum[:])[:16]
+}
