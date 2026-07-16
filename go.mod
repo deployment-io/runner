@@ -26,7 +26,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/servicediscovery v1.31.1
 	github.com/aws/aws-sdk-go-v2/service/sts v1.28.6
 	github.com/aws/smithy-go v1.22.2
-	github.com/deployment-io/deployment-runner-kit v0.0.0-20260716042349-b665b1dfcf98
+	github.com/deployment-io/deployment-runner-kit v0.0.0-20260716054714-28558a103f33
 	github.com/deployment-io/team-ai v0.0.0-20250917084912-bdbad6a834e1
 	github.com/docker/docker v27.3.0+incompatible
 	github.com/go-git/go-git/v5 v5.12.0
