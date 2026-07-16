@@ -2,6 +2,7 @@ package commands
 
 import (
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,6 +11,37 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 )
+
+const claudeOAuthSecretNameEnvVar = "AGENTBOX_CLAUDE_OAUTH_SECRET_NAME"
+
+// maybeApplyClaudeSubscriptionAuth is off unless the runner sets the secret
+// name; with it unset, the injected API key must survive untouched.
+func TestSubscriptionAuth_DisabledByDefault(t *testing.T) {
+	t.Setenv(claudeOAuthSecretNameEnvVar, "")
+	env := map[string]string{"ANTHROPIC_API_KEY": "sk-ant-api-xyz", "AGENT_TYPE": "claude-code"}
+	maybeApplyClaudeSubscriptionAuth(env, io.Discard)
+	if env["ANTHROPIC_API_KEY"] != "sk-ant-api-xyz" {
+		t.Errorf("API key was modified while subscription auth disabled: %q", env["ANTHROPIC_API_KEY"])
+	}
+	if _, ok := env["CLAUDE_CODE_OAUTH_TOKEN"]; ok {
+		t.Error("OAuth token set while subscription auth disabled")
+	}
+}
+
+// Even with subscription auth enabled, non-Claude-Code agents (codex/opencode)
+// must be left on their injected API key — the function returns before any
+// Secrets Manager lookup, so this test makes no AWS calls.
+func TestSubscriptionAuth_ClaudeCodeOnly(t *testing.T) {
+	t.Setenv(claudeOAuthSecretNameEnvVar, "deployment-io/claude-code-oauth-token")
+	env := map[string]string{"OPENAI_API_KEY": "sk-openai", "AGENT_TYPE": "codex"}
+	maybeApplyClaudeSubscriptionAuth(env, io.Discard)
+	if env["OPENAI_API_KEY"] != "sk-openai" {
+		t.Errorf("codex key was modified: %q", env["OPENAI_API_KEY"])
+	}
+	if _, ok := env["CLAUDE_CODE_OAUTH_TOKEN"]; ok {
+		t.Error("OAuth token set for codex agent (Claude Code only)")
+	}
+}
 
 func TestResolveContainerLimits_Defaults(t *testing.T) {
 	t.Setenv(memoryBytesEnvVar, "")
