@@ -14,8 +14,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/cloudfront"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
 	"github.com/deployment-io/deployment-runner-kit/cloud_api_clients"
 	"github.com/deployment-io/deployment-runner-kit/deployments"
 	"github.com/deployment-io/deployment-runner-kit/enums/build_enums"
@@ -246,7 +248,7 @@ func (rs *RunAgentStep) Run(parameters map[string]interface{}, logsWriter io.Wri
 	if err := rs.spawnVendorAndWait(vendorSpec, logsWriter); err != nil {
 		return parameters, fmt.Errorf("error vendoring dependencies: %s", err)
 	}
-	envVars, err := buildAgentSpawnEnvVars(parameters)
+	envVars, err := buildAgentSpawnEnvVars(parameters, logsWriter)
 	if err != nil {
 		return parameters, err
 	}
@@ -349,7 +351,7 @@ func prepareAgentboxResultDir(workDirHost string) error {
 // populated by deployment-server at Job pickup) with the per-Job spawn
 // parameters (StepPrompt, MaxTurns, etc.) and the fixed agentbox contract
 // vars (WORK_DIR, RESULT_PATH).
-func buildAgentSpawnEnvVars(parameters map[string]interface{}) ([]string, error) {
+func buildAgentSpawnEnvVars(parameters map[string]interface{}, logsWriter io.Writer) ([]string, error) {
 	env := map[string]string{
 		"WORK_DIR":    agentboxWorkDirInContainer,
 		"RESULT_PATH": agentboxResultPathInCtr,
@@ -398,7 +400,103 @@ func buildAgentSpawnEnvVars(parameters map[string]interface{}) ([]string, error)
 	if allowed != "" {
 		env["ADDITIONAL_ALLOWED_HOSTS"] = allowed
 	}
+	// Optionally swap the injected ANTHROPIC_API_KEY for a Claude Code
+	// subscription OAuth token read from this runner's own AWS Secrets Manager.
+	// Engages only when the org is in subscription mode (marker in AgentEnvVars).
+	maybeApplyClaudeSubscriptionAuth(env, logsWriter)
 	return mapToEnvSlice(env), nil
+}
+
+// Subscription-mode contract with the control plane.
+//
+// CROSS-REPO CONTRACT: deployment-server injects these exact strings into
+// AgentEnvVars when the org's ClaudeAuth.Provider is Subscription — see
+// kit's organization_models.ClaudeAuthModeEnvVar / ...Subscription. This repo
+// does not import kit, so the literals are duplicated; change them in both or
+// subscription auth silently stops engaging and every task quietly falls back
+// to the API key. The marker is non-secret; the token never leaves the
+// customer's cloud.
+const (
+	claudeAuthModeEnvVar       = "CLAUDE_AUTH_MODE"
+	claudeAuthModeSubscription = "subscription"
+
+	// claudeOAuthSecretName is the Secrets Manager entry holding the customer's
+	// Claude Code subscription OAuth token, in their own account.
+	//
+	// DELIBERATELY A CONSTANT — do NOT make this control-plane-supplied.
+	// The runner's IAM role carries secretsmanager:* on Resource "*" (granted on
+	// the deploy path via iam_policies AwsSecretsManager), so a remote-supplied
+	// name would hand the control plane an arbitrary-secret-read primitive on
+	// the customer's account: it could name any secret and we'd read it and
+	// inject it into an agent container's env. Keeping the name in code means
+	// there is no path to read anything else, regardless of what IAM allows.
+	// If this ever needs to vary per customer, scope the IAM to a single secret
+	// ARN FIRST. See plans/PLAN_tasks_subscription_auth.md §4.3.
+	claudeOAuthSecretName = "deployment-io/claude-code-oauth-token"
+)
+
+// maybeApplyClaudeSubscriptionAuth swaps the injected ANTHROPIC_API_KEY for a
+// Claude Code subscription OAuth token when the org is in subscription mode.
+// The token is read from the customer's own AWS Secrets Manager on this runner
+// and never transits the control plane (unlike the API key, which
+// deployment-server injects at Job pickup).
+//
+// Guardrails (see plans/PLAN_tasks_subscription_auth.md):
+//   - Off unless deployment-server marked the org subscription-mode. The
+//     customer must also have created the secret and granted this runner read
+//     access, so the feature is inert without their action on their own cloud.
+//   - Genuine Claude Code only — never codex/opencode (their subscription auth
+//     is prohibited/blocked; genuine `claude` is what passes Anthropic's
+//     client-identity check).
+//   - Replace, not co-set: ANTHROPIC_API_KEY is removed so Claude Code doesn't
+//     ambiguously prefer it over the OAuth token.
+//   - Any failure (missing/unreadable/malformed secret) falls back to the
+//     injected API key rather than hard-failing the task. An org configured
+//     strict subscription-only has no key to fall back to, so agentbox fails
+//     fast instead of quietly reverting to metered billing.
+func maybeApplyClaudeSubscriptionAuth(env map[string]string, logsWriter io.Writer) {
+	mode := strings.TrimSpace(env[claudeAuthModeEnvVar])
+	// Consumed here — keep the marker out of the agent container's env.
+	delete(env, claudeAuthModeEnvVar)
+	if mode != claudeAuthModeSubscription {
+		return // org is not in subscription mode (the default)
+	}
+	// AGENT_TYPE unset defaults to claude-code in agentbox, so "" is allowed.
+	if at := env["AGENT_TYPE"]; at != "" && at != "claude-code" {
+		return // genuine Claude Code only
+	}
+	token, err := readClaudeOAuthToken(claudeOAuthSecretName)
+	if err != nil {
+		io.WriteString(logsWriter, fmt.Sprintf("Subscription auth: could not read OAuth secret %q, falling back to API key (%s).\n", claudeOAuthSecretName, err))
+		return
+	}
+	if !strings.HasPrefix(token, "sk-ant-oat") {
+		io.WriteString(logsWriter, "Subscription auth: secret is not a Claude Code OAuth token (expected sk-ant-oat...), falling back to API key.\n")
+		return
+	}
+	delete(env, "ANTHROPIC_API_KEY")
+	env["CLAUDE_CODE_OAUTH_TOKEN"] = token
+	io.WriteString(logsWriter, "Subscription auth: using Claude Code subscription OAuth token from Secrets Manager.\n")
+}
+
+// readClaudeOAuthToken fetches the OAuth token string from this runner's AWS
+// Secrets Manager (runner's own region / instance-role credentials).
+func readClaudeOAuthToken(secretName string) (string, error) {
+	runnerData := utils.RunnerData.Get()
+	client, err := cloud_api_clients.GetSecretsManagerClientFromRegion(runnerData.RunnerRegion)
+	if err != nil {
+		return "", err
+	}
+	out, err := client.GetSecretValue(context.TODO(), &secretsmanager.GetSecretValueInput{
+		SecretId: aws.String(secretName),
+	})
+	if err != nil {
+		return "", err
+	}
+	if out.SecretString == nil {
+		return "", fmt.Errorf("secret %q has no string value", secretName)
+	}
+	return strings.TrimSpace(*out.SecretString), nil
 }
 
 // mergeAdditionalAllowedHosts unions:

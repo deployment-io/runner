@@ -104,7 +104,7 @@ func (rs *RunAssistantSession) Run(parameters map[string]interface{}, logsWriter
 	if err := prepareSessionDirs(workDirHost); err != nil {
 		return parameters, fmt.Errorf("error preparing session dirs: %s", err)
 	}
-	envVars, err := buildSessionSpawnEnvVars(parameters)
+	envVars, err := buildSessionSpawnEnvVars(parameters, logsWriter)
 	if err != nil {
 		return parameters, err
 	}
@@ -142,7 +142,7 @@ func prepareSessionDirs(workDirHost string) error {
 // agent a stable conversation id, and the prompt file carries plan mode. The
 // rest mirrors buildAgentSpawnEnvVars (creds, agent type, model, versions,
 // allowlist) minus the one-shot STEP_PROMPT.
-func buildSessionSpawnEnvVars(parameters map[string]interface{}) ([]string, error) {
+func buildSessionSpawnEnvVars(parameters map[string]interface{}, logsWriter io.Writer) ([]string, error) {
 	env := map[string]string{
 		"AGENT_MODE":                "interactive",
 		"READ_ONLY":                 "1",
@@ -180,6 +180,12 @@ func buildSessionSpawnEnvVars(parameters map[string]interface{}) ([]string, erro
 	if allowed := mergeAdditionalAllowedHosts(parameters); allowed != "" {
 		env["ADDITIONAL_ALLOWED_HOSTS"] = allowed
 	}
+	// Same opt-in subscription-auth swap the Tasks path gets: prefer a Claude
+	// Code subscription OAuth token from this runner's own Secrets Manager over
+	// the injected API key. Sessions hold the seat across many turns, so the
+	// subscription's rate-limit window is shared more heavily than by a Task —
+	// see plans/PLAN_tasks_subscription_auth.md.
+	maybeApplyClaudeSubscriptionAuth(env, logsWriter)
 	return mapToEnvSlice(env), nil
 }
 
