@@ -12,12 +12,9 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 )
 
-const claudeOAuthSecretNameEnvVar = "AGENTBOX_CLAUDE_OAUTH_SECRET_NAME"
-
-// maybeApplyClaudeSubscriptionAuth is off unless the runner sets the secret
-// name; with it unset, the injected API key must survive untouched.
+// Without the subscription marker (the default — org is on AnthropicDirect),
+// the injected API key must survive untouched.
 func TestSubscriptionAuth_DisabledByDefault(t *testing.T) {
-	t.Setenv(claudeOAuthSecretNameEnvVar, "")
 	env := map[string]string{"ANTHROPIC_API_KEY": "sk-ant-api-xyz", "AGENT_TYPE": "claude-code"}
 	maybeApplyClaudeSubscriptionAuth(env, io.Discard)
 	if env["ANTHROPIC_API_KEY"] != "sk-ant-api-xyz" {
@@ -28,12 +25,29 @@ func TestSubscriptionAuth_DisabledByDefault(t *testing.T) {
 	}
 }
 
-// Even with subscription auth enabled, non-Claude-Code agents (codex/opencode)
-// must be left on their injected API key — the function returns before any
-// Secrets Manager lookup, so this test makes no AWS calls.
+// The marker is a control-plane signal, not part of the agentbox contract — it
+// must be consumed here and never reach the container env.
+func TestSubscriptionAuth_MarkerNotLeakedToContainer(t *testing.T) {
+	env := map[string]string{
+		claudeAuthModeEnvVar: claudeAuthModeSubscription,
+		"ANTHROPIC_API_KEY":  "sk-ant-api-xyz",
+		"AGENT_TYPE":         "codex", // returns before any AWS call
+	}
+	maybeApplyClaudeSubscriptionAuth(env, io.Discard)
+	if _, ok := env[claudeAuthModeEnvVar]; ok {
+		t.Errorf("%s leaked into the container env", claudeAuthModeEnvVar)
+	}
+}
+
+// Even in subscription mode, non-Claude-Code agents (codex/opencode) must be
+// left on their injected API key — the function returns before any Secrets
+// Manager lookup, so this test makes no AWS calls.
 func TestSubscriptionAuth_ClaudeCodeOnly(t *testing.T) {
-	t.Setenv(claudeOAuthSecretNameEnvVar, "deployment-io/claude-code-oauth-token")
-	env := map[string]string{"OPENAI_API_KEY": "sk-openai", "AGENT_TYPE": "codex"}
+	env := map[string]string{
+		claudeAuthModeEnvVar: claudeAuthModeSubscription,
+		"OPENAI_API_KEY":     "sk-openai",
+		"AGENT_TYPE":         "codex",
+	}
 	maybeApplyClaudeSubscriptionAuth(env, io.Discard)
 	if env["OPENAI_API_KEY"] != "sk-openai" {
 		t.Errorf("codex key was modified: %q", env["OPENAI_API_KEY"])

@@ -402,38 +402,72 @@ func buildAgentSpawnEnvVars(parameters map[string]interface{}, logsWriter io.Wri
 	}
 	// Optionally swap the injected ANTHROPIC_API_KEY for a Claude Code
 	// subscription OAuth token read from this runner's own AWS Secrets Manager.
-	// Off by default; enabled per-runner via AGENTBOX_CLAUDE_OAUTH_SECRET_NAME.
+	// Engages only when the org is in subscription mode (marker in AgentEnvVars).
 	maybeApplyClaudeSubscriptionAuth(env, logsWriter)
 	return mapToEnvSlice(env), nil
 }
 
+// Subscription-mode contract with the control plane.
+//
+// CROSS-REPO CONTRACT: deployment-server injects these exact strings into
+// AgentEnvVars when the org's ClaudeAuth.Provider is Subscription — see
+// kit's organization_models.ClaudeAuthModeEnvVar / ...Subscription. This repo
+// does not import kit, so the literals are duplicated; change them in both or
+// subscription auth silently stops engaging and every task quietly falls back
+// to the API key. The marker is non-secret; the token never leaves the
+// customer's cloud.
+const (
+	claudeAuthModeEnvVar       = "CLAUDE_AUTH_MODE"
+	claudeAuthModeSubscription = "subscription"
+
+	// claudeOAuthSecretName is the Secrets Manager entry holding the customer's
+	// Claude Code subscription OAuth token, in their own account.
+	//
+	// DELIBERATELY A CONSTANT — do NOT make this control-plane-supplied.
+	// The runner's IAM role carries secretsmanager:* on Resource "*" (granted on
+	// the deploy path via iam_policies AwsSecretsManager), so a remote-supplied
+	// name would hand the control plane an arbitrary-secret-read primitive on
+	// the customer's account: it could name any secret and we'd read it and
+	// inject it into an agent container's env. Keeping the name in code means
+	// there is no path to read anything else, regardless of what IAM allows.
+	// If this ever needs to vary per customer, scope the IAM to a single secret
+	// ARN FIRST. See plans/PLAN_tasks_subscription_auth.md §4.3.
+	claudeOAuthSecretName = "deployment-io/claude-code-oauth-token"
+)
+
 // maybeApplyClaudeSubscriptionAuth swaps the injected ANTHROPIC_API_KEY for a
-// Claude Code subscription OAuth token when this runner is configured for
-// subscription auth. The token is read from the customer's own AWS Secrets
-// Manager on this runner and never transits the control plane (unlike the API
-// key, which is injected by deployment-server at Job pickup).
+// Claude Code subscription OAuth token when the org is in subscription mode.
+// The token is read from the customer's own AWS Secrets Manager on this runner
+// and never transits the control plane (unlike the API key, which
+// deployment-server injects at Job pickup).
 //
 // Guardrails (see plans/PLAN_tasks_subscription_auth.md):
-//   - Off unless AGENTBOX_CLAUDE_OAUTH_SECRET_NAME is set on the runner.
+//   - Off unless deployment-server marked the org subscription-mode. The
+//     customer must also have created the secret and granted this runner read
+//     access, so the feature is inert without their action on their own cloud.
 //   - Genuine Claude Code only — never codex/opencode (their subscription auth
 //     is prohibited/blocked; genuine `claude` is what passes Anthropic's
 //     client-identity check).
 //   - Replace, not co-set: ANTHROPIC_API_KEY is removed so Claude Code doesn't
 //     ambiguously prefer it over the OAuth token.
 //   - Any failure (missing/unreadable/malformed secret) falls back to the
-//     injected API key rather than hard-failing the task.
+//     injected API key rather than hard-failing the task. An org configured
+//     strict subscription-only has no key to fall back to, so agentbox fails
+//     fast instead of quietly reverting to metered billing.
 func maybeApplyClaudeSubscriptionAuth(env map[string]string, logsWriter io.Writer) {
-	secretName := strings.TrimSpace(os.Getenv("AGENTBOX_CLAUDE_OAUTH_SECRET_NAME"))
-	if secretName == "" {
-		return // subscription auth disabled (default)
+	mode := strings.TrimSpace(env[claudeAuthModeEnvVar])
+	// Consumed here — keep the marker out of the agent container's env.
+	delete(env, claudeAuthModeEnvVar)
+	if mode != claudeAuthModeSubscription {
+		return // org is not in subscription mode (the default)
 	}
 	// AGENT_TYPE unset defaults to claude-code in agentbox, so "" is allowed.
 	if at := env["AGENT_TYPE"]; at != "" && at != "claude-code" {
 		return // genuine Claude Code only
 	}
-	token, err := readClaudeOAuthToken(secretName)
+	token, err := readClaudeOAuthToken(claudeOAuthSecretName)
 	if err != nil {
-		io.WriteString(logsWriter, fmt.Sprintf("Subscription auth: could not read OAuth secret %q, falling back to API key (%s).\n", secretName, err))
+		io.WriteString(logsWriter, fmt.Sprintf("Subscription auth: could not read OAuth secret %q, falling back to API key (%s).\n", claudeOAuthSecretName, err))
 		return
 	}
 	if !strings.HasPrefix(token, "sk-ant-oat") {
