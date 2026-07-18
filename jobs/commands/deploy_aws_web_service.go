@@ -2,8 +2,10 @@ package commands
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"log"
 	"regexp"
 	"strings"
 	"time"
@@ -17,6 +19,7 @@ import (
 	elbTypes "github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2/types"
 	"github.com/aws/aws-sdk-go-v2/service/servicediscovery"
 	sd_types "github.com/aws/aws-sdk-go-v2/service/servicediscovery/types"
+	"github.com/aws/smithy-go"
 	"github.com/deployment-io/deployment-runner-kit/builds"
 	"github.com/deployment-io/deployment-runner-kit/cloud_api_clients"
 	"github.com/deployment-io/deployment-runner-kit/deployments"
@@ -85,6 +88,72 @@ func getDefaultVpcSecurityGroupIngressRuleNameForPort(parameters map[string]inte
 		return "", err
 	}
 	return fmt.Sprintf("sgin-%d", port), nil
+}
+
+// isDuplicateSecurityGroupRuleError reports whether err is the EC2
+// InvalidPermission.Duplicate API error. EC2 returns it from
+// AuthorizeSecurityGroupIngress/AuthorizeSecurityGroupEgress when the rule we are
+// trying to add already exists. For our deploys that means the desired rule is
+// already in place, so the caller can treat it as success and continue.
+func isDuplicateSecurityGroupRuleError(err error) bool {
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		return apiErr.ErrorCode() == "InvalidPermission.Duplicate"
+	}
+	return false
+}
+
+// recoverAndTagAlbSecurityGroupRule finds the id of the existing rule in the ALB
+// security group matching the given direction, tcp port and cidr, and re-applies our
+// Name tags to it so future deploys find the rule with the tag-based describe again.
+// Called after EC2 reports InvalidPermission.Duplicate for a rule the tag-based
+// describe missed (rule created by an older runner or with its tags stripped).
+// Recovery is best effort - the security group is already in the desired state at
+// this point - so failures are logged and an empty id is returned instead of
+// failing the deploy.
+func recoverAndTagAlbSecurityGroupRule(ec2Client *ec2.Client, albSecurityGroupId, ruleName string, isEgress bool, port int32, cidr string) string {
+	describeOutput, err := ec2Client.DescribeSecurityGroupRules(context.TODO(), &ec2.DescribeSecurityGroupRulesInput{
+		DryRun: aws.Bool(false),
+		Filters: []ec2Types.Filter{{
+			Name:   aws.String("group-id"),
+			Values: []string{albSecurityGroupId},
+		}},
+	})
+	if err != nil {
+		log.Printf("recovering rule %s: error describing rules for security group %s: %s", ruleName, albSecurityGroupId, err)
+		return ""
+	}
+	for _, rule := range describeOutput.SecurityGroupRules {
+		if aws.ToBool(rule.IsEgress) != isEgress || aws.ToString(rule.IpProtocol) != "tcp" ||
+			aws.ToInt32(rule.FromPort) != port || aws.ToInt32(rule.ToPort) != port ||
+			aws.ToString(rule.CidrIpv4) != cidr {
+			continue
+		}
+		ruleId := aws.ToString(rule.SecurityGroupRuleId)
+		_, err = ec2Client.CreateTags(context.TODO(), &ec2.CreateTagsInput{
+			Resources: []string{ruleId},
+			Tags: []ec2Types.Tag{
+				{
+					Key:   aws.String("Name"),
+					Value: aws.String(ruleName),
+				},
+				{
+					Key:   aws.String("created by"),
+					Value: aws.String("deployment.io"),
+				},
+				{
+					Key:   aws.String("alb-security-group-id"),
+					Value: aws.String(albSecurityGroupId),
+				},
+			},
+		})
+		if err != nil {
+			log.Printf("recovering rule %s: error tagging rule %s: %s", ruleName, ruleId, err)
+		}
+		return ruleId
+	}
+	log.Printf("recovering rule %s: no matching rule found in security group %s", ruleName, albSecurityGroupId)
+	return ""
 }
 
 func addIngressRuleToDefaultVpcSecurityGroupForPortIfNeeded(parameters map[string]interface{}, ec2Client *ec2.Client) error {
@@ -159,7 +228,9 @@ func addIngressRuleToDefaultVpcSecurityGroupForPortIfNeeded(parameters map[strin
 			ToPort: aws.Int32(int32(port)),
 		}
 		_, err = ec2Client.AuthorizeSecurityGroupIngress(context.TODO(), authorizeSecurityGroupIngressInput)
-		if err != nil {
+		//if the rule already exists EC2 returns InvalidPermission.Duplicate. The desired rule is
+		//already present, so we treat it as success and continue (idempotent ingress setup).
+		if err != nil && !isDuplicateSecurityGroupRuleError(err) {
 			return err
 		}
 
@@ -327,9 +398,21 @@ func createAlbSecurityGroupIfNeeded(parameters map[string]interface{}, ec2Client
 		}
 		authorizeSecurityGroupIngressOutput, err := ec2Client.AuthorizeSecurityGroupIngress(context.TODO(), authorizeSecurityGroupIngressInput)
 		if err != nil {
-			return "", err
+			//InvalidPermission.Duplicate means the rule already exists - treat as success,
+			//recover the existing rule id and re-tag the rule so future deploys find it by tag
+			if !isDuplicateSecurityGroupRuleError(err) {
+				return "", err
+			}
+			log.Printf("alb security group ingress rule %s already exists, recovering rule id", albSecurityGroupIngressRuleName)
+			for _, internetPort := range []int32{443, 80} {
+				ruleId := recoverAndTagAlbSecurityGroupRule(ec2Client, albSecurityGroupId, albSecurityGroupIngressRuleName, false, internetPort, "0.0.0.0/0")
+				if len(albSecurityGroupIngressRuleId) == 0 {
+					albSecurityGroupIngressRuleId = ruleId
+				}
+			}
+		} else {
+			albSecurityGroupIngressRuleId = aws.ToString(authorizeSecurityGroupIngressOutput.SecurityGroupRules[0].SecurityGroupRuleId)
 		}
-		albSecurityGroupIngressRuleId = aws.ToString(authorizeSecurityGroupIngressOutput.SecurityGroupRules[0].SecurityGroupRuleId)
 	}
 
 	albSecurityGroupEgressRuleName, err := getAlbSecurityGroupEgressRuleName(parameters)
@@ -403,9 +486,16 @@ func createAlbSecurityGroupIfNeeded(parameters map[string]interface{}, ec2Client
 
 		authorizeSecurityGroupEgressOutput, err := ec2Client.AuthorizeSecurityGroupEgress(context.TODO(), authorizeSecurityGroupEgressInput)
 		if err != nil {
-			return "", err
+			//InvalidPermission.Duplicate means the rule already exists - treat as success,
+			//recover the existing rule id and re-tag the rule so future deploys find it by tag
+			if !isDuplicateSecurityGroupRuleError(err) {
+				return "", err
+			}
+			log.Printf("alb security group egress rule %s already exists, recovering rule id", albSecurityGroupEgressRuleName)
+			albSecurityGroupEgressRuleId = recoverAndTagAlbSecurityGroupRule(ec2Client, albSecurityGroupId, albSecurityGroupEgressRuleName, true, int32(port), vpcCidr)
+		} else {
+			albSecurityGroupEgressRuleId = aws.ToString(authorizeSecurityGroupEgressOutput.SecurityGroupRules[0].SecurityGroupRuleId)
 		}
-		albSecurityGroupEgressRuleId = aws.ToString(authorizeSecurityGroupEgressOutput.SecurityGroupRules[0].SecurityGroupRuleId)
 	}
 
 	//TODO can sync both sg ingress ids later
