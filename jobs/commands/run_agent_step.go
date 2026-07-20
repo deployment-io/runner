@@ -907,7 +907,11 @@ type agentResult struct {
 	ExitCode       int        `json:"exit_code"`
 	AgentVersion   string     `json:"agent_version,omitempty"`
 	ChangesSummary string     `json:"changes_summary,omitempty"`
-	TokenUsage     tokenUsage `json:"token_usage"`
+	// FilesChanged is the agent's self-reported list of changed files. Carried
+	// through to agentOutput so CommitAndPush can detect the "agent reported
+	// changes but nothing landed in a repo" failure (writes outside the repo dir).
+	FilesChanged []string   `json:"files_changed,omitempty"`
+	TokenUsage   tokenUsage `json:"token_usage"`
 	// Turns is agentbox's per-run turn count (internal/result.Outcome.Turns,
 	// emitted as "turns"). The runner previously declared this as TurnCount
 	// with json:"turn_count" — neither name matched agentbox's wire shape,
@@ -1007,6 +1011,7 @@ func mergeAgentResultIntoJobOutput(parameters map[string]interface{}, result age
 	data.SchemaVersion = jobOutputSchemaVersion
 	data.Agent = &agentOutput{
 		ChangesSummary: result.ChangesSummary,
+		FilesChanged:   result.FilesChanged,
 		TokenUsage:     result.TokenUsage,
 		Turns:          result.Turns,
 		CostUSD:        result.CostUSD,
