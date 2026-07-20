@@ -55,6 +55,9 @@ func (cap *CommitAndPush) Run(parameters map[string]interface{}, logsWriter io.W
 	if err != nil {
 		return parameters, err
 	}
+	if err := detectOrphanedChanges(parameters, repoOutputs, logsWriter); err != nil {
+		return parameters, err
+	}
 	if err := tcp.mergeRepositoriesIntoJobOutput(parameters, repoOutputs); err != nil {
 		return parameters, fmt.Errorf("error merging repositories into job output: %s", err)
 	}
@@ -211,6 +214,43 @@ func (tcp *taskCommitPush) subjectAndBody() (string, string) {
 	return fmt.Sprintf("Tasks Step %d: %s", tcp.ctx.StepIndex+1, tcp.ctx.TaskTitle), ""
 }
 
+// detectOrphanedChanges fails the Step when the agent reported changed files but
+// none landed in any repository — the "wrote outside the repo directory" failure
+// (the agent creates files at the /work root instead of /work/<owner>/<repo>, so
+// the per-repo git diff is empty). Without this the Step silently succeeds with
+// no commit and no PR, which looks like success but produced nothing. A genuine
+// no-op (the agent changed nothing) has empty files_changed and is left alone.
+func detectOrphanedChanges(parameters map[string]interface{}, repoOutputs []repoOutput, logsWriter io.Writer) error {
+	for _, r := range repoOutputs {
+		if r.HasChanges {
+			return nil // at least one repo changed — normal path
+		}
+	}
+	filesChanged := readAgentFilesChangedFromJobOutput(parameters)
+	if len(filesChanged) == 0 {
+		return nil // genuine no-op — the agent reported no changed files
+	}
+	joined := strings.Join(filesChanged, ", ")
+	io.WriteString(logsWriter, fmt.Sprintf(
+		"Agent reported %d changed file(s) but none landed in any repository — they were likely written outside the repository directory (e.g. at /work instead of /work/<owner>/<repo>) and cannot be committed. Files: %s\n",
+		len(filesChanged), joined))
+	return fmt.Errorf("agent changes were written outside the repository — nothing to commit (files: %s)", joined)
+}
+
+// readAgentFilesChangedFromJobOutput pulls the agent.files_changed list from the
+// JobOutput envelope (written by RunAgentStep). Empty on any parse miss.
+func readAgentFilesChangedFromJobOutput(parameters map[string]interface{}) []string {
+	existing, err := jobs.GetParameterValue[string](parameters, parameters_enums.JobOutput)
+	if err != nil || len(existing) == 0 {
+		return nil
+	}
+	var data jobOutputData
+	if err := json.Unmarshal([]byte(existing), &data); err != nil || data.Agent == nil {
+		return nil
+	}
+	return data.Agent.FilesChanged
+}
+
 // readAgentSummaryFromJobOutput pulls the agent.changes_summary field
 // out of the accumulated JobOutput envelope. RunAgentStep populates
 // this before CommitAndPush + OpenPullRequest run; both commands call
@@ -306,8 +346,12 @@ type jobOutputData struct {
 }
 
 type agentOutput struct {
-	ChangesSummary string     `json:"changes_summary,omitempty"`
-	TokenUsage     tokenUsage `json:"token_usage"`
+	ChangesSummary string `json:"changes_summary,omitempty"`
+	// FilesChanged is the agent's self-reported changed-file list. Used by
+	// CommitAndPush to detect the "reported changes but none landed in a repo"
+	// failure (files written outside the repo dir → nothing to commit).
+	FilesChanged []string   `json:"files_changed,omitempty"`
+	TokenUsage   tokenUsage `json:"token_usage"`
 	// Turns is the per-run turn count agentbox writes to /result.json.
 	// Surfaced on the JobOutput envelope so app-server's projection
 	// can populate AgentRunSummary.Turns for completed runs — the
