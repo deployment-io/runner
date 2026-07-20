@@ -15,9 +15,11 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/cloudfront"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/deployment-io/deployment-runner-kit/cloud_api_clients"
 	"github.com/deployment-io/deployment-runner-kit/deployments"
 	"github.com/deployment-io/deployment-runner-kit/enums/build_enums"
@@ -400,11 +402,70 @@ func buildAgentSpawnEnvVars(parameters map[string]interface{}, logsWriter io.Wri
 	if allowed != "" {
 		env["ADDITIONAL_ALLOWED_HOSTS"] = allowed
 	}
+	// Bedrock: when the org is in Bedrock mode (CLAUDE_CODE_USE_BEDROCK marker in
+	// AgentEnvVars), assume dr-bedrock-role and inject its scoped short-lived creds.
+	applyBedrockCredsIfNeeded(env, logsWriter)
 	// Optionally swap the injected ANTHROPIC_API_KEY for a Claude Code
 	// subscription OAuth token read from this runner's own AWS Secrets Manager.
 	// Engages only when the org is in subscription mode (marker in AgentEnvVars).
 	maybeApplyClaudeSubscriptionAuth(env, logsWriter)
 	return mapToEnvSlice(env), nil
+}
+
+// bedrockRoleArnEnvVar names the env var the CloudFormation runner task def sets
+// to the dr-bedrock-role ARN (see cloud-formation-one-click). Empty means the
+// runner's stack predates Bedrock support.
+const bedrockRoleArnEnvVar = "BedrockRoleArn"
+
+// applyBedrockCredsIfNeeded switches a claude-code task to AWS Bedrock. When
+// deployment-server has injected the CLAUDE_CODE_USE_BEDROCK=1 marker (from the
+// org's Bedrock provider — see kit's ClaudeAuth.ResolveAgentEnvVars), the runner
+// assumes the minimal dr-bedrock-role and injects the short-lived, Bedrock-only
+// credentials into the agent container. No long-lived secret is stored, and the
+// agent receives creds that can invoke Bedrock and nothing else. The Bedrock API
+// host is added to the egress allowlist. On any failure the task proceeds without
+// creds (and fails auth in the container) rather than crashing the runner.
+func applyBedrockCredsIfNeeded(env map[string]string, logsWriter io.Writer) {
+	if env["CLAUDE_CODE_USE_BEDROCK"] != "1" {
+		return
+	}
+	roleArn := strings.TrimSpace(os.Getenv(bedrockRoleArnEnvVar))
+	if roleArn == "" {
+		io.WriteString(logsWriter, "Bedrock: BedrockRoleArn is not set on this runner — update the CloudFormation stack to add the Bedrock role.\n")
+		return
+	}
+	region := utils.RunnerData.Get().RunnerRegion
+	cfg, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion(region))
+	if err != nil {
+		io.WriteString(logsWriter, fmt.Sprintf("Bedrock: could not load AWS config: %s\n", err))
+		return
+	}
+	out, err := sts.NewFromConfig(cfg).AssumeRole(context.TODO(), &sts.AssumeRoleInput{
+		RoleArn:         aws.String(roleArn),
+		RoleSessionName: aws.String("agentbox-bedrock"),
+	})
+	if err != nil || out.Credentials == nil {
+		io.WriteString(logsWriter, fmt.Sprintf("Bedrock: AssumeRole %s failed: %s\n", roleArn, err))
+		return
+	}
+	c := out.Credentials
+	env["AWS_ACCESS_KEY_ID"] = aws.ToString(c.AccessKeyId)
+	env["AWS_SECRET_ACCESS_KEY"] = aws.ToString(c.SecretAccessKey)
+	env["AWS_SESSION_TOKEN"] = aws.ToString(c.SessionToken)
+	env["AWS_REGION"] = region
+	// claude-code in Bedrock mode takes the model from ANTHROPIC_MODEL (an
+	// inference-profile id). Pass the selected model through.
+	if m := env["MODEL"]; m != "" {
+		env["ANTHROPIC_MODEL"] = m
+	}
+	// Allowlist the Bedrock data-plane host — agentbox's proxy gates egress.
+	bedrockHost := "bedrock-runtime." + region + ".amazonaws.com"
+	if existing := env["ADDITIONAL_ALLOWED_HOSTS"]; existing != "" {
+		env["ADDITIONAL_ALLOWED_HOSTS"] = existing + "," + bedrockHost
+	} else {
+		env["ADDITIONAL_ALLOWED_HOSTS"] = bedrockHost
+	}
+	io.WriteString(logsWriter, fmt.Sprintf("Bedrock: assumed %s; agent will use Bedrock in %s.\n", roleArn, region))
 }
 
 // Subscription-mode contract with the control plane.
