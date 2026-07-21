@@ -19,7 +19,7 @@ import (
 // the injected API key must survive untouched.
 func TestSubscriptionAuth_DisabledByDefault(t *testing.T) {
 	env := map[string]string{"ANTHROPIC_API_KEY": "sk-ant-api-xyz", "AGENT_TYPE": "claude-code"}
-	maybeApplyClaudeSubscriptionAuth(env, io.Discard)
+	maybeApplyClaudeSubscriptionAuth(env, "", io.Discard)
 	if env["ANTHROPIC_API_KEY"] != "sk-ant-api-xyz" {
 		t.Errorf("API key was modified while subscription auth disabled: %q", env["ANTHROPIC_API_KEY"])
 	}
@@ -36,7 +36,7 @@ func TestSubscriptionAuth_MarkerNotLeakedToContainer(t *testing.T) {
 		"ANTHROPIC_API_KEY":  "sk-ant-api-xyz",
 		"AGENT_TYPE":         "codex", // returns before any AWS call
 	}
-	maybeApplyClaudeSubscriptionAuth(env, io.Discard)
+	maybeApplyClaudeSubscriptionAuth(env, "", io.Discard)
 	if _, ok := env[claudeAuthModeEnvVar]; ok {
 		t.Errorf("%s leaked into the container env", claudeAuthModeEnvVar)
 	}
@@ -51,7 +51,7 @@ func TestSubscriptionAuth_ClaudeCodeOnly(t *testing.T) {
 		"OPENAI_API_KEY":     "sk-openai",
 		"AGENT_TYPE":         "codex",
 	}
-	maybeApplyClaudeSubscriptionAuth(env, io.Discard)
+	maybeApplyClaudeSubscriptionAuth(env, "", io.Discard)
 	if env["OPENAI_API_KEY"] != "sk-openai" {
 		t.Errorf("codex key was modified: %q", env["OPENAI_API_KEY"])
 	}
@@ -299,41 +299,6 @@ func TestIsAccessDenied(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := isAccessDenied(tt.err); got != tt.want {
 				t.Errorf("isAccessDenied(%v) = %v, want %v", tt.err, got, tt.want)
-			}
-		})
-	}
-}
-
-// The role name is parsed out of the STS assumed-role ARN so the grant works on
-// any runner without reconstructing the dr-task-role-... naming convention.
-func TestRunnerTaskRoleNameParsing(t *testing.T) {
-	tests := []struct {
-		name    string
-		arn     string
-		want    string
-		wantErr bool
-	}{
-		{
-			name: "ecs task role",
-			arn:  "arn:aws:sts::123456789012:assumed-role/dr-task-role-linuxamd-abc123-us-east-1/a1b2c3",
-			want: "dr-task-role-linuxamd-abc123-us-east-1",
-		},
-		{
-			name: "arm task role",
-			arn:  "arn:aws:sts::123456789012:assumed-role/dr-task-role-linuxarm-abc123-eu-west-1/sess",
-			want: "dr-task-role-linuxarm-abc123-eu-west-1",
-		},
-		{"iam user, not a role", "arn:aws:iam::123456789012:user/ankit", "", true},
-		{"malformed", "not-an-arn", "", true},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got, err := parseAssumedRoleName(tt.arn)
-			if (err != nil) != tt.wantErr {
-				t.Fatalf("parseAssumedRoleName(%q) err = %v, wantErr %v", tt.arn, err, tt.wantErr)
-			}
-			if got != tt.want {
-				t.Errorf("parseAssumedRoleName(%q) = %q, want %q", tt.arn, got, tt.want)
 			}
 		})
 	}

@@ -16,16 +16,16 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/cloudfront"
-	"github.com/aws/aws-sdk-go-v2/service/iam"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
-	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/aws/smithy-go"
 	"github.com/deployment-io/deployment-runner-kit/cloud_api_clients"
 	"github.com/deployment-io/deployment-runner-kit/deployments"
 	"github.com/deployment-io/deployment-runner-kit/enums/build_enums"
+	"github.com/deployment-io/deployment-runner-kit/enums/iam_policy_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/region_enums"
+	"github.com/deployment-io/deployment-runner-kit/iam_policies"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner-kit/task_previews"
 	"github.com/deployment-io/deployment-runner-kit/types"
@@ -406,7 +406,11 @@ func buildAgentSpawnEnvVars(parameters map[string]interface{}, logsWriter io.Wri
 	// Optionally swap the injected ANTHROPIC_API_KEY for a Claude Code
 	// subscription OAuth token read from this runner's own AWS Secrets Manager.
 	// Engages only when the org is in subscription mode (marker in AgentEnvVars).
-	maybeApplyClaudeSubscriptionAuth(env, logsWriter)
+	// OrganizationIDNamespace is best-effort here: it only enables the
+	// self-grant retry below, and an unreadable secret still degrades to the
+	// API key without it.
+	organizationID, _ := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIDNamespace)
+	maybeApplyClaudeSubscriptionAuth(env, organizationID, logsWriter)
 	return mapToEnvSlice(env), nil
 }
 
@@ -457,7 +461,7 @@ const (
 //     injected API key rather than hard-failing the task. An org configured
 //     strict subscription-only has no key to fall back to, so agentbox fails
 //     fast instead of quietly reverting to metered billing.
-func maybeApplyClaudeSubscriptionAuth(env map[string]string, logsWriter io.Writer) {
+func maybeApplyClaudeSubscriptionAuth(env map[string]string, organizationID string, logsWriter io.Writer) {
 	mode := strings.TrimSpace(env[claudeAuthModeEnvVar])
 	// Consumed here — keep the marker out of the agent container's env.
 	delete(env, claudeAuthModeEnvVar)
@@ -469,12 +473,17 @@ func maybeApplyClaudeSubscriptionAuth(env map[string]string, logsWriter io.Write
 		return // genuine Claude Code only
 	}
 	token, err := readClaudeOAuthToken(claudeOAuthSecretName)
-	if err != nil && isAccessDenied(err) {
-		// The customer created the secret but this runner's role can't read it.
-		// Grant ourselves read on that one secret and retry, so subscription auth
-		// doesn't require a manual IAM step during setup. Only ever fires on a
-		// denial, so the steady-state cost is zero IAM calls.
-		token, err = grantSecretReadAndRetry(logsWriter)
+	if err != nil && isAccessDenied(err) && organizationID != "" {
+		// The customer created the secret but this runner's role can't read it
+		// (its stack never deployed anything, so it never self-granted Secrets
+		// Manager). Grant it the same way the deploy path does and re-read, so
+		// subscription auth needs no manual IAM step during setup.
+		io.WriteString(logsWriter, "Subscription auth: no read access to the OAuth secret — granting this runner Secrets Manager access.\n")
+		if grantErr := grantSecretsManagerAccess(organizationID); grantErr != nil {
+			io.WriteString(logsWriter, fmt.Sprintf("Subscription auth: could not grant Secrets Manager access (%s).\n", grantErr))
+		} else {
+			token, err = readClaudeOAuthToken(claudeOAuthSecretName)
+		}
 	}
 	if err != nil {
 		io.WriteString(logsWriter, fmt.Sprintf("Subscription auth: could not read OAuth secret %q, falling back to API key (%s).\n", claudeOAuthSecretName, err))
@@ -509,13 +518,6 @@ func readClaudeOAuthToken(secretName string) (string, error) {
 	return strings.TrimSpace(*out.SecretString), nil
 }
 
-// claudeOAuthPolicyName is the inline policy this runner writes onto its own task
-// role to read the subscription secret. DELIBERATELY ITS OWN NAME — never the
-// CloudFormation-managed dr-policy-<osCpu>-<orgID>-<region>, which
-// iam_policies.AddAwsPolicyForDeploymentRunner read-modify-writes wholesale. A
-// separate policy can't be clobbered by that flow and can't clobber it.
-const claudeOAuthPolicyName = "deployment-io-claude-oauth-read"
-
 // isAccessDenied reports whether an AWS error is an authorization failure, as
 // opposed to the secret simply not existing. Only a denial is worth self-granting
 // for — retrying a genuinely missing secret would write IAM on every task.
@@ -531,91 +533,19 @@ func isAccessDenied(err error) bool {
 	return false
 }
 
-// grantSecretReadAndRetry gives this runner's own task role read access to the
-// subscription secret and re-reads it. The grant is scoped to exactly one action
-// on exactly one secret ARN — narrower than the account-wide secretsmanager:*
-// the deploy path self-grants.
-//
-// The role name is discovered from STS rather than reconstructed from the
-// dr-task-role-<osCpu>-<orgID>-<region> convention, so this works on any runner
-// (amd/arm, any stack vintage) with no CloudFormation update.
-//
-// Mirrors applyBedrockCredsIfNeeded's contract: every failure degrades to the API
-// key path with a log line, and never crashes the runner.
-func grantSecretReadAndRetry(logsWriter io.Writer) (string, error) {
+// grantSecretsManagerAccess self-grants this runner Secrets Manager access, the
+// same way the deploy path does before creating a registry-credential secret
+// (see CreateSecretAwsSecretManager). Reusing the shared helper means the grant,
+// the already-present short-circuit and the IAM propagation wait all behave
+// identically to every other policy the runner self-provisions — including
+// returning immediately once the actions are in place, so a runner that can
+// never read the secret (permissions boundary, SCP, CMK-encrypted secret) pays
+// the propagation wait once rather than on every spawn.
+func grantSecretsManagerAccess(organizationID string) error {
 	runnerData := utils.RunnerData.Get()
-	roleName, err := runnerTaskRoleName(runnerData.RunnerRegion)
-	if err != nil {
-		return "", fmt.Errorf("could not determine this runner's role: %s", err)
-	}
-	secretArn := fmt.Sprintf("arn:aws:secretsmanager:%s:%s:secret:%s-*",
-		runnerData.RunnerRegion, runnerData.AWSAccountID, claudeOAuthSecretName)
-	policy := fmt.Sprintf(`{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"secretsmanager:GetSecretValue","Resource":%q}]}`, secretArn)
-
-	// GetIamClient reads its region from the job-parameter map, so build the
-	// one key it needs rather than passing an empty map (which errors).
-	regionKey, err := parameters_enums.Region.Key()
-	if err != nil {
-		return "", err
-	}
-	regionType, err := region_enums.GetType(runnerData.RunnerRegion)
-	if err != nil {
-		return "", err
-	}
-	iamClient, err := cloud_api_clients.GetIamClient(map[string]interface{}{regionKey: int64(regionType)})
-	if err != nil {
-		return "", err
-	}
-	if _, err = iamClient.PutRolePolicy(context.TODO(), &iam.PutRolePolicyInput{
-		RoleName:       aws.String(roleName),
-		PolicyName:     aws.String(claudeOAuthPolicyName),
-		PolicyDocument: aws.String(policy),
-	}); err != nil {
-		return "", fmt.Errorf("could not grant read on the OAuth secret: %s", err)
-	}
-	io.WriteString(logsWriter, fmt.Sprintf("Subscription auth: granted %s read access to %s; waiting for IAM to propagate.\n", roleName, claudeOAuthSecretName))
-
-	// IAM is eventually consistent — a fresh grant is not usable immediately.
-	// Poll rather than sleeping a flat 60s so the common case costs a few seconds.
-	var lastErr error
-	for attempt := 0; attempt < 12; attempt++ {
-		time.Sleep(5 * time.Second)
-		token, err := readClaudeOAuthToken(claudeOAuthSecretName)
-		if err == nil {
-			return token, nil
-		}
-		lastErr = err
-		if !isAccessDenied(err) {
-			break // a different failure (missing/empty secret) won't fix itself
-		}
-	}
-	return "", lastErr
-}
-
-// runnerTaskRoleName returns the name of the IAM role this runner is running as,
-// parsed from the STS assumed-role ARN
-// (arn:aws:sts::<account>:assumed-role/<RoleName>/<sessionName>).
-func runnerTaskRoleName(region string) (string, error) {
-	stsClient, err := cloud_api_clients.GetStsClient(region)
-	if err != nil {
-		return "", err
-	}
-	out, err := stsClient.GetCallerIdentity(context.TODO(), &sts.GetCallerIdentityInput{})
-	if err != nil {
-		return "", err
-	}
-	return parseAssumedRoleName(aws.ToString(out.Arn))
-}
-
-// parseAssumedRoleName pulls the role name out of an STS assumed-role ARN,
-// arn:aws:sts::<account>:assumed-role/<RoleName>/<sessionName>. Split out from
-// the STS call so the parsing is testable on its own.
-func parseAssumedRoleName(arn string) (string, error) {
-	parts := strings.Split(arn, "/")
-	if len(parts) < 2 || !strings.Contains(parts[0], ":assumed-role") {
-		return "", fmt.Errorf("not running as an assumed role (identity %q)", arn)
-	}
-	return parts[1], nil
+	return iam_policies.AddAwsPolicyForDeploymentRunner(iam_policy_enums.AwsSecretsManager,
+		runnerData.OsType.String(), runnerData.CpuArchEnum.String(), organizationID,
+		runnerData.RunnerRegion, runnerData.Mode, runnerData.TargetCloud)
 }
 
 // mergeAdditionalAllowedHosts unions:
