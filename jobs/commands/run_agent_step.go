@@ -18,11 +18,14 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/cloudfront"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
+	"github.com/aws/smithy-go"
 	"github.com/deployment-io/deployment-runner-kit/cloud_api_clients"
 	"github.com/deployment-io/deployment-runner-kit/deployments"
 	"github.com/deployment-io/deployment-runner-kit/enums/build_enums"
+	"github.com/deployment-io/deployment-runner-kit/enums/iam_policy_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/region_enums"
+	"github.com/deployment-io/deployment-runner-kit/iam_policies"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner-kit/task_previews"
 	"github.com/deployment-io/deployment-runner-kit/types"
@@ -403,7 +406,11 @@ func buildAgentSpawnEnvVars(parameters map[string]interface{}, logsWriter io.Wri
 	// Optionally swap the injected ANTHROPIC_API_KEY for a Claude Code
 	// subscription OAuth token read from this runner's own AWS Secrets Manager.
 	// Engages only when the org is in subscription mode (marker in AgentEnvVars).
-	maybeApplyClaudeSubscriptionAuth(env, logsWriter)
+	// OrganizationIDNamespace is best-effort here: it only enables the
+	// self-grant retry below, and an unreadable secret still degrades to the
+	// API key without it.
+	organizationID, _ := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIDNamespace)
+	maybeApplyClaudeSubscriptionAuth(env, organizationID, logsWriter)
 	return mapToEnvSlice(env), nil
 }
 
@@ -454,7 +461,7 @@ const (
 //     injected API key rather than hard-failing the task. An org configured
 //     strict subscription-only has no key to fall back to, so agentbox fails
 //     fast instead of quietly reverting to metered billing.
-func maybeApplyClaudeSubscriptionAuth(env map[string]string, logsWriter io.Writer) {
+func maybeApplyClaudeSubscriptionAuth(env map[string]string, organizationID string, logsWriter io.Writer) {
 	mode := strings.TrimSpace(env[claudeAuthModeEnvVar])
 	// Consumed here — keep the marker out of the agent container's env.
 	delete(env, claudeAuthModeEnvVar)
@@ -466,6 +473,18 @@ func maybeApplyClaudeSubscriptionAuth(env map[string]string, logsWriter io.Write
 		return // genuine Claude Code only
 	}
 	token, err := readClaudeOAuthToken(claudeOAuthSecretName)
+	if err != nil && isAccessDenied(err) && organizationID != "" {
+		// The customer created the secret but this runner's role can't read it
+		// (its stack never deployed anything, so it never self-granted Secrets
+		// Manager). Grant it the same way the deploy path does and re-read, so
+		// subscription auth needs no manual IAM step during setup.
+		io.WriteString(logsWriter, "Subscription auth: no read access to the OAuth secret — granting this runner Secrets Manager access.\n")
+		if grantErr := grantSecretsManagerAccess(organizationID); grantErr != nil {
+			io.WriteString(logsWriter, fmt.Sprintf("Subscription auth: could not grant Secrets Manager access (%s).\n", grantErr))
+		} else {
+			token, err = readClaudeOAuthToken(claudeOAuthSecretName)
+		}
+	}
 	if err != nil {
 		io.WriteString(logsWriter, fmt.Sprintf("Subscription auth: could not read OAuth secret %q, falling back to API key (%s).\n", claudeOAuthSecretName, err))
 		return
@@ -497,6 +516,36 @@ func readClaudeOAuthToken(secretName string) (string, error) {
 		return "", fmt.Errorf("secret %q has no string value", secretName)
 	}
 	return strings.TrimSpace(*out.SecretString), nil
+}
+
+// isAccessDenied reports whether an AWS error is an authorization failure, as
+// opposed to the secret simply not existing. Only a denial is worth self-granting
+// for — retrying a genuinely missing secret would write IAM on every task.
+func isAccessDenied(err error) bool {
+	var apiErr smithy.APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	switch apiErr.ErrorCode() {
+	case "AccessDeniedException", "AccessDenied", "UnauthorizedOperation":
+		return true
+	}
+	return false
+}
+
+// grantSecretsManagerAccess self-grants this runner Secrets Manager access, the
+// same way the deploy path does before creating a registry-credential secret
+// (see CreateSecretAwsSecretManager). Reusing the shared helper means the grant,
+// the already-present short-circuit and the IAM propagation wait all behave
+// identically to every other policy the runner self-provisions — including
+// returning immediately once the actions are in place, so a runner that can
+// never read the secret (permissions boundary, SCP, CMK-encrypted secret) pays
+// the propagation wait once rather than on every spawn.
+func grantSecretsManagerAccess(organizationID string) error {
+	runnerData := utils.RunnerData.Get()
+	return iam_policies.AddAwsPolicyForDeploymentRunner(iam_policy_enums.AwsSecretsManager,
+		runnerData.OsType.String(), runnerData.CpuArchEnum.String(), organizationID,
+		runnerData.RunnerRegion, runnerData.Mode, runnerData.TargetCloud)
 }
 
 // mergeAdditionalAllowedHosts unions:

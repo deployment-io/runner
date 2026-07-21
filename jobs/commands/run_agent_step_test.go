@@ -2,12 +2,15 @@ package commands
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/aws/smithy-go"
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 )
@@ -16,7 +19,7 @@ import (
 // the injected API key must survive untouched.
 func TestSubscriptionAuth_DisabledByDefault(t *testing.T) {
 	env := map[string]string{"ANTHROPIC_API_KEY": "sk-ant-api-xyz", "AGENT_TYPE": "claude-code"}
-	maybeApplyClaudeSubscriptionAuth(env, io.Discard)
+	maybeApplyClaudeSubscriptionAuth(env, "", io.Discard)
 	if env["ANTHROPIC_API_KEY"] != "sk-ant-api-xyz" {
 		t.Errorf("API key was modified while subscription auth disabled: %q", env["ANTHROPIC_API_KEY"])
 	}
@@ -33,7 +36,7 @@ func TestSubscriptionAuth_MarkerNotLeakedToContainer(t *testing.T) {
 		"ANTHROPIC_API_KEY":  "sk-ant-api-xyz",
 		"AGENT_TYPE":         "codex", // returns before any AWS call
 	}
-	maybeApplyClaudeSubscriptionAuth(env, io.Discard)
+	maybeApplyClaudeSubscriptionAuth(env, "", io.Discard)
 	if _, ok := env[claudeAuthModeEnvVar]; ok {
 		t.Errorf("%s leaked into the container env", claudeAuthModeEnvVar)
 	}
@@ -48,7 +51,7 @@ func TestSubscriptionAuth_ClaudeCodeOnly(t *testing.T) {
 		"OPENAI_API_KEY":     "sk-openai",
 		"AGENT_TYPE":         "codex",
 	}
-	maybeApplyClaudeSubscriptionAuth(env, io.Discard)
+	maybeApplyClaudeSubscriptionAuth(env, "", io.Discard)
 	if env["OPENAI_API_KEY"] != "sk-openai" {
 		t.Errorf("codex key was modified: %q", env["OPENAI_API_KEY"])
 	}
@@ -270,5 +273,33 @@ func TestMergeAgentResultIntoJobOutput_TurnsCarryThrough(t *testing.T) {
 	}
 	if got.Agent.TokenUsage.InputTokens != 100 {
 		t.Errorf("agent.token_usage.input_tokens = %d, want 100", got.Agent.TokenUsage.InputTokens)
+	}
+}
+
+// isAccessDenied must fire only on authorization failures. A missing secret is
+// the customer not having created it yet — self-granting wouldn't help, and
+// treating it as a denial would write IAM on every task of a misconfigured org.
+func TestIsAccessDenied(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"access denied", &smithy.GenericAPIError{Code: "AccessDeniedException"}, true},
+		{"access denied short form", &smithy.GenericAPIError{Code: "AccessDenied"}, true},
+		{"unauthorized operation", &smithy.GenericAPIError{Code: "UnauthorizedOperation"}, true},
+		{"secret not found", &smithy.GenericAPIError{Code: "ResourceNotFoundException"}, false},
+		{"throttled", &smithy.GenericAPIError{Code: "ThrottlingException"}, false},
+		{"wrapped access denied", fmt.Errorf("reading secret: %w",
+			&smithy.GenericAPIError{Code: "AccessDeniedException"}), true},
+		{"plain error", errors.New("connection refused"), false},
+		{"nil", nil, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isAccessDenied(tt.err); got != tt.want {
+				t.Errorf("isAccessDenied(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
 	}
 }
