@@ -16,8 +16,11 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/cloudfront"
+	"github.com/aws/aws-sdk-go-v2/service/iam"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
+	"github.com/aws/smithy-go"
 	"github.com/deployment-io/deployment-runner-kit/cloud_api_clients"
 	"github.com/deployment-io/deployment-runner-kit/deployments"
 	"github.com/deployment-io/deployment-runner-kit/enums/build_enums"
@@ -466,6 +469,13 @@ func maybeApplyClaudeSubscriptionAuth(env map[string]string, logsWriter io.Write
 		return // genuine Claude Code only
 	}
 	token, err := readClaudeOAuthToken(claudeOAuthSecretName)
+	if err != nil && isAccessDenied(err) {
+		// The customer created the secret but this runner's role can't read it.
+		// Grant ourselves read on that one secret and retry, so subscription auth
+		// doesn't require a manual IAM step during setup. Only ever fires on a
+		// denial, so the steady-state cost is zero IAM calls.
+		token, err = grantSecretReadAndRetry(logsWriter)
+	}
 	if err != nil {
 		io.WriteString(logsWriter, fmt.Sprintf("Subscription auth: could not read OAuth secret %q, falling back to API key (%s).\n", claudeOAuthSecretName, err))
 		return
@@ -497,6 +507,115 @@ func readClaudeOAuthToken(secretName string) (string, error) {
 		return "", fmt.Errorf("secret %q has no string value", secretName)
 	}
 	return strings.TrimSpace(*out.SecretString), nil
+}
+
+// claudeOAuthPolicyName is the inline policy this runner writes onto its own task
+// role to read the subscription secret. DELIBERATELY ITS OWN NAME — never the
+// CloudFormation-managed dr-policy-<osCpu>-<orgID>-<region>, which
+// iam_policies.AddAwsPolicyForDeploymentRunner read-modify-writes wholesale. A
+// separate policy can't be clobbered by that flow and can't clobber it.
+const claudeOAuthPolicyName = "deployment-io-claude-oauth-read"
+
+// isAccessDenied reports whether an AWS error is an authorization failure, as
+// opposed to the secret simply not existing. Only a denial is worth self-granting
+// for — retrying a genuinely missing secret would write IAM on every task.
+func isAccessDenied(err error) bool {
+	var apiErr smithy.APIError
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	switch apiErr.ErrorCode() {
+	case "AccessDeniedException", "AccessDenied", "UnauthorizedOperation":
+		return true
+	}
+	return false
+}
+
+// grantSecretReadAndRetry gives this runner's own task role read access to the
+// subscription secret and re-reads it. The grant is scoped to exactly one action
+// on exactly one secret ARN — narrower than the account-wide secretsmanager:*
+// the deploy path self-grants.
+//
+// The role name is discovered from STS rather than reconstructed from the
+// dr-task-role-<osCpu>-<orgID>-<region> convention, so this works on any runner
+// (amd/arm, any stack vintage) with no CloudFormation update.
+//
+// Mirrors applyBedrockCredsIfNeeded's contract: every failure degrades to the API
+// key path with a log line, and never crashes the runner.
+func grantSecretReadAndRetry(logsWriter io.Writer) (string, error) {
+	runnerData := utils.RunnerData.Get()
+	roleName, err := runnerTaskRoleName(runnerData.RunnerRegion)
+	if err != nil {
+		return "", fmt.Errorf("could not determine this runner's role: %s", err)
+	}
+	secretArn := fmt.Sprintf("arn:aws:secretsmanager:%s:%s:secret:%s-*",
+		runnerData.RunnerRegion, runnerData.AWSAccountID, claudeOAuthSecretName)
+	policy := fmt.Sprintf(`{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"secretsmanager:GetSecretValue","Resource":%q}]}`, secretArn)
+
+	// GetIamClient reads its region from the job-parameter map, so build the
+	// one key it needs rather than passing an empty map (which errors).
+	regionKey, err := parameters_enums.Region.Key()
+	if err != nil {
+		return "", err
+	}
+	regionType, err := region_enums.GetType(runnerData.RunnerRegion)
+	if err != nil {
+		return "", err
+	}
+	iamClient, err := cloud_api_clients.GetIamClient(map[string]interface{}{regionKey: int64(regionType)})
+	if err != nil {
+		return "", err
+	}
+	if _, err = iamClient.PutRolePolicy(context.TODO(), &iam.PutRolePolicyInput{
+		RoleName:       aws.String(roleName),
+		PolicyName:     aws.String(claudeOAuthPolicyName),
+		PolicyDocument: aws.String(policy),
+	}); err != nil {
+		return "", fmt.Errorf("could not grant read on the OAuth secret: %s", err)
+	}
+	io.WriteString(logsWriter, fmt.Sprintf("Subscription auth: granted %s read access to %s; waiting for IAM to propagate.\n", roleName, claudeOAuthSecretName))
+
+	// IAM is eventually consistent — a fresh grant is not usable immediately.
+	// Poll rather than sleeping a flat 60s so the common case costs a few seconds.
+	var lastErr error
+	for attempt := 0; attempt < 12; attempt++ {
+		time.Sleep(5 * time.Second)
+		token, err := readClaudeOAuthToken(claudeOAuthSecretName)
+		if err == nil {
+			return token, nil
+		}
+		lastErr = err
+		if !isAccessDenied(err) {
+			break // a different failure (missing/empty secret) won't fix itself
+		}
+	}
+	return "", lastErr
+}
+
+// runnerTaskRoleName returns the name of the IAM role this runner is running as,
+// parsed from the STS assumed-role ARN
+// (arn:aws:sts::<account>:assumed-role/<RoleName>/<sessionName>).
+func runnerTaskRoleName(region string) (string, error) {
+	stsClient, err := cloud_api_clients.GetStsClient(region)
+	if err != nil {
+		return "", err
+	}
+	out, err := stsClient.GetCallerIdentity(context.TODO(), &sts.GetCallerIdentityInput{})
+	if err != nil {
+		return "", err
+	}
+	return parseAssumedRoleName(aws.ToString(out.Arn))
+}
+
+// parseAssumedRoleName pulls the role name out of an STS assumed-role ARN,
+// arn:aws:sts::<account>:assumed-role/<RoleName>/<sessionName>. Split out from
+// the STS call so the parsing is testable on its own.
+func parseAssumedRoleName(arn string) (string, error) {
+	parts := strings.Split(arn, "/")
+	if len(parts) < 2 || !strings.Contains(parts[0], ":assumed-role") {
+		return "", fmt.Errorf("not running as an assumed role (identity %q)", arn)
+	}
+	return parts[1], nil
 }
 
 // mergeAdditionalAllowedHosts unions:

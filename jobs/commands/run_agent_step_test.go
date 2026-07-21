@@ -2,12 +2,15 @@ package commands
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/aws/smithy-go"
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 )
@@ -270,5 +273,68 @@ func TestMergeAgentResultIntoJobOutput_TurnsCarryThrough(t *testing.T) {
 	}
 	if got.Agent.TokenUsage.InputTokens != 100 {
 		t.Errorf("agent.token_usage.input_tokens = %d, want 100", got.Agent.TokenUsage.InputTokens)
+	}
+}
+
+// isAccessDenied must fire only on authorization failures. A missing secret is
+// the customer not having created it yet — self-granting wouldn't help, and
+// treating it as a denial would write IAM on every task of a misconfigured org.
+func TestIsAccessDenied(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"access denied", &smithy.GenericAPIError{Code: "AccessDeniedException"}, true},
+		{"access denied short form", &smithy.GenericAPIError{Code: "AccessDenied"}, true},
+		{"unauthorized operation", &smithy.GenericAPIError{Code: "UnauthorizedOperation"}, true},
+		{"secret not found", &smithy.GenericAPIError{Code: "ResourceNotFoundException"}, false},
+		{"throttled", &smithy.GenericAPIError{Code: "ThrottlingException"}, false},
+		{"wrapped access denied", fmt.Errorf("reading secret: %w",
+			&smithy.GenericAPIError{Code: "AccessDeniedException"}), true},
+		{"plain error", errors.New("connection refused"), false},
+		{"nil", nil, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isAccessDenied(tt.err); got != tt.want {
+				t.Errorf("isAccessDenied(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
+
+// The role name is parsed out of the STS assumed-role ARN so the grant works on
+// any runner without reconstructing the dr-task-role-... naming convention.
+func TestRunnerTaskRoleNameParsing(t *testing.T) {
+	tests := []struct {
+		name    string
+		arn     string
+		want    string
+		wantErr bool
+	}{
+		{
+			name: "ecs task role",
+			arn:  "arn:aws:sts::123456789012:assumed-role/dr-task-role-linuxamd-abc123-us-east-1/a1b2c3",
+			want: "dr-task-role-linuxamd-abc123-us-east-1",
+		},
+		{
+			name: "arm task role",
+			arn:  "arn:aws:sts::123456789012:assumed-role/dr-task-role-linuxarm-abc123-eu-west-1/sess",
+			want: "dr-task-role-linuxarm-abc123-eu-west-1",
+		},
+		{"iam user, not a role", "arn:aws:iam::123456789012:user/ankit", "", true},
+		{"malformed", "not-an-arn", "", true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := parseAssumedRoleName(tt.arn)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("parseAssumedRoleName(%q) err = %v, wantErr %v", tt.arn, err, tt.wantErr)
+			}
+			if got != tt.want {
+				t.Errorf("parseAssumedRoleName(%q) = %q, want %q", tt.arn, got, tt.want)
+			}
+		})
 	}
 }
