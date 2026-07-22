@@ -443,6 +443,13 @@ func applyBedrockCredsIfNeeded(env map[string]string, logsWriter io.Writer) {
 	out, err := sts.NewFromConfig(cfg).AssumeRole(context.TODO(), &sts.AssumeRoleInput{
 		RoleArn:         aws.String(roleArn),
 		RoleSessionName: aws.String("agentbox-bedrock"),
+		// Match the per-task wall-clock cap. These creds are injected as env
+		// vars and do NOT auto-refresh, so a session shorter than the task
+		// would expire mid-run. AssumeRole defaults to 1h when this is unset,
+		// regardless of the role's MaxSessionDuration - so both this and the
+		// role's ceiling (set in the CloudFormation template) are required.
+		// STS caps this at the role's MaxSessionDuration if that is lower.
+		DurationSeconds: aws.Int32(int32(defaultWallClockTimeout.Seconds())),
 	})
 	if err != nil || out.Credentials == nil {
 		io.WriteString(logsWriter, fmt.Sprintf("Bedrock: AssumeRole %s failed: %s\n", roleArn, err))
