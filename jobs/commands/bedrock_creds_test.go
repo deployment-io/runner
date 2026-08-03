@@ -29,28 +29,36 @@ func TestApplyBedrockCredsIfNeeded_NoOpWhenRoleArnMissing(t *testing.T) {
 	}
 }
 
-// The requested session duration is a cross-repo constraint, not a local knob:
-// STS rejects the whole AssumeRole call if it exceeds dr-bedrock-role's
-// MaxSessionDuration, and the caller then runs the task credential-free. These
-// pin the invariant so that changing defaultWallClockTimeout — which reads as a
-// plain task-timeout constant — cannot silently break Bedrock.
-func TestBedrockSessionSeconds_WithinStsAndRoleBounds(t *testing.T) {
+// The requested session duration is governed by AWS role chaining, not by
+// dr-bedrock-role's MaxSessionDuration: the runner is already an assumed role,
+// so assuming another role is chained and hard-capped at 1 hour. Exceeding it
+// fails the whole AssumeRole call and the task then runs credential-free.
+// These pin the limit so it cannot drift back up.
+func TestBedrockSessionSeconds_WithinStsAndChainingBounds(t *testing.T) {
 	const stsMinSeconds = 900
 	got := bedrockSessionSeconds()
 	if got > bedrockMaxSessionSeconds {
-		t.Errorf("session %ds exceeds the dr-bedrock-role ceiling of %ds — AssumeRole would fail outright", got, bedrockMaxSessionSeconds)
+		t.Errorf("session %ds exceeds the role-chaining limit of %ds — AssumeRole would fail outright", got, bedrockMaxSessionSeconds)
 	}
 	if got < stsMinSeconds {
 		t.Errorf("session %ds is below the STS minimum of %ds", got, stsMinSeconds)
 	}
 }
 
-func TestBedrockSessionSeconds_UsesFullTaskCapToday(t *testing.T) {
-	// defaultWallClockTimeout is 4h and the role ceiling is also 14400, so the
-	// clamp is a no-op right now and creds last exactly as long as the task may.
-	// If this fails, the two have drifted apart — check whether the template's
-	// MaxSessionDuration still matches bedrockMaxSessionSeconds.
-	if got := bedrockSessionSeconds(); got != int32(defaultWallClockTimeout.Seconds()) {
-		t.Errorf("bedrockSessionSeconds() = %d, want the full task cap %d", got, int32(defaultWallClockTimeout.Seconds()))
+func TestBedrockSessionSeconds_ClampedToOneHourNotTheTaskCap(t *testing.T) {
+	// Regression guard for the first live Bedrock run, which requested the full
+	// 4h task cap and was rejected with "exceeds the 1 hour session limit for
+	// roles assumed by role chaining". The clamp must bite here — asserting the
+	// concrete 3600 rather than just "<= the constant" so that raising the
+	// constant fails this test instead of silently reintroducing the bug.
+	const roleChainingLimit = 3600
+	if got := bedrockSessionSeconds(); got != roleChainingLimit {
+		t.Errorf("bedrockSessionSeconds() = %d, want %d (AWS role-chaining cap)", got, roleChainingLimit)
+	}
+	// And it must genuinely be shorter than the task cap — i.e. the clamp is
+	// doing work, not coincidentally agreeing. Bedrock creds therefore expire
+	// mid-run on long tasks; refresh is the deferred fix, not a longer session.
+	if int32(defaultWallClockTimeout.Seconds()) <= roleChainingLimit {
+		t.Skip("task cap no longer exceeds the chaining limit; mid-run expiry note is stale")
 	}
 }
