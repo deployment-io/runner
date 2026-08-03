@@ -15,9 +15,11 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/cloudfront"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
+	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/aws/smithy-go"
 	"github.com/deployment-io/deployment-runner-kit/cloud_api_clients"
 	"github.com/deployment-io/deployment-runner-kit/deployments"
@@ -403,6 +405,9 @@ func buildAgentSpawnEnvVars(parameters map[string]interface{}, logsWriter io.Wri
 	if allowed != "" {
 		env["ADDITIONAL_ALLOWED_HOSTS"] = allowed
 	}
+	// Bedrock: when the org is in Bedrock mode (CLAUDE_CODE_USE_BEDROCK marker in
+	// AgentEnvVars), assume dr-bedrock-role and inject its scoped short-lived creds.
+	applyBedrockCredsIfNeeded(env, logsWriter)
 	// Optionally swap the injected ANTHROPIC_API_KEY for a Claude Code
 	// subscription OAuth token read from this runner's own AWS Secrets Manager.
 	// Engages only when the org is in subscription mode (marker in AgentEnvVars).
@@ -412,6 +417,110 @@ func buildAgentSpawnEnvVars(parameters map[string]interface{}, logsWriter io.Wri
 	organizationID, _ := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIDNamespace)
 	maybeApplyClaudeSubscriptionAuth(env, organizationID, logsWriter)
 	return mapToEnvSlice(env), nil
+}
+
+// bedrockRoleArnEnvVar names the env var the CloudFormation runner task def sets
+// to the dr-bedrock-role ARN (see cloud-formation-one-click). Empty means the
+// runner's stack predates Bedrock support.
+const bedrockRoleArnEnvVar = "BedrockRoleArn"
+
+// bedrockMaxSessionSeconds mirrors MaxSessionDuration on dr-bedrock-role in
+// the CloudFormation template (cloud-formation-one-click/go-formation-amd).
+//
+// This is a CROSS-REPO CONSTRAINT, not a local tuning knob. STS does not clamp
+// DurationSeconds to the role's ceiling — asking for more FAILS the call
+// ("The requested DurationSeconds exceeds the MaxSessionDuration set for this
+// role"), after which every Bedrock task runs credential-free. Without the
+// clamp below, raising defaultWallClockTimeout — a plain task-timeout constant
+// with nothing about it suggesting an IAM coupling — would silently break
+// Bedrock, with the symptom nowhere near the cause. Raise this only together
+// with the template (and its own 12h AWS ceiling).
+const bedrockMaxSessionSeconds = 14400
+
+// bedrockSessionSeconds is how long a vended Bedrock session should last:
+// the per-task wall-clock cap, clamped to what the role permits. These creds
+// are injected as env vars and do NOT auto-refresh, so a session shorter than
+// the task expires mid-run — hence asking for the full cap where allowed.
+// STS also rejects anything below 900s, so guard that end too.
+func bedrockSessionSeconds() int32 {
+	const stsMinSeconds = 900
+	d := int32(defaultWallClockTimeout.Seconds())
+	if d > bedrockMaxSessionSeconds {
+		return bedrockMaxSessionSeconds
+	}
+	if d < stsMinSeconds {
+		return stsMinSeconds
+	}
+	return d
+}
+
+// applyBedrockCredsIfNeeded switches a claude-code task to AWS Bedrock. When
+// deployment-server has injected the CLAUDE_CODE_USE_BEDROCK=1 marker (from the
+// org's Bedrock provider — see kit's ClaudeAuth.ResolveAgentEnvVars), the runner
+// assumes the minimal dr-bedrock-role and injects the short-lived, Bedrock-only
+// credentials into the agent container. No long-lived secret is stored, and the
+// agent receives creds that can invoke Bedrock and nothing else. The Bedrock API
+// host is added to the egress allowlist. On any failure the task proceeds without
+// creds (and fails auth in the container) rather than crashing the runner.
+func applyBedrockCredsIfNeeded(env map[string]string, logsWriter io.Writer) {
+	if env["CLAUDE_CODE_USE_BEDROCK"] != "1" {
+		return
+	}
+	roleArn := strings.TrimSpace(os.Getenv(bedrockRoleArnEnvVar))
+	if roleArn == "" {
+		io.WriteString(logsWriter, "Bedrock: BedrockRoleArn is not set on this runner — update the CloudFormation stack to add the Bedrock role.\n")
+		return
+	}
+	region := utils.RunnerData.Get().RunnerRegion
+	cfg, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion(region))
+	if err != nil {
+		io.WriteString(logsWriter, fmt.Sprintf("Bedrock: could not load AWS config: %s\n", err))
+		return
+	}
+	out, err := sts.NewFromConfig(cfg).AssumeRole(context.TODO(), &sts.AssumeRoleInput{
+		RoleArn:         aws.String(roleArn),
+		RoleSessionName: aws.String("agentbox-bedrock"),
+		// Match the per-task wall-clock cap. These creds are injected as env
+		// vars and do NOT auto-refresh, so a session shorter than the task
+		// would expire mid-run. AssumeRole defaults to 1h when this is unset,
+		// regardless of the role's MaxSessionDuration - so both this and the
+		// role's ceiling (set in the CloudFormation template) are required.
+		//
+		// STS does NOT clamp this to the role's MaxSessionDuration — asking for
+		// more than the role allows FAILS the call outright, after which the
+		// guard below logs and runs the task credential-free. bedrockSessionSeconds
+		// clamps to what the role permits so that cannot happen; see its comment.
+		//
+		// The clamp does NOT remove the deploy-order requirement: a stack whose
+		// dr-bedrock-role still has the 1h default will reject the 4h request
+		// regardless. Update the CloudFormation stack BEFORE deploying a runner
+		// that requests 4h. Runners auto-upgrade while customer stacks do not,
+		// so before Bedrock is customer-reachable this should also retry at a
+		// shorter duration on ValidationError rather than rely on that order.
+		DurationSeconds: aws.Int32(bedrockSessionSeconds()),
+	})
+	if err != nil || out.Credentials == nil {
+		io.WriteString(logsWriter, fmt.Sprintf("Bedrock: AssumeRole %s failed: %s\n", roleArn, err))
+		return
+	}
+	c := out.Credentials
+	env["AWS_ACCESS_KEY_ID"] = aws.ToString(c.AccessKeyId)
+	env["AWS_SECRET_ACCESS_KEY"] = aws.ToString(c.SecretAccessKey)
+	env["AWS_SESSION_TOKEN"] = aws.ToString(c.SessionToken)
+	env["AWS_REGION"] = region
+	// claude-code in Bedrock mode takes the model from ANTHROPIC_MODEL (an
+	// inference-profile id). Pass the selected model through.
+	if m := env["MODEL"]; m != "" {
+		env["ANTHROPIC_MODEL"] = m
+	}
+	// Allowlist the Bedrock data-plane host — agentbox's proxy gates egress.
+	bedrockHost := "bedrock-runtime." + region + ".amazonaws.com"
+	if existing := env["ADDITIONAL_ALLOWED_HOSTS"]; existing != "" {
+		env["ADDITIONAL_ALLOWED_HOSTS"] = existing + "," + bedrockHost
+	} else {
+		env["ADDITIONAL_ALLOWED_HOSTS"] = bedrockHost
+	}
+	io.WriteString(logsWriter, fmt.Sprintf("Bedrock: assumed %s; agent will use Bedrock in %s.\n", roleArn, region))
 }
 
 // Subscription-mode contract with the control plane.
