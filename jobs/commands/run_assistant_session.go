@@ -185,7 +185,8 @@ func buildSessionSpawnEnvVars(parameters map[string]interface{}, logsWriter io.W
 	// the injected API key. Sessions hold the seat across many turns, so the
 	// subscription's rate-limit window is shared more heavily than by a Task —
 	// see plans/PLAN_tasks_subscription_auth.md.
-	maybeApplyClaudeSubscriptionAuth(env, logsWriter)
+	organizationID, _ := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIDNamespace)
+	maybeApplyClaudeSubscriptionAuth(env, organizationID, logsWriter)
 	return mapToEnvSlice(env), nil
 }
 
