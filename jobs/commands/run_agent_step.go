@@ -417,6 +417,36 @@ func buildAgentSpawnEnvVars(parameters map[string]interface{}, logsWriter io.Wri
 // runner's stack predates Bedrock support.
 const bedrockRoleArnEnvVar = "BedrockRoleArn"
 
+// bedrockMaxSessionSeconds mirrors MaxSessionDuration on dr-bedrock-role in
+// the CloudFormation template (cloud-formation-one-click/go-formation-amd).
+//
+// This is a CROSS-REPO CONSTRAINT, not a local tuning knob. STS does not clamp
+// DurationSeconds to the role's ceiling — asking for more FAILS the call
+// ("The requested DurationSeconds exceeds the MaxSessionDuration set for this
+// role"), after which every Bedrock task runs credential-free. Without the
+// clamp below, raising defaultWallClockTimeout — a plain task-timeout constant
+// with nothing about it suggesting an IAM coupling — would silently break
+// Bedrock, with the symptom nowhere near the cause. Raise this only together
+// with the template (and its own 12h AWS ceiling).
+const bedrockMaxSessionSeconds = 14400
+
+// bedrockSessionSeconds is how long a vended Bedrock session should last:
+// the per-task wall-clock cap, clamped to what the role permits. These creds
+// are injected as env vars and do NOT auto-refresh, so a session shorter than
+// the task expires mid-run — hence asking for the full cap where allowed.
+// STS also rejects anything below 900s, so guard that end too.
+func bedrockSessionSeconds() int32 {
+	const stsMinSeconds = 900
+	d := int32(defaultWallClockTimeout.Seconds())
+	if d > bedrockMaxSessionSeconds {
+		return bedrockMaxSessionSeconds
+	}
+	if d < stsMinSeconds {
+		return stsMinSeconds
+	}
+	return d
+}
+
 // applyBedrockCredsIfNeeded switches a claude-code task to AWS Bedrock. When
 // deployment-server has injected the CLAUDE_CODE_USE_BEDROCK=1 marker (from the
 // org's Bedrock provider — see kit's ClaudeAuth.ResolveAgentEnvVars), the runner
@@ -450,18 +480,17 @@ func applyBedrockCredsIfNeeded(env map[string]string, logsWriter io.Writer) {
 		// role's ceiling (set in the CloudFormation template) are required.
 		//
 		// STS does NOT clamp this to the role's MaxSessionDuration — asking for
-		// more than the role allows FAILS the call outright ("The requested
-		// DurationSeconds exceeds the MaxSessionDuration set for this role").
-		// So the two are ORDER-DEPENDENT across repos: a runner carrying this
-		// value against a stack whose dr-bedrock-role still has the 1h default
-		// gets a hard AssumeRole failure on every Bedrock task, and the guard
-		// below logs it and runs the task credential-free. Update the
-		// CloudFormation stack BEFORE deploying a runner that requests 4h.
+		// more than the role allows FAILS the call outright, after which the
+		// guard below logs and runs the task credential-free. bedrockSessionSeconds
+		// clamps to what the role permits so that cannot happen; see its comment.
 		//
-		// Runners auto-upgrade but customer stacks do not, so before Bedrock is
-		// customer-reachable this should fall back to a shorter duration on
-		// ValidationError rather than relying on deploy discipline.
-		DurationSeconds: aws.Int32(int32(defaultWallClockTimeout.Seconds())),
+		// The clamp does NOT remove the deploy-order requirement: a stack whose
+		// dr-bedrock-role still has the 1h default will reject the 4h request
+		// regardless. Update the CloudFormation stack BEFORE deploying a runner
+		// that requests 4h. Runners auto-upgrade while customer stacks do not,
+		// so before Bedrock is customer-reachable this should also retry at a
+		// shorter duration on ValidationError rather than rely on that order.
+		DurationSeconds: aws.Int32(bedrockSessionSeconds()),
 	})
 	if err != nil || out.Credentials == nil {
 		io.WriteString(logsWriter, fmt.Sprintf("Bedrock: AssumeRole %s failed: %s\n", roleArn, err))
