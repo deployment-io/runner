@@ -424,23 +424,37 @@ func buildAgentSpawnEnvVars(parameters map[string]interface{}, logsWriter io.Wri
 // runner's stack predates Bedrock support.
 const bedrockRoleArnEnvVar = "BedrockRoleArn"
 
-// bedrockMaxSessionSeconds mirrors MaxSessionDuration on dr-bedrock-role in
-// the CloudFormation template (cloud-formation-one-click/go-formation-amd).
+// bedrockMaxSessionSeconds is the ROLE CHAINING limit — 1 hour, hard.
 //
-// This is a CROSS-REPO CONSTRAINT, not a local tuning knob. STS does not clamp
-// DurationSeconds to the role's ceiling — asking for more FAILS the call
-// ("The requested DurationSeconds exceeds the MaxSessionDuration set for this
-// role"), after which every Bedrock task runs credential-free. Without the
-// clamp below, raising defaultWallClockTimeout — a plain task-timeout constant
-// with nothing about it suggesting an IAM coupling — would silently break
-// Bedrock, with the symptom nowhere near the cause. Raise this only together
-// with the template (and its own 12h AWS ceiling).
-const bedrockMaxSessionSeconds = 14400
+// ⚠️ This is NOT dr-bedrock-role's MaxSessionDuration, and raising that will
+// not raise this. The runner already runs as an assumed role (its ECS task
+// role), so using those credentials to assume dr-bedrock-role is *role
+// chaining*, which AWS caps at 1 hour regardless of what either role permits.
+// Asking for more fails the whole call:
+//
+//	ValidationError: The requested DurationSeconds exceeds the 1 hour session
+//	limit for roles assumed by role chaining.
+//
+// after which the guard below logs and the task runs credential-free —
+// agentbox then fail-fasts on the missing AWS_* vars. Observed on the first
+// live Bedrock run (2026-07-28), which had requested 4h.
+//
+// The template's MaxSessionDuration: 14400 is therefore moot for this path.
+// It is left in place because it is harmless and would matter if the assume
+// ever stopped being chained, but it is NOT what governs here.
+//
+// CONSEQUENCE — creds expire 1h into a task that may run 4h, and env-injected
+// credentials do not auto-refresh. A Bedrock task still running past the hour
+// loses access mid-run. Raising this constant cannot fix that; the fix is
+// refresh over the existing agentbox<->runner RPC channel (a local
+// credential_process), which PLAN_opencode_completion_and_bedrock.md scopes
+// and defers. Ship v1 at 1h and revisit if long-task expiry is actually hit.
+const bedrockMaxSessionSeconds = 3600
 
-// bedrockSessionSeconds is how long a vended Bedrock session should last:
-// the per-task wall-clock cap, clamped to what the role permits. These creds
-// are injected as env vars and do NOT auto-refresh, so a session shorter than
-// the task expires mid-run — hence asking for the full cap where allowed.
+// bedrockSessionSeconds is how long a vended Bedrock session should last: the
+// per-task wall-clock cap, clamped to the role-chaining limit above. These
+// creds are injected as env vars and do NOT auto-refresh, so a session shorter
+// than the task expires mid-run — hence asking for as much as is allowed.
 // STS also rejects anything below 900s, so guard that end too.
 func bedrockSessionSeconds() int32 {
 	const stsMinSeconds = 900
