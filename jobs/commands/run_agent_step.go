@@ -448,7 +448,19 @@ func applyBedrockCredsIfNeeded(env map[string]string, logsWriter io.Writer) {
 		// would expire mid-run. AssumeRole defaults to 1h when this is unset,
 		// regardless of the role's MaxSessionDuration - so both this and the
 		// role's ceiling (set in the CloudFormation template) are required.
-		// STS caps this at the role's MaxSessionDuration if that is lower.
+		//
+		// STS does NOT clamp this to the role's MaxSessionDuration — asking for
+		// more than the role allows FAILS the call outright ("The requested
+		// DurationSeconds exceeds the MaxSessionDuration set for this role").
+		// So the two are ORDER-DEPENDENT across repos: a runner carrying this
+		// value against a stack whose dr-bedrock-role still has the 1h default
+		// gets a hard AssumeRole failure on every Bedrock task, and the guard
+		// below logs it and runs the task credential-free. Update the
+		// CloudFormation stack BEFORE deploying a runner that requests 4h.
+		//
+		// Runners auto-upgrade but customer stacks do not, so before Bedrock is
+		// customer-reachable this should fall back to a shorter duration on
+		// ValidationError rather than relying on deploy discipline.
 		DurationSeconds: aws.Int32(int32(defaultWallClockTimeout.Seconds())),
 	})
 	if err != nil || out.Credentials == nil {
