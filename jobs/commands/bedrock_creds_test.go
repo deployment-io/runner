@@ -132,3 +132,69 @@ func TestBedrockSessionSeconds_ClampedToOneHourNotTheTaskCap(t *testing.T) {
 		t.Skip("task cap no longer exceeds the chaining limit; mid-run expiry note is stale")
 	}
 }
+
+// applyBedrockModelEnv is where the org-level Bedrock marker is rendered into
+// whatever the SELECTED HARNESS actually reads. Both branches are pure once a
+// model is already concrete (the dot rule short-circuits before any AWS call),
+// so they are testable without live credentials.
+
+func TestApplyBedrockModelEnv_ClaudeCodeGetsAnthropicModel(t *testing.T) {
+	const concrete = "eu.anthropic.claude-sonnet-4-5-20250929-v1:0"
+	env := map[string]string{"CLAUDE_CODE_USE_BEDROCK": "1", "MODEL": concrete}
+	applyBedrockModelEnv(env, aws.Config{}, "eu-west-1", io.Discard)
+
+	if env["ANTHROPIC_MODEL"] != concrete {
+		t.Errorf("ANTHROPIC_MODEL = %q, want %q", env["ANTHROPIC_MODEL"], concrete)
+	}
+	// claude-code reads the marker itself, so it must survive.
+	if env["CLAUDE_CODE_USE_BEDROCK"] != "1" {
+		t.Error("claude-code needs CLAUDE_CODE_USE_BEDROCK in its own env; it must not be consumed")
+	}
+	if env["MODEL"] != concrete {
+		t.Errorf("MODEL = %q, want it left alone for claude-code", env["MODEL"])
+	}
+}
+
+func TestApplyBedrockModelEnv_EmptyAgentTypeIsClaudeCode(t *testing.T) {
+	// Tasks created before AGENT_TYPE existed carry no value, and agentbox
+	// defaults empty to claude-code. Diverging here would render the wrong env.
+	const concrete = "eu.anthropic.claude-sonnet-4-5-20250929-v1:0"
+	env := map[string]string{"CLAUDE_CODE_USE_BEDROCK": "1", "MODEL": concrete, "AGENT_TYPE": ""}
+	applyBedrockModelEnv(env, aws.Config{}, "eu-west-1", io.Discard)
+	if env["ANTHROPIC_MODEL"] != concrete {
+		t.Errorf("empty AGENT_TYPE must be treated as claude-code; ANTHROPIC_MODEL = %q", env["ANTHROPIC_MODEL"])
+	}
+}
+
+func TestApplyBedrockModelEnv_OpencodeKeepsThePrefixAndDropsTheMarker(t *testing.T) {
+	const concrete = "eu.anthropic.claude-sonnet-4-5-20250929-v1:0"
+	env := map[string]string{
+		"CLAUDE_CODE_USE_BEDROCK": "1",
+		"AGENT_TYPE":              llm_provider_enums.Opencode.String(),
+		"MODEL":                   "amazon-bedrock/" + concrete,
+	}
+	applyBedrockModelEnv(env, aws.Config{}, "eu-west-1", io.Discard)
+
+	// opencode picks its provider from the prefix, so a bare profile id would
+	// route the request somewhere else entirely.
+	if want := "amazon-bedrock/" + concrete; env["MODEL"] != want {
+		t.Errorf("MODEL = %q, want %q — opencode selects its provider from the prefix", env["MODEL"], want)
+	}
+	// The marker is a runner-facing signal. opencode cannot use it, so leaking
+	// it into the container would be inert but misleading.
+	if _, present := env["CLAUDE_CODE_USE_BEDROCK"]; present {
+		t.Error("CLAUDE_CODE_USE_BEDROCK must be consumed for opencode, not passed through")
+	}
+	// ANTHROPIC_MODEL means nothing to opencode.
+	if _, present := env["ANTHROPIC_MODEL"]; present {
+		t.Error("ANTHROPIC_MODEL must not be set for opencode")
+	}
+}
+
+func TestApplyBedrockModelEnv_NoModelIsANoOp(t *testing.T) {
+	env := map[string]string{"CLAUDE_CODE_USE_BEDROCK": "1"}
+	applyBedrockModelEnv(env, aws.Config{}, "eu-west-1", io.Discard)
+	if _, present := env["ANTHROPIC_MODEL"]; present {
+		t.Error("no MODEL means nothing to render")
+	}
+}

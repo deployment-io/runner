@@ -545,6 +545,51 @@ func bedrockSessionSeconds() int32 {
 	return d
 }
 
+// opencodeBedrockPrefix is the provider prefix opencode expects on a Bedrock
+// model id. The runner strips it to resolve the underlying model and puts it
+// back on the concrete profile id.
+const opencodeBedrockPrefix = "amazon-bedrock/"
+
+// applyBedrockModelEnv renders the Bedrock model into whatever env var the
+// SELECTED HARNESS actually reads, and removes what it must not see.
+//
+// The org-level marker (CLAUDE_CODE_USE_BEDROCK) is a signal to the RUNNER
+// that this org uses Bedrock — kit emits it without knowing which harness will
+// run, because ClaudeAuth has no harness context. The runner is the first place
+// that knows both, so harness-specific rendering belongs here:
+//
+//	claude-code — reads ANTHROPIC_MODEL (a concrete inference-profile id) and
+//	              needs CLAUDE_CODE_USE_BEDROCK in its own env; both are kept.
+//	opencode    — reads MODEL as "provider/model" and knows nothing about
+//	              CLAUDE_CODE_USE_BEDROCK. Passing that var through would be
+//	              inert but misleading, so it is consumed here rather than
+//	              leaked into a container that cannot use it.
+//
+// Doing the split here rather than inventing a second marker keeps kit's
+// contract as one honest fact ("this org uses Bedrock") instead of two that
+// can disagree.
+func applyBedrockModelEnv(env map[string]string, cfg aws.Config, region string, logsWriter io.Writer) {
+	model := env["MODEL"]
+	if model == "" {
+		return
+	}
+	// AGENT_TYPE unset means claude-code, matching agentbox's own defaulting.
+	// The harness name comes from the shared catalogue rather than a literal —
+	// this repo cannot import kit, but it can import deployment-runner-kit,
+	// which is exactly why the catalogue lives there.
+	if env["AGENT_TYPE"] != llm_provider_enums.Opencode.String() {
+		env["ANTHROPIC_MODEL"] = resolveBedrockModelID(context.TODO(), cfg, model, region, logsWriter)
+		return
+	}
+	// opencode ids arrive provider-prefixed. Resolve the model underneath, then
+	// put the prefix back: opencode selects its provider from that prefix, so
+	// handing it a bare profile id would route the request to the wrong place.
+	bare := strings.TrimPrefix(model, opencodeBedrockPrefix)
+	resolved := resolveBedrockModelID(context.TODO(), cfg, bare, region, logsWriter)
+	env["MODEL"] = opencodeBedrockPrefix + resolved
+	delete(env, "CLAUDE_CODE_USE_BEDROCK")
+}
+
 // applyBedrockCredsIfNeeded switches a claude-code task to AWS Bedrock. When
 // deployment-server has injected the CLAUDE_CODE_USE_BEDROCK=1 marker (from the
 // org's Bedrock provider — see kit's ClaudeAuth.ResolveAgentEnvVars), the runner
@@ -599,13 +644,7 @@ func applyBedrockCredsIfNeeded(env map[string]string, logsWriter io.Writer) {
 	env["AWS_SECRET_ACCESS_KEY"] = aws.ToString(c.SecretAccessKey)
 	env["AWS_SESSION_TOKEN"] = aws.ToString(c.SessionToken)
 	env["AWS_REGION"] = region
-	// claude-code in Bedrock mode takes the model from ANTHROPIC_MODEL, which
-	// must be a concrete inference-profile id — a logical id like
-	// "claude-opus-4-8" reaches Bedrock verbatim and is rejected with
-	// "The provided model identifier is invalid". Resolve it here.
-	if m := env["MODEL"]; m != "" {
-		env["ANTHROPIC_MODEL"] = resolveBedrockModelID(context.TODO(), cfg, m, region, logsWriter)
-	}
+	applyBedrockModelEnv(env, cfg, region, logsWriter)
 	// Allowlist BOTH Bedrock hosts — agentbox's proxy gates egress, and
 	// claude-code uses both planes:
 	//
