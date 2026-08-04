@@ -1,8 +1,12 @@
 package commands
 
 import (
+	"context"
 	"io"
 	"testing"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/deployment-io/deployment-runner-kit/enums/llm_provider_enums"
 )
 
 // Both guards return before any AWS/RunnerData access, so they're safe to unit
@@ -26,6 +30,72 @@ func TestApplyBedrockCredsIfNeeded_NoOpWhenRoleArnMissing(t *testing.T) {
 	applyBedrockCredsIfNeeded(env, io.Discard)
 	if _, ok := env["AWS_ACCESS_KEY_ID"]; ok {
 		t.Error("must not inject creds when BedrockRoleArn is unset")
+	}
+}
+
+// Model resolution: the dot rule and the region prefix are pure logic and
+// testable; the ListInferenceProfiles branch needs live AWS and is covered by
+// the smoke test. The dot rule is what keeps a hand-pinned profile id working,
+// so it is worth pinning precisely.
+func TestResolveBedrockModelID_PassesThroughConcreteProfileIDs(t *testing.T) {
+	// Both real shapes seen in the wild — a clean id and a dated/revisioned one.
+	for _, id := range []string{
+		"eu.anthropic.claude-sonnet-4-5-20250929-v1:0",
+		"anthropic.claude-sonnet-5",
+		"us.anthropic.claude-opus-4-1-20250805-v1:0",
+	} {
+		// A concrete id must short-circuit BEFORE any AWS call — passing a zero
+		// aws.Config proves it never reaches the SDK.
+		if got := resolveBedrockModelID(context.Background(), aws.Config{}, id, "eu-west-1", io.Discard); got != id {
+			t.Errorf("resolveBedrockModelID(%q) = %q, want it passed through unchanged", id, got)
+		}
+	}
+}
+
+func TestResolveBedrockModelID_UnknownLogicalIDPassesThrough(t *testing.T) {
+	// Not in the family map and not dotted: hand it to Bedrock so its own error
+	// message surfaces, rather than guessing a profile.
+	const model = "some-future-model"
+	if got := resolveBedrockModelID(context.Background(), aws.Config{}, model, "eu-west-1", io.Discard); got != model {
+		t.Errorf("resolveBedrockModelID(%q) = %q, want it passed through unchanged", model, got)
+	}
+}
+
+func TestBedrockRegionPrefix(t *testing.T) {
+	cases := map[string]string{
+		"eu-west-1":      "eu.",
+		"eu-central-1":   "eu.",
+		"ap-southeast-2": "apac.", // NOT "ap." — Bedrock groups APAC under one prefix
+		"us-east-1":      "us.",
+		"ca-central-1":   "us.", // Americas fall back to the us. geography
+	}
+	for region, want := range cases {
+		if got := bedrockRegionPrefix(region); got != want {
+			t.Errorf("bedrockRegionPrefix(%q) = %q, want %q", region, got, want)
+		}
+	}
+}
+
+func TestResolveBedrockModelID_UsesTheSharedCatalogue(t *testing.T) {
+	// The logical -> family map is no longer duplicated here; it comes from
+	// deployment-runner-kit, which the control plane also imports. Pin the seam
+	// so a catalogue change that drops a family is visible from this side too.
+	m, err := llm_provider_enums.GetModel("claude-opus-4-8")
+	if err != nil {
+		t.Fatalf("catalogue no longer knows claude-opus-4-8: %v", err)
+	}
+	if m.BedrockFamily() == "" {
+		t.Error("claude-opus-4-8 has no Bedrock family in the catalogue; discovery cannot resolve it")
+	}
+	// A model the catalogue does not know must pass through, not panic or guess.
+	const unknown = "some-future-model"
+	if got := resolveBedrockModelID(context.Background(), aws.Config{}, unknown, "eu-west-1", io.Discard); got != unknown {
+		t.Errorf("resolveBedrockModelID(%q) = %q, want it passed through unchanged", unknown, got)
+	}
+	// A known model that Bedrock does not serve must also pass through — gpt-5.5
+	// is in the catalogue but has no family token.
+	if got := resolveBedrockModelID(context.Background(), aws.Config{}, "gpt-5.5", "eu-west-1", io.Discard); got != "gpt-5.5" {
+		t.Errorf("resolveBedrockModelID(gpt-5.5) = %q, want it passed through unchanged", got)
 	}
 }
 

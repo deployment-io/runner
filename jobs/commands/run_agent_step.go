@@ -16,6 +16,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/bedrock"
 	"github.com/aws/aws-sdk-go-v2/service/cloudfront"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
@@ -25,6 +26,7 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/deployments"
 	"github.com/deployment-io/deployment-runner-kit/enums/build_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/iam_policy_enums"
+	"github.com/deployment-io/deployment-runner-kit/enums/llm_provider_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/region_enums"
 	"github.com/deployment-io/deployment-runner-kit/iam_policies"
@@ -451,6 +453,81 @@ const bedrockRoleArnEnvVar = "BedrockRoleArn"
 // and defers. Ship v1 at 1h and revisit if long-task expiry is actually hit.
 const bedrockMaxSessionSeconds = 3600
 
+// bedrockRegionPrefix returns the cross-region inference prefix for an AWS
+// region. Bedrock groups regions into geographies, so this is a coarse mapping
+// of the region's first segment, not a per-region lookup.
+func bedrockRegionPrefix(region string) string {
+	switch {
+	case strings.HasPrefix(region, "eu-"):
+		return "eu."
+	case strings.HasPrefix(region, "ap-"):
+		return "apac."
+	default:
+		return "us."
+	}
+}
+
+// resolveBedrockModelID turns the Task's model into a Bedrock inference-profile
+// id, discovering the concrete id rather than deriving it.
+//
+// Three paths, in order:
+//  1. A model containing a "." is already a Bedrock id — passed through
+//     verbatim. Our logical ids never contain dots, so this is unambiguous, and
+//     it is the escape hatch that lets an exact revision be pinned by hand.
+//  2. A known logical id is matched against the profiles this account can
+//     actually see in this region.
+//  3. Anything else is passed through so Bedrock rejects it with its own
+//     message, which is more useful than us guessing.
+//
+// Discovery failures are NEVER fatal: the original model is returned and the
+// reason logged. A wrong model produces a legible Bedrock error, whereas
+// failing the Step here would hide the cause one layer up.
+func resolveBedrockModelID(ctx context.Context, cfg aws.Config, model, region string, logsWriter io.Writer) string {
+	if strings.Contains(model, ".") {
+		return model
+	}
+	// The logical model -> Bedrock family map lives in the shared catalogue, not
+	// here: deployment-runner-kit is the one module both the control plane and
+	// the runner import, so a second copy in this file was exactly the drift the
+	// catalogue exists to prevent. It also carries the guard that any model
+	// claiming Bedrock has a family token.
+	m, err := llm_provider_enums.GetModel(model)
+	if err != nil {
+		io.WriteString(logsWriter, fmt.Sprintf("Bedrock: %q is not a catalogue model; passing it through unchanged.\n", model))
+		return model
+	}
+	family := m.BedrockFamily()
+	if family == "" {
+		io.WriteString(logsWriter, fmt.Sprintf("Bedrock: model %q is not served by Bedrock; passing it through unchanged.\n", model))
+		return model
+	}
+	out, err := bedrock.NewFromConfig(cfg).ListInferenceProfiles(ctx, &bedrock.ListInferenceProfilesInput{
+		MaxResults: aws.Int32(100),
+	})
+	if err != nil {
+		io.WriteString(logsWriter, fmt.Sprintf("Bedrock: could not list inference profiles (%s); passing %q through unchanged.\n", err, model))
+		return model
+	}
+	prefix := bedrockRegionPrefix(region)
+	var matches []string
+	for _, p := range out.InferenceProfileSummaries {
+		id := aws.ToString(p.InferenceProfileId)
+		if strings.HasPrefix(id, prefix) && strings.Contains(id, family) {
+			matches = append(matches, id)
+		}
+	}
+	if len(matches) == 0 {
+		io.WriteString(logsWriter, fmt.Sprintf("Bedrock: no %s inference profile for %q in %s — check model access for this account/region. Passing it through unchanged.\n", prefix, model, region))
+		return model
+	}
+	// Descending so the newest revision wins: the date and -vN:0 suffixes sort
+	// lexicographically within a family. Logged because a silent pick between
+	// several revisions is hard to reconstruct from a failure later.
+	sort.Sort(sort.Reverse(sort.StringSlice(matches)))
+	io.WriteString(logsWriter, fmt.Sprintf("Bedrock: resolved model %q -> %s.\n", model, matches[0]))
+	return matches[0]
+}
+
 // bedrockSessionSeconds is how long a vended Bedrock session should last: the
 // per-task wall-clock cap, clamped to the role-chaining limit above. These
 // creds are injected as env vars and do NOT auto-refresh, so a session shorter
@@ -522,10 +599,12 @@ func applyBedrockCredsIfNeeded(env map[string]string, logsWriter io.Writer) {
 	env["AWS_SECRET_ACCESS_KEY"] = aws.ToString(c.SecretAccessKey)
 	env["AWS_SESSION_TOKEN"] = aws.ToString(c.SessionToken)
 	env["AWS_REGION"] = region
-	// claude-code in Bedrock mode takes the model from ANTHROPIC_MODEL (an
-	// inference-profile id). Pass the selected model through.
+	// claude-code in Bedrock mode takes the model from ANTHROPIC_MODEL, which
+	// must be a concrete inference-profile id — a logical id like
+	// "claude-opus-4-8" reaches Bedrock verbatim and is rejected with
+	// "The provided model identifier is invalid". Resolve it here.
 	if m := env["MODEL"]; m != "" {
-		env["ANTHROPIC_MODEL"] = m
+		env["ANTHROPIC_MODEL"] = resolveBedrockModelID(context.TODO(), cfg, m, region, logsWriter)
 	}
 	// Allowlist BOTH Bedrock hosts — agentbox's proxy gates egress, and
 	// claude-code uses both planes:
@@ -1091,10 +1170,10 @@ func removeContainer(ctx context.Context, cli *client.Client, containerID string
 // dashboard can surface "add these to your allowlist" suggestions.
 // Empty when no allowlist denies happened during the run.
 type agentResult struct {
-	Status         string     `json:"status"`
-	ExitCode       int        `json:"exit_code"`
-	AgentVersion   string     `json:"agent_version,omitempty"`
-	ChangesSummary string     `json:"changes_summary,omitempty"`
+	Status         string `json:"status"`
+	ExitCode       int    `json:"exit_code"`
+	AgentVersion   string `json:"agent_version,omitempty"`
+	ChangesSummary string `json:"changes_summary,omitempty"`
 	// FilesChanged is the agent's self-reported list of changed files. Carried
 	// through to agentOutput so CommitAndPush can detect the "agent reported
 	// changes but nothing landed in a repo" failure (writes outside the repo dir).
