@@ -527,12 +527,28 @@ func applyBedrockCredsIfNeeded(env map[string]string, logsWriter io.Writer) {
 	if m := env["MODEL"]; m != "" {
 		env["ANTHROPIC_MODEL"] = m
 	}
-	// Allowlist the Bedrock data-plane host — agentbox's proxy gates egress.
-	bedrockHost := "bedrock-runtime." + region + ".amazonaws.com"
+	// Allowlist BOTH Bedrock hosts — agentbox's proxy gates egress, and
+	// claude-code uses both planes:
+	//
+	//   bedrock-runtime.<region> — data plane (InvokeModel*), the obvious one
+	//   bedrock.<region>         — control plane (model/inference-profile
+	//                              lookups) which claude-code calls at startup
+	//
+	// The control-plane host was initially judged unnecessary "for pure
+	// inference". That was wrong: the first live run logged
+	// `denied:bedrock.eu-west-1.amazonaws.com` before the agent had issued a
+	// single completion. Both are required.
+	//
+	// The proxy denies rather than fails closed, so omitting a host degrades
+	// oddly instead of erroring clearly — worth keeping both in step with the
+	// dr-bedrock-role policy, which already grants ListInferenceProfiles and
+	// GetInferenceProfile (control-plane calls).
+	bedrockHosts := "bedrock-runtime." + region + ".amazonaws.com" +
+		",bedrock." + region + ".amazonaws.com"
 	if existing := env["ADDITIONAL_ALLOWED_HOSTS"]; existing != "" {
-		env["ADDITIONAL_ALLOWED_HOSTS"] = existing + "," + bedrockHost
+		env["ADDITIONAL_ALLOWED_HOSTS"] = existing + "," + bedrockHosts
 	} else {
-		env["ADDITIONAL_ALLOWED_HOSTS"] = bedrockHost
+		env["ADDITIONAL_ALLOWED_HOSTS"] = bedrockHosts
 	}
 	io.WriteString(logsWriter, fmt.Sprintf("Bedrock: assumed %s; agent will use Bedrock in %s.\n", roleArn, region))
 }
