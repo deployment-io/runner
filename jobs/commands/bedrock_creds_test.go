@@ -3,10 +3,10 @@ package commands
 import (
 	"context"
 	"io"
-	"strings"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/deployment-io/deployment-runner-kit/enums/llm_provider_enums"
 )
 
 // Both guards return before any AWS/RunnerData access, so they're safe to unit
@@ -76,17 +76,26 @@ func TestBedrockRegionPrefix(t *testing.T) {
 	}
 }
 
-func TestBedrockModelFamilies_AreFamilyTokensNotConcreteIDs(t *testing.T) {
-	// The whole point of the map is that it stops at the family: a version or
-	// revision baked in here would need a runner release per Bedrock model
-	// launch, and would fail at task time in between.
-	for logical, family := range bedrockModelFamilies {
-		if strings.Contains(family, ".") || strings.Contains(family, ":") {
-			t.Errorf("family %q for %q looks like a concrete profile id; it must be a family token only", family, logical)
-		}
-		if strings.Contains(logical, ".") {
-			t.Errorf("logical id %q contains a dot, which resolveBedrockModelID treats as an already-concrete id", logical)
-		}
+func TestResolveBedrockModelID_UsesTheSharedCatalogue(t *testing.T) {
+	// The logical -> family map is no longer duplicated here; it comes from
+	// deployment-runner-kit, which the control plane also imports. Pin the seam
+	// so a catalogue change that drops a family is visible from this side too.
+	m, err := llm_provider_enums.GetModel("claude-opus-4-8")
+	if err != nil {
+		t.Fatalf("catalogue no longer knows claude-opus-4-8: %v", err)
+	}
+	if m.BedrockFamily() == "" {
+		t.Error("claude-opus-4-8 has no Bedrock family in the catalogue; discovery cannot resolve it")
+	}
+	// A model the catalogue does not know must pass through, not panic or guess.
+	const unknown = "some-future-model"
+	if got := resolveBedrockModelID(context.Background(), aws.Config{}, unknown, "eu-west-1", io.Discard); got != unknown {
+		t.Errorf("resolveBedrockModelID(%q) = %q, want it passed through unchanged", unknown, got)
+	}
+	// A known model that Bedrock does not serve must also pass through — gpt-5.5
+	// is in the catalogue but has no family token.
+	if got := resolveBedrockModelID(context.Background(), aws.Config{}, "gpt-5.5", "eu-west-1", io.Discard); got != "gpt-5.5" {
+		t.Errorf("resolveBedrockModelID(gpt-5.5) = %q, want it passed through unchanged", got)
 	}
 }
 

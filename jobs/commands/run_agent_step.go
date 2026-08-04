@@ -26,6 +26,7 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/deployments"
 	"github.com/deployment-io/deployment-runner-kit/enums/build_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/iam_policy_enums"
+	"github.com/deployment-io/deployment-runner-kit/enums/llm_provider_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/region_enums"
 	"github.com/deployment-io/deployment-runner-kit/iam_policies"
@@ -452,25 +453,6 @@ const bedrockRoleArnEnvVar = "BedrockRoleArn"
 // and defers. Ship v1 at 1h and revisit if long-task expiry is actually hit.
 const bedrockMaxSessionSeconds = 3600
 
-// bedrockModelFamilies maps our logical model ids to the Bedrock "family token"
-// shared by every concrete profile for that model.
-//
-// It deliberately stops at the family. Real Bedrock ids carry a version and
-// revision that we do NOT hardcode — the live run turned up two shapes,
-// `anthropic.claude-sonnet-5` and `anthropic.claude-sonnet-4-5-20250929-v1:0` —
-// and those suffixes change as models ship and differ per region. Pinning them
-// here would mean a runner release per Bedrock model launch, failing at task
-// time in between. The volatile half comes from ListInferenceProfiles instead.
-//
-// NOTE: this map cannot live in kit — deployment-runner does not import it (the
-// same constraint that forces the subscription-marker literals to be duplicated
-// across repos). Keep it here, in one place.
-var bedrockModelFamilies = map[string]string{
-	"claude-opus-4-8":   "claude-opus-4",
-	"claude-sonnet-4-6": "claude-sonnet-4",
-	"claude-haiku-4-5":  "claude-haiku-4",
-}
-
 // bedrockRegionPrefix returns the cross-region inference prefix for an AWS
 // region. Bedrock groups regions into geographies, so this is a coarse mapping
 // of the region's first segment, not a per-region lookup.
@@ -504,9 +486,19 @@ func resolveBedrockModelID(ctx context.Context, cfg aws.Config, model, region st
 	if strings.Contains(model, ".") {
 		return model
 	}
-	family, known := bedrockModelFamilies[model]
-	if !known {
-		io.WriteString(logsWriter, fmt.Sprintf("Bedrock: no profile mapping for model %q; passing it through unchanged.\n", model))
+	// The logical model -> Bedrock family map lives in the shared catalogue, not
+	// here: deployment-runner-kit is the one module both the control plane and
+	// the runner import, so a second copy in this file was exactly the drift the
+	// catalogue exists to prevent. It also carries the guard that any model
+	// claiming Bedrock has a family token.
+	m, err := llm_provider_enums.GetModel(model)
+	if err != nil {
+		io.WriteString(logsWriter, fmt.Sprintf("Bedrock: %q is not a catalogue model; passing it through unchanged.\n", model))
+		return model
+	}
+	family := m.BedrockFamily()
+	if family == "" {
+		io.WriteString(logsWriter, fmt.Sprintf("Bedrock: model %q is not served by Bedrock; passing it through unchanged.\n", model))
 		return model
 	}
 	out, err := bedrock.NewFromConfig(cfg).ListInferenceProfiles(ctx, &bedrock.ListInferenceProfilesInput{
@@ -1178,10 +1170,10 @@ func removeContainer(ctx context.Context, cli *client.Client, containerID string
 // dashboard can surface "add these to your allowlist" suggestions.
 // Empty when no allowlist denies happened during the run.
 type agentResult struct {
-	Status         string     `json:"status"`
-	ExitCode       int        `json:"exit_code"`
-	AgentVersion   string     `json:"agent_version,omitempty"`
-	ChangesSummary string     `json:"changes_summary,omitempty"`
+	Status         string `json:"status"`
+	ExitCode       int    `json:"exit_code"`
+	AgentVersion   string `json:"agent_version,omitempty"`
+	ChangesSummary string `json:"changes_summary,omitempty"`
 	// FilesChanged is the agent's self-reported list of changed files. Carried
 	// through to agentOutput so CommitAndPush can detect the "agent reported
 	// changes but nothing landed in a repo" failure (writes outside the repo dir).
