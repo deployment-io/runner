@@ -16,6 +16,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/bedrock"
 	"github.com/aws/aws-sdk-go-v2/service/cloudfront"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
@@ -451,6 +452,90 @@ const bedrockRoleArnEnvVar = "BedrockRoleArn"
 // and defers. Ship v1 at 1h and revisit if long-task expiry is actually hit.
 const bedrockMaxSessionSeconds = 3600
 
+// bedrockModelFamilies maps our logical model ids to the Bedrock "family token"
+// shared by every concrete profile for that model.
+//
+// It deliberately stops at the family. Real Bedrock ids carry a version and
+// revision that we do NOT hardcode — the live run turned up two shapes,
+// `anthropic.claude-sonnet-5` and `anthropic.claude-sonnet-4-5-20250929-v1:0` —
+// and those suffixes change as models ship and differ per region. Pinning them
+// here would mean a runner release per Bedrock model launch, failing at task
+// time in between. The volatile half comes from ListInferenceProfiles instead.
+//
+// NOTE: this map cannot live in kit — deployment-runner does not import it (the
+// same constraint that forces the subscription-marker literals to be duplicated
+// across repos). Keep it here, in one place.
+var bedrockModelFamilies = map[string]string{
+	"claude-opus-4-8":   "claude-opus-4",
+	"claude-sonnet-4-6": "claude-sonnet-4",
+	"claude-haiku-4-5":  "claude-haiku-4",
+}
+
+// bedrockRegionPrefix returns the cross-region inference prefix for an AWS
+// region. Bedrock groups regions into geographies, so this is a coarse mapping
+// of the region's first segment, not a per-region lookup.
+func bedrockRegionPrefix(region string) string {
+	switch {
+	case strings.HasPrefix(region, "eu-"):
+		return "eu."
+	case strings.HasPrefix(region, "ap-"):
+		return "apac."
+	default:
+		return "us."
+	}
+}
+
+// resolveBedrockModelID turns the Task's model into a Bedrock inference-profile
+// id, discovering the concrete id rather than deriving it.
+//
+// Three paths, in order:
+//  1. A model containing a "." is already a Bedrock id — passed through
+//     verbatim. Our logical ids never contain dots, so this is unambiguous, and
+//     it is the escape hatch that lets an exact revision be pinned by hand.
+//  2. A known logical id is matched against the profiles this account can
+//     actually see in this region.
+//  3. Anything else is passed through so Bedrock rejects it with its own
+//     message, which is more useful than us guessing.
+//
+// Discovery failures are NEVER fatal: the original model is returned and the
+// reason logged. A wrong model produces a legible Bedrock error, whereas
+// failing the Step here would hide the cause one layer up.
+func resolveBedrockModelID(ctx context.Context, cfg aws.Config, model, region string, logsWriter io.Writer) string {
+	if strings.Contains(model, ".") {
+		return model
+	}
+	family, known := bedrockModelFamilies[model]
+	if !known {
+		io.WriteString(logsWriter, fmt.Sprintf("Bedrock: no profile mapping for model %q; passing it through unchanged.\n", model))
+		return model
+	}
+	out, err := bedrock.NewFromConfig(cfg).ListInferenceProfiles(ctx, &bedrock.ListInferenceProfilesInput{
+		MaxResults: aws.Int32(100),
+	})
+	if err != nil {
+		io.WriteString(logsWriter, fmt.Sprintf("Bedrock: could not list inference profiles (%s); passing %q through unchanged.\n", err, model))
+		return model
+	}
+	prefix := bedrockRegionPrefix(region)
+	var matches []string
+	for _, p := range out.InferenceProfileSummaries {
+		id := aws.ToString(p.InferenceProfileId)
+		if strings.HasPrefix(id, prefix) && strings.Contains(id, family) {
+			matches = append(matches, id)
+		}
+	}
+	if len(matches) == 0 {
+		io.WriteString(logsWriter, fmt.Sprintf("Bedrock: no %s inference profile for %q in %s — check model access for this account/region. Passing it through unchanged.\n", prefix, model, region))
+		return model
+	}
+	// Descending so the newest revision wins: the date and -vN:0 suffixes sort
+	// lexicographically within a family. Logged because a silent pick between
+	// several revisions is hard to reconstruct from a failure later.
+	sort.Sort(sort.Reverse(sort.StringSlice(matches)))
+	io.WriteString(logsWriter, fmt.Sprintf("Bedrock: resolved model %q -> %s.\n", model, matches[0]))
+	return matches[0]
+}
+
 // bedrockSessionSeconds is how long a vended Bedrock session should last: the
 // per-task wall-clock cap, clamped to the role-chaining limit above. These
 // creds are injected as env vars and do NOT auto-refresh, so a session shorter
@@ -522,10 +607,12 @@ func applyBedrockCredsIfNeeded(env map[string]string, logsWriter io.Writer) {
 	env["AWS_SECRET_ACCESS_KEY"] = aws.ToString(c.SecretAccessKey)
 	env["AWS_SESSION_TOKEN"] = aws.ToString(c.SessionToken)
 	env["AWS_REGION"] = region
-	// claude-code in Bedrock mode takes the model from ANTHROPIC_MODEL (an
-	// inference-profile id). Pass the selected model through.
+	// claude-code in Bedrock mode takes the model from ANTHROPIC_MODEL, which
+	// must be a concrete inference-profile id — a logical id like
+	// "claude-opus-4-8" reaches Bedrock verbatim and is rejected with
+	// "The provided model identifier is invalid". Resolve it here.
 	if m := env["MODEL"]; m != "" {
-		env["ANTHROPIC_MODEL"] = m
+		env["ANTHROPIC_MODEL"] = resolveBedrockModelID(context.TODO(), cfg, m, region, logsWriter)
 	}
 	// Allowlist BOTH Bedrock hosts — agentbox's proxy gates egress, and
 	// claude-code uses both planes:

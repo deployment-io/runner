@@ -9,9 +9,10 @@ require (
 	github.com/ankit-arora/langchaingo v0.0.0-20250213122302-122a5007324f
 	github.com/ankit-arora/markdown v0.0.0-20240801070227-28eff2aa6649
 	github.com/ankit-arora/nixpacks-go v0.0.0-20240925063829-e4f7ef9412db
-	github.com/aws/aws-sdk-go-v2 v1.34.0
+	github.com/aws/aws-sdk-go-v2 v1.43.3
 	github.com/aws/aws-sdk-go-v2/config v1.27.11
 	github.com/aws/aws-sdk-go-v2/service/acm v1.25.4
+	github.com/aws/aws-sdk-go-v2/service/bedrock v1.66.3
 	github.com/aws/aws-sdk-go-v2/service/cloudfront v1.36.0
 	github.com/aws/aws-sdk-go-v2/service/cloudwatch v1.38.6
 	github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs v1.45.6
@@ -25,7 +26,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/secretsmanager v1.31.1
 	github.com/aws/aws-sdk-go-v2/service/servicediscovery v1.31.1
 	github.com/aws/aws-sdk-go-v2/service/sts v1.28.6
-	github.com/aws/smithy-go v1.22.2
+	github.com/aws/smithy-go v1.27.6
 	github.com/deployment-io/deployment-runner-kit v0.0.0-20260716054714-28558a103f33
 	github.com/deployment-io/team-ai v0.0.0-20250917084912-bdbad6a834e1
 	github.com/docker/docker v27.3.0+incompatible
@@ -52,8 +53,8 @@ require (
 	github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream v1.6.7 // indirect
 	github.com/aws/aws-sdk-go-v2/credentials v1.17.11 // indirect
 	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.16.1 // indirect
-	github.com/aws/aws-sdk-go-v2/internal/configsources v1.3.29 // indirect
-	github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.6.29 // indirect
+	github.com/aws/aws-sdk-go-v2/internal/configsources v1.4.34 // indirect
+	github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.7.34 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/ini v1.8.0 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/v4a v1.3.5 // indirect
 	github.com/aws/aws-sdk-go-v2/service/autoscaling v1.40.5 // indirect
