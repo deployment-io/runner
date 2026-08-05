@@ -153,10 +153,6 @@ github.com/cyphar/filepath-securejoin v0.2.5/go.mod h1:aPGpWjXOXUn2NCNjFvBE6aRxG
 github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
-github.com/deployment-io/deployment-runner-kit v0.0.0-20260804115737-e2d8747cdfbc h1:e7JZQHIRtd/Zo4Ggj2HYXv1zObPS3MnZOPKnSTQT5fc=
-github.com/deployment-io/deployment-runner-kit v0.0.0-20260804115737-e2d8747cdfbc/go.mod h1:wKTz63GqLOHVXT173zlW/zJFRLi9krn7dqXoDm/BXFI=
-github.com/deployment-io/deployment-runner-kit v0.0.0-20260805070911-8c6507c4b19e h1:ZqW720Lx/adZeJ1Pc/YbKXQrqCixYI9AgsYXie+o2Fg=
-github.com/deployment-io/deployment-runner-kit v0.0.0-20260805070911-8c6507c4b19e/go.mod h1:wKTz63GqLOHVXT173zlW/zJFRLi9krn7dqXoDm/BXFI=
 github.com/deployment-io/deployment-runner-kit v0.0.0-20260805084335-9e73ab19f56f h1:MtWCHlLuVcQW7//i1M/BuldXWoumw4E5O8htNqVsn54=
 github.com/deployment-io/deployment-runner-kit v0.0.0-20260805084335-9e73ab19f56f/go.mod h1:wKTz63GqLOHVXT173zlW/zJFRLi9krn7dqXoDm/BXFI=
 github.com/deployment-io/team-ai v0.0.0-20250917084912-bdbad6a834e1 h1:gfeNqym19IiO38sQ84WPMmZXrdDisu64qQP3Xs0N2RM=
