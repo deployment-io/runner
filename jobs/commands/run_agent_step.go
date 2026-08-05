@@ -409,10 +409,10 @@ func buildAgentSpawnEnvVars(parameters map[string]interface{}, logsWriter io.Wri
 	}
 	// Bedrock: when the org is in Bedrock mode (CLAUDE_CODE_USE_BEDROCK marker in
 	// AgentEnvVars), assume dr-bedrock-role and inject its scoped short-lived creds.
-	bedrockCfg, bedrockRegion, bedrockReady := applyBedrockCredsIfNeeded(env, logsWriter)
+	bedrockCfg, bedrockRegion, bedrockOK := applyBedrockCredsIfNeeded(env, logsWriter)
 	// Render the model for the selected agent BEFORE the subscription step,
 	// which consumes the marker providerFromEnv reads.
-	applyAgentModelEnv(env, bedrockCfg, bedrockRegion, bedrockReady, logsWriter)
+	applyAgentModelEnv(env, buildModelResolvers(bedrockCfg, bedrockRegion, bedrockOK, logsWriter), logsWriter)
 	// Optionally swap the injected ANTHROPIC_API_KEY for a Claude Code
 	// subscription OAuth token read from this runner's own AWS Secrets Manager.
 	// Engages only when the org is in subscription mode (marker in AgentEnvVars).
@@ -572,6 +572,31 @@ func providerFromEnv(env map[string]string) llm_provider_enums.Provider {
 	return 0
 }
 
+// modelResolver returns the concrete provider-side id for a model, or "" when
+// it cannot produce one.
+//
+// Exists so the call site never names a provider. Each implementation reaches
+// for its OWN discovery input — Bedrock uses Model.BedrockProfilePrefix, Vertex
+// would use whatever it needs — instead of the caller branching to pick one.
+type modelResolver func(ctx context.Context, m llm_provider_enums.Model) string
+
+// buildModelResolvers returns a resolver for each provider that can ACTUALLY
+// discover ids right now.
+//
+// Absence is the signal: a provider whose credentials never landed simply has
+// no entry, so availability needs no boolean threaded through the call chain.
+// A second runtime-resolved provider is one more entry here and no change
+// anywhere else.
+func buildModelResolvers(bedrockCfg aws.Config, bedrockRegion string, bedrockOK bool, logsWriter io.Writer) map[llm_provider_enums.Provider]modelResolver {
+	resolvers := map[llm_provider_enums.Provider]modelResolver{}
+	if bedrockOK {
+		resolvers[llm_provider_enums.AWSBedrock] = func(ctx context.Context, m llm_provider_enums.Model) string {
+			return resolveBedrockModelID(ctx, bedrockCfg, m.BedrockProfilePrefix(), bedrockRegion, logsWriter)
+		}
+	}
+	return resolvers
+}
+
 // applyAgentModelEnv renders the Task's LOGICAL model id into whatever the
 // selected agent actually reads.
 //
@@ -591,7 +616,7 @@ func providerFromEnv(env map[string]string) llm_provider_enums.Provider {
 //
 // Must run BEFORE maybeApplyClaudeSubscriptionAuth, which consumes the
 // subscription marker that providerFromEnv reads.
-func applyAgentModelEnv(env map[string]string, cfg aws.Config, region string, bedrockReady bool, logsWriter io.Writer) {
+func applyAgentModelEnv(env map[string]string, resolvers map[llm_provider_enums.Provider]modelResolver, logsWriter io.Writer) {
 	logical := env["MODEL"]
 	if logical == "" {
 		return
@@ -607,16 +632,16 @@ func applyAgentModelEnv(env map[string]string, cfg aws.Config, region string, be
 	if model, err := llm_provider_enums.GetModel(logical); err == nil {
 		id = model.IDFor(provider)
 		if provider.ResolvesModelIDAtRuntime() {
-			// Only when the credential step actually succeeded. It leaves the
-			// marker in env even on failure, so without this guard a failed
-			// AssumeRole would reach the SDK with a zero aws.Config — which
-			// panics rather than returning an error. Degrade to the logical id
-			// and let the agent fail on the missing credential, which is the
-			// real problem and the one worth reporting.
-			if !bedrockReady {
-				io.WriteString(logsWriter, fmt.Sprintf("Bedrock: credentials unavailable, cannot resolve %q; leaving the model unchanged.\n", logical))
-			} else {
-				id = resolveBedrockModelID(context.TODO(), cfg, model.BedrockProfilePrefix(), region, logsWriter)
+			// The provider says a concrete id must be DISCOVERED; the map says
+			// whether we can do that right now. Splitting the two keeps a
+			// credential failure from looking like "this provider does not need
+			// discovery", and means a second such provider adds a map entry
+			// rather than another boolean.
+			resolve, available := resolvers[provider]
+			if !available {
+				io.WriteString(logsWriter, fmt.Sprintf("%s: cannot resolve %q — credentials unavailable; leaving the model unchanged.\n", provider, logical))
+			} else if resolved := resolve(context.TODO(), model); resolved != "" {
+				id = resolved
 			}
 		}
 	} else {

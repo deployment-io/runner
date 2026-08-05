@@ -161,7 +161,7 @@ func TestApplyAgentModelEnv_OpencodeGetsAProviderPrefixWithoutBedrock(t *testing
 		"MODEL":             "claude-sonnet-4-6",
 		"ANTHROPIC_API_KEY": "sk-ant-x",
 	}
-	applyAgentModelEnv(env, aws.Config{}, "", false, io.Discard)
+	applyAgentModelEnv(env, nil, io.Discard)
 	if want := "anthropic/claude-sonnet-4-6"; env["MODEL"] != want {
 		t.Errorf("MODEL = %q, want %q", env["MODEL"], want)
 	}
@@ -176,7 +176,7 @@ func TestApplyAgentModelEnv_OpencodeOnOpenAI(t *testing.T) {
 		"MODEL":          "gpt-5.5",
 		"OPENAI_API_KEY": "sk-x",
 	}
-	applyAgentModelEnv(env, aws.Config{}, "", false, io.Discard)
+	applyAgentModelEnv(env, nil, io.Discard)
 	if want := "openai/gpt-5.5"; env["MODEL"] != want {
 		t.Errorf("MODEL = %q, want %q", env["MODEL"], want)
 	}
@@ -189,7 +189,7 @@ func TestApplyAgentModelEnv_ClaudeCodeKeepsTheLogicalIDOffBedrock(t *testing.T) 
 		"MODEL":             "claude-opus-4-8",
 		"ANTHROPIC_API_KEY": "sk-ant-x",
 	}
-	applyAgentModelEnv(env, aws.Config{}, "", false, io.Discard)
+	applyAgentModelEnv(env, nil, io.Discard)
 	if env["MODEL"] != "claude-opus-4-8" {
 		t.Errorf("MODEL = %q, want the logical id unchanged", env["MODEL"])
 	}
@@ -201,7 +201,7 @@ func TestApplyAgentModelEnv_ClaudeCodeKeepsTheLogicalIDOffBedrock(t *testing.T) 
 func TestApplyAgentModelEnv_NoCredentialLeavesTheModelAlone(t *testing.T) {
 	// Better to fail on the missing credential than on a mangled model id.
 	env := map[string]string{"AGENT_TYPE": llm_provider_enums.Opencode.String(), "MODEL": "claude-opus-4-8"}
-	applyAgentModelEnv(env, aws.Config{}, "", false, io.Discard)
+	applyAgentModelEnv(env, nil, io.Discard)
 	if env["MODEL"] != "claude-opus-4-8" {
 		t.Errorf("MODEL = %q, want it untouched when no provider can be inferred", env["MODEL"])
 	}
@@ -209,26 +209,75 @@ func TestApplyAgentModelEnv_NoCredentialLeavesTheModelAlone(t *testing.T) {
 
 func TestApplyAgentModelEnv_UnknownModelPassesThrough(t *testing.T) {
 	env := map[string]string{"MODEL": "some-future-model", "ANTHROPIC_API_KEY": "sk-ant-x"}
-	applyAgentModelEnv(env, aws.Config{}, "", false, io.Discard)
+	applyAgentModelEnv(env, nil, io.Discard)
 	if env["MODEL"] != "some-future-model" {
 		t.Errorf("MODEL = %q, want an unknown id passed through unchanged", env["MODEL"])
 	}
 }
 
-func TestApplyAgentModelEnv_BedrockUnavailableDoesNotPanic(t *testing.T) {
+func TestApplyAgentModelEnv_NoResolverAvailableDoesNotPanic(t *testing.T) {
 	// applyBedrockCredsIfNeeded leaves the marker in env even when it fails, so
-	// this path runs with a zero aws.Config. Without the bedrockReady guard the
-	// SDK panics instead of erroring, taking the runner down rather than
-	// failing one Step.
+	// providerFromEnv still reports AWSBedrock. With no resolver registered the
+	// discovery step must be skipped entirely — an earlier revision called into
+	// the SDK with a zero aws.Config, which PANICS rather than erroring and
+	// took the whole runner down instead of failing one Step.
 	env := map[string]string{
 		"CLAUDE_CODE_USE_BEDROCK": "1",
 		"MODEL":                   "nova-pro-v1",
 		"AGENT_TYPE":              llm_provider_enums.Opencode.String(),
 	}
-	applyAgentModelEnv(env, aws.Config{}, "eu-west-1", false, io.Discard)
+	applyAgentModelEnv(env, nil, io.Discard)
 	// Degrades to the logical id, still provider-prefixed so opencode reports a
 	// credential problem rather than an unroutable model.
 	if want := "amazon-bedrock/nova-pro-v1"; env["MODEL"] != want {
+		t.Errorf("MODEL = %q, want %q", env["MODEL"], want)
+	}
+}
+
+func TestBuildModelResolvers_AbsenceIsTheAvailabilitySignal(t *testing.T) {
+	// No boolean is threaded through the call chain: a provider that cannot
+	// discover right now simply has no entry.
+	if got := buildModelResolvers(aws.Config{}, "eu-west-1", false, io.Discard); len(got) != 0 {
+		t.Errorf("failed Bedrock setup registered %d resolver(s), want none", len(got))
+	}
+	ready := buildModelResolvers(aws.Config{}, "eu-west-1", true, io.Discard)
+	if _, ok := ready[llm_provider_enums.AWSBedrock]; !ok {
+		t.Error("a successful Bedrock setup must register a resolver for AWSBedrock")
+	}
+	// Providers that declare their ids must never get one — a resolver for them
+	// would mean discovery where none is needed.
+	for _, p := range []llm_provider_enums.Provider{
+		llm_provider_enums.AnthropicDirect,
+		llm_provider_enums.OpenAIDirect,
+		llm_provider_enums.AnthropicSubscription,
+	} {
+		if _, ok := ready[p]; ok {
+			t.Errorf("%s declares its model ids; it must not have a resolver", p)
+		}
+	}
+}
+
+func TestApplyAgentModelEnv_UsesTheRegisteredResolver(t *testing.T) {
+	// The call site must not name a provider: it looks the resolver up and uses
+	// whatever it returns, which is what lets Vertex slot in as a map entry.
+	called := ""
+	resolvers := map[llm_provider_enums.Provider]modelResolver{
+		llm_provider_enums.AWSBedrock: func(_ context.Context, m llm_provider_enums.Model) string {
+			called = m.String()
+			return "eu.amazon.nova-pro-v1:0"
+		},
+	}
+	env := map[string]string{
+		"CLAUDE_CODE_USE_BEDROCK": "1",
+		"AGENT_TYPE":              llm_provider_enums.Opencode.String(),
+		"MODEL":                   "nova-pro-v1",
+	}
+	applyAgentModelEnv(env, resolvers, io.Discard)
+
+	if called != "nova-pro-v1" {
+		t.Errorf("resolver received %q, want the logical model", called)
+	}
+	if want := "amazon-bedrock/eu.amazon.nova-pro-v1:0"; env["MODEL"] != want {
 		t.Errorf("MODEL = %q, want %q", env["MODEL"], want)
 	}
 }
