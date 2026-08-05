@@ -84,7 +84,7 @@ func TestResolveBedrockModelID_UsesTheSharedCatalogue(t *testing.T) {
 	if err != nil {
 		t.Fatalf("catalogue no longer knows claude-opus-4-8: %v", err)
 	}
-	if m.BedrockFamily() == "" {
+	if m.BedrockProfilePrefix() == "" {
 		t.Error("claude-opus-4-8 has no Bedrock family in the catalogue; discovery cannot resolve it")
 	}
 	// A model the catalogue does not know must pass through, not panic or guess.

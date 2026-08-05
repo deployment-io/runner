@@ -486,18 +486,20 @@ func resolveBedrockModelID(ctx context.Context, cfg aws.Config, model, region st
 	if strings.Contains(model, ".") {
 		return model
 	}
-	// The logical model -> Bedrock family map lives in the shared catalogue, not
-	// here: deployment-runner-kit is the one module both the control plane and
-	// the runner import, so a second copy in this file was exactly the drift the
-	// catalogue exists to prevent. It also carries the guard that any model
-	// claiming Bedrock has a family token.
+	// The logical model -> Bedrock profile prefix lives in the shared catalogue,
+	// not here: deployment-runner-kit is the one module both the control plane
+	// and the runner import, so a second copy in this file was exactly the drift
+	// the catalogue exists to prevent. It also carries the guards that any model
+	// claiming Bedrock has a prefix, and that the prefix pins the model VERSION
+	// — a loose prefix Contains-matches a neighbouring version's profile and
+	// silently runs the wrong model.
 	m, err := llm_provider_enums.GetModel(model)
 	if err != nil {
 		io.WriteString(logsWriter, fmt.Sprintf("Bedrock: %q is not a catalogue model; passing it through unchanged.\n", model))
 		return model
 	}
-	family := m.BedrockFamily()
-	if family == "" {
+	profilePrefix := m.BedrockProfilePrefix()
+	if profilePrefix == "" {
 		io.WriteString(logsWriter, fmt.Sprintf("Bedrock: model %q is not served by Bedrock; passing it through unchanged.\n", model))
 		return model
 	}
@@ -512,7 +514,7 @@ func resolveBedrockModelID(ctx context.Context, cfg aws.Config, model, region st
 	var matches []string
 	for _, p := range out.InferenceProfileSummaries {
 		id := aws.ToString(p.InferenceProfileId)
-		if strings.HasPrefix(id, prefix) && strings.Contains(id, family) {
+		if strings.HasPrefix(id, prefix) && strings.Contains(id, profilePrefix) {
 			matches = append(matches, id)
 		}
 	}
@@ -520,9 +522,10 @@ func resolveBedrockModelID(ctx context.Context, cfg aws.Config, model, region st
 		io.WriteString(logsWriter, fmt.Sprintf("Bedrock: no %s inference profile for %q in %s — check model access for this account/region. Passing it through unchanged.\n", prefix, model, region))
 		return model
 	}
-	// Descending so the newest revision wins: the date and -vN:0 suffixes sort
-	// lexicographically within a family. Logged because a silent pick between
-	// several revisions is hard to reconstruct from a failure later.
+	// Descending so the newest revision wins. Because the prefix pins the model
+	// version, this only ever chooses between DATES/revisions of the same
+	// model — a safe auto-upgrade, not a silent model swap. Logged because a
+	// silent pick between several revisions is hard to reconstruct later.
 	sort.Sort(sort.Reverse(sort.StringSlice(matches)))
 	io.WriteString(logsWriter, fmt.Sprintf("Bedrock: resolved model %q -> %s.\n", model, matches[0]))
 	return matches[0]
