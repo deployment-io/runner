@@ -52,15 +52,6 @@ func TestResolveBedrockModelID_PassesThroughConcreteProfileIDs(t *testing.T) {
 	}
 }
 
-func TestResolveBedrockModelID_UnknownLogicalIDPassesThrough(t *testing.T) {
-	// Not in the family map and not dotted: hand it to Bedrock so its own error
-	// message surfaces, rather than guessing a profile.
-	const model = "some-future-model"
-	if got := resolveBedrockModelID(context.Background(), aws.Config{}, model, "eu-west-1", io.Discard); got != model {
-		t.Errorf("resolveBedrockModelID(%q) = %q, want it passed through unchanged", model, got)
-	}
-}
-
 func TestBedrockRegionPrefix(t *testing.T) {
 	cases := map[string]string{
 		"eu-west-1":      "eu.",
@@ -77,25 +68,22 @@ func TestBedrockRegionPrefix(t *testing.T) {
 }
 
 func TestResolveBedrockModelID_UsesTheSharedCatalogue(t *testing.T) {
-	// The logical -> family map is no longer duplicated here; it comes from
+	// The logical -> prefix map is not duplicated here; it comes from
 	// deployment-runner-kit, which the control plane also imports. Pin the seam
-	// so a catalogue change that drops a family is visible from this side too.
+	// so a catalogue change that drops a prefix is visible from this side too.
 	m, err := llm_provider_enums.GetModel("claude-opus-4-8")
 	if err != nil {
 		t.Fatalf("catalogue no longer knows claude-opus-4-8: %v", err)
 	}
 	if m.BedrockProfilePrefix() == "" {
-		t.Error("claude-opus-4-8 has no Bedrock family in the catalogue; discovery cannot resolve it")
+		t.Error("claude-opus-4-8 has no Bedrock profile prefix in the catalogue; discovery cannot resolve it")
 	}
-	// A model the catalogue does not know must pass through, not panic or guess.
-	const unknown = "some-future-model"
-	if got := resolveBedrockModelID(context.Background(), aws.Config{}, unknown, "eu-west-1", io.Discard); got != unknown {
-		t.Errorf("resolveBedrockModelID(%q) = %q, want it passed through unchanged", unknown, got)
-	}
-	// A known model that Bedrock does not serve must also pass through — gpt-5.5
-	// is in the catalogue but has no family token.
-	if got := resolveBedrockModelID(context.Background(), aws.Config{}, "gpt-5.5", "eu-west-1", io.Discard); got != "gpt-5.5" {
-		t.Errorf("resolveBedrockModelID(gpt-5.5) = %q, want it passed through unchanged", got)
+	// This function takes a PROFILE PREFIX, not a logical model — deciding
+	// whether a model is a catalogue model, and whether it is served by
+	// Bedrock at all, belongs to applyAgentModelEnv one layer up. An empty
+	// prefix must short-circuit rather than reach the SDK.
+	if got := resolveBedrockModelID(context.Background(), aws.Config{}, "", "eu-west-1", io.Discard); got != "" {
+		t.Errorf("empty prefix returned %q, want \"\" without touching AWS", got)
 	}
 }
 
@@ -133,68 +121,114 @@ func TestBedrockSessionSeconds_ClampedToOneHourNotTheTaskCap(t *testing.T) {
 	}
 }
 
-// applyBedrockModelEnv is where the org-level Bedrock marker is rendered into
-// whatever the SELECTED HARNESS actually reads. Both branches are pure once a
-// model is already concrete (the dot rule short-circuits before any AWS call),
-// so they are testable without live credentials.
+// applyAgentModelEnv renders the Task's LOGICAL model into whatever the agent
+// reads. These exercise the non-Bedrock paths, which need no AWS at all — and
+// which are the ones that previously had no rendering step, so an opencode task
+// on Anthropic would have received a bare id with no provider prefix.
 
-func TestApplyBedrockModelEnv_ClaudeCodeGetsAnthropicModel(t *testing.T) {
-	const concrete = "eu.anthropic.claude-sonnet-4-5-20250929-v1:0"
-	env := map[string]string{"CLAUDE_CODE_USE_BEDROCK": "1", "MODEL": concrete}
-	applyBedrockModelEnv(env, aws.Config{}, "eu-west-1", io.Discard)
-
-	if env["ANTHROPIC_MODEL"] != concrete {
-		t.Errorf("ANTHROPIC_MODEL = %q, want %q", env["ANTHROPIC_MODEL"], concrete)
+func TestProviderFromEnv_ReadsTheInjectedCredentials(t *testing.T) {
+	cases := []struct {
+		name string
+		env  map[string]string
+		want llm_provider_enums.Provider
+	}{
+		{"bedrock marker", map[string]string{"CLAUDE_CODE_USE_BEDROCK": "1"}, llm_provider_enums.AWSBedrock},
+		{"anthropic key", map[string]string{"ANTHROPIC_API_KEY": "sk-ant-x"}, llm_provider_enums.AnthropicDirect},
+		{"openai key", map[string]string{"OPENAI_API_KEY": "sk-x"}, llm_provider_enums.OpenAIDirect},
+		{"subscription", map[string]string{claudeAuthModeEnvVar: claudeAuthModeSubscription}, llm_provider_enums.AnthropicSubscription},
+		// A subscription org may ALSO carry an API key as its documented
+		// fallback, so the marker has to win or such orgs look like
+		// AnthropicDirect and get the wrong model id.
+		{"subscription with fallback key", map[string]string{
+			claudeAuthModeEnvVar: claudeAuthModeSubscription,
+			"ANTHROPIC_API_KEY":  "sk-ant-fallback",
+		}, llm_provider_enums.AnthropicSubscription},
+		{"nothing recognisable", map[string]string{}, 0},
 	}
-	// claude-code reads the marker itself, so it must survive.
-	if env["CLAUDE_CODE_USE_BEDROCK"] != "1" {
-		t.Error("claude-code needs CLAUDE_CODE_USE_BEDROCK in its own env; it must not be consumed")
-	}
-	if env["MODEL"] != concrete {
-		t.Errorf("MODEL = %q, want it left alone for claude-code", env["MODEL"])
-	}
-}
-
-func TestApplyBedrockModelEnv_EmptyAgentTypeIsClaudeCode(t *testing.T) {
-	// Tasks created before AGENT_TYPE existed carry no value, and agentbox
-	// defaults empty to claude-code. Diverging here would render the wrong env.
-	const concrete = "eu.anthropic.claude-sonnet-4-5-20250929-v1:0"
-	env := map[string]string{"CLAUDE_CODE_USE_BEDROCK": "1", "MODEL": concrete, "AGENT_TYPE": ""}
-	applyBedrockModelEnv(env, aws.Config{}, "eu-west-1", io.Discard)
-	if env["ANTHROPIC_MODEL"] != concrete {
-		t.Errorf("empty AGENT_TYPE must be treated as claude-code; ANTHROPIC_MODEL = %q", env["ANTHROPIC_MODEL"])
+	for _, c := range cases {
+		if got := providerFromEnv(c.env); got != c.want {
+			t.Errorf("%s: providerFromEnv = %v, want %v", c.name, got, c.want)
+		}
 	}
 }
 
-func TestApplyBedrockModelEnv_OpencodeKeepsThePrefixAndDropsTheMarker(t *testing.T) {
-	const concrete = "eu.anthropic.claude-sonnet-4-5-20250929-v1:0"
+func TestApplyAgentModelEnv_OpencodeGetsAProviderPrefixWithoutBedrock(t *testing.T) {
+	// The gap this function closes: before it, only the Bedrock path rendered a
+	// model, so opencode on Anthropic received a bare "claude-sonnet-4-6" and
+	// had no way to know where to route it.
+	env := map[string]string{
+		"AGENT_TYPE":        llm_provider_enums.Opencode.String(),
+		"MODEL":             "claude-sonnet-4-6",
+		"ANTHROPIC_API_KEY": "sk-ant-x",
+	}
+	applyAgentModelEnv(env, aws.Config{}, "", false, io.Discard)
+	if want := "anthropic/claude-sonnet-4-6"; env["MODEL"] != want {
+		t.Errorf("MODEL = %q, want %q", env["MODEL"], want)
+	}
+	if _, present := env["ANTHROPIC_MODEL"]; present {
+		t.Error("ANTHROPIC_MODEL means nothing to opencode")
+	}
+}
+
+func TestApplyAgentModelEnv_OpencodeOnOpenAI(t *testing.T) {
+	env := map[string]string{
+		"AGENT_TYPE":     llm_provider_enums.Opencode.String(),
+		"MODEL":          "gpt-5.5",
+		"OPENAI_API_KEY": "sk-x",
+	}
+	applyAgentModelEnv(env, aws.Config{}, "", false, io.Discard)
+	if want := "openai/gpt-5.5"; env["MODEL"] != want {
+		t.Errorf("MODEL = %q, want %q", env["MODEL"], want)
+	}
+}
+
+func TestApplyAgentModelEnv_ClaudeCodeKeepsTheLogicalIDOffBedrock(t *testing.T) {
+	// claude-code takes --model from MODEL when it is NOT in Bedrock mode, and
+	// the logical id is what it expects.
+	env := map[string]string{
+		"MODEL":             "claude-opus-4-8",
+		"ANTHROPIC_API_KEY": "sk-ant-x",
+	}
+	applyAgentModelEnv(env, aws.Config{}, "", false, io.Discard)
+	if env["MODEL"] != "claude-opus-4-8" {
+		t.Errorf("MODEL = %q, want the logical id unchanged", env["MODEL"])
+	}
+	if _, present := env["ANTHROPIC_MODEL"]; present {
+		t.Error("ANTHROPIC_MODEL is the Bedrock-mode input; it must not be set otherwise")
+	}
+}
+
+func TestApplyAgentModelEnv_NoCredentialLeavesTheModelAlone(t *testing.T) {
+	// Better to fail on the missing credential than on a mangled model id.
+	env := map[string]string{"AGENT_TYPE": llm_provider_enums.Opencode.String(), "MODEL": "claude-opus-4-8"}
+	applyAgentModelEnv(env, aws.Config{}, "", false, io.Discard)
+	if env["MODEL"] != "claude-opus-4-8" {
+		t.Errorf("MODEL = %q, want it untouched when no provider can be inferred", env["MODEL"])
+	}
+}
+
+func TestApplyAgentModelEnv_UnknownModelPassesThrough(t *testing.T) {
+	env := map[string]string{"MODEL": "some-future-model", "ANTHROPIC_API_KEY": "sk-ant-x"}
+	applyAgentModelEnv(env, aws.Config{}, "", false, io.Discard)
+	if env["MODEL"] != "some-future-model" {
+		t.Errorf("MODEL = %q, want an unknown id passed through unchanged", env["MODEL"])
+	}
+}
+
+func TestApplyAgentModelEnv_BedrockUnavailableDoesNotPanic(t *testing.T) {
+	// applyBedrockCredsIfNeeded leaves the marker in env even when it fails, so
+	// this path runs with a zero aws.Config. Without the bedrockReady guard the
+	// SDK panics instead of erroring, taking the runner down rather than
+	// failing one Step.
 	env := map[string]string{
 		"CLAUDE_CODE_USE_BEDROCK": "1",
+		"MODEL":                   "nova-pro-v1",
 		"AGENT_TYPE":              llm_provider_enums.Opencode.String(),
-		"MODEL":                   "amazon-bedrock/" + concrete,
 	}
-	applyBedrockModelEnv(env, aws.Config{}, "eu-west-1", io.Discard)
-
-	// opencode picks its provider from the prefix, so a bare profile id would
-	// route the request somewhere else entirely.
-	if want := "amazon-bedrock/" + concrete; env["MODEL"] != want {
-		t.Errorf("MODEL = %q, want %q — opencode selects its provider from the prefix", env["MODEL"], want)
-	}
-	// The marker is a runner-facing signal. opencode cannot use it, so leaking
-	// it into the container would be inert but misleading.
-	if _, present := env["CLAUDE_CODE_USE_BEDROCK"]; present {
-		t.Error("CLAUDE_CODE_USE_BEDROCK must be consumed for opencode, not passed through")
-	}
-	// ANTHROPIC_MODEL means nothing to opencode.
-	if _, present := env["ANTHROPIC_MODEL"]; present {
-		t.Error("ANTHROPIC_MODEL must not be set for opencode")
-	}
-}
-
-func TestApplyBedrockModelEnv_NoModelIsANoOp(t *testing.T) {
-	env := map[string]string{"CLAUDE_CODE_USE_BEDROCK": "1"}
-	applyBedrockModelEnv(env, aws.Config{}, "eu-west-1", io.Discard)
-	if _, present := env["ANTHROPIC_MODEL"]; present {
-		t.Error("no MODEL means nothing to render")
+	applyAgentModelEnv(env, aws.Config{}, "eu-west-1", false, io.Discard)
+	// Degrades to the logical id, still provider-prefixed so opencode reports a
+	// credential problem rather than an unroutable model.
+	if want := "amazon-bedrock/nova-pro-v1"; env["MODEL"] != want {
+		t.Errorf("MODEL = %q, want %q", env["MODEL"], want)
 	}
 }

@@ -409,7 +409,10 @@ func buildAgentSpawnEnvVars(parameters map[string]interface{}, logsWriter io.Wri
 	}
 	// Bedrock: when the org is in Bedrock mode (CLAUDE_CODE_USE_BEDROCK marker in
 	// AgentEnvVars), assume dr-bedrock-role and inject its scoped short-lived creds.
-	applyBedrockCredsIfNeeded(env, logsWriter)
+	bedrockCfg, bedrockRegion, bedrockReady := applyBedrockCredsIfNeeded(env, logsWriter)
+	// Render the model for the selected agent BEFORE the subscription step,
+	// which consumes the marker providerFromEnv reads.
+	applyAgentModelEnv(env, bedrockCfg, bedrockRegion, bedrockReady, logsWriter)
 	// Optionally swap the injected ANTHROPIC_API_KEY for a Claude Code
 	// subscription OAuth token read from this runner's own AWS Secrets Manager.
 	// Engages only when the org is in subscription mode (marker in AgentEnvVars).
@@ -482,9 +485,11 @@ func bedrockRegionPrefix(region string) string {
 // Discovery failures are NEVER fatal: the original model is returned and the
 // reason logged. A wrong model produces a legible Bedrock error, whereas
 // failing the Step here would hide the cause one layer up.
-func resolveBedrockModelID(ctx context.Context, cfg aws.Config, model, region string, logsWriter io.Writer) string {
-	if strings.Contains(model, ".") {
-		return model
+func resolveBedrockModelID(ctx context.Context, cfg aws.Config, profilePrefix, region string, logsWriter io.Writer) string {
+	// An already-concrete id (dotted) is used verbatim — the escape hatch for
+	// pinning an exact revision by hand.
+	if strings.Contains(profilePrefix, ".") {
+		return profilePrefix
 	}
 	// The logical model -> Bedrock profile prefix lives in the shared catalogue,
 	// not here: deployment-runner-kit is the one module both the control plane
@@ -493,22 +498,16 @@ func resolveBedrockModelID(ctx context.Context, cfg aws.Config, model, region st
 	// claiming Bedrock has a prefix, and that the prefix pins the model VERSION
 	// — a loose prefix Contains-matches a neighbouring version's profile and
 	// silently runs the wrong model.
-	m, err := llm_provider_enums.GetModel(model)
-	if err != nil {
-		io.WriteString(logsWriter, fmt.Sprintf("Bedrock: %q is not a catalogue model; passing it through unchanged.\n", model))
-		return model
-	}
-	profilePrefix := m.BedrockProfilePrefix()
 	if profilePrefix == "" {
-		io.WriteString(logsWriter, fmt.Sprintf("Bedrock: model %q is not served by Bedrock; passing it through unchanged.\n", model))
-		return model
+		io.WriteString(logsWriter, fmt.Sprintf("Bedrock: %q has no Bedrock profile prefix; passing it through unchanged.\n", profilePrefix))
+		return profilePrefix
 	}
 	out, err := bedrock.NewFromConfig(cfg).ListInferenceProfiles(ctx, &bedrock.ListInferenceProfilesInput{
 		MaxResults: aws.Int32(100),
 	})
 	if err != nil {
-		io.WriteString(logsWriter, fmt.Sprintf("Bedrock: could not list inference profiles (%s); passing %q through unchanged.\n", err, model))
-		return model
+		io.WriteString(logsWriter, fmt.Sprintf("Bedrock: could not list inference profiles (%s); passing %q through unchanged.\n", err, profilePrefix))
+		return profilePrefix
 	}
 	prefix := bedrockRegionPrefix(region)
 	var matches []string
@@ -519,15 +518,15 @@ func resolveBedrockModelID(ctx context.Context, cfg aws.Config, model, region st
 		}
 	}
 	if len(matches) == 0 {
-		io.WriteString(logsWriter, fmt.Sprintf("Bedrock: no %s inference profile for %q in %s — check model access for this account/region. Passing it through unchanged.\n", prefix, model, region))
-		return model
+		io.WriteString(logsWriter, fmt.Sprintf("Bedrock: no %s inference profile for %q in %s — check model access for this account/region. Passing it through unchanged.\n", prefix, profilePrefix, region))
+		return profilePrefix
 	}
 	// Descending so the newest revision wins. Because the prefix pins the model
 	// version, this only ever chooses between DATES/revisions of the same
 	// model — a safe auto-upgrade, not a silent model swap. Logged because a
 	// silent pick between several revisions is hard to reconstruct later.
 	sort.Sort(sort.Reverse(sort.StringSlice(matches)))
-	io.WriteString(logsWriter, fmt.Sprintf("Bedrock: resolved model %q -> %s.\n", model, matches[0]))
+	io.WriteString(logsWriter, fmt.Sprintf("Bedrock: resolved %q -> %s.\n", profilePrefix, matches[0]))
 	return matches[0]
 }
 
@@ -548,49 +547,99 @@ func bedrockSessionSeconds() int32 {
 	return d
 }
 
-// opencodeBedrockPrefix is the provider prefix opencode expects on a Bedrock
-// model id. The runner strips it to resolve the underlying model and puts it
-// back on the concrete profile id.
-const opencodeBedrockPrefix = "amazon-bedrock/"
+// providerFromEnv infers which provider will serve this Job from the
+// credentials deployment-server injected.
+//
+// The credentials ARE the signal — deployment-server already decided which
+// provider serves the model when it resolved them, and re-stating that in a
+// separate env var would create two sources that can disagree, with no rule
+// for which wins.
+//
+// Order matters: a subscription org may ALSO carry an API key as its
+// documented fallback, so the subscription marker must be checked before
+// ANTHROPIC_API_KEY or such orgs would look like AnthropicDirect.
+func providerFromEnv(env map[string]string) llm_provider_enums.Provider {
+	switch {
+	case env["CLAUDE_CODE_USE_BEDROCK"] == "1":
+		return llm_provider_enums.AWSBedrock
+	case env[claudeAuthModeEnvVar] == claudeAuthModeSubscription:
+		return llm_provider_enums.AnthropicSubscription
+	case env["ANTHROPIC_API_KEY"] != "":
+		return llm_provider_enums.AnthropicDirect
+	case env["OPENAI_API_KEY"] != "":
+		return llm_provider_enums.OpenAIDirect
+	}
+	return 0
+}
 
-// applyBedrockModelEnv renders the Bedrock model into whatever env var the
-// SELECTED HARNESS actually reads, and removes what it must not see.
+// applyAgentModelEnv renders the Task's LOGICAL model id into whatever the
+// selected agent actually reads.
 //
-// The org-level marker (CLAUDE_CODE_USE_BEDROCK) is a signal to the RUNNER
-// that this org uses Bedrock — kit emits it without knowing which harness will
-// run, because ClaudeAuth has no harness context. The runner is the first place
-// that knows both, so harness-specific rendering belongs here:
+// This runs for every spawn, not just Bedrock ones. Model ids are logical now
+// ("claude-sonnet-4-6"), and opencode needs a "provider/model" string, so an
+// opencode task on Anthropic would otherwise receive a bare id with no way to
+// know where to route it.
 //
-//	claude-code — reads ANTHROPIC_MODEL (a concrete inference-profile id) and
-//	              needs CLAUDE_CODE_USE_BEDROCK in its own env; both are kept.
-//	opencode    — reads MODEL as "provider/model" and knows nothing about
-//	              CLAUDE_CODE_USE_BEDROCK. Passing that var through would be
-//	              inert but misleading, so it is consumed here rather than
-//	              leaked into a container that cannot use it.
+// The provider drives everything and no branch names one:
 //
-// Doing the split here rather than inventing a second marker keeps kit's
-// contract as one honest fact ("this org uses Bedrock") instead of two that
-// can disagree.
-func applyBedrockModelEnv(env map[string]string, cfg aws.Config, region string, logsWriter io.Writer) {
-	model := env["MODEL"]
-	if model == "" {
+//	IDFor                      — the provider's own name for the model
+//	ResolvesModelIDAtRuntime   — whether the concrete id must be discovered
+//	OpencodeModelID            — the "provider/model" rendering
+//
+// Adding Vertex later means setting that property and supplying its discovery;
+// nothing here changes.
+//
+// Must run BEFORE maybeApplyClaudeSubscriptionAuth, which consumes the
+// subscription marker that providerFromEnv reads.
+func applyAgentModelEnv(env map[string]string, cfg aws.Config, region string, bedrockReady bool, logsWriter io.Writer) {
+	logical := env["MODEL"]
+	if logical == "" {
 		return
 	}
-	// AGENT_TYPE unset means claude-code, matching agentbox's own defaulting.
-	// The harness name comes from the shared catalogue rather than a literal —
-	// this repo cannot import kit, but it can import deployment-runner-kit,
-	// which is exactly why the catalogue lives there.
-	if env["AGENT_TYPE"] != llm_provider_enums.Opencode.String() {
-		env["ANTHROPIC_MODEL"] = resolveBedrockModelID(context.TODO(), cfg, model, region, logsWriter)
+	provider := providerFromEnv(env)
+	if !provider.IsValid() {
+		// No recognisable credential. Leave the model untouched so the agent
+		// fails on the missing credential rather than on a mangled id.
 		return
 	}
-	// opencode ids arrive provider-prefixed. Resolve the model underneath, then
-	// put the prefix back: opencode selects its provider from that prefix, so
-	// handing it a bare profile id would route the request to the wrong place.
-	bare := strings.TrimPrefix(model, opencodeBedrockPrefix)
-	resolved := resolveBedrockModelID(context.TODO(), cfg, bare, region, logsWriter)
-	env["MODEL"] = opencodeBedrockPrefix + resolved
-	delete(env, "CLAUDE_CODE_USE_BEDROCK")
+
+	id := logical
+	if model, err := llm_provider_enums.GetModel(logical); err == nil {
+		id = model.IDFor(provider)
+		if provider.ResolvesModelIDAtRuntime() {
+			// Only when the credential step actually succeeded. It leaves the
+			// marker in env even on failure, so without this guard a failed
+			// AssumeRole would reach the SDK with a zero aws.Config — which
+			// panics rather than returning an error. Degrade to the logical id
+			// and let the agent fail on the missing credential, which is the
+			// real problem and the one worth reporting.
+			if !bedrockReady {
+				io.WriteString(logsWriter, fmt.Sprintf("Bedrock: credentials unavailable, cannot resolve %q; leaving the model unchanged.\n", logical))
+			} else {
+				id = resolveBedrockModelID(context.TODO(), cfg, model.BedrockProfilePrefix(), region, logsWriter)
+			}
+		}
+	} else {
+		io.WriteString(logsWriter, fmt.Sprintf("Model %q is not in the catalogue; passing it through unchanged.\n", logical))
+	}
+
+	if env["AGENT_TYPE"] == llm_provider_enums.Opencode.String() {
+		if rendered := llm_provider_enums.OpencodeModelID(id, provider); rendered != "" {
+			env["MODEL"] = rendered
+		}
+		// Consumed here: opencode cannot use it, and leaking a claude-code
+		// switch into its container would be inert but misleading.
+		delete(env, "CLAUDE_CODE_USE_BEDROCK")
+		return
+	}
+	// claude-code in Bedrock mode takes the model from ANTHROPIC_MODEL rather
+	// than --model. Keyed off the marker, which is what actually puts the CLI
+	// in that mode — not off the provider.
+	if env["CLAUDE_CODE_USE_BEDROCK"] == "1" {
+		env["ANTHROPIC_MODEL"] = id
+		return
+	}
+	env["MODEL"] = id
 }
 
 // applyBedrockCredsIfNeeded switches a claude-code task to AWS Bedrock. When
@@ -601,20 +650,20 @@ func applyBedrockModelEnv(env map[string]string, cfg aws.Config, region string, 
 // agent receives creds that can invoke Bedrock and nothing else. The Bedrock API
 // host is added to the egress allowlist. On any failure the task proceeds without
 // creds (and fails auth in the container) rather than crashing the runner.
-func applyBedrockCredsIfNeeded(env map[string]string, logsWriter io.Writer) {
+func applyBedrockCredsIfNeeded(env map[string]string, logsWriter io.Writer) (aws.Config, string, bool) {
 	if env["CLAUDE_CODE_USE_BEDROCK"] != "1" {
-		return
+		return aws.Config{}, "", false
 	}
 	roleArn := strings.TrimSpace(os.Getenv(bedrockRoleArnEnvVar))
 	if roleArn == "" {
 		io.WriteString(logsWriter, "Bedrock: BedrockRoleArn is not set on this runner — update the CloudFormation stack to add the Bedrock role.\n")
-		return
+		return aws.Config{}, "", false
 	}
 	region := utils.RunnerData.Get().RunnerRegion
 	cfg, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion(region))
 	if err != nil {
 		io.WriteString(logsWriter, fmt.Sprintf("Bedrock: could not load AWS config: %s\n", err))
-		return
+		return aws.Config{}, "", false
 	}
 	out, err := sts.NewFromConfig(cfg).AssumeRole(context.TODO(), &sts.AssumeRoleInput{
 		RoleArn:         aws.String(roleArn),
@@ -640,14 +689,13 @@ func applyBedrockCredsIfNeeded(env map[string]string, logsWriter io.Writer) {
 	})
 	if err != nil || out.Credentials == nil {
 		io.WriteString(logsWriter, fmt.Sprintf("Bedrock: AssumeRole %s failed: %s\n", roleArn, err))
-		return
+		return aws.Config{}, "", false
 	}
 	c := out.Credentials
 	env["AWS_ACCESS_KEY_ID"] = aws.ToString(c.AccessKeyId)
 	env["AWS_SECRET_ACCESS_KEY"] = aws.ToString(c.SecretAccessKey)
 	env["AWS_SESSION_TOKEN"] = aws.ToString(c.SessionToken)
 	env["AWS_REGION"] = region
-	applyBedrockModelEnv(env, cfg, region, logsWriter)
 	// Allowlist BOTH Bedrock hosts — agentbox's proxy gates egress, and
 	// claude-code uses both planes:
 	//
@@ -672,6 +720,7 @@ func applyBedrockCredsIfNeeded(env map[string]string, logsWriter io.Writer) {
 		env["ADDITIONAL_ALLOWED_HOSTS"] = bedrockHosts
 	}
 	io.WriteString(logsWriter, fmt.Sprintf("Bedrock: assumed %s; agent will use Bedrock in %s.\n", roleArn, region))
+	return cfg, region, true
 }
 
 // Subscription-mode contract with the control plane.
