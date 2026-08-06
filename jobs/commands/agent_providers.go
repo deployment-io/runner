@@ -50,6 +50,11 @@ func resolveJobProvider(parameters map[string]interface{}, logsWriter io.Writer)
 type agentSpawn struct {
 	provider  llm_provider_enums.Provider
 	agentType llm_provider_enums.AgentType
+	// model is the LOGICAL id the Task asked for ("claude-sonnet-4-6"), taken
+	// from the job parameter — not read back out of env. Rendering it is this
+	// package's job, so taking it as input keeps the function from depending on
+	// whether some earlier step happened to have written env["MODEL"] yet.
+	model string
 }
 
 // modelResolver returns the concrete provider-side id for a model, or "" when
@@ -117,7 +122,7 @@ func prepareProvider(env map[string]string, p llm_provider_enums.Provider, logsW
 // nothing here changes.
 func applyAgentModelEnv(env map[string]string, spawn agentSpawn, resolvers map[llm_provider_enums.Provider]modelResolver, logsWriter io.Writer) {
 	provider := spawn.provider
-	logical := env["MODEL"]
+	logical := spawn.model
 	if logical == "" {
 		return
 	}
