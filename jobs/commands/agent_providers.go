@@ -81,27 +81,39 @@ type providerSetup interface {
 	prepare(env map[string]string, logsWriter io.Writer) modelResolver
 }
 
-// providerSetups is the registry. A new provider is one entry here plus its own
-// type; no call site changes.
+// providerSetups is the registry of providers needing RUNNER-SIDE preparation,
+// which in practice means the cloud-role ones: their credentials are assumed
+// here rather than arriving in the bundle, and their model ids must be
+// discovered rather than declared.
+//
+// The API-key and subscription providers deliberately have no entry. There is
+// nothing for a setup to do — their credentials are already in the injected
+// bundle and their model ids are declared — so an entry would be an empty type
+// whose only content is "nothing to do", and would break the invariant that a
+// registered setup means discovery is needed.
+//
+// A new provider is one entry here plus its own file; no call site changes.
 var providerSetups = []providerSetup{bedrockSetup{}}
 
 // prepareProvider runs the setup for the provider serving this Job and returns
-// the resolvers that are ACTUALLY usable.
+// its resolver, or nil when it has none.
 //
-// Absence is the availability signal: a provider whose setup failed simply has
-// no entry, so no boolean is threaded through the call chain and a caller
-// cannot mistake "credentials failed" for "this provider needs no discovery".
-func prepareProvider(env map[string]string, p llm_provider_enums.Provider, logsWriter io.Writer) map[llm_provider_enums.Provider]modelResolver {
-	resolvers := map[llm_provider_enums.Provider]modelResolver{}
+// ONE resolver, not a map keyed by provider. A Job is served by exactly one
+// provider — the map could only ever hold that one entry, under a key the
+// caller already had. Provider PRIORITY does not change this: choosing which
+// provider wins happens upstream, so by the time a model is being rendered the
+// choice is already made.
+//
+// nil is the availability signal, so no boolean is threaded through the call
+// chain and a caller cannot mistake "credentials failed" for "this provider
+// needs no discovery" — ResolvesModelIDAtRuntime answers the second.
+func prepareProvider(env map[string]string, p llm_provider_enums.Provider, logsWriter io.Writer) modelResolver {
 	for _, setup := range providerSetups {
-		if setup.provider() != p {
-			continue
-		}
-		if resolve := setup.prepare(env, logsWriter); resolve != nil {
-			resolvers[p] = resolve
+		if setup.provider() == p {
+			return setup.prepare(env, logsWriter)
 		}
 	}
-	return resolvers
+	return nil
 }
 
 // applyAgentModelEnv renders the Task's LOGICAL model id into whatever the
@@ -120,7 +132,7 @@ func prepareProvider(env map[string]string, p llm_provider_enums.Provider, logsW
 //
 // Adding Vertex later means setting that property and supplying its discovery;
 // nothing here changes.
-func applyAgentModelEnv(env map[string]string, spawn agentSpawn, resolvers map[llm_provider_enums.Provider]modelResolver, logsWriter io.Writer) {
+func applyAgentModelEnv(env map[string]string, spawn agentSpawn, resolve modelResolver, logsWriter io.Writer) {
 	provider := spawn.provider
 	logical := spawn.model
 	if logical == "" {
@@ -136,13 +148,11 @@ func applyAgentModelEnv(env map[string]string, spawn agentSpawn, resolvers map[l
 	if model, err := llm_provider_enums.GetModel(logical); err == nil {
 		id = model.IDFor(provider)
 		if provider.ResolvesModelIDAtRuntime() {
-			// The provider says a concrete id must be DISCOVERED; the map says
-			// whether we can do that right now. Splitting the two keeps a
-			// credential failure from looking like "this provider does not need
-			// discovery", and means a second such provider adds a map entry
-			// rather than another boolean.
-			resolve, available := resolvers[provider]
-			if !available {
+			// Two different questions, deliberately kept apart: the provider
+			// says whether an id must be DISCOVERED, and a nil resolver says
+			// whether we can discover right now. Collapsing them would make a
+			// credential failure look like "this provider needs no discovery".
+			if resolve == nil {
 				io.WriteString(logsWriter, fmt.Sprintf("%s: cannot resolve %q — credentials unavailable; leaving the model unchanged.\n", provider, logical))
 			} else if resolved := resolve(context.TODO(), model); resolved != "" {
 				id = resolved

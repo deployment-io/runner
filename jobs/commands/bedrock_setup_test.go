@@ -20,8 +20,8 @@ func TestPrepareProvider_BedrockWithoutARoleArnRegistersNothing(t *testing.T) {
 	// A failed setup must register NO resolver. Registering one anyway would
 	// hand the SDK a zero aws.Config, which panics rather than erroring and
 	// takes the whole runner down instead of failing one Step.
-	if got := prepareProvider(env, llm_provider_enums.AWSBedrock, io.Discard); len(got) != 0 {
-		t.Errorf("failed Bedrock setup registered %d resolver(s), want none", len(got))
+	if prepareProvider(env, llm_provider_enums.AWSBedrock, io.Discard) != nil {
+		t.Error("a failed Bedrock setup must produce no resolver")
 	}
 	if _, ok := env["AWS_ACCESS_KEY_ID"]; ok {
 		t.Error("must not inject creds when BedrockRoleArn is unset")

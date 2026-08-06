@@ -18,8 +18,8 @@ import (
 // nothing injected and nothing resolved.
 func TestPrepareProvider_NoOpForAProviderWithNoSetup(t *testing.T) {
 	env := map[string]string{"MODEL": "us.anthropic.claude-sonnet-4-6"}
-	if got := prepareProvider(env, llm_provider_enums.AnthropicDirect, io.Discard); len(got) != 0 {
-		t.Errorf("registered %d resolver(s) for a provider that declares its ids", len(got))
+	if prepareProvider(env, llm_provider_enums.AnthropicDirect, io.Discard) != nil {
+		t.Error("a provider that declares its ids must get no resolver")
 	}
 	if _, ok := env["AWS_ACCESS_KEY_ID"]; ok {
 		t.Error("must not inject another provider's credentials")
@@ -43,10 +43,8 @@ func TestApplyAgentModelEnv_HandPinnedBedrockIDsSurviveUntouched(t *testing.T) {
 	} {
 		env := map[string]string{"MODEL": id}
 		// A resolver that would corrupt the id if it were ever consulted.
-		resolvers := map[llm_provider_enums.Provider]modelResolver{
-			llm_provider_enums.AWSBedrock: func(context.Context, llm_provider_enums.Model) string { return "WRONG" },
-		}
-		applyAgentModelEnv(env, agentSpawn{provider: llm_provider_enums.AWSBedrock, agentType: llm_provider_enums.ClaudeCode, model: id}, resolvers, io.Discard)
+		resolve := modelResolver(func(context.Context, llm_provider_enums.Model) string { return "WRONG" })
+		applyAgentModelEnv(env, agentSpawn{provider: llm_provider_enums.AWSBedrock, agentType: llm_provider_enums.ClaudeCode, model: id}, resolve, io.Discard)
 		if env["ANTHROPIC_MODEL"] != id {
 			t.Errorf("hand-pinned %q became %q", id, env["ANTHROPIC_MODEL"])
 		}
@@ -167,17 +165,15 @@ func TestApplyAgentModelEnv_UsesTheRegisteredResolver(t *testing.T) {
 	// The call site must not name a provider: it looks the resolver up and uses
 	// whatever it returns, which is what lets Vertex slot in as a map entry.
 	called := ""
-	resolvers := map[llm_provider_enums.Provider]modelResolver{
-		llm_provider_enums.AWSBedrock: func(_ context.Context, m llm_provider_enums.Model) string {
-			called = m.String()
-			return "eu.amazon.nova-pro-v1:0"
-		},
-	}
+	resolve := modelResolver(func(_ context.Context, m llm_provider_enums.Model) string {
+		called = m.String()
+		return "eu.amazon.nova-pro-v1:0"
+	})
 	env := map[string]string{
 		"AGENT_TYPE": llm_provider_enums.Opencode.String(),
 		"MODEL":      "nova-pro-v1",
 	}
-	applyAgentModelEnv(env, agentSpawn{provider: llm_provider_enums.AWSBedrock, agentType: llm_provider_enums.Opencode, model: "nova-pro-v1"}, resolvers, io.Discard)
+	applyAgentModelEnv(env, agentSpawn{provider: llm_provider_enums.AWSBedrock, agentType: llm_provider_enums.Opencode, model: "nova-pro-v1"}, resolve, io.Discard)
 
 	if called != "nova-pro-v1" {
 		t.Errorf("resolver received %q, want the logical model", called)

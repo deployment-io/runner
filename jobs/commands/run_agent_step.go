@@ -422,8 +422,8 @@ func buildAgentSpawnEnvVars(parameters map[string]interface{}, logsWriter io.Wri
 
 	// Whatever this provider needs at spawn — credentials, discovery — is its
 	// own business; the call site does not know which provider it is.
-	resolvers := prepareProvider(env, provider, logsWriter)
-	applyAgentModelEnv(env, spawn, resolvers, logsWriter)
+	resolve := prepareProvider(env, provider, logsWriter)
+	applyAgentModelEnv(env, spawn, resolve, logsWriter)
 	// Optionally swap the injected ANTHROPIC_API_KEY for a Claude Code
 	// subscription OAuth token read from this runner's own AWS Secrets Manager.
 	// OrganizationIDNamespace is best-effort here: it only enables the
