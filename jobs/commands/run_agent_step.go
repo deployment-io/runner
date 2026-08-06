@@ -430,20 +430,6 @@ func buildAgentSpawnEnvVars(parameters map[string]interface{}, logsWriter io.Wri
 	return mapToEnvSlice(env), nil
 }
 
-func (bedrockSetup) provider() llm_provider_enums.Provider { return llm_provider_enums.AWSBedrock }
-
-func (bedrockSetup) prepare(env map[string]string, logsWriter io.Writer) modelResolver {
-	cfg, region, ok := applyBedrockCreds(env, logsWriter)
-	if !ok {
-		// No credentials, so no discovery. Returning a resolver anyway would
-		// hand the SDK a zero aws.Config, which PANICS rather than erroring.
-		return nil
-	}
-	return func(ctx context.Context, m llm_provider_enums.Model) string {
-		return resolveBedrockModelID(ctx, cfg, m, region, logsWriter)
-	}
-}
-
 const (
 
 	// claudeOAuthSecretName is the Secrets Manager entry holding the customer's
