@@ -29,50 +29,30 @@ func TestSubscriptionAuth_DisabledByDefault(t *testing.T) {
 	}
 }
 
-// The markers are control-plane signals, not part of the agentbox contract —
-// resolveJobProvider consumes them and nothing downstream ever sees one.
-func TestResolveJobProvider_ConsumesLegacyMarkers(t *testing.T) {
-	env := map[string]string{
-		legacyAuthModeMarker: legacyAuthModeSubscription,
-		legacyBedrockMarker:  "1",
-		"ANTHROPIC_API_KEY":  "sk-ant-api-xyz",
-	}
-	resolveJobProvider(map[string]interface{}{}, env)
-	for _, marker := range []string{legacyAuthModeMarker, legacyBedrockMarker} {
-		if _, ok := env[marker]; ok {
-			t.Errorf("%s leaked into the container env", marker)
-		}
-	}
-	if env["ANTHROPIC_API_KEY"] != "sk-ant-api-xyz" {
-		t.Error("real credentials must survive the strip")
-	}
-}
-
-// The typed parameter wins over the markers. Both are stripped either way, so
-// an opencode Job from a control plane that still sends markers cannot inherit
-// claude-code's Bedrock switch.
-func TestResolveJobProvider_ParameterIsAuthoritative(t *testing.T) {
+// The parameter is the ONLY source. An absent or unknown one yields 0 rather
+// than a guess: inferring from whichever secrets happen to be present is what
+// made a subscription org — which also carries an API key as its documented
+// fallback — look like AnthropicDirect.
+func TestResolveJobProvider_ParameterIsTheOnlySource(t *testing.T) {
 	parameters := map[string]interface{}{}
 	jobs.SetParameterValue[string](parameters, parameters_enums.AgentProvider, llm_provider_enums.AnthropicSubscription.Key())
-	env := map[string]string{legacyBedrockMarker: "1"}
-	if got := resolveJobProvider(parameters, env); got != llm_provider_enums.AnthropicSubscription {
-		t.Errorf("resolveJobProvider = %v, want the parameter to win", got)
-	}
-	if _, ok := env[legacyBedrockMarker]; ok {
-		t.Error("the losing marker must still be consumed, or opencode inherits it")
+	if got := resolveJobProvider(parameters, io.Discard); got != llm_provider_enums.AnthropicSubscription {
+		t.Errorf("resolveJobProvider = %v, want AnthropicSubscription", got)
 	}
 }
 
-// Falling back matters: a runner that upgrades before deployment-server still
-// gets marker-shaped Jobs, and guessing AnthropicDirect there would silently
-// drop a subscription org onto metered API-key billing.
-func TestResolveJobProvider_FallsBackWhenTheParameterIsAbsent(t *testing.T) {
-	env := map[string]string{
-		legacyAuthModeMarker: legacyAuthModeSubscription,
-		"ANTHROPIC_API_KEY":  "sk-ant-fallback",
+func TestResolveJobProvider_NoGuessingWhenAbsentOrUnknown(t *testing.T) {
+	// A bundle full of recognisable credentials must NOT be read as a provider.
+	if got := resolveJobProvider(map[string]interface{}{}, io.Discard); got.IsValid() {
+		t.Errorf("resolveJobProvider = %v, want an invalid provider when the parameter is missing", got)
 	}
-	if got := resolveJobProvider(map[string]interface{}{}, env); got != llm_provider_enums.AnthropicSubscription {
-		t.Errorf("resolveJobProvider = %v, want AnthropicSubscription from the marker", got)
+	// A slug from a newer control plane. 0 leaves the model unrendered and runs
+	// no provider setup, so the agent fails on the credential — better than
+	// silently serving the Job through whatever this build guesses instead.
+	unknown := map[string]interface{}{}
+	jobs.SetParameterValue[string](unknown, parameters_enums.AgentProvider, "some-future-provider")
+	if got := resolveJobProvider(unknown, io.Discard); got.IsValid() {
+		t.Errorf("resolveJobProvider = %v, want an invalid provider for an unknown slug", got)
 	}
 }
 

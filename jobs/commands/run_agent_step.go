@@ -413,11 +413,11 @@ func buildAgentSpawnEnvVars(parameters map[string]interface{}, logsWriter io.Wri
 	// the old ordering matter (model rendering had to run before the
 	// subscription step, because that step consumed the marker the model step
 	// still needed).
-	provider := resolveJobProvider(parameters, env)
+	provider := resolveJobProvider(parameters, logsWriter)
 	agentType, _ := llm_provider_enums.ResolveAgentType(env["AGENT_TYPE"])
-	// claude-code's own Bedrock switch, written for the one agent that reads
-	// it. It arrives from nowhere now — resolveJobProvider consumed any legacy
-	// copy — so opencode and codex cannot inherit a stale one.
+	// claude-code's own Bedrock switch, written for the one agent that reads it.
+	// Nothing puts it in the credential bundle, so opencode and codex cannot
+	// inherit one.
 	llm_provider_enums.ApplyClaudeCodeUseBedrock(env, provider, agentType)
 
 	// Whatever this provider needs at spawn — credentials, discovery — is its
@@ -574,53 +574,27 @@ func bedrockSessionSeconds() int32 {
 	return d
 }
 
-// resolveJobProvider determines which provider serves this Job, and consumes
-// every legacy marker on the way out.
+// resolveJobProvider returns the provider serving this Job, or 0 when the
+// parameter is missing or names a provider this build does not know.
 //
-// The AgentProvider parameter is authoritative: deployment-server decided this
-// when it resolved credentials, and it arrives typed and named rather than
-// inferred from which secrets happen to be present.
-//
-// The markers are stripped UNCONDITIONALLY, whichever path won. They are our
-// signals, not any CLI's, so nothing downstream should see them — and
-// ApplyClaudeCodeUseBedrock writes CLAUDE_CODE_USE_BEDROCK back for the one
-// agent that does read it. Without the strip, an opencode Job picked up from a
-// control plane that still sends markers would carry a claude-code switch into
-// its container.
-func resolveJobProvider(parameters map[string]interface{}, env map[string]string) llm_provider_enums.Provider {
-	provider := providerFromEnv(env)
-	if slug, err := jobs.GetParameterValue[string](parameters, parameters_enums.AgentProvider); err == nil && slug != "" {
-		if p, parseErr := llm_provider_enums.ProviderFromKey(slug); parseErr == nil {
-			provider = p
-		}
+// deployment-server decided this when it resolved credentials, so the
+// parameter is the only source — the provider is never inferred from which
+// secrets happen to be present. An unknown slug means this runner is older
+// than the control plane; 0 is invalid, so the model is left unrendered and no
+// provider setup runs, and the agent fails on the credential rather than on a
+// guess.
+func resolveJobProvider(parameters map[string]interface{}, logsWriter io.Writer) llm_provider_enums.Provider {
+	slug, err := jobs.GetParameterValue[string](parameters, parameters_enums.AgentProvider)
+	if err != nil || slug == "" {
+		io.WriteString(logsWriter, "No agent provider on this Job — deployment-server should have set it at pickup.\n")
+		return 0
 	}
-	delete(env, legacyBedrockMarker)
-	delete(env, legacyAuthModeMarker)
+	provider, err := llm_provider_enums.ProviderFromKey(slug)
+	if err != nil {
+		io.WriteString(logsWriter, fmt.Sprintf("Unknown agent provider %q — this runner may be older than the control plane.\n", slug))
+		return 0
+	}
 	return provider
-}
-
-// providerFromEnv infers the provider from the credential bundle.
-//
-// TRANSITIONAL — delete once every deployment-server sends AgentProvider.
-// It exists only because the two sides deploy independently: a runner that
-// upgrades first still gets marker-shaped Jobs, and guessing wrong here means
-// a subscription org silently falls back to metered API-key billing.
-//
-// Order matters: a subscription org may ALSO carry an API key as its
-// documented fallback, so the subscription marker must be checked before
-// ANTHROPIC_API_KEY or such orgs would look like AnthropicDirect.
-func providerFromEnv(env map[string]string) llm_provider_enums.Provider {
-	switch {
-	case env[legacyBedrockMarker] == llm_provider_enums.ClaudeCodeUseBedrockValue:
-		return llm_provider_enums.AWSBedrock
-	case env[legacyAuthModeMarker] == legacyAuthModeSubscription:
-		return llm_provider_enums.AnthropicSubscription
-	case env["ANTHROPIC_API_KEY"] != "":
-		return llm_provider_enums.AnthropicDirect
-	case env["OPENAI_API_KEY"] != "":
-		return llm_provider_enums.OpenAIDirect
-	}
-	return 0
 }
 
 // modelResolver returns the concrete provider-side id for a model, or "" when
@@ -826,17 +800,6 @@ func applyBedrockCreds(env map[string]string, logsWriter io.Writer) (aws.Config,
 	io.WriteString(logsWriter, fmt.Sprintf("Bedrock: assumed %s; agent will use Bedrock in %s.\n", roleArn, region))
 	return cfg, region, true
 }
-
-// Legacy provider markers, read only by providerFromEnv.
-//
-// TRANSITIONAL — delete with providerFromEnv once every deployment-server
-// sends the AgentProvider parameter. The provider is typed now; these are what
-// it used to look like on the wire.
-const (
-	legacyBedrockMarker        = llm_provider_enums.EnvClaudeCodeUseBedrock
-	legacyAuthModeMarker       = "CLAUDE_AUTH_MODE"
-	legacyAuthModeSubscription = "subscription"
-)
 
 const (
 

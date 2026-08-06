@@ -146,32 +146,6 @@ func TestBedrockSessionSeconds_ClampedToOneHourNotTheTaskCap(t *testing.T) {
 // which are the ones that previously had no rendering step, so an opencode task
 // on Anthropic would have received a bare id with no provider prefix.
 
-func TestProviderFromEnv_ReadsTheInjectedCredentials(t *testing.T) {
-	cases := []struct {
-		name string
-		env  map[string]string
-		want llm_provider_enums.Provider
-	}{
-		{"bedrock marker", map[string]string{legacyBedrockMarker: "1"}, llm_provider_enums.AWSBedrock},
-		{"anthropic key", map[string]string{"ANTHROPIC_API_KEY": "sk-ant-x"}, llm_provider_enums.AnthropicDirect},
-		{"openai key", map[string]string{"OPENAI_API_KEY": "sk-x"}, llm_provider_enums.OpenAIDirect},
-		{"subscription", map[string]string{legacyAuthModeMarker: legacyAuthModeSubscription}, llm_provider_enums.AnthropicSubscription},
-		// A subscription org may ALSO carry an API key as its documented
-		// fallback, so the marker has to win or such orgs look like
-		// AnthropicDirect and get the wrong model id.
-		{"subscription with fallback key", map[string]string{
-			legacyAuthModeMarker: legacyAuthModeSubscription,
-			"ANTHROPIC_API_KEY":  "sk-ant-fallback",
-		}, llm_provider_enums.AnthropicSubscription},
-		{"nothing recognisable", map[string]string{}, 0},
-	}
-	for _, c := range cases {
-		if got := providerFromEnv(c.env); got != c.want {
-			t.Errorf("%s: providerFromEnv = %v, want %v", c.name, got, c.want)
-		}
-	}
-}
-
 func TestApplyAgentModelEnv_OpencodeGetsAProviderPrefixWithoutBedrock(t *testing.T) {
 	// The gap this function closes: before it, only the Bedrock path rendered a
 	// model, so opencode on Anthropic received a bare "claude-sonnet-4-6" and
