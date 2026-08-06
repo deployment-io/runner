@@ -148,19 +148,16 @@ func applyAgentModelEnv(env map[string]string, spawn agentSpawn, resolvers map[l
 	}
 
 	if spawn.agentType == llm_provider_enums.Opencode {
-		if rendered := llm_provider_enums.OpencodeModelID(id, provider); rendered != "" {
-			env["MODEL"] = rendered
+		rendered := llm_provider_enums.OpencodeModelID(id, provider)
+		if rendered == "" {
+			return // unroutable; leave what the Task asked for so the error names it
 		}
-		return
+		id = rendered
 	}
-	// claude-code in Bedrock mode takes the model from ANTHROPIC_MODEL rather
-	// than --model. The condition MIRRORS ApplyClaudeCodeUseBedrock: whichever
-	// agents get that switch must be exactly the ones told where to read the
-	// model, or an agent runs in Bedrock mode looking at the wrong variable.
-	// Testing the provider alone would have set ANTHROPIC_MODEL for codex too.
-	if provider == llm_provider_enums.AWSBedrock && spawn.agentType == llm_provider_enums.ClaudeCode {
-		env["ANTHROPIC_MODEL"] = id
-		return
-	}
-	env["MODEL"] = id
+	// WHICH variable carries the model is the catalogue's call, not ours: it is
+	// the same fact as claude-code's Bedrock switch, and the two must agree —
+	// an agent in Bedrock mode reading the wrong variable is broken either way.
+	// This file wrote that rule out itself and got it wrong, keying on the
+	// provider alone so codex on Bedrock was pointed at claude-code's variable.
+	env[llm_provider_enums.ModelEnvVar(provider, spawn.agentType)] = id
 }
