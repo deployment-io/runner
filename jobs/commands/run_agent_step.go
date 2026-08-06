@@ -17,6 +17,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/bedrock"
+	bedrocktypes "github.com/aws/aws-sdk-go-v2/service/bedrock/types"
 	"github.com/aws/aws-sdk-go-v2/service/cloudfront"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
@@ -511,19 +512,36 @@ func resolveBedrockModelID(ctx context.Context, cfg aws.Config, model llm_provid
 		io.WriteString(logsWriter, fmt.Sprintf("Bedrock: %s has no Bedrock profile prefix; leaving the model unchanged.\n", model))
 		return ""
 	}
-	out, err := bedrock.NewFromConfig(cfg).ListInferenceProfiles(ctx, &bedrock.ListInferenceProfilesInput{
+	// There is no prefix query: ListInferenceProfiles filters only by TYPE, and
+	// GetInferenceProfile wants the exact id — which is the thing being
+	// discovered. So the match is client-side, over every page.
+	//
+	// SYSTEM_DEFINED is a correctness filter, not just a smaller response.
+	// APPLICATION profiles are ones the CUSTOMER created; one of those could
+	// Contains-match our prefix and win the sort below, silently routing the
+	// task through a user-defined profile with its own regions and cost
+	// behaviour. We want Amazon's cross-region profiles only.
+	paginator := bedrock.NewListInferenceProfilesPaginator(bedrock.NewFromConfig(cfg), &bedrock.ListInferenceProfilesInput{
 		MaxResults: aws.Int32(100),
+		TypeEquals: bedrocktypes.InferenceProfileTypeSystemDefined,
 	})
-	if err != nil {
-		io.WriteString(logsWriter, fmt.Sprintf("Bedrock: could not list inference profiles (%s); leaving %s unchanged.\n", err, model))
-		return ""
-	}
 	prefix := bedrockRegionPrefix(region)
 	var matches []string
-	for _, p := range out.InferenceProfileSummaries {
-		id := aws.ToString(p.InferenceProfileId)
-		if strings.HasPrefix(id, prefix) && strings.Contains(id, profilePrefix) {
-			matches = append(matches, id)
+	// PAGINATED deliberately. A single 100-result page silently truncates: an
+	// account whose profile list is longer would look like "no profile for this
+	// model", and the task would then run against an id Bedrock does not know.
+	// A miss must mean absent, not unread.
+	for paginator.HasMorePages() {
+		out, err := paginator.NextPage(ctx)
+		if err != nil {
+			io.WriteString(logsWriter, fmt.Sprintf("Bedrock: could not list inference profiles (%s); leaving %s unchanged.\n", err, model))
+			return ""
+		}
+		for _, p := range out.InferenceProfileSummaries {
+			id := aws.ToString(p.InferenceProfileId)
+			if strings.HasPrefix(id, prefix) && strings.Contains(id, profilePrefix) {
+				matches = append(matches, id)
+			}
 		}
 	}
 	if len(matches) == 0 {
