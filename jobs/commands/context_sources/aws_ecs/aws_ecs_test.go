@@ -32,7 +32,7 @@ func TestRecoverRepo(t *testing.T) {
 
 func TestNameFromArn(t *testing.T) {
 	cases := map[string]string{
-		"arn:aws:ecs:us-east-1:123456789:cluster/prod":         "prod",
+		"arn:aws:ecs:us-east-1:123456789:cluster/prod":          "prod",
 		"arn:aws:ecs:us-east-1:123456789:task-definition/web:7": "web:7", // last segment after the final slash
 		"prod": "prod",
 	}

@@ -15,7 +15,7 @@ import (
 
 func TestApplyBedrockCredsIfNeeded_NoOpWhenNotBedrock(t *testing.T) {
 	env := map[string]string{"MODEL": "us.anthropic.claude-sonnet-4-6"}
-	applyBedrockCredsIfNeeded(env, io.Discard)
+	applyBedrockCredsIfNeeded(env, llm_provider_enums.AnthropicDirect, io.Discard)
 	if _, ok := env["AWS_ACCESS_KEY_ID"]; ok {
 		t.Error("must not inject creds when CLAUDE_CODE_USE_BEDROCK is absent")
 	}
@@ -26,8 +26,8 @@ func TestApplyBedrockCredsIfNeeded_NoOpWhenNotBedrock(t *testing.T) {
 
 func TestApplyBedrockCredsIfNeeded_NoOpWhenRoleArnMissing(t *testing.T) {
 	t.Setenv("BedrockRoleArn", "") // stack predates Bedrock support
-	env := map[string]string{"CLAUDE_CODE_USE_BEDROCK": "1"}
-	applyBedrockCredsIfNeeded(env, io.Discard)
+	env := map[string]string{}
+	applyBedrockCredsIfNeeded(env, llm_provider_enums.AWSBedrock, io.Discard)
 	if _, ok := env["AWS_ACCESS_KEY_ID"]; ok {
 		t.Error("must not inject creds when BedrockRoleArn is unset")
 	}
@@ -132,15 +132,15 @@ func TestProviderFromEnv_ReadsTheInjectedCredentials(t *testing.T) {
 		env  map[string]string
 		want llm_provider_enums.Provider
 	}{
-		{"bedrock marker", map[string]string{"CLAUDE_CODE_USE_BEDROCK": "1"}, llm_provider_enums.AWSBedrock},
+		{"bedrock marker", map[string]string{legacyBedrockMarker: "1"}, llm_provider_enums.AWSBedrock},
 		{"anthropic key", map[string]string{"ANTHROPIC_API_KEY": "sk-ant-x"}, llm_provider_enums.AnthropicDirect},
 		{"openai key", map[string]string{"OPENAI_API_KEY": "sk-x"}, llm_provider_enums.OpenAIDirect},
-		{"subscription", map[string]string{claudeAuthModeEnvVar: claudeAuthModeSubscription}, llm_provider_enums.AnthropicSubscription},
+		{"subscription", map[string]string{legacyAuthModeMarker: legacyAuthModeSubscription}, llm_provider_enums.AnthropicSubscription},
 		// A subscription org may ALSO carry an API key as its documented
 		// fallback, so the marker has to win or such orgs look like
 		// AnthropicDirect and get the wrong model id.
 		{"subscription with fallback key", map[string]string{
-			claudeAuthModeEnvVar: claudeAuthModeSubscription,
+			legacyAuthModeMarker: legacyAuthModeSubscription,
 			"ANTHROPIC_API_KEY":  "sk-ant-fallback",
 		}, llm_provider_enums.AnthropicSubscription},
 		{"nothing recognisable", map[string]string{}, 0},
@@ -161,7 +161,7 @@ func TestApplyAgentModelEnv_OpencodeGetsAProviderPrefixWithoutBedrock(t *testing
 		"MODEL":             "claude-sonnet-4-6",
 		"ANTHROPIC_API_KEY": "sk-ant-x",
 	}
-	applyAgentModelEnv(env, nil, io.Discard)
+	applyAgentModelEnv(env, llm_provider_enums.AnthropicDirect, nil, io.Discard)
 	if want := "anthropic/claude-sonnet-4-6"; env["MODEL"] != want {
 		t.Errorf("MODEL = %q, want %q", env["MODEL"], want)
 	}
@@ -176,7 +176,7 @@ func TestApplyAgentModelEnv_OpencodeOnOpenAI(t *testing.T) {
 		"MODEL":          "gpt-5.5",
 		"OPENAI_API_KEY": "sk-x",
 	}
-	applyAgentModelEnv(env, nil, io.Discard)
+	applyAgentModelEnv(env, llm_provider_enums.OpenAIDirect, nil, io.Discard)
 	if want := "openai/gpt-5.5"; env["MODEL"] != want {
 		t.Errorf("MODEL = %q, want %q", env["MODEL"], want)
 	}
@@ -189,7 +189,7 @@ func TestApplyAgentModelEnv_ClaudeCodeKeepsTheLogicalIDOffBedrock(t *testing.T) 
 		"MODEL":             "claude-opus-4-8",
 		"ANTHROPIC_API_KEY": "sk-ant-x",
 	}
-	applyAgentModelEnv(env, nil, io.Discard)
+	applyAgentModelEnv(env, llm_provider_enums.AnthropicDirect, nil, io.Discard)
 	if env["MODEL"] != "claude-opus-4-8" {
 		t.Errorf("MODEL = %q, want the logical id unchanged", env["MODEL"])
 	}
@@ -201,7 +201,7 @@ func TestApplyAgentModelEnv_ClaudeCodeKeepsTheLogicalIDOffBedrock(t *testing.T) 
 func TestApplyAgentModelEnv_NoCredentialLeavesTheModelAlone(t *testing.T) {
 	// Better to fail on the missing credential than on a mangled model id.
 	env := map[string]string{"AGENT_TYPE": llm_provider_enums.Opencode.String(), "MODEL": "claude-opus-4-8"}
-	applyAgentModelEnv(env, nil, io.Discard)
+	applyAgentModelEnv(env, 0, nil, io.Discard)
 	if env["MODEL"] != "claude-opus-4-8" {
 		t.Errorf("MODEL = %q, want it untouched when no provider can be inferred", env["MODEL"])
 	}
@@ -209,24 +209,22 @@ func TestApplyAgentModelEnv_NoCredentialLeavesTheModelAlone(t *testing.T) {
 
 func TestApplyAgentModelEnv_UnknownModelPassesThrough(t *testing.T) {
 	env := map[string]string{"MODEL": "some-future-model", "ANTHROPIC_API_KEY": "sk-ant-x"}
-	applyAgentModelEnv(env, nil, io.Discard)
+	applyAgentModelEnv(env, llm_provider_enums.AnthropicDirect, nil, io.Discard)
 	if env["MODEL"] != "some-future-model" {
 		t.Errorf("MODEL = %q, want an unknown id passed through unchanged", env["MODEL"])
 	}
 }
 
 func TestApplyAgentModelEnv_NoResolverAvailableDoesNotPanic(t *testing.T) {
-	// applyBedrockCredsIfNeeded leaves the marker in env even when it fails, so
-	// providerFromEnv still reports AWSBedrock. With no resolver registered the
-	// discovery step must be skipped entirely — an earlier revision called into
-	// the SDK with a zero aws.Config, which PANICS rather than erroring and
-	// took the whole runner down instead of failing one Step.
+	// The org is on Bedrock but applyBedrockCredsIfNeeded failed, so no resolver
+	// was registered. The discovery step must be skipped entirely — an earlier
+	// revision called into the SDK with a zero aws.Config, which PANICS rather
+	// than erroring and took the whole runner down instead of failing one Step.
 	env := map[string]string{
-		"CLAUDE_CODE_USE_BEDROCK": "1",
-		"MODEL":                   "nova-pro-v1",
-		"AGENT_TYPE":              llm_provider_enums.Opencode.String(),
+		"MODEL":      "nova-pro-v1",
+		"AGENT_TYPE": llm_provider_enums.Opencode.String(),
 	}
-	applyAgentModelEnv(env, nil, io.Discard)
+	applyAgentModelEnv(env, llm_provider_enums.AWSBedrock, nil, io.Discard)
 	// Degrades to the logical id, still provider-prefixed so opencode reports a
 	// credential problem rather than an unroutable model.
 	if want := "amazon-bedrock/nova-pro-v1"; env["MODEL"] != want {
@@ -268,11 +266,10 @@ func TestApplyAgentModelEnv_UsesTheRegisteredResolver(t *testing.T) {
 		},
 	}
 	env := map[string]string{
-		"CLAUDE_CODE_USE_BEDROCK": "1",
-		"AGENT_TYPE":              llm_provider_enums.Opencode.String(),
-		"MODEL":                   "nova-pro-v1",
+		"AGENT_TYPE": llm_provider_enums.Opencode.String(),
+		"MODEL":      "nova-pro-v1",
 	}
-	applyAgentModelEnv(env, resolvers, io.Discard)
+	applyAgentModelEnv(env, llm_provider_enums.AWSBedrock, resolvers, io.Discard)
 
 	if called != "nova-pro-v1" {
 		t.Errorf("resolver received %q, want the logical model", called)

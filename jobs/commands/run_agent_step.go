@@ -407,20 +407,28 @@ func buildAgentSpawnEnvVars(parameters map[string]interface{}, logsWriter io.Wri
 	if allowed != "" {
 		env["ADDITIONAL_ALLOWED_HOSTS"] = allowed
 	}
-	// Bedrock: when the org is in Bedrock mode (CLAUDE_CODE_USE_BEDROCK marker in
-	// AgentEnvVars), assume dr-bedrock-role and inject its scoped short-lived creds.
-	bedrockCfg, bedrockRegion, bedrockOK := applyBedrockCredsIfNeeded(env, logsWriter)
-	// Render the model for the selected agent BEFORE the subscription step,
-	// which consumes the marker providerFromEnv reads.
-	applyAgentModelEnv(env, buildModelResolvers(bedrockCfg, bedrockRegion, bedrockOK, logsWriter), logsWriter)
+	// Resolved ONCE, up front. Every step below is told which provider serves
+	// this Job instead of re-reading the env for a signal — which is what let
+	// the old ordering matter (model rendering had to run before the
+	// subscription step, because that step consumed the marker the model step
+	// still needed).
+	provider := resolveJobProvider(parameters, env)
+	agentType, _ := llm_provider_enums.ResolveAgentType(env["AGENT_TYPE"])
+	// claude-code's own Bedrock switch, written for the one agent that reads
+	// it. It arrives from nowhere now — resolveJobProvider consumed any legacy
+	// copy — so opencode and codex cannot inherit a stale one.
+	llm_provider_enums.ApplyClaudeCodeUseBedrock(env, provider, agentType)
+
+	// Bedrock: assume dr-bedrock-role and inject its scoped short-lived creds.
+	bedrockCfg, bedrockRegion, bedrockOK := applyBedrockCredsIfNeeded(env, provider, logsWriter)
+	applyAgentModelEnv(env, provider, buildModelResolvers(bedrockCfg, bedrockRegion, bedrockOK, logsWriter), logsWriter)
 	// Optionally swap the injected ANTHROPIC_API_KEY for a Claude Code
 	// subscription OAuth token read from this runner's own AWS Secrets Manager.
-	// Engages only when the org is in subscription mode (marker in AgentEnvVars).
 	// OrganizationIDNamespace is best-effort here: it only enables the
 	// self-grant retry below, and an unreadable secret still degrades to the
 	// API key without it.
 	organizationID, _ := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIDNamespace)
-	maybeApplyClaudeSubscriptionAuth(env, organizationID, logsWriter)
+	maybeApplyClaudeSubscriptionAuth(env, provider, organizationID, logsWriter)
 	return mapToEnvSlice(env), nil
 }
 
@@ -547,22 +555,46 @@ func bedrockSessionSeconds() int32 {
 	return d
 }
 
-// providerFromEnv infers which provider will serve this Job from the
-// credentials deployment-server injected.
+// resolveJobProvider determines which provider serves this Job, and consumes
+// every legacy marker on the way out.
 //
-// The credentials ARE the signal — deployment-server already decided which
-// provider serves the model when it resolved them, and re-stating that in a
-// separate env var would create two sources that can disagree, with no rule
-// for which wins.
+// The AgentProvider parameter is authoritative: deployment-server decided this
+// when it resolved credentials, and it arrives typed and named rather than
+// inferred from which secrets happen to be present.
+//
+// The markers are stripped UNCONDITIONALLY, whichever path won. They are our
+// signals, not any CLI's, so nothing downstream should see them — and
+// ApplyClaudeCodeUseBedrock writes CLAUDE_CODE_USE_BEDROCK back for the one
+// agent that does read it. Without the strip, an opencode Job picked up from a
+// control plane that still sends markers would carry a claude-code switch into
+// its container.
+func resolveJobProvider(parameters map[string]interface{}, env map[string]string) llm_provider_enums.Provider {
+	provider := providerFromEnv(env)
+	if slug, err := jobs.GetParameterValue[string](parameters, parameters_enums.AgentProvider); err == nil && slug != "" {
+		if p, parseErr := llm_provider_enums.ProviderFromKey(slug); parseErr == nil {
+			provider = p
+		}
+	}
+	delete(env, legacyBedrockMarker)
+	delete(env, legacyAuthModeMarker)
+	return provider
+}
+
+// providerFromEnv infers the provider from the credential bundle.
+//
+// TRANSITIONAL — delete once every deployment-server sends AgentProvider.
+// It exists only because the two sides deploy independently: a runner that
+// upgrades first still gets marker-shaped Jobs, and guessing wrong here means
+// a subscription org silently falls back to metered API-key billing.
 //
 // Order matters: a subscription org may ALSO carry an API key as its
 // documented fallback, so the subscription marker must be checked before
 // ANTHROPIC_API_KEY or such orgs would look like AnthropicDirect.
 func providerFromEnv(env map[string]string) llm_provider_enums.Provider {
 	switch {
-	case env["CLAUDE_CODE_USE_BEDROCK"] == "1":
+	case env[legacyBedrockMarker] == llm_provider_enums.ClaudeCodeUseBedrockValue:
 		return llm_provider_enums.AWSBedrock
-	case env[claudeAuthModeEnvVar] == claudeAuthModeSubscription:
+	case env[legacyAuthModeMarker] == legacyAuthModeSubscription:
 		return llm_provider_enums.AnthropicSubscription
 	case env["ANTHROPIC_API_KEY"] != "":
 		return llm_provider_enums.AnthropicDirect
@@ -613,15 +645,11 @@ func buildModelResolvers(bedrockCfg aws.Config, bedrockRegion string, bedrockOK 
 //
 // Adding Vertex later means setting that property and supplying its discovery;
 // nothing here changes.
-//
-// Must run BEFORE maybeApplyClaudeSubscriptionAuth, which consumes the
-// subscription marker that providerFromEnv reads.
-func applyAgentModelEnv(env map[string]string, resolvers map[llm_provider_enums.Provider]modelResolver, logsWriter io.Writer) {
+func applyAgentModelEnv(env map[string]string, provider llm_provider_enums.Provider, resolvers map[llm_provider_enums.Provider]modelResolver, logsWriter io.Writer) {
 	logical := env["MODEL"]
 	if logical == "" {
 		return
 	}
-	provider := providerFromEnv(env)
 	if !provider.IsValid() {
 		// No recognisable credential. Leave the model untouched so the agent
 		// fails on the missing credential rather than on a mangled id.
@@ -652,31 +680,25 @@ func applyAgentModelEnv(env map[string]string, resolvers map[llm_provider_enums.
 		if rendered := llm_provider_enums.OpencodeModelID(id, provider); rendered != "" {
 			env["MODEL"] = rendered
 		}
-		// Consumed here: opencode cannot use it, and leaking a claude-code
-		// switch into its container would be inert but misleading.
-		delete(env, "CLAUDE_CODE_USE_BEDROCK")
 		return
 	}
 	// claude-code in Bedrock mode takes the model from ANTHROPIC_MODEL rather
-	// than --model. Keyed off the marker, which is what actually puts the CLI
-	// in that mode — not off the provider.
-	if env["CLAUDE_CODE_USE_BEDROCK"] == "1" {
+	// than --model.
+	if provider == llm_provider_enums.AWSBedrock {
 		env["ANTHROPIC_MODEL"] = id
 		return
 	}
 	env["MODEL"] = id
 }
 
-// applyBedrockCredsIfNeeded switches a claude-code task to AWS Bedrock. When
-// deployment-server has injected the CLAUDE_CODE_USE_BEDROCK=1 marker (from the
-// org's Bedrock provider — see kit's ClaudeAuth.ResolveAgentEnvVars), the runner
-// assumes the minimal dr-bedrock-role and injects the short-lived, Bedrock-only
+// applyBedrockCredsIfNeeded switches a task to AWS Bedrock. When the org's
+// provider is AWSBedrock, the runner assumes the minimal dr-bedrock-role and injects the short-lived, Bedrock-only
 // credentials into the agent container. No long-lived secret is stored, and the
 // agent receives creds that can invoke Bedrock and nothing else. The Bedrock API
 // host is added to the egress allowlist. On any failure the task proceeds without
 // creds (and fails auth in the container) rather than crashing the runner.
-func applyBedrockCredsIfNeeded(env map[string]string, logsWriter io.Writer) (aws.Config, string, bool) {
-	if env["CLAUDE_CODE_USE_BEDROCK"] != "1" {
+func applyBedrockCredsIfNeeded(env map[string]string, provider llm_provider_enums.Provider, logsWriter io.Writer) (aws.Config, string, bool) {
+	if provider != llm_provider_enums.AWSBedrock {
 		return aws.Config{}, "", false
 	}
 	roleArn := strings.TrimSpace(os.Getenv(bedrockRoleArnEnvVar))
@@ -748,18 +770,18 @@ func applyBedrockCredsIfNeeded(env map[string]string, logsWriter io.Writer) (aws
 	return cfg, region, true
 }
 
-// Subscription-mode contract with the control plane.
+// Legacy provider markers, read only by providerFromEnv.
 //
-// CROSS-REPO CONTRACT: deployment-server injects these exact strings into
-// AgentEnvVars when the org's ClaudeAuth.Provider is Subscription — see
-// kit's organization_models.ClaudeAuthModeEnvVar / ...Subscription. This repo
-// does not import kit, so the literals are duplicated; change them in both or
-// subscription auth silently stops engaging and every task quietly falls back
-// to the API key. The marker is non-secret; the token never leaves the
-// customer's cloud.
+// TRANSITIONAL — delete with providerFromEnv once every deployment-server
+// sends the AgentProvider parameter. The provider is typed now; these are what
+// it used to look like on the wire.
 const (
-	claudeAuthModeEnvVar       = "CLAUDE_AUTH_MODE"
-	claudeAuthModeSubscription = "subscription"
+	legacyBedrockMarker        = llm_provider_enums.EnvClaudeCodeUseBedrock
+	legacyAuthModeMarker       = "CLAUDE_AUTH_MODE"
+	legacyAuthModeSubscription = "subscription"
+)
+
+const (
 
 	// claudeOAuthSecretName is the Secrets Manager entry holding the customer's
 	// Claude Code subscription OAuth token, in their own account.
@@ -795,11 +817,8 @@ const (
 //     injected API key rather than hard-failing the task. An org configured
 //     strict subscription-only has no key to fall back to, so agentbox fails
 //     fast instead of quietly reverting to metered billing.
-func maybeApplyClaudeSubscriptionAuth(env map[string]string, organizationID string, logsWriter io.Writer) {
-	mode := strings.TrimSpace(env[claudeAuthModeEnvVar])
-	// Consumed here — keep the marker out of the agent container's env.
-	delete(env, claudeAuthModeEnvVar)
-	if mode != claudeAuthModeSubscription {
+func maybeApplyClaudeSubscriptionAuth(env map[string]string, provider llm_provider_enums.Provider, organizationID string, logsWriter io.Writer) {
+	if provider.AuthMode() != llm_provider_enums.AuthSubscription {
 		return // org is not in subscription mode (the default)
 	}
 	// AGENT_TYPE unset defaults to claude-code in agentbox, so "" is allowed.

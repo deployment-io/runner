@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/aws/smithy-go"
+	"github.com/deployment-io/deployment-runner-kit/enums/llm_provider_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 )
@@ -19,7 +20,7 @@ import (
 // the injected API key must survive untouched.
 func TestSubscriptionAuth_DisabledByDefault(t *testing.T) {
 	env := map[string]string{"ANTHROPIC_API_KEY": "sk-ant-api-xyz", "AGENT_TYPE": "claude-code"}
-	maybeApplyClaudeSubscriptionAuth(env, "", io.Discard)
+	maybeApplyClaudeSubscriptionAuth(env, llm_provider_enums.AnthropicDirect, "", io.Discard)
 	if env["ANTHROPIC_API_KEY"] != "sk-ant-api-xyz" {
 		t.Errorf("API key was modified while subscription auth disabled: %q", env["ANTHROPIC_API_KEY"])
 	}
@@ -28,17 +29,50 @@ func TestSubscriptionAuth_DisabledByDefault(t *testing.T) {
 	}
 }
 
-// The marker is a control-plane signal, not part of the agentbox contract — it
-// must be consumed here and never reach the container env.
-func TestSubscriptionAuth_MarkerNotLeakedToContainer(t *testing.T) {
+// The markers are control-plane signals, not part of the agentbox contract —
+// resolveJobProvider consumes them and nothing downstream ever sees one.
+func TestResolveJobProvider_ConsumesLegacyMarkers(t *testing.T) {
 	env := map[string]string{
-		claudeAuthModeEnvVar: claudeAuthModeSubscription,
+		legacyAuthModeMarker: legacyAuthModeSubscription,
+		legacyBedrockMarker:  "1",
 		"ANTHROPIC_API_KEY":  "sk-ant-api-xyz",
-		"AGENT_TYPE":         "codex", // returns before any AWS call
 	}
-	maybeApplyClaudeSubscriptionAuth(env, "", io.Discard)
-	if _, ok := env[claudeAuthModeEnvVar]; ok {
-		t.Errorf("%s leaked into the container env", claudeAuthModeEnvVar)
+	resolveJobProvider(map[string]interface{}{}, env)
+	for _, marker := range []string{legacyAuthModeMarker, legacyBedrockMarker} {
+		if _, ok := env[marker]; ok {
+			t.Errorf("%s leaked into the container env", marker)
+		}
+	}
+	if env["ANTHROPIC_API_KEY"] != "sk-ant-api-xyz" {
+		t.Error("real credentials must survive the strip")
+	}
+}
+
+// The typed parameter wins over the markers. Both are stripped either way, so
+// an opencode Job from a control plane that still sends markers cannot inherit
+// claude-code's Bedrock switch.
+func TestResolveJobProvider_ParameterIsAuthoritative(t *testing.T) {
+	parameters := map[string]interface{}{}
+	jobs.SetParameterValue[string](parameters, parameters_enums.AgentProvider, llm_provider_enums.AnthropicSubscription.Key())
+	env := map[string]string{legacyBedrockMarker: "1"}
+	if got := resolveJobProvider(parameters, env); got != llm_provider_enums.AnthropicSubscription {
+		t.Errorf("resolveJobProvider = %v, want the parameter to win", got)
+	}
+	if _, ok := env[legacyBedrockMarker]; ok {
+		t.Error("the losing marker must still be consumed, or opencode inherits it")
+	}
+}
+
+// Falling back matters: a runner that upgrades before deployment-server still
+// gets marker-shaped Jobs, and guessing AnthropicDirect there would silently
+// drop a subscription org onto metered API-key billing.
+func TestResolveJobProvider_FallsBackWhenTheParameterIsAbsent(t *testing.T) {
+	env := map[string]string{
+		legacyAuthModeMarker: legacyAuthModeSubscription,
+		"ANTHROPIC_API_KEY":  "sk-ant-fallback",
+	}
+	if got := resolveJobProvider(map[string]interface{}{}, env); got != llm_provider_enums.AnthropicSubscription {
+		t.Errorf("resolveJobProvider = %v, want AnthropicSubscription from the marker", got)
 	}
 }
 
@@ -47,11 +81,10 @@ func TestSubscriptionAuth_MarkerNotLeakedToContainer(t *testing.T) {
 // Manager lookup, so this test makes no AWS calls.
 func TestSubscriptionAuth_ClaudeCodeOnly(t *testing.T) {
 	env := map[string]string{
-		claudeAuthModeEnvVar: claudeAuthModeSubscription,
-		"OPENAI_API_KEY":     "sk-openai",
-		"AGENT_TYPE":         "codex",
+		"OPENAI_API_KEY": "sk-openai",
+		"AGENT_TYPE":     "codex",
 	}
-	maybeApplyClaudeSubscriptionAuth(env, "", io.Discard)
+	maybeApplyClaudeSubscriptionAuth(env, llm_provider_enums.AnthropicSubscription, "", io.Discard)
 	if env["OPENAI_API_KEY"] != "sk-openai" {
 		t.Errorf("codex key was modified: %q", env["OPENAI_API_KEY"])
 	}
