@@ -419,9 +419,10 @@ func buildAgentSpawnEnvVars(parameters map[string]interface{}, logsWriter io.Wri
 	// copy — so opencode and codex cannot inherit a stale one.
 	llm_provider_enums.ApplyClaudeCodeUseBedrock(env, provider, agentType)
 
-	// Bedrock: assume dr-bedrock-role and inject its scoped short-lived creds.
-	bedrockCfg, bedrockRegion, bedrockOK := applyBedrockCredsIfNeeded(env, provider, logsWriter)
-	applyAgentModelEnv(env, provider, buildModelResolvers(bedrockCfg, bedrockRegion, bedrockOK, logsWriter), logsWriter)
+	// Whatever this provider needs at spawn — credentials, discovery — is its
+	// own business; the call site does not know which provider it is.
+	resolvers := prepareProvider(env, provider, logsWriter)
+	applyAgentModelEnv(env, provider, resolvers, logsWriter)
 	// Optionally swap the injected ANTHROPIC_API_KEY for a Claude Code
 	// subscription OAuth token read from this runner's own AWS Secrets Manager.
 	// OrganizationIDNamespace is best-effort here: it only enables the
@@ -612,21 +613,61 @@ func providerFromEnv(env map[string]string) llm_provider_enums.Provider {
 // would use whatever it needs — instead of the caller branching to pick one.
 type modelResolver func(ctx context.Context, m llm_provider_enums.Model) string
 
-// buildModelResolvers returns a resolver for each provider that can ACTUALLY
-// discover ids right now.
+// providerSetup prepares one provider for an agent spawn.
 //
-// Absence is the signal: a provider whose credentials never landed simply has
-// no entry, so availability needs no boolean threaded through the call chain.
-// A second runtime-resolved provider is one more entry here and no change
-// anywhere else.
-func buildModelResolvers(bedrockCfg aws.Config, bedrockRegion string, bedrockOK bool, logsWriter io.Writer) map[llm_provider_enums.Provider]modelResolver {
+// Exists so nothing provider-specific crosses the spawn path. Bedrock needs an
+// aws.Config, a region and a did-it-work flag; Vertex will need a project, a
+// location and a service account. Threading those through as parameters means
+// the generic call site names every provider and grows by three arguments per
+// provider added. Here they are a setup's own state, captured in the closure it
+// returns, and never seen by anyone else.
+type providerSetup interface {
+	provider() llm_provider_enums.Provider
+	// prepare injects whatever the agent needs to reach this provider, and
+	// returns a resolver for its model ids — or nil when the provider declares
+	// its ids (no discovery needed) or the setup failed.
+	prepare(env map[string]string, logsWriter io.Writer) modelResolver
+}
+
+// providerSetups is the registry. A new provider is one entry here plus its own
+// type; no call site changes.
+var providerSetups = []providerSetup{bedrockSetup{}}
+
+// prepareProvider runs the setup for the provider serving this Job and returns
+// the resolvers that are ACTUALLY usable.
+//
+// Absence is the availability signal: a provider whose setup failed simply has
+// no entry, so no boolean is threaded through the call chain and a caller
+// cannot mistake "credentials failed" for "this provider needs no discovery".
+func prepareProvider(env map[string]string, p llm_provider_enums.Provider, logsWriter io.Writer) map[llm_provider_enums.Provider]modelResolver {
 	resolvers := map[llm_provider_enums.Provider]modelResolver{}
-	if bedrockOK {
-		resolvers[llm_provider_enums.AWSBedrock] = func(ctx context.Context, m llm_provider_enums.Model) string {
-			return resolveBedrockModelID(ctx, bedrockCfg, m.BedrockProfilePrefix(), bedrockRegion, logsWriter)
+	for _, setup := range providerSetups {
+		if setup.provider() != p {
+			continue
+		}
+		if resolve := setup.prepare(env, logsWriter); resolve != nil {
+			resolvers[p] = resolve
 		}
 	}
 	return resolvers
+}
+
+// bedrockSetup assumes dr-bedrock-role and injects its scoped short-lived
+// credentials, then resolves model ids through Bedrock's inference profiles.
+type bedrockSetup struct{}
+
+func (bedrockSetup) provider() llm_provider_enums.Provider { return llm_provider_enums.AWSBedrock }
+
+func (bedrockSetup) prepare(env map[string]string, logsWriter io.Writer) modelResolver {
+	cfg, region, ok := applyBedrockCreds(env, logsWriter)
+	if !ok {
+		// No credentials, so no discovery. Returning a resolver anyway would
+		// hand the SDK a zero aws.Config, which PANICS rather than erroring.
+		return nil
+	}
+	return func(ctx context.Context, m llm_provider_enums.Model) string {
+		return resolveBedrockModelID(ctx, cfg, m.BedrockProfilePrefix(), region, logsWriter)
+	}
 }
 
 // applyAgentModelEnv renders the Task's LOGICAL model id into whatever the
@@ -691,16 +732,14 @@ func applyAgentModelEnv(env map[string]string, provider llm_provider_enums.Provi
 	env["MODEL"] = id
 }
 
-// applyBedrockCredsIfNeeded switches a task to AWS Bedrock. When the org's
-// provider is AWSBedrock, the runner assumes the minimal dr-bedrock-role and injects the short-lived, Bedrock-only
+// applyBedrockCreds switches a task to AWS Bedrock. Called only for an org
+// whose provider IS AWSBedrock — prepareProvider dispatches, so there is no
+// provider check here. The runner assumes the minimal dr-bedrock-role and injects the short-lived, Bedrock-only
 // credentials into the agent container. No long-lived secret is stored, and the
 // agent receives creds that can invoke Bedrock and nothing else. The Bedrock API
 // host is added to the egress allowlist. On any failure the task proceeds without
 // creds (and fails auth in the container) rather than crashing the runner.
-func applyBedrockCredsIfNeeded(env map[string]string, provider llm_provider_enums.Provider, logsWriter io.Writer) (aws.Config, string, bool) {
-	if provider != llm_provider_enums.AWSBedrock {
-		return aws.Config{}, "", false
-	}
+func applyBedrockCreds(env map[string]string, logsWriter io.Writer) (aws.Config, string, bool) {
 	roleArn := strings.TrimSpace(os.Getenv(bedrockRoleArnEnvVar))
 	if roleArn == "" {
 		io.WriteString(logsWriter, "Bedrock: BedrockRoleArn is not set on this runner — update the CloudFormation stack to add the Bedrock role.\n")

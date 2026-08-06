@@ -13,21 +13,30 @@ import (
 // test. The AssumeRole+inject path needs live AWS creds and is covered by the
 // end-to-end dogfood on a Bedrock-enabled runner.
 
-func TestApplyBedrockCredsIfNeeded_NoOpWhenNotBedrock(t *testing.T) {
+// Dispatch is the registry's job: a provider with no setup registered gets
+// nothing injected and nothing resolved.
+func TestPrepareProvider_NoOpForAProviderWithNoSetup(t *testing.T) {
 	env := map[string]string{"MODEL": "us.anthropic.claude-sonnet-4-6"}
-	applyBedrockCredsIfNeeded(env, llm_provider_enums.AnthropicDirect, io.Discard)
+	if got := prepareProvider(env, llm_provider_enums.AnthropicDirect, io.Discard); len(got) != 0 {
+		t.Errorf("registered %d resolver(s) for a provider that declares its ids", len(got))
+	}
 	if _, ok := env["AWS_ACCESS_KEY_ID"]; ok {
-		t.Error("must not inject creds when CLAUDE_CODE_USE_BEDROCK is absent")
+		t.Error("must not inject another provider's credentials")
 	}
 	if _, ok := env["ANTHROPIC_MODEL"]; ok {
-		t.Error("must not touch env at all when not in Bedrock mode")
+		t.Error("must not touch env at all for a provider with no setup")
 	}
 }
 
-func TestApplyBedrockCredsIfNeeded_NoOpWhenRoleArnMissing(t *testing.T) {
+func TestPrepareProvider_BedrockWithoutARoleArnRegistersNothing(t *testing.T) {
 	t.Setenv("BedrockRoleArn", "") // stack predates Bedrock support
 	env := map[string]string{}
-	applyBedrockCredsIfNeeded(env, llm_provider_enums.AWSBedrock, io.Discard)
+	// A failed setup must register NO resolver. Registering one anyway would
+	// hand the SDK a zero aws.Config, which panics rather than erroring and
+	// takes the whole runner down instead of failing one Step.
+	if got := prepareProvider(env, llm_provider_enums.AWSBedrock, io.Discard); len(got) != 0 {
+		t.Errorf("failed Bedrock setup registered %d resolver(s), want none", len(got))
+	}
 	if _, ok := env["AWS_ACCESS_KEY_ID"]; ok {
 		t.Error("must not inject creds when BedrockRoleArn is unset")
 	}
@@ -232,25 +241,27 @@ func TestApplyAgentModelEnv_NoResolverAvailableDoesNotPanic(t *testing.T) {
 	}
 }
 
-func TestBuildModelResolvers_AbsenceIsTheAvailabilitySignal(t *testing.T) {
-	// No boolean is threaded through the call chain: a provider that cannot
-	// discover right now simply has no entry.
-	if got := buildModelResolvers(aws.Config{}, "eu-west-1", false, io.Discard); len(got) != 0 {
-		t.Errorf("failed Bedrock setup registered %d resolver(s), want none", len(got))
+// Every registered setup must answer for exactly the provider it claims, and
+// only providers whose ids need DISCOVERING may have one at all. A setup
+// registered under the wrong key would resolve one provider's model through
+// another's discovery.
+func TestProviderSetups_RegisterOnlyRuntimeResolvedProviders(t *testing.T) {
+	seen := map[llm_provider_enums.Provider]bool{}
+	for _, setup := range providerSetups {
+		p := setup.provider()
+		if seen[p] {
+			t.Errorf("%s has two setups; the second would be unreachable", p)
+		}
+		seen[p] = true
+		if !p.ResolvesModelIDAtRuntime() {
+			t.Errorf("%s declares its model ids; a setup for it means discovery where none is needed", p)
+		}
 	}
-	ready := buildModelResolvers(aws.Config{}, "eu-west-1", true, io.Discard)
-	if _, ok := ready[llm_provider_enums.AWSBedrock]; !ok {
-		t.Error("a successful Bedrock setup must register a resolver for AWSBedrock")
-	}
-	// Providers that declare their ids must never get one — a resolver for them
-	// would mean discovery where none is needed.
-	for _, p := range []llm_provider_enums.Provider{
-		llm_provider_enums.AnthropicDirect,
-		llm_provider_enums.OpenAIDirect,
-		llm_provider_enums.AnthropicSubscription,
-	} {
-		if _, ok := ready[p]; ok {
-			t.Errorf("%s declares its model ids; it must not have a resolver", p)
+	// Every provider that DOES need discovery must have one, or its models
+	// silently pass through unresolved.
+	for _, p := range llm_provider_enums.AllProviders() {
+		if p.ResolvesModelIDAtRuntime() && p.IsConfigurable() && !seen[p] {
+			t.Errorf("%s resolves ids at runtime but has no setup registered", p)
 		}
 	}
 }
