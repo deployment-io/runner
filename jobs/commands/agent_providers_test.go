@@ -7,6 +7,8 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/deployment-io/deployment-runner-kit/enums/llm_provider_enums"
+	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
+	"github.com/deployment-io/deployment-runner-kit/jobs"
 )
 
 // Both guards return before any AWS/RunnerData access, so they're safe to unit
@@ -272,5 +274,32 @@ func TestApplyAgentModelEnv_UsesTheRegisteredResolver(t *testing.T) {
 	}
 	if want := "amazon-bedrock/eu.amazon.nova-pro-v1:0"; env["MODEL"] != want {
 		t.Errorf("MODEL = %q, want %q", env["MODEL"], want)
+	}
+}
+
+// The parameter is the ONLY source. An absent or unknown one yields 0 rather
+// than a guess: inferring from whichever secrets happen to be present is what
+// made a subscription org — which also carries an API key as its documented
+// fallback — look like AnthropicDirect.
+func TestResolveJobProvider_ParameterIsTheOnlySource(t *testing.T) {
+	parameters := map[string]interface{}{}
+	jobs.SetParameterValue[string](parameters, parameters_enums.AgentProvider, llm_provider_enums.AnthropicSubscription.Key())
+	if got := resolveJobProvider(parameters, io.Discard); got != llm_provider_enums.AnthropicSubscription {
+		t.Errorf("resolveJobProvider = %v, want AnthropicSubscription", got)
+	}
+}
+
+func TestResolveJobProvider_NoGuessingWhenAbsentOrUnknown(t *testing.T) {
+	// A bundle full of recognisable credentials must NOT be read as a provider.
+	if got := resolveJobProvider(map[string]interface{}{}, io.Discard); got.IsValid() {
+		t.Errorf("resolveJobProvider = %v, want an invalid provider when the parameter is missing", got)
+	}
+	// A slug from a newer control plane. 0 leaves the model unrendered and runs
+	// no provider setup, so the agent fails on the credential — better than
+	// silently serving the Job through whatever this build guesses instead.
+	unknown := map[string]interface{}{}
+	jobs.SetParameterValue[string](unknown, parameters_enums.AgentProvider, "some-future-provider")
+	if got := resolveJobProvider(unknown, io.Discard); got.IsValid() {
+		t.Errorf("resolveJobProvider = %v, want an invalid provider for an unknown slug", got)
 	}
 }
