@@ -46,7 +46,7 @@ func TestApplyAgentModelEnv_HandPinnedBedrockIDsSurviveUntouched(t *testing.T) {
 		resolvers := map[llm_provider_enums.Provider]modelResolver{
 			llm_provider_enums.AWSBedrock: func(context.Context, llm_provider_enums.Model) string { return "WRONG" },
 		}
-		applyAgentModelEnv(env, llm_provider_enums.AWSBedrock, resolvers, io.Discard)
+		applyAgentModelEnv(env, agentSpawn{provider: llm_provider_enums.AWSBedrock, agentType: llm_provider_enums.ClaudeCode}, resolvers, io.Discard)
 		if env["ANTHROPIC_MODEL"] != id {
 			t.Errorf("hand-pinned %q became %q", id, env["ANTHROPIC_MODEL"])
 		}
@@ -67,7 +67,7 @@ func TestApplyAgentModelEnv_OpencodeGetsAProviderPrefixWithoutBedrock(t *testing
 		"MODEL":             "claude-sonnet-4-6",
 		"ANTHROPIC_API_KEY": "sk-ant-x",
 	}
-	applyAgentModelEnv(env, llm_provider_enums.AnthropicDirect, nil, io.Discard)
+	applyAgentModelEnv(env, agentSpawn{provider: llm_provider_enums.AnthropicDirect, agentType: llm_provider_enums.Opencode}, nil, io.Discard)
 	if want := "anthropic/claude-sonnet-4-6"; env["MODEL"] != want {
 		t.Errorf("MODEL = %q, want %q", env["MODEL"], want)
 	}
@@ -82,7 +82,7 @@ func TestApplyAgentModelEnv_OpencodeOnOpenAI(t *testing.T) {
 		"MODEL":          "gpt-5.5",
 		"OPENAI_API_KEY": "sk-x",
 	}
-	applyAgentModelEnv(env, llm_provider_enums.OpenAIDirect, nil, io.Discard)
+	applyAgentModelEnv(env, agentSpawn{provider: llm_provider_enums.OpenAIDirect, agentType: llm_provider_enums.Opencode}, nil, io.Discard)
 	if want := "openai/gpt-5.5"; env["MODEL"] != want {
 		t.Errorf("MODEL = %q, want %q", env["MODEL"], want)
 	}
@@ -95,7 +95,7 @@ func TestApplyAgentModelEnv_ClaudeCodeKeepsTheLogicalIDOffBedrock(t *testing.T) 
 		"MODEL":             "claude-opus-4-8",
 		"ANTHROPIC_API_KEY": "sk-ant-x",
 	}
-	applyAgentModelEnv(env, llm_provider_enums.AnthropicDirect, nil, io.Discard)
+	applyAgentModelEnv(env, agentSpawn{provider: llm_provider_enums.AnthropicDirect, agentType: llm_provider_enums.ClaudeCode}, nil, io.Discard)
 	if env["MODEL"] != "claude-opus-4-8" {
 		t.Errorf("MODEL = %q, want the logical id unchanged", env["MODEL"])
 	}
@@ -107,7 +107,7 @@ func TestApplyAgentModelEnv_ClaudeCodeKeepsTheLogicalIDOffBedrock(t *testing.T) 
 func TestApplyAgentModelEnv_NoCredentialLeavesTheModelAlone(t *testing.T) {
 	// Better to fail on the missing credential than on a mangled model id.
 	env := map[string]string{"AGENT_TYPE": llm_provider_enums.Opencode.String(), "MODEL": "claude-opus-4-8"}
-	applyAgentModelEnv(env, 0, nil, io.Discard)
+	applyAgentModelEnv(env, agentSpawn{provider: 0, agentType: llm_provider_enums.Opencode}, nil, io.Discard)
 	if env["MODEL"] != "claude-opus-4-8" {
 		t.Errorf("MODEL = %q, want it untouched when no provider can be inferred", env["MODEL"])
 	}
@@ -115,7 +115,7 @@ func TestApplyAgentModelEnv_NoCredentialLeavesTheModelAlone(t *testing.T) {
 
 func TestApplyAgentModelEnv_UnknownModelPassesThrough(t *testing.T) {
 	env := map[string]string{"MODEL": "some-future-model", "ANTHROPIC_API_KEY": "sk-ant-x"}
-	applyAgentModelEnv(env, llm_provider_enums.AnthropicDirect, nil, io.Discard)
+	applyAgentModelEnv(env, agentSpawn{provider: llm_provider_enums.AnthropicDirect, agentType: llm_provider_enums.ClaudeCode}, nil, io.Discard)
 	if env["MODEL"] != "some-future-model" {
 		t.Errorf("MODEL = %q, want an unknown id passed through unchanged", env["MODEL"])
 	}
@@ -130,7 +130,7 @@ func TestApplyAgentModelEnv_NoResolverAvailableDoesNotPanic(t *testing.T) {
 		"MODEL":      "nova-pro-v1",
 		"AGENT_TYPE": llm_provider_enums.Opencode.String(),
 	}
-	applyAgentModelEnv(env, llm_provider_enums.AWSBedrock, nil, io.Discard)
+	applyAgentModelEnv(env, agentSpawn{provider: llm_provider_enums.AWSBedrock, agentType: llm_provider_enums.Opencode}, nil, io.Discard)
 	// Degrades to the logical id, still provider-prefixed so opencode reports a
 	// credential problem rather than an unroutable model.
 	if want := "amazon-bedrock/nova-pro-v1"; env["MODEL"] != want {
@@ -177,7 +177,7 @@ func TestApplyAgentModelEnv_UsesTheRegisteredResolver(t *testing.T) {
 		"AGENT_TYPE": llm_provider_enums.Opencode.String(),
 		"MODEL":      "nova-pro-v1",
 	}
-	applyAgentModelEnv(env, llm_provider_enums.AWSBedrock, resolvers, io.Discard)
+	applyAgentModelEnv(env, agentSpawn{provider: llm_provider_enums.AWSBedrock, agentType: llm_provider_enums.Opencode}, resolvers, io.Discard)
 
 	if called != "nova-pro-v1" {
 		t.Errorf("resolver received %q, want the logical model", called)
@@ -211,5 +211,31 @@ func TestResolveJobProvider_NoGuessingWhenAbsentOrUnknown(t *testing.T) {
 	jobs.SetParameterValue[string](unknown, parameters_enums.AgentProvider, "some-future-provider")
 	if got := resolveJobProvider(unknown, io.Discard); got.IsValid() {
 		t.Errorf("resolveJobProvider = %v, want an invalid provider for an unknown slug", got)
+	}
+}
+
+// ANTHROPIC_MODEL is claude-code's Bedrock-mode input. Which agents receive it
+// must match exactly which agents get CLAUDE_CODE_USE_BEDROCK — an agent put in
+// Bedrock mode but told to read a different variable, or told where to read
+// without being in the mode, is broken either way. Keying on the provider alone
+// set it for codex too.
+func TestApplyAgentModelEnv_OnlyClaudeCodeReadsTheModelFromAnthropicModel(t *testing.T) {
+	for _, agentType := range []llm_provider_enums.AgentType{
+		llm_provider_enums.Codex,
+		llm_provider_enums.Opencode,
+	} {
+		env := map[string]string{"MODEL": "claude-sonnet-4-6"}
+		spawn := agentSpawn{provider: llm_provider_enums.AWSBedrock, agentType: agentType}
+		applyAgentModelEnv(env, spawn, nil, io.Discard)
+		if _, present := env["ANTHROPIC_MODEL"]; present {
+			t.Errorf("%v on Bedrock got ANTHROPIC_MODEL, which only claude-code reads", agentType)
+		}
+	}
+	// And claude-code still must.
+	env := map[string]string{"MODEL": "claude-sonnet-4-6"}
+	spawn := agentSpawn{provider: llm_provider_enums.AWSBedrock, agentType: llm_provider_enums.ClaudeCode}
+	applyAgentModelEnv(env, spawn, nil, io.Discard)
+	if env["ANTHROPIC_MODEL"] == "" {
+		t.Error("claude-code on Bedrock takes its model from ANTHROPIC_MODEL")
 	}
 }

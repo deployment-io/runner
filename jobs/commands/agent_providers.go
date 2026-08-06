@@ -43,6 +43,15 @@ func resolveJobProvider(parameters map[string]interface{}, logsWriter io.Writer)
 	return provider
 }
 
+// agentSpawn is the pair every decision here turns on: WHO serves the model and
+// WHAT runs it. Grouped because they always travel together and because
+// rendering needs BOTH — an id is not correct in isolation, only correct for a
+// given agent talking to a given provider.
+type agentSpawn struct {
+	provider  llm_provider_enums.Provider
+	agentType llm_provider_enums.AgentType
+}
+
 // modelResolver returns the concrete provider-side id for a model, or "" when
 // it cannot produce one.
 //
@@ -106,7 +115,8 @@ func prepareProvider(env map[string]string, p llm_provider_enums.Provider, logsW
 //
 // Adding Vertex later means setting that property and supplying its discovery;
 // nothing here changes.
-func applyAgentModelEnv(env map[string]string, provider llm_provider_enums.Provider, resolvers map[llm_provider_enums.Provider]modelResolver, logsWriter io.Writer) {
+func applyAgentModelEnv(env map[string]string, spawn agentSpawn, resolvers map[llm_provider_enums.Provider]modelResolver, logsWriter io.Writer) {
+	provider := spawn.provider
 	logical := env["MODEL"]
 	if logical == "" {
 		return
@@ -137,15 +147,18 @@ func applyAgentModelEnv(env map[string]string, provider llm_provider_enums.Provi
 		io.WriteString(logsWriter, fmt.Sprintf("Model %q is not in the catalogue; passing it through unchanged.\n", logical))
 	}
 
-	if env["AGENT_TYPE"] == llm_provider_enums.Opencode.String() {
+	if spawn.agentType == llm_provider_enums.Opencode {
 		if rendered := llm_provider_enums.OpencodeModelID(id, provider); rendered != "" {
 			env["MODEL"] = rendered
 		}
 		return
 	}
 	// claude-code in Bedrock mode takes the model from ANTHROPIC_MODEL rather
-	// than --model.
-	if provider == llm_provider_enums.AWSBedrock {
+	// than --model. The condition MIRRORS ApplyClaudeCodeUseBedrock: whichever
+	// agents get that switch must be exactly the ones told where to read the
+	// model, or an agent runs in Bedrock mode looking at the wrong variable.
+	// Testing the provider alone would have set ANTHROPIC_MODEL for codex too.
+	if provider == llm_provider_enums.AWSBedrock && spawn.agentType == llm_provider_enums.ClaudeCode {
 		env["ANTHROPIC_MODEL"] = id
 		return
 	}

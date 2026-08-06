@@ -411,6 +411,7 @@ func buildAgentSpawnEnvVars(parameters map[string]interface{}, logsWriter io.Wri
 	// still needed).
 	provider := resolveJobProvider(parameters, logsWriter)
 	agentType, _ := llm_provider_enums.ResolveAgentType(env["AGENT_TYPE"])
+	spawn := agentSpawn{provider: provider, agentType: agentType}
 	// claude-code's own Bedrock switch, written for the one agent that reads it.
 	// Nothing puts it in the credential bundle, so opencode and codex cannot
 	// inherit one.
@@ -419,7 +420,7 @@ func buildAgentSpawnEnvVars(parameters map[string]interface{}, logsWriter io.Wri
 	// Whatever this provider needs at spawn — credentials, discovery — is its
 	// own business; the call site does not know which provider it is.
 	resolvers := prepareProvider(env, provider, logsWriter)
-	applyAgentModelEnv(env, provider, resolvers, logsWriter)
+	applyAgentModelEnv(env, spawn, resolvers, logsWriter)
 	// Optionally swap the injected ANTHROPIC_API_KEY for a Claude Code
 	// subscription OAuth token read from this runner's own AWS Secrets Manager.
 	// OrganizationIDNamespace is best-effort here: it only enables the
