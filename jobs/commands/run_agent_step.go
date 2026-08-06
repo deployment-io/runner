@@ -479,44 +479,44 @@ func bedrockRegionPrefix(region string) string {
 	}
 }
 
-// resolveBedrockModelID turns the Task's model into a Bedrock inference-profile
-// id, discovering the concrete id rather than deriving it.
+// resolveBedrockModelID discovers the Bedrock inference-profile id for a model,
+// or returns "" when it cannot.
 //
-// Three paths, in order:
-//  1. A model containing a "." is already a Bedrock id — passed through
-//     verbatim. Our logical ids never contain dots, so this is unambiguous, and
-//     it is the escape hatch that lets an exact revision be pinned by hand.
-//  2. A known logical id is matched against the profiles this account can
-//     actually see in this region.
-//  3. Anything else is passed through so Bedrock rejects it with its own
-//     message, which is more useful than us guessing.
+// Takes the MODEL, not a prefix. The catalogue lookup belongs to Bedrock's own
+// code — it is Bedrock's discovery input, and nothing outside should have to
+// know that "the thing you search profiles by" is what to pass. Passing a
+// string also let the caller supply anything at all, including an already-dotted
+// profile id, which is why this used to carry a pass-through branch for input it
+// can no longer receive: a hand-pinned id is not in the catalogue, so
+// applyAgentModelEnv passes it through without ever calling a resolver.
 //
-// Discovery failures are NEVER fatal: the original model is returned and the
-// reason logged. A wrong model produces a legible Bedrock error, whereas
-// failing the Step here would hide the cause one layer up.
-func resolveBedrockModelID(ctx context.Context, cfg aws.Config, profilePrefix, region string, logsWriter io.Writer) string {
-	// An already-concrete id (dotted) is used verbatim — the escape hatch for
-	// pinning an exact revision by hand.
-	if strings.Contains(profilePrefix, ".") {
-		return profilePrefix
-	}
-	// The logical model -> Bedrock profile prefix lives in the shared catalogue,
-	// not here: deployment-runner-kit is the one module both the control plane
-	// and the runner import, so a second copy in this file was exactly the drift
-	// the catalogue exists to prevent. It also carries the guards that any model
-	// claiming Bedrock has a prefix, and that the prefix pins the model VERSION
-	// — a loose prefix Contains-matches a neighbouring version's profile and
-	// silently runs the wrong model.
+// "" ON EVERY FAILURE, never a guess. The caller has already computed
+// model.IDFor(provider) and keeps it when this returns "" — so returning the
+// profile PREFIX here (a family token like "claude-sonnet-4-6", not an id)
+// would overwrite a correct id with a worse one. That is invisible while the
+// two coincide, and silently wrong the moment IDFor gains an override.
+//
+// Discovery failure is never fatal: the reason is logged and the caller's id
+// stands. A wrong model then produces a legible Bedrock error, whereas failing
+// the Step here would hide the cause one layer up.
+func resolveBedrockModelID(ctx context.Context, cfg aws.Config, model llm_provider_enums.Model, region string, logsWriter io.Writer) string {
+	// The model -> profile prefix mapping lives in the shared catalogue, not
+	// here: deployment-runner-kit is the one module both the control plane and
+	// the runner import, so a second copy in this file was exactly the drift the
+	// catalogue exists to prevent. It also carries the guard that a prefix pins
+	// the model VERSION — a loose one Contains-matches a neighbouring version's
+	// profile and silently runs the wrong model.
+	profilePrefix := model.BedrockProfilePrefix()
 	if profilePrefix == "" {
-		io.WriteString(logsWriter, fmt.Sprintf("Bedrock: %q has no Bedrock profile prefix; passing it through unchanged.\n", profilePrefix))
-		return profilePrefix
+		io.WriteString(logsWriter, fmt.Sprintf("Bedrock: %s has no Bedrock profile prefix; leaving the model unchanged.\n", model))
+		return ""
 	}
 	out, err := bedrock.NewFromConfig(cfg).ListInferenceProfiles(ctx, &bedrock.ListInferenceProfilesInput{
 		MaxResults: aws.Int32(100),
 	})
 	if err != nil {
-		io.WriteString(logsWriter, fmt.Sprintf("Bedrock: could not list inference profiles (%s); passing %q through unchanged.\n", err, profilePrefix))
-		return profilePrefix
+		io.WriteString(logsWriter, fmt.Sprintf("Bedrock: could not list inference profiles (%s); leaving %s unchanged.\n", err, model))
+		return ""
 	}
 	prefix := bedrockRegionPrefix(region)
 	var matches []string
@@ -527,15 +527,15 @@ func resolveBedrockModelID(ctx context.Context, cfg aws.Config, profilePrefix, r
 		}
 	}
 	if len(matches) == 0 {
-		io.WriteString(logsWriter, fmt.Sprintf("Bedrock: no %s inference profile for %q in %s — check model access for this account/region. Passing it through unchanged.\n", prefix, profilePrefix, region))
-		return profilePrefix
+		io.WriteString(logsWriter, fmt.Sprintf("Bedrock: no %s inference profile for %s in %s — check model access for this account/region. Leaving it unchanged.\n", prefix, model, region))
+		return ""
 	}
 	// Descending so the newest revision wins. Because the prefix pins the model
 	// version, this only ever chooses between DATES/revisions of the same
 	// model — a safe auto-upgrade, not a silent model swap. Logged because a
 	// silent pick between several revisions is hard to reconstruct later.
 	sort.Sort(sort.Reverse(sort.StringSlice(matches)))
-	io.WriteString(logsWriter, fmt.Sprintf("Bedrock: resolved %q -> %s.\n", profilePrefix, matches[0]))
+	io.WriteString(logsWriter, fmt.Sprintf("Bedrock: resolved %s -> %s.\n", model, matches[0]))
 	return matches[0]
 }
 
@@ -666,7 +666,7 @@ func (bedrockSetup) prepare(env map[string]string, logsWriter io.Writer) modelRe
 		return nil
 	}
 	return func(ctx context.Context, m llm_provider_enums.Model) string {
-		return resolveBedrockModelID(ctx, cfg, m.BedrockProfilePrefix(), region, logsWriter)
+		return resolveBedrockModelID(ctx, cfg, m, region, logsWriter)
 	}
 }
 

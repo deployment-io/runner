@@ -42,21 +42,26 @@ func TestPrepareProvider_BedrockWithoutARoleArnRegistersNothing(t *testing.T) {
 	}
 }
 
-// Model resolution: the dot rule and the region prefix are pure logic and
-// testable; the ListInferenceProfiles branch needs live AWS and is covered by
-// the smoke test. The dot rule is what keeps a hand-pinned profile id working,
-// so it is worth pinning precisely.
-func TestResolveBedrockModelID_PassesThroughConcreteProfileIDs(t *testing.T) {
+// A hand-pinned profile id must still reach the agent untouched. That is now
+// settled a layer UP: such an id is not in the catalogue, so applyAgentModelEnv
+// passes it through and never calls a resolver at all. Asserting it here — the
+// only place it could be observed before — would test a branch that can no
+// longer be reached, so it is asserted where the behaviour actually lives.
+func TestApplyAgentModelEnv_HandPinnedBedrockIDsSurviveUntouched(t *testing.T) {
 	// Both real shapes seen in the wild — a clean id and a dated/revisioned one.
 	for _, id := range []string{
 		"eu.anthropic.claude-sonnet-4-5-20250929-v1:0",
 		"anthropic.claude-sonnet-5",
 		"us.anthropic.claude-opus-4-1-20250805-v1:0",
 	} {
-		// A concrete id must short-circuit BEFORE any AWS call — passing a zero
-		// aws.Config proves it never reaches the SDK.
-		if got := resolveBedrockModelID(context.Background(), aws.Config{}, id, "eu-west-1", io.Discard); got != id {
-			t.Errorf("resolveBedrockModelID(%q) = %q, want it passed through unchanged", id, got)
+		env := map[string]string{"MODEL": id}
+		// A resolver that would corrupt the id if it were ever consulted.
+		resolvers := map[llm_provider_enums.Provider]modelResolver{
+			llm_provider_enums.AWSBedrock: func(context.Context, llm_provider_enums.Model) string { return "WRONG" },
+		}
+		applyAgentModelEnv(env, llm_provider_enums.AWSBedrock, resolvers, io.Discard)
+		if env["ANTHROPIC_MODEL"] != id {
+			t.Errorf("hand-pinned %q became %q", id, env["ANTHROPIC_MODEL"])
 		}
 	}
 }
@@ -87,12 +92,18 @@ func TestResolveBedrockModelID_UsesTheSharedCatalogue(t *testing.T) {
 	if m.BedrockProfilePrefix() == "" {
 		t.Error("claude-opus-4-8 has no Bedrock profile prefix in the catalogue; discovery cannot resolve it")
 	}
-	// This function takes a PROFILE PREFIX, not a logical model — deciding
-	// whether a model is a catalogue model, and whether it is served by
-	// Bedrock at all, belongs to applyAgentModelEnv one layer up. An empty
-	// prefix must short-circuit rather than reach the SDK.
-	if got := resolveBedrockModelID(context.Background(), aws.Config{}, "", "eu-west-1", io.Discard); got != "" {
-		t.Errorf("empty prefix returned %q, want \"\" without touching AWS", got)
+	// A model with no Bedrock prefix cannot be discovered, and must say so by
+	// returning "" — the caller then keeps model.IDFor(provider). Returning the
+	// prefix instead would overwrite a correct id with a family token, which is
+	// invisible while the two coincide and wrong as soon as IDFor gains an
+	// override. Passing a zero aws.Config proves it short-circuits before the
+	// SDK, which would panic.
+	unmapped := llm_provider_enums.Gpt55 // real model, no Bedrock profile
+	if unmapped.BedrockProfilePrefix() != "" {
+		t.Skip("Gpt55 gained a Bedrock prefix; pick another unmapped model")
+	}
+	if got := resolveBedrockModelID(context.Background(), aws.Config{}, unmapped, "eu-west-1", io.Discard); got != "" {
+		t.Errorf("unmapped model returned %q, want \"\" so the caller keeps IDFor", got)
 	}
 }
 
