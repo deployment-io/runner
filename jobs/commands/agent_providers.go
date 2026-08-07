@@ -1,0 +1,178 @@
+package commands
+
+import (
+	"context"
+	"fmt"
+	"io"
+
+	"github.com/deployment-io/deployment-runner-kit/enums/llm_provider_enums"
+	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
+	"github.com/deployment-io/deployment-runner-kit/jobs"
+)
+
+// How a Job's PROVIDER is chosen and how its MODEL is rendered for that
+// provider — split out of run_agent_step.go, which is about spawning a
+// container, not about who serves the model.
+//
+// The seam is providerSetup: a provider's own credentials, discovery and
+// quirks live in ITS OWN FILE (bedrock_setup.go), and this file only ever holds
+// a llm_provider_enums.Provider and a map of resolvers. Adding a provider is a
+// new file plus one registry entry — no signature grows, nothing here learns
+// its name, and none of this needs reading to write it.
+
+// resolveJobProvider returns the provider serving this Job, or 0 when the
+// parameter is missing or names a provider this build does not know.
+//
+// deployment-server decided this when it resolved credentials, so the
+// parameter is the only source — the provider is never inferred from which
+// secrets happen to be present. An unknown slug means this runner is older
+// than the control plane; 0 is invalid, so the model is left unrendered and no
+// provider setup runs, and the agent fails on the credential rather than on a
+// guess.
+func resolveJobProvider(parameters map[string]interface{}, logsWriter io.Writer) llm_provider_enums.Provider {
+	slug, err := jobs.GetParameterValue[string](parameters, parameters_enums.AgentProvider)
+	if err != nil || slug == "" {
+		io.WriteString(logsWriter, "No agent provider on this Job — deployment-server should have set it at pickup.\n")
+		return 0
+	}
+	provider, err := llm_provider_enums.ProviderFromKey(slug)
+	if err != nil {
+		io.WriteString(logsWriter, fmt.Sprintf("Unknown agent provider %q — this runner may be older than the control plane.\n", slug))
+		return 0
+	}
+	return provider
+}
+
+// agentSpawn is the pair every decision here turns on: WHO serves the model and
+// WHAT runs it. Grouped because they always travel together and because
+// rendering needs BOTH — an id is not correct in isolation, only correct for a
+// given agent talking to a given provider.
+type agentSpawn struct {
+	provider  llm_provider_enums.Provider
+	agentType llm_provider_enums.AgentType
+	// model is the LOGICAL id the Task asked for ("claude-sonnet-4-6"), taken
+	// from the job parameter — not read back out of env. Rendering it is this
+	// package's job, so taking it as input keeps the function from depending on
+	// whether some earlier step happened to have written env["MODEL"] yet.
+	model string
+}
+
+// modelResolver returns the concrete provider-side id for a model, or "" when
+// it cannot produce one.
+//
+// Exists so the call site never names a provider. Each implementation reaches
+// for its OWN discovery input — Bedrock uses Model.BedrockProfilePrefix, Vertex
+// would use whatever it needs — instead of the caller branching to pick one.
+type modelResolver func(ctx context.Context, m llm_provider_enums.Model) string
+
+// providerSetup prepares one provider for an agent spawn.
+//
+// Exists so nothing provider-specific crosses the spawn path. Bedrock needs an
+// aws.Config, a region and a did-it-work flag; Vertex will need a project, a
+// location and a service account. Threading those through as parameters means
+// the generic call site names every provider and grows by three arguments per
+// provider added. Here they are a setup's own state, captured in the closure it
+// returns, and never seen by anyone else.
+type providerSetup interface {
+	provider() llm_provider_enums.Provider
+	// prepare injects whatever the agent needs to reach this provider, and
+	// returns a resolver for its model ids — or nil when the provider declares
+	// its ids (no discovery needed) or the setup failed.
+	prepare(env map[string]string, logsWriter io.Writer) modelResolver
+}
+
+// providerSetups is the registry of providers needing RUNNER-SIDE preparation,
+// which in practice means the cloud-role ones: their credentials are assumed
+// here rather than arriving in the bundle, and their model ids must be
+// discovered rather than declared.
+//
+// The API-key and subscription providers deliberately have no entry. There is
+// nothing for a setup to do — their credentials are already in the injected
+// bundle and their model ids are declared — so an entry would be an empty type
+// whose only content is "nothing to do", and would break the invariant that a
+// registered setup means discovery is needed.
+//
+// A new provider is one entry here plus its own file; no call site changes.
+var providerSetups = []providerSetup{bedrockSetup{}}
+
+// prepareProvider runs the setup for the provider serving this Job and returns
+// its resolver, or nil when it has none.
+//
+// ONE resolver, not a map keyed by provider. A Job is served by exactly one
+// provider — the map could only ever hold that one entry, under a key the
+// caller already had. Provider PRIORITY does not change this: choosing which
+// provider wins happens upstream, so by the time a model is being rendered the
+// choice is already made.
+//
+// nil is the availability signal, so no boolean is threaded through the call
+// chain and a caller cannot mistake "credentials failed" for "this provider
+// needs no discovery" — ResolvesModelIDAtRuntime answers the second.
+func prepareProvider(env map[string]string, p llm_provider_enums.Provider, logsWriter io.Writer) modelResolver {
+	for _, setup := range providerSetups {
+		if setup.provider() == p {
+			return setup.prepare(env, logsWriter)
+		}
+	}
+	return nil
+}
+
+// applyAgentModelEnv renders the Task's LOGICAL model id into whatever the
+// selected agent actually reads.
+//
+// This runs for every spawn, not just Bedrock ones. Model ids are logical now
+// ("claude-sonnet-4-6"), and opencode needs a "provider/model" string, so an
+// opencode task on Anthropic would otherwise receive a bare id with no way to
+// know where to route it.
+//
+// The provider drives everything and no branch names one:
+//
+//	IDFor                      — the provider's own name for the model
+//	ResolvesModelIDAtRuntime   — whether the concrete id must be discovered
+//	OpencodeModelID            — the "provider/model" rendering
+//
+// Adding Vertex later means setting that property and supplying its discovery;
+// nothing here changes.
+func applyAgentModelEnv(env map[string]string, spawn agentSpawn, resolve modelResolver, logsWriter io.Writer) {
+	provider := spawn.provider
+	logical := spawn.model
+	if logical == "" {
+		return
+	}
+	if !provider.IsValid() {
+		// No recognisable credential. Leave the model untouched so the agent
+		// fails on the missing credential rather than on a mangled id.
+		return
+	}
+
+	id := logical
+	if model, err := llm_provider_enums.GetModel(logical); err == nil {
+		id = model.IDFor(provider)
+		if provider.ResolvesModelIDAtRuntime() {
+			// Two different questions, deliberately kept apart: the provider
+			// says whether an id must be DISCOVERED, and a nil resolver says
+			// whether we can discover right now. Collapsing them would make a
+			// credential failure look like "this provider needs no discovery".
+			if resolve == nil {
+				io.WriteString(logsWriter, fmt.Sprintf("%s: cannot resolve %q — credentials unavailable; leaving the model unchanged.\n", provider, logical))
+			} else if resolved := resolve(context.TODO(), model); resolved != "" {
+				id = resolved
+			}
+		}
+	} else {
+		io.WriteString(logsWriter, fmt.Sprintf("Model %q is not in the catalogue; passing it through unchanged.\n", logical))
+	}
+
+	if spawn.agentType == llm_provider_enums.Opencode {
+		rendered := llm_provider_enums.OpencodeModelID(id, provider)
+		if rendered == "" {
+			return // unroutable; leave what the Task asked for so the error names it
+		}
+		id = rendered
+	}
+	// WHICH variable carries the model is the catalogue's call, not ours: it is
+	// the same fact as claude-code's Bedrock switch, and the two must agree —
+	// an agent in Bedrock mode reading the wrong variable is broken either way.
+	// This file wrote that rule out itself and got it wrong, keying on the
+	// provider alone so codex on Bedrock was pointed at claude-code's variable.
+	env[llm_provider_enums.ModelEnvVar(provider, spawn.agentType)] = id
+}

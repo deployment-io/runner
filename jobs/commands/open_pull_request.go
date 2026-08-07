@@ -182,13 +182,13 @@ func (opr *taskOpenPR) buildPRTitleAndBody() (string, string) {
 // source is available, with defensive truncation against agents that
 // ignore the 72-char instruction:
 //
-//   1. Newer agentbox (v1.x+ with pr_title): use agentPRTitle, capped
-//      at 72 chars. Full changes_summary becomes the lead-in body.
-//   2. Older agentbox (no pr_title): split changes_summary at its
-//      first newline. Short first line → use as-is; long first line →
-//      cap AND keep the full narrative as the body so reviewers don't
-//      lose context.
-//   3. No agent output at all: generic "Tasks Step N: <title>".
+//  1. Newer agentbox (v1.x+ with pr_title): use agentPRTitle, capped
+//     at 72 chars. Full changes_summary becomes the lead-in body.
+//  2. Older agentbox (no pr_title): split changes_summary at its
+//     first newline. Short first line → use as-is; long first line →
+//     cap AND keep the full narrative as the body so reviewers don't
+//     lose context.
+//  3. No agent output at all: generic "Tasks Step N: <title>".
 //
 // Bug 2 fix: the pre-fix code emitted the entire first line as the PR
 // title regardless of length. A 119-char single-line narrative ended
@@ -315,4 +315,3 @@ func readHasChangesFromJobOutput(parameters map[string]interface{}) (map[int]boo
 	}
 	return out, nil
 }
-

@@ -15,12 +15,9 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/service/bedrock"
 	"github.com/aws/aws-sdk-go-v2/service/cloudfront"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/secretsmanager"
-	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/aws/smithy-go"
 	"github.com/deployment-io/deployment-runner-kit/cloud_api_clients"
 	"github.com/deployment-io/deployment-runner-kit/deployments"
@@ -407,243 +404,37 @@ func buildAgentSpawnEnvVars(parameters map[string]interface{}, logsWriter io.Wri
 	if allowed != "" {
 		env["ADDITIONAL_ALLOWED_HOSTS"] = allowed
 	}
-	// Bedrock: when the org is in Bedrock mode (CLAUDE_CODE_USE_BEDROCK marker in
-	// AgentEnvVars), assume dr-bedrock-role and inject its scoped short-lived creds.
-	applyBedrockCredsIfNeeded(env, logsWriter)
+	// Resolved ONCE, up front. Every step below is told which provider serves
+	// this Job instead of re-reading the env for a signal — which is what let
+	// the old ordering matter (model rendering had to run before the
+	// subscription step, because that step consumed the marker the model step
+	// still needed).
+	provider := resolveJobProvider(parameters, logsWriter)
+	agentType, _ := llm_provider_enums.ResolveAgentType(env["AGENT_TYPE"])
+	// env["MODEL"] is still set above from the same parameter: agentbox reads it
+	// as the generic model var, and applyAgentModelEnv overwrites it with the
+	// rendered id for every agent that reads it there.
+	spawn := agentSpawn{provider: provider, agentType: agentType, model: env["MODEL"]}
+	// claude-code's own Bedrock switch, written for the one agent that reads it.
+	// Nothing puts it in the credential bundle, so opencode and codex cannot
+	// inherit one.
+	llm_provider_enums.ApplyClaudeCodeUseBedrock(env, provider, agentType)
+
+	// Whatever this provider needs at spawn — credentials, discovery — is its
+	// own business; the call site does not know which provider it is.
+	resolve := prepareProvider(env, provider, logsWriter)
+	applyAgentModelEnv(env, spawn, resolve, logsWriter)
 	// Optionally swap the injected ANTHROPIC_API_KEY for a Claude Code
 	// subscription OAuth token read from this runner's own AWS Secrets Manager.
-	// Engages only when the org is in subscription mode (marker in AgentEnvVars).
 	// OrganizationIDNamespace is best-effort here: it only enables the
 	// self-grant retry below, and an unreadable secret still degrades to the
 	// API key without it.
 	organizationID, _ := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIDNamespace)
-	maybeApplyClaudeSubscriptionAuth(env, organizationID, logsWriter)
+	maybeApplyClaudeSubscriptionAuth(env, provider, organizationID, logsWriter)
 	return mapToEnvSlice(env), nil
 }
 
-// bedrockRoleArnEnvVar names the env var the CloudFormation runner task def sets
-// to the dr-bedrock-role ARN (see cloud-formation-one-click). Empty means the
-// runner's stack predates Bedrock support.
-const bedrockRoleArnEnvVar = "BedrockRoleArn"
-
-// bedrockMaxSessionSeconds is the ROLE CHAINING limit — 1 hour, hard.
-//
-// ⚠️ This is NOT dr-bedrock-role's MaxSessionDuration, and raising that will
-// not raise this. The runner already runs as an assumed role (its ECS task
-// role), so using those credentials to assume dr-bedrock-role is *role
-// chaining*, which AWS caps at 1 hour regardless of what either role permits.
-// Asking for more fails the whole call:
-//
-//	ValidationError: The requested DurationSeconds exceeds the 1 hour session
-//	limit for roles assumed by role chaining.
-//
-// after which the guard below logs and the task runs credential-free —
-// agentbox then fail-fasts on the missing AWS_* vars. Observed on the first
-// live Bedrock run (2026-07-28), which had requested 4h.
-//
-// The template's MaxSessionDuration: 14400 is therefore moot for this path.
-// It is left in place because it is harmless and would matter if the assume
-// ever stopped being chained, but it is NOT what governs here.
-//
-// CONSEQUENCE — creds expire 1h into a task that may run 4h, and env-injected
-// credentials do not auto-refresh. A Bedrock task still running past the hour
-// loses access mid-run. Raising this constant cannot fix that; the fix is
-// refresh over the existing agentbox<->runner RPC channel (a local
-// credential_process), which PLAN_opencode_completion_and_bedrock.md scopes
-// and defers. Ship v1 at 1h and revisit if long-task expiry is actually hit.
-const bedrockMaxSessionSeconds = 3600
-
-// bedrockRegionPrefix returns the cross-region inference prefix for an AWS
-// region. Bedrock groups regions into geographies, so this is a coarse mapping
-// of the region's first segment, not a per-region lookup.
-func bedrockRegionPrefix(region string) string {
-	switch {
-	case strings.HasPrefix(region, "eu-"):
-		return "eu."
-	case strings.HasPrefix(region, "ap-"):
-		return "apac."
-	default:
-		return "us."
-	}
-}
-
-// resolveBedrockModelID turns the Task's model into a Bedrock inference-profile
-// id, discovering the concrete id rather than deriving it.
-//
-// Three paths, in order:
-//  1. A model containing a "." is already a Bedrock id — passed through
-//     verbatim. Our logical ids never contain dots, so this is unambiguous, and
-//     it is the escape hatch that lets an exact revision be pinned by hand.
-//  2. A known logical id is matched against the profiles this account can
-//     actually see in this region.
-//  3. Anything else is passed through so Bedrock rejects it with its own
-//     message, which is more useful than us guessing.
-//
-// Discovery failures are NEVER fatal: the original model is returned and the
-// reason logged. A wrong model produces a legible Bedrock error, whereas
-// failing the Step here would hide the cause one layer up.
-func resolveBedrockModelID(ctx context.Context, cfg aws.Config, model, region string, logsWriter io.Writer) string {
-	if strings.Contains(model, ".") {
-		return model
-	}
-	// The logical model -> Bedrock family map lives in the shared catalogue, not
-	// here: deployment-runner-kit is the one module both the control plane and
-	// the runner import, so a second copy in this file was exactly the drift the
-	// catalogue exists to prevent. It also carries the guard that any model
-	// claiming Bedrock has a family token.
-	m, err := llm_provider_enums.GetModel(model)
-	if err != nil {
-		io.WriteString(logsWriter, fmt.Sprintf("Bedrock: %q is not a catalogue model; passing it through unchanged.\n", model))
-		return model
-	}
-	family := m.BedrockFamily()
-	if family == "" {
-		io.WriteString(logsWriter, fmt.Sprintf("Bedrock: model %q is not served by Bedrock; passing it through unchanged.\n", model))
-		return model
-	}
-	out, err := bedrock.NewFromConfig(cfg).ListInferenceProfiles(ctx, &bedrock.ListInferenceProfilesInput{
-		MaxResults: aws.Int32(100),
-	})
-	if err != nil {
-		io.WriteString(logsWriter, fmt.Sprintf("Bedrock: could not list inference profiles (%s); passing %q through unchanged.\n", err, model))
-		return model
-	}
-	prefix := bedrockRegionPrefix(region)
-	var matches []string
-	for _, p := range out.InferenceProfileSummaries {
-		id := aws.ToString(p.InferenceProfileId)
-		if strings.HasPrefix(id, prefix) && strings.Contains(id, family) {
-			matches = append(matches, id)
-		}
-	}
-	if len(matches) == 0 {
-		io.WriteString(logsWriter, fmt.Sprintf("Bedrock: no %s inference profile for %q in %s — check model access for this account/region. Passing it through unchanged.\n", prefix, model, region))
-		return model
-	}
-	// Descending so the newest revision wins: the date and -vN:0 suffixes sort
-	// lexicographically within a family. Logged because a silent pick between
-	// several revisions is hard to reconstruct from a failure later.
-	sort.Sort(sort.Reverse(sort.StringSlice(matches)))
-	io.WriteString(logsWriter, fmt.Sprintf("Bedrock: resolved model %q -> %s.\n", model, matches[0]))
-	return matches[0]
-}
-
-// bedrockSessionSeconds is how long a vended Bedrock session should last: the
-// per-task wall-clock cap, clamped to the role-chaining limit above. These
-// creds are injected as env vars and do NOT auto-refresh, so a session shorter
-// than the task expires mid-run — hence asking for as much as is allowed.
-// STS also rejects anything below 900s, so guard that end too.
-func bedrockSessionSeconds() int32 {
-	const stsMinSeconds = 900
-	d := int32(defaultWallClockTimeout.Seconds())
-	if d > bedrockMaxSessionSeconds {
-		return bedrockMaxSessionSeconds
-	}
-	if d < stsMinSeconds {
-		return stsMinSeconds
-	}
-	return d
-}
-
-// applyBedrockCredsIfNeeded switches a claude-code task to AWS Bedrock. When
-// deployment-server has injected the CLAUDE_CODE_USE_BEDROCK=1 marker (from the
-// org's Bedrock provider — see kit's ClaudeAuth.ResolveAgentEnvVars), the runner
-// assumes the minimal dr-bedrock-role and injects the short-lived, Bedrock-only
-// credentials into the agent container. No long-lived secret is stored, and the
-// agent receives creds that can invoke Bedrock and nothing else. The Bedrock API
-// host is added to the egress allowlist. On any failure the task proceeds without
-// creds (and fails auth in the container) rather than crashing the runner.
-func applyBedrockCredsIfNeeded(env map[string]string, logsWriter io.Writer) {
-	if env["CLAUDE_CODE_USE_BEDROCK"] != "1" {
-		return
-	}
-	roleArn := strings.TrimSpace(os.Getenv(bedrockRoleArnEnvVar))
-	if roleArn == "" {
-		io.WriteString(logsWriter, "Bedrock: BedrockRoleArn is not set on this runner — update the CloudFormation stack to add the Bedrock role.\n")
-		return
-	}
-	region := utils.RunnerData.Get().RunnerRegion
-	cfg, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion(region))
-	if err != nil {
-		io.WriteString(logsWriter, fmt.Sprintf("Bedrock: could not load AWS config: %s\n", err))
-		return
-	}
-	out, err := sts.NewFromConfig(cfg).AssumeRole(context.TODO(), &sts.AssumeRoleInput{
-		RoleArn:         aws.String(roleArn),
-		RoleSessionName: aws.String("agentbox-bedrock"),
-		// Match the per-task wall-clock cap. These creds are injected as env
-		// vars and do NOT auto-refresh, so a session shorter than the task
-		// would expire mid-run. AssumeRole defaults to 1h when this is unset,
-		// regardless of the role's MaxSessionDuration - so both this and the
-		// role's ceiling (set in the CloudFormation template) are required.
-		//
-		// STS does NOT clamp this to the role's MaxSessionDuration — asking for
-		// more than the role allows FAILS the call outright, after which the
-		// guard below logs and runs the task credential-free. bedrockSessionSeconds
-		// clamps to what the role permits so that cannot happen; see its comment.
-		//
-		// The clamp does NOT remove the deploy-order requirement: a stack whose
-		// dr-bedrock-role still has the 1h default will reject the 4h request
-		// regardless. Update the CloudFormation stack BEFORE deploying a runner
-		// that requests 4h. Runners auto-upgrade while customer stacks do not,
-		// so before Bedrock is customer-reachable this should also retry at a
-		// shorter duration on ValidationError rather than rely on that order.
-		DurationSeconds: aws.Int32(bedrockSessionSeconds()),
-	})
-	if err != nil || out.Credentials == nil {
-		io.WriteString(logsWriter, fmt.Sprintf("Bedrock: AssumeRole %s failed: %s\n", roleArn, err))
-		return
-	}
-	c := out.Credentials
-	env["AWS_ACCESS_KEY_ID"] = aws.ToString(c.AccessKeyId)
-	env["AWS_SECRET_ACCESS_KEY"] = aws.ToString(c.SecretAccessKey)
-	env["AWS_SESSION_TOKEN"] = aws.ToString(c.SessionToken)
-	env["AWS_REGION"] = region
-	// claude-code in Bedrock mode takes the model from ANTHROPIC_MODEL, which
-	// must be a concrete inference-profile id — a logical id like
-	// "claude-opus-4-8" reaches Bedrock verbatim and is rejected with
-	// "The provided model identifier is invalid". Resolve it here.
-	if m := env["MODEL"]; m != "" {
-		env["ANTHROPIC_MODEL"] = resolveBedrockModelID(context.TODO(), cfg, m, region, logsWriter)
-	}
-	// Allowlist BOTH Bedrock hosts — agentbox's proxy gates egress, and
-	// claude-code uses both planes:
-	//
-	//   bedrock-runtime.<region> — data plane (InvokeModel*), the obvious one
-	//   bedrock.<region>         — control plane (model/inference-profile
-	//                              lookups) which claude-code calls at startup
-	//
-	// The control-plane host was initially judged unnecessary "for pure
-	// inference". That was wrong: the first live run logged
-	// `denied:bedrock.eu-west-1.amazonaws.com` before the agent had issued a
-	// single completion. Both are required.
-	//
-	// The proxy denies rather than fails closed, so omitting a host degrades
-	// oddly instead of erroring clearly — worth keeping both in step with the
-	// dr-bedrock-role policy, which already grants ListInferenceProfiles and
-	// GetInferenceProfile (control-plane calls).
-	bedrockHosts := "bedrock-runtime." + region + ".amazonaws.com" +
-		",bedrock." + region + ".amazonaws.com"
-	if existing := env["ADDITIONAL_ALLOWED_HOSTS"]; existing != "" {
-		env["ADDITIONAL_ALLOWED_HOSTS"] = existing + "," + bedrockHosts
-	} else {
-		env["ADDITIONAL_ALLOWED_HOSTS"] = bedrockHosts
-	}
-	io.WriteString(logsWriter, fmt.Sprintf("Bedrock: assumed %s; agent will use Bedrock in %s.\n", roleArn, region))
-}
-
-// Subscription-mode contract with the control plane.
-//
-// CROSS-REPO CONTRACT: deployment-server injects these exact strings into
-// AgentEnvVars when the org's ClaudeAuth.Provider is Subscription — see
-// kit's organization_models.ClaudeAuthModeEnvVar / ...Subscription. This repo
-// does not import kit, so the literals are duplicated; change them in both or
-// subscription auth silently stops engaging and every task quietly falls back
-// to the API key. The marker is non-secret; the token never leaves the
-// customer's cloud.
 const (
-	claudeAuthModeEnvVar       = "CLAUDE_AUTH_MODE"
-	claudeAuthModeSubscription = "subscription"
 
 	// claudeOAuthSecretName is the Secrets Manager entry holding the customer's
 	// Claude Code subscription OAuth token, in their own account.
@@ -679,11 +470,8 @@ const (
 //     injected API key rather than hard-failing the task. An org configured
 //     strict subscription-only has no key to fall back to, so agentbox fails
 //     fast instead of quietly reverting to metered billing.
-func maybeApplyClaudeSubscriptionAuth(env map[string]string, organizationID string, logsWriter io.Writer) {
-	mode := strings.TrimSpace(env[claudeAuthModeEnvVar])
-	// Consumed here — keep the marker out of the agent container's env.
-	delete(env, claudeAuthModeEnvVar)
-	if mode != claudeAuthModeSubscription {
+func maybeApplyClaudeSubscriptionAuth(env map[string]string, provider llm_provider_enums.Provider, organizationID string, logsWriter io.Writer) {
+	if provider.AuthMode() != llm_provider_enums.AuthSubscription {
 		return // org is not in subscription mode (the default)
 	}
 	// AGENT_TYPE unset defaults to claude-code in agentbox, so "" is allowed.
