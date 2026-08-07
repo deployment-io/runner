@@ -2,6 +2,7 @@ package commands
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"regexp"
@@ -17,6 +18,7 @@ import (
 	elbTypes "github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2/types"
 	"github.com/aws/aws-sdk-go-v2/service/servicediscovery"
 	sd_types "github.com/aws/aws-sdk-go-v2/service/servicediscovery/types"
+	"github.com/aws/smithy-go"
 	"github.com/deployment-io/deployment-runner-kit/builds"
 	"github.com/deployment-io/deployment-runner-kit/cloud_api_clients"
 	"github.com/deployment-io/deployment-runner-kit/deployments"
@@ -85,6 +87,72 @@ func getDefaultVpcSecurityGroupIngressRuleNameForPort(parameters map[string]inte
 		return "", err
 	}
 	return fmt.Sprintf("sgin-%d", port), nil
+}
+
+// isDuplicateSecurityGroupRuleError reports whether err is the EC2
+// InvalidPermission.Duplicate API error. EC2 returns it from
+// AuthorizeSecurityGroupIngress/AuthorizeSecurityGroupEgress when the rule we are
+// trying to add already exists. For our deploys that means the desired rule is
+// already in place, so the caller can treat it as success and continue.
+func isDuplicateSecurityGroupRuleError(err error) bool {
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		return apiErr.ErrorCode() == "InvalidPermission.Duplicate"
+	}
+	return false
+}
+
+// recoverAndTagAlbSecurityGroupRule finds the id of the existing rule in the ALB
+// security group matching the given direction, tcp port and cidr, and re-applies our
+// Name tags to it so future deploys find the rule with the tag-based describe again.
+// Called after EC2 reports InvalidPermission.Duplicate for a rule the tag-based
+// describe missed (rule created by an older runner or with its tags stripped).
+// Recovery is best effort - the security group is already in the desired state at
+// this point - so failures are logged and an empty id is returned instead of
+// failing the deploy.
+func recoverAndTagAlbSecurityGroupRule(ec2Client *ec2.Client, albSecurityGroupId, ruleName string, isEgress bool, port int32, cidr string, logsWriter io.Writer) string {
+	describeOutput, err := ec2Client.DescribeSecurityGroupRules(context.TODO(), &ec2.DescribeSecurityGroupRulesInput{
+		DryRun: aws.Bool(false),
+		Filters: []ec2Types.Filter{{
+			Name:   aws.String("group-id"),
+			Values: []string{albSecurityGroupId},
+		}},
+	})
+	if err != nil {
+		io.WriteString(logsWriter, fmt.Sprintf("ALB security group: could not describe rules while recovering %s: %s\n", ruleName, err))
+		return ""
+	}
+	for _, rule := range describeOutput.SecurityGroupRules {
+		if aws.ToBool(rule.IsEgress) != isEgress || aws.ToString(rule.IpProtocol) != "tcp" ||
+			aws.ToInt32(rule.FromPort) != port || aws.ToInt32(rule.ToPort) != port ||
+			aws.ToString(rule.CidrIpv4) != cidr {
+			continue
+		}
+		ruleId := aws.ToString(rule.SecurityGroupRuleId)
+		_, err = ec2Client.CreateTags(context.TODO(), &ec2.CreateTagsInput{
+			Resources: []string{ruleId},
+			Tags: []ec2Types.Tag{
+				{
+					Key:   aws.String("Name"),
+					Value: aws.String(ruleName),
+				},
+				{
+					Key:   aws.String("created by"),
+					Value: aws.String("deployment.io"),
+				},
+				{
+					Key:   aws.String("alb-security-group-id"),
+					Value: aws.String(albSecurityGroupId),
+				},
+			},
+		})
+		if err != nil {
+			io.WriteString(logsWriter, fmt.Sprintf("ALB security group: could not re-tag rule %s (%s): %s — the next deploy will retry.\n", ruleName, ruleId, err))
+		}
+		return ruleId
+	}
+	io.WriteString(logsWriter, fmt.Sprintf("ALB security group: no existing rule matched %s on port %d.\n", ruleName, port))
+	return ""
 }
 
 func addIngressRuleToDefaultVpcSecurityGroupForPortIfNeeded(parameters map[string]interface{}, ec2Client *ec2.Client) error {
@@ -159,7 +227,9 @@ func addIngressRuleToDefaultVpcSecurityGroupForPortIfNeeded(parameters map[strin
 			ToPort: aws.Int32(int32(port)),
 		}
 		_, err = ec2Client.AuthorizeSecurityGroupIngress(context.TODO(), authorizeSecurityGroupIngressInput)
-		if err != nil {
+		//if the rule already exists EC2 returns InvalidPermission.Duplicate. The desired rule is
+		//already present, so we treat it as success and continue (idempotent ingress setup).
+		if err != nil && !isDuplicateSecurityGroupRuleError(err) {
 			return err
 		}
 
@@ -209,7 +279,7 @@ func addIngressRuleToDefaultVpcSecurityGroupForPortIfNeeded(parameters map[strin
 	return nil
 }
 
-func createAlbSecurityGroupIfNeeded(parameters map[string]interface{}, ec2Client *ec2.Client) (albSecurityGroupId string, err error) {
+func createAlbSecurityGroupIfNeeded(parameters map[string]interface{}, ec2Client *ec2.Client, logsWriter io.Writer) (albSecurityGroupId string, err error) {
 	albSecurityGroupIDFromParams, err := jobs.GetParameterValue[string](parameters, parameters_enums.AlbSecurityGroupId)
 	if err == nil && len(albSecurityGroupIDFromParams) > 0 {
 		return albSecurityGroupIDFromParams, nil
@@ -327,9 +397,68 @@ func createAlbSecurityGroupIfNeeded(parameters map[string]interface{}, ec2Client
 		}
 		authorizeSecurityGroupIngressOutput, err := ec2Client.AuthorizeSecurityGroupIngress(context.TODO(), authorizeSecurityGroupIngressInput)
 		if err != nil {
-			return "", err
+			//InvalidPermission.Duplicate means the rule already exists - treat as success,
+			//recover the existing rule id and re-tag the rule so future deploys find it by tag
+			if !isDuplicateSecurityGroupRuleError(err) {
+				return "", err
+			}
+			//AuthorizeSecurityGroupIngress is ALL-OR-NOTHING across its
+			//IpPermissions: one duplicate rejects the whole request, and the
+			//others are never added. So a group holding 443 but not 80 fails
+			//here, and treating that as "already configured" would leave 80
+			//permanently missing — the ALB's HTTP->HTTPS redirect listener
+			//would have no ingress, and http:// would time out rather than
+			//redirect. Worse, it self-seals: once 443 is re-tagged below, the
+			//tag-based describe above finds it and every later deploy skips
+			//this block entirely.
+			//
+			//So retry each port on its OWN request. A port that really is
+			//present duplicates again and gets recovered; a port that is
+			//missing is created. Only a genuinely different error fails the
+			//deploy.
+			io.WriteString(logsWriter, fmt.Sprintf("ALB security group: ingress rule %s already exists; reconciling each port.\n", albSecurityGroupIngressRuleName))
+			//Retry exactly what THIS request asked for, one permission at a
+			//time — derived from ipPermissions rather than restating the
+			//ports. Restating them means adding a port above silently leaves
+			//it out of the reconcile, which is this same bug again for the new
+			//port.
+			for _, permission := range ipPermissions {
+				perPortInput := &ec2.AuthorizeSecurityGroupIngressInput{
+					DryRun:            aws.Bool(false),
+					IpPermissions:     []ec2Types.IpPermission{permission},
+					GroupId:           aws.String(albSecurityGroupId),
+					TagSpecifications: authorizeSecurityGroupIngressInput.TagSpecifications,
+				}
+				port := aws.ToInt32(permission.FromPort)
+				perPortOutput, perPortErr := ec2Client.AuthorizeSecurityGroupIngress(context.TODO(), perPortInput)
+				var ruleId string
+				switch {
+				case perPortErr == nil:
+					if len(perPortOutput.SecurityGroupRules) > 0 {
+						ruleId = aws.ToString(perPortOutput.SecurityGroupRules[0].SecurityGroupRuleId)
+					}
+					io.WriteString(logsWriter, fmt.Sprintf("ALB security group: added missing ingress on port %d.\n", port))
+				case isDuplicateSecurityGroupRuleError(perPortErr):
+					//Genuinely present, but the tag-based describe missed it —
+					//an older runner created it, or its tags were stripped.
+					//Re-tag so the next deploy finds it and never reaches here.
+					//The cidr comes from the permission too, so the matcher
+					//cannot drift from what was authorized.
+					cidr := ""
+					if len(permission.IpRanges) > 0 {
+						cidr = aws.ToString(permission.IpRanges[0].CidrIp)
+					}
+					ruleId = recoverAndTagAlbSecurityGroupRule(ec2Client, albSecurityGroupId, albSecurityGroupIngressRuleName, false, port, cidr, logsWriter)
+				default:
+					return "", perPortErr
+				}
+				if len(albSecurityGroupIngressRuleId) == 0 {
+					albSecurityGroupIngressRuleId = ruleId
+				}
+			}
+		} else {
+			albSecurityGroupIngressRuleId = aws.ToString(authorizeSecurityGroupIngressOutput.SecurityGroupRules[0].SecurityGroupRuleId)
 		}
-		albSecurityGroupIngressRuleId = aws.ToString(authorizeSecurityGroupIngressOutput.SecurityGroupRules[0].SecurityGroupRuleId)
 	}
 
 	albSecurityGroupEgressRuleName, err := getAlbSecurityGroupEgressRuleName(parameters)
@@ -403,9 +532,18 @@ func createAlbSecurityGroupIfNeeded(parameters map[string]interface{}, ec2Client
 
 		authorizeSecurityGroupEgressOutput, err := ec2Client.AuthorizeSecurityGroupEgress(context.TODO(), authorizeSecurityGroupEgressInput)
 		if err != nil {
-			return "", err
+			//InvalidPermission.Duplicate means the rule already exists - treat as success,
+			//recover the existing rule id and re-tag the rule so future deploys find it by tag
+			if !isDuplicateSecurityGroupRuleError(err) {
+				return "", err
+			}
+			//Single IpPermission here, so a duplicate means exactly this rule
+			//exists — no all-or-nothing hazard as on the ingress side above.
+			io.WriteString(logsWriter, fmt.Sprintf("ALB security group: egress rule %s already exists; re-tagging it.\n", albSecurityGroupEgressRuleName))
+			albSecurityGroupEgressRuleId = recoverAndTagAlbSecurityGroupRule(ec2Client, albSecurityGroupId, albSecurityGroupEgressRuleName, true, int32(port), vpcCidr, logsWriter)
+		} else {
+			albSecurityGroupEgressRuleId = aws.ToString(authorizeSecurityGroupEgressOutput.SecurityGroupRules[0].SecurityGroupRuleId)
 		}
-		albSecurityGroupEgressRuleId = aws.ToString(authorizeSecurityGroupEgressOutput.SecurityGroupRules[0].SecurityGroupRuleId)
 	}
 
 	//TODO can sync both sg ingress ids later
@@ -1283,7 +1421,7 @@ func (d *DeployAwsWebService) Run(parameters map[string]interface{}, logsWriter 
 		return parameters, err
 	}
 	var securityGroupId string
-	securityGroupId, err = createAlbSecurityGroupIfNeeded(parameters, ec2Client)
+	securityGroupId, err = createAlbSecurityGroupIfNeeded(parameters, ec2Client, logsWriter)
 	if err != nil {
 		return parameters, err
 	}
