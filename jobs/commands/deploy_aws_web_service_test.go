@@ -65,26 +65,33 @@ func TestIsDuplicateSecurityGroupRuleError(t *testing.T) {
 // ingress call asks for 443 and 80 together, so a group holding only 443 fails
 // it — and treating that as "already configured" leaves 80 permanently missing.
 //
-// This pins the retry SHAPE, which is what makes the difference: one request
-// per port, so an existing 443 cannot mask a missing 80. The AWS calls
-// themselves need live EC2 and are covered by a real deploy.
-func TestAlbIngressRetriesEachPortSeparately(t *testing.T) {
-	// One IpPermission per request is the whole point. Two ports in one request
-	// is what fails when either already exists.
+// The reconcile derives its ports from ipPermissions rather than restating
+// them, so adding a port to that list cannot silently leave it unreconciled.
+// This pins the properties that derivation depends on; the AWS calls need live
+// EC2 and are covered by a real deploy.
+func TestIngressPermissionCarriesWhatTheReconcileNeeds(t *testing.T) {
 	for _, port := range []int64{443, 80} {
 		perm := getIngressIpPermissionFromInternetToPort(port)
-		if aws.ToInt32(perm.FromPort) != int32(port) || aws.ToInt32(perm.ToPort) != int32(port) {
-			t.Errorf("port %d: permission covers %d-%d", port, aws.ToInt32(perm.FromPort), aws.ToInt32(perm.ToPort))
-		}
-		if len(perm.IpRanges) != 1 || aws.ToString(perm.IpRanges[0].CidrIp) != "0.0.0.0/0" {
-			t.Errorf("port %d: expected a single 0.0.0.0/0 range, got %v", port, perm.IpRanges)
-		}
-	}
 
-	// The recovery matcher must agree with what was authorized, or a rule that
-	// exists is reported missing and its tags are never restored — leaving
-	// every future deploy to re-enter the duplicate path.
-	if got := aws.ToString(getIngressIpPermissionFromInternetToPort(80).IpProtocol); got != "tcp" {
-		t.Errorf("protocol = %q, want tcp — recoverAndTagAlbSecurityGroupRule matches on tcp", got)
+		// One port per permission. Two ports in a single permission would make
+		// the per-permission retry ambiguous — and is what fails when either
+		// already exists.
+		if aws.ToInt32(perm.FromPort) != int32(port) || aws.ToInt32(perm.ToPort) != int32(port) {
+			t.Errorf("port %d: permission spans %d-%d, so a per-permission retry cannot name one port",
+				port, aws.ToInt32(perm.FromPort), aws.ToInt32(perm.ToPort))
+		}
+
+		// The reconcile reads the cidr off the permission so its matcher cannot
+		// drift from what was authorized. An empty IpRanges would leave it
+		// matching on "" and never finding the existing rule — which means the
+		// tags are never restored and every deploy re-enters this path.
+		if len(perm.IpRanges) == 0 || aws.ToString(perm.IpRanges[0].CidrIp) == "" {
+			t.Errorf("port %d: no cidr on the permission for the reconcile to match on", port)
+		}
+
+		// recoverAndTagAlbSecurityGroupRule matches on tcp.
+		if got := aws.ToString(perm.IpProtocol); got != "tcp" {
+			t.Errorf("port %d: protocol = %q, want tcp", port, got)
+		}
 	}
 }

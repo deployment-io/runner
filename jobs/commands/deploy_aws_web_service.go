@@ -417,13 +417,19 @@ func createAlbSecurityGroupIfNeeded(parameters map[string]interface{}, ec2Client
 			//missing is created. Only a genuinely different error fails the
 			//deploy.
 			io.WriteString(logsWriter, fmt.Sprintf("ALB security group: ingress rule %s already exists; reconciling each port.\n", albSecurityGroupIngressRuleName))
-			for _, internetPort := range []int64{443, 80} {
+			//Retry exactly what THIS request asked for, one permission at a
+			//time — derived from ipPermissions rather than restating the
+			//ports. Restating them means adding a port above silently leaves
+			//it out of the reconcile, which is this same bug again for the new
+			//port.
+			for _, permission := range ipPermissions {
 				perPortInput := &ec2.AuthorizeSecurityGroupIngressInput{
 					DryRun:            aws.Bool(false),
-					IpPermissions:     []ec2Types.IpPermission{getIngressIpPermissionFromInternetToPort(internetPort)},
+					IpPermissions:     []ec2Types.IpPermission{permission},
 					GroupId:           aws.String(albSecurityGroupId),
 					TagSpecifications: authorizeSecurityGroupIngressInput.TagSpecifications,
 				}
+				port := aws.ToInt32(permission.FromPort)
 				perPortOutput, perPortErr := ec2Client.AuthorizeSecurityGroupIngress(context.TODO(), perPortInput)
 				var ruleId string
 				switch {
@@ -431,12 +437,18 @@ func createAlbSecurityGroupIfNeeded(parameters map[string]interface{}, ec2Client
 					if len(perPortOutput.SecurityGroupRules) > 0 {
 						ruleId = aws.ToString(perPortOutput.SecurityGroupRules[0].SecurityGroupRuleId)
 					}
-					io.WriteString(logsWriter, fmt.Sprintf("ALB security group: added missing ingress on port %d.\n", internetPort))
+					io.WriteString(logsWriter, fmt.Sprintf("ALB security group: added missing ingress on port %d.\n", port))
 				case isDuplicateSecurityGroupRuleError(perPortErr):
 					//Genuinely present, but the tag-based describe missed it —
 					//an older runner created it, or its tags were stripped.
 					//Re-tag so the next deploy finds it and never reaches here.
-					ruleId = recoverAndTagAlbSecurityGroupRule(ec2Client, albSecurityGroupId, albSecurityGroupIngressRuleName, false, int32(internetPort), "0.0.0.0/0", logsWriter)
+					//The cidr comes from the permission too, so the matcher
+					//cannot drift from what was authorized.
+					cidr := ""
+					if len(permission.IpRanges) > 0 {
+						cidr = aws.ToString(permission.IpRanges[0].CidrIp)
+					}
+					ruleId = recoverAndTagAlbSecurityGroupRule(ec2Client, albSecurityGroupId, albSecurityGroupIngressRuleName, false, port, cidr, logsWriter)
 				default:
 					return "", perPortErr
 				}
