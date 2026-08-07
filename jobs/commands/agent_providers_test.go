@@ -235,3 +235,28 @@ func TestApplyAgentModelEnv_OnlyClaudeCodeReadsTheModelFromAnthropicModel(t *tes
 		t.Error("claude-code on Bedrock takes its model from ANTHROPIC_MODEL")
 	}
 }
+
+// The bug this fixes: agentbox reads MODEL and passes it as --model for every
+// agent, so writing only ANTHROPIC_MODEL left claude-code being told to run the
+// unresolved LOGICAL id against Bedrock — a flag overriding the inference
+// profile discovery had just resolved. Opencode was unaffected (it writes
+// MODEL), which is why a Nova smoke test would have gone green over it.
+func TestApplyAgentModelEnv_BedrockClaudeCodeGetsTheResolvedIDInBothVars(t *testing.T) {
+	const resolved = "eu.anthropic.claude-sonnet-4-6-20260101-v1:0"
+	env := map[string]string{}
+	resolve := modelResolver(func(context.Context, llm_provider_enums.Model) string { return resolved })
+	spawn := agentSpawn{
+		provider:  llm_provider_enums.AWSBedrock,
+		agentType: llm_provider_enums.ClaudeCode,
+		model:     "claude-sonnet-4-6",
+	}
+	applyAgentModelEnv(env, spawn, resolve, io.Discard)
+
+	if env["ANTHROPIC_MODEL"] != resolved {
+		t.Errorf("ANTHROPIC_MODEL = %q, want the resolved profile", env["ANTHROPIC_MODEL"])
+	}
+	// The one that was wrong: agentbox turns this into --model.
+	if env["MODEL"] != resolved {
+		t.Errorf("MODEL = %q, want the resolved profile — agentbox passes it as --model, so a logical id here overrides ANTHROPIC_MODEL", env["MODEL"])
+	}
+}

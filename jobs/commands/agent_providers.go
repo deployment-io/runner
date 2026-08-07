@@ -169,10 +169,12 @@ func applyAgentModelEnv(env map[string]string, spawn agentSpawn, resolve modelRe
 		}
 		id = rendered
 	}
-	// WHICH variable carries the model is the catalogue's call, not ours: it is
-	// the same fact as claude-code's Bedrock switch, and the two must agree —
-	// an agent in Bedrock mode reading the wrong variable is broken either way.
-	// This file wrote that rule out itself and got it wrong, keying on the
-	// provider alone so codex on Bedrock was pointed at claude-code's variable.
-	env[llm_provider_enums.ModelEnvVar(provider, spawn.agentType)] = id
+	// WHERE the model goes is the catalogue's call, not ours: it is the same
+	// fact as claude-code's Bedrock switch, and the two must agree — an agent in
+	// Bedrock mode reading the wrong variable is broken either way. This file
+	// wrote that rule out itself and got it wrong twice: once keying on the
+	// provider alone, so codex on Bedrock was pointed at claude-code's
+	// variable, and once writing ANTHROPIC_MODEL *instead of* MODEL, which left
+	// agentbox passing the unresolved logical id as --model.
+	llm_provider_enums.ApplyModelEnv(env, id, provider, spawn.agentType)
 }
