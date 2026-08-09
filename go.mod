@@ -11,6 +11,7 @@ require (
 	github.com/ankit-arora/nixpacks-go v0.0.0-20240925063829-e4f7ef9412db
 	github.com/aws/aws-sdk-go-v2 v1.43.3
 	github.com/aws/aws-sdk-go-v2/config v1.27.11
+	github.com/aws/aws-sdk-go-v2/credentials v1.17.11
 	github.com/aws/aws-sdk-go-v2/service/acm v1.25.4
 	github.com/aws/aws-sdk-go-v2/service/bedrock v1.66.3
 	github.com/aws/aws-sdk-go-v2/service/cloudfront v1.36.0
@@ -51,7 +52,6 @@ require (
 	github.com/ProtonMail/go-crypto v1.0.0 // indirect
 	github.com/ankit-arora/bitset v0.0.0-20250212073004-6a047aa1a9a0 // indirect
 	github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream v1.6.7 // indirect
-	github.com/aws/aws-sdk-go-v2/credentials v1.17.11 // indirect
 	github.com/aws/aws-sdk-go-v2/feature/ec2/imds v1.16.1 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/configsources v1.4.34 // indirect
 	github.com/aws/aws-sdk-go-v2/internal/endpoints/v2 v2.7.34 // indirect
