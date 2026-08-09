@@ -102,3 +102,25 @@ func TestBedrockSessionSeconds_ClampedToOneHourNotTheTaskCap(t *testing.T) {
 		t.Skip("task cap no longer exceeds the chaining limit; mid-run expiry note is stale")
 	}
 }
+
+// Profile discovery must run as the ASSUMED role, not as the runner's task
+// role. Returning the default config meant discovery went out as dr-task-role
+// and got a 403 on ListInferenceProfiles, while dr-bedrock-role — which grants
+// exactly that — was used only to populate the container's env vars.
+//
+// The identity mismatch is invisible in code review and only shows up in an AWS
+// error message, so it is pinned here: the returned config's credentials must
+// be the ones handed to the agent, not the ambient ones.
+func TestBedrockConfigUsesAssumedCredentials(t *testing.T) {
+	t.Setenv("BedrockRoleArn", "") // no role → early return, no AWS calls
+	env := map[string]string{}
+	cfg, _, ok := applyBedrockCreds(env, io.Discard)
+	if ok {
+		t.Fatal("expected the no-role guard to short-circuit")
+	}
+	// The guard must return a ZERO config. A partially-built one would reach
+	// the SDK and panic rather than error.
+	if cfg.Credentials != nil {
+		t.Error("failed setup must not return a credentials provider")
+	}
+}

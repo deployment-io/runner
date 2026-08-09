@@ -18,6 +18,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/bedrock"
 	bedrocktypes "github.com/aws/aws-sdk-go-v2/service/bedrock/types"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
@@ -226,7 +227,28 @@ func applyBedrockCreds(env map[string]string, logsWriter io.Writer) (aws.Config,
 		env["ADDITIONAL_ALLOWED_HOSTS"] = bedrockHosts
 	}
 	io.WriteString(logsWriter, fmt.Sprintf("Bedrock: assumed %s; agent will use Bedrock in %s.\n", roleArn, region))
-	return cfg, region, true
+	// Hand back a config built from the ASSUMED credentials, not the default
+	// one used to make the AssumeRole call.
+	//
+	// cfg here is the runner's own task role, which has no Bedrock permissions
+	// — it exists only to call STS. Returning it meant profile discovery ran as
+	// dr-task-role and got a 403 on ListInferenceProfiles, while
+	// dr-bedrock-role (which grants exactly that) was used for nothing but the
+	// container's env vars. The failure was legible but pointed at IAM policy
+	// rather than at the caller's identity:
+	//
+	//   AccessDeniedException: User: .../dr-task-role-... is not authorized to
+	//   perform: bedrock:ListInferenceProfiles
+	//
+	// Same credentials the agent gets, so discovery and inference cannot
+	// disagree about who they are — or about when they expire.
+	assumed := cfg.Copy()
+	assumed.Credentials = credentials.NewStaticCredentialsProvider(
+		aws.ToString(c.AccessKeyId),
+		aws.ToString(c.SecretAccessKey),
+		aws.ToString(c.SessionToken),
+	)
+	return assumed, region, true
 }
 
 // bedrockSessionSeconds is how long a vended Bedrock session should last: the
