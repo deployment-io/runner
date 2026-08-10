@@ -1054,6 +1054,60 @@ func readAgentResult(workDirHost string) (agentResult, error) {
 	return result, nil
 }
 
+// resolveRunCost prices this run ONCE, at completion.
+//
+// Two sources, and which one applied is recorded rather than inferred:
+//
+//	the agent said so    — Claude Code and opencode both report a total, and a
+//	                       figure from the vendor that billed it beats any
+//	                       arithmetic of ours
+//	we priced it         — codex reports token counts only, so the catalogue's
+//	                       (model, provider) rate turns them into dollars
+//
+// nil when neither is possible: an unpriced pair, an unknown model, or a
+// subscription, which has no per-token price at all. Callers must render that
+// as an unknown cost — a confident zero tells a customer their run was free.
+//
+// The provider comes from the Job's own parameter, so the rate is the one for
+// the route actually taken. That is the whole reason rates are keyed by
+// (model, provider): the same model costs different amounts through Bedrock, a
+// direct API, or a gateway.
+func resolveRunCost(parameters map[string]interface{}, result agentResult) *costOutput {
+	logical, _ := jobs.GetParameterValue[string](parameters, parameters_enums.Model)
+	provider := resolveJobProvider(parameters, io.Discard)
+
+	// The agent's own figure wins outright, and is recorded even when we could
+	// also have estimated one — measured beats inferred.
+	if result.CostUSD != nil {
+		return &costOutput{
+			USD:      *result.CostUSD,
+			Source:   costSourceAgent,
+			Model:    logical,
+			Provider: provider.String(),
+		}
+	}
+
+	model, err := llm_provider_enums.GetModel(logical)
+	if err != nil {
+		return nil
+	}
+	rate, ok := model.RateFor(provider)
+	if !ok {
+		return nil
+	}
+	// Cache WRITES are passed as zero because the runner's tokenUsage does not
+	// carry them — agentbox reports cache_creation_tokens, but this struct
+	// never picked the field up. Harmless for the only models priced here
+	// (codex, where OpenAI does not bill a separate cache-write rate) and worth
+	// fixing before anything Anthropic-shaped is priced from a table.
+	return &costOutput{
+		USD:      rate.CostUSD(result.TokenUsage.InputTokens, result.TokenUsage.CacheReadTokens, 0, result.TokenUsage.OutputTokens),
+		Source:   costSourceEstimated,
+		Model:    logical,
+		Provider: provider.String(),
+	}
+}
+
 // mergeAgentResultIntoJobOutput writes the agent block of the JobOutput
 // envelope. CommitAndPush + OpenPullRequest later extend the same
 // envelope's repositories block; the merge-then-write pattern preserves
@@ -1064,6 +1118,7 @@ func mergeAgentResultIntoJobOutput(parameters map[string]interface{}, result age
 		_ = json.Unmarshal([]byte(existing), &data)
 	}
 	data.SchemaVersion = jobOutputSchemaVersion
+	data.Cost = resolveRunCost(parameters, result)
 	data.Agent = &agentOutput{
 		ChangesSummary: result.ChangesSummary,
 		FilesChanged:   result.FilesChanged,

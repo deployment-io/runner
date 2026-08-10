@@ -343,7 +343,43 @@ type jobOutputData struct {
 	SchemaVersion int          `json:"schema_version"`
 	Agent         *agentOutput `json:"agent,omitempty"`
 	Repositories  []repoOutput `json:"repositories,omitempty"`
+	// Cost is what the run cost, RESOLVED ONCE HERE and never recomputed.
+	//
+	// Deliberately outside Agent: that block is agentbox's result.json passed
+	// through verbatim, and this is our resolution of it — sometimes the
+	// agent's own figure, sometimes our arithmetic. Mixing the two would lose
+	// the distinction between what was measured and what was inferred.
+	Cost *costOutput `json:"cost,omitempty"`
 }
+
+// costOutput is a run's cost with its PROVENANCE.
+//
+// Source matters as much as the number. An agent-reported cost came from the
+// vendor that billed it; an estimate is our arithmetic over token counts and a
+// rate table, and is wrong whenever the table is stale. Rendering them
+// identically tells a customer we know something we do not.
+//
+// Recorded at completion rather than derived on read, because a Task's cost is
+// a fact about when it ran. app-server previously recomputed codex costs during
+// response mapping, so editing a rate silently rewrote every past Task.
+type costOutput struct {
+	USD float64 `json:"usd"`
+	// Source is "agent" (the agent reported it) or "estimated" (we priced it
+	// from token counts). Absent Cost means neither was possible — render an
+	// unknown cost, never zero.
+	Source string `json:"source"`
+	// Model and Provider are recorded so a later question about a surprising
+	// figure can be answered without guessing which rate applied. They are also
+	// the only durable record of WHICH provider served a run, since the same
+	// model costs different amounts by route.
+	Model    string `json:"model,omitempty"`
+	Provider string `json:"provider,omitempty"`
+}
+
+const (
+	costSourceAgent     = "agent"
+	costSourceEstimated = "estimated"
+)
 
 type agentOutput struct {
 	ChangesSummary string `json:"changes_summary,omitempty"`
