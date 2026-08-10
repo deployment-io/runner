@@ -1011,6 +1011,17 @@ type tokenUsage struct {
 	InputTokens     int `json:"input_tokens"`
 	OutputTokens    int `json:"output_tokens"`
 	CacheReadTokens int `json:"cache_read_tokens"`
+	// CacheCreationTokens is cache-WRITE input, which Anthropic bills at a
+	// premium over fresh input and separately from cache reads.
+	//
+	// This field was missing, so the value was dropped HERE — in the middle of
+	// a chain where both ends already handled it. agentbox emits
+	// cache_creation_tokens and its Claude and opencode parsers populate it;
+	// app-server reads the same key out of Job.Output. Only this struct never
+	// carried it, so every cache write silently became zero and the dashboard
+	// has been under-reporting cache-heavy runs since the field was added
+	// upstream.
+	CacheCreationTokens int `json:"cache_creation_tokens"`
 }
 
 // formatAgentFailure produces the error returned when agentbox reports
@@ -1095,13 +1106,19 @@ func resolveRunCost(parameters map[string]interface{}, result agentResult) *cost
 	if !ok {
 		return nil
 	}
-	// Cache WRITES are passed as zero because the runner's tokenUsage does not
-	// carry them — agentbox reports cache_creation_tokens, but this struct
-	// never picked the field up. Harmless for the only models priced here
-	// (codex, where OpenAI does not bill a separate cache-write rate) and worth
-	// fixing before anything Anthropic-shaped is priced from a table.
+	// Cache writes bill at the fresh-input rate, which UNDERSTATES a
+	// cache-heavy Anthropic run — Anthropic charges a premium for them, and
+	// Rate has no separate field yet. Harmless for the only models priced here
+	// (codex, where cached tokens are a subset of input rather than a
+	// separately-billed bucket, so this count is zero), and the count is now
+	// passed through so adding that field is the only remaining step.
 	return &costOutput{
-		USD:      rate.CostUSD(result.TokenUsage.InputTokens, result.TokenUsage.CacheReadTokens, 0, result.TokenUsage.OutputTokens),
+		USD: rate.CostUSD(
+			result.TokenUsage.InputTokens,
+			result.TokenUsage.CacheReadTokens,
+			result.TokenUsage.CacheCreationTokens,
+			result.TokenUsage.OutputTokens,
+		),
 		Source:   costSourceEstimated,
 		Model:    logical,
 		Provider: provider.String(),

@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/deployment-io/deployment-runner-kit/enums/llm_provider_enums"
@@ -74,5 +75,48 @@ func TestResolveRunCost_UnpriceableIsNilNotZero(t *testing.T) {
 		}); got != nil {
 			t.Errorf("%s: resolveRunCost = %+v, want nil so the cost renders as unknown", c.name, got)
 		}
+	}
+}
+
+// Cache-write tokens must survive the trip from agentbox to Job.Output.
+//
+// They were silently dropped here for a while: agentbox emits
+// cache_creation_tokens and app-server reads it, but this package's tokenUsage
+// had no such field, so the middle of the chain zeroed it. A struct field
+// missing from a passthrough type is invisible in review and in tests that only
+// assert on the fields that exist — hence a test that decodes the real wire
+// shape rather than constructing the struct.
+func TestTokenUsage_CarriesCacheCreationTokens(t *testing.T) {
+	const resultJSON = `{
+		"status": "success",
+		"token_usage": {
+			"input_tokens": 1000,
+			"output_tokens": 200,
+			"cache_read_tokens": 300,
+			"cache_creation_tokens": 400
+		}
+	}`
+	var got agentResult
+	if err := json.Unmarshal([]byte(resultJSON), &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got.TokenUsage.CacheCreationTokens != 400 {
+		t.Errorf("CacheCreationTokens = %d, want 400 — agentbox reports this and app-server reads it; dropping it here understates every cache-heavy run",
+			got.TokenUsage.CacheCreationTokens)
+	}
+
+	// And it must survive re-encoding into the JobOutput envelope under the key
+	// app-server looks for.
+	encoded, err := json.Marshal(agentOutput{TokenUsage: got.TokenUsage})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var envelope map[string]interface{}
+	if err := json.Unmarshal(encoded, &envelope); err != nil {
+		t.Fatalf("re-unmarshal: %v", err)
+	}
+	usage, _ := envelope["token_usage"].(map[string]interface{})
+	if v, _ := usage["cache_creation_tokens"].(float64); v != 400 {
+		t.Errorf("token_usage.cache_creation_tokens = %v, want 400 — this is the key app-server extracts", usage["cache_creation_tokens"])
 	}
 }
