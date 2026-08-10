@@ -130,6 +130,11 @@ func prepareProvider(env map[string]string, p llm_provider_enums.Provider, logsW
 //	ResolvesModelIDAtRuntime   — whether the concrete id must be discovered
 //	OpencodeModelID            — the "provider/model" rendering
 //
+// The one thing the provider does NOT decide is whether a Bedrock id keeps its
+// cross-region geography prefix. That is a property of the model's VENDOR, so
+// the vendor is read off the catalogue here and handed to the renderer rather
+// than inferred from the id's own text.
+//
 // Adding Vertex later means setting that property and supplying its discovery;
 // nothing here changes.
 func applyAgentModelEnv(env map[string]string, spawn agentSpawn, resolve modelResolver, logsWriter io.Writer) {
@@ -144,9 +149,17 @@ func applyAgentModelEnv(env map[string]string, spawn agentSpawn, resolve modelRe
 		return
 	}
 
+	// The vendor travels with the id because opencode's rendering depends on
+	// WHO MAKES the model, not on how it is reached — models.dev lists some
+	// vendors' Bedrock ids under their cross-region geography prefix and others
+	// only bare. VendorUnknown is the honest answer for a model outside the
+	// catalogue, and means the id is passed through untouched.
+	vendor := llm_provider_enums.VendorUnknown
+
 	id := logical
 	if model, err := llm_provider_enums.GetModel(logical); err == nil {
 		id = model.IDFor(provider)
+		vendor = model.Vendor()
 		if provider.ResolvesModelIDAtRuntime() {
 			// Two different questions, deliberately kept apart: the provider
 			// says whether an id must be DISCOVERED, and a nil resolver says
@@ -163,7 +176,7 @@ func applyAgentModelEnv(env map[string]string, spawn agentSpawn, resolve modelRe
 	}
 
 	if spawn.agentType == llm_provider_enums.Opencode {
-		rendered := llm_provider_enums.OpencodeModelID(id, provider)
+		rendered := llm_provider_enums.OpencodeModelID(id, provider, vendor)
 		if rendered == "" {
 			return // unroutable; leave what the Task asked for so the error names it
 		}

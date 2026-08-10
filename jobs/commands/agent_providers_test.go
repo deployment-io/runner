@@ -178,7 +178,48 @@ func TestApplyAgentModelEnv_UsesTheRegisteredResolver(t *testing.T) {
 	if called != "nova-pro-v1" {
 		t.Errorf("resolver received %q, want the logical model", called)
 	}
-	if want := "amazon-bedrock/eu.amazon.nova-pro-v1:0"; env["MODEL"] != want {
+	// The geography discovery found is gone, because Nova is an AMAZON-vendor
+	// model and opencode's registry has no prefixed entry for it. This
+	// assertion previously demanded eu.amazon.nova-pro-v1:0 — the id a live run
+	// failed on with ProviderModelNotFoundError. The test was pinning the bug.
+	if want := "amazon-bedrock/amazon.nova-pro-v1:0"; env["MODEL"] != want {
+		t.Errorf("MODEL = %q, want %q", env["MODEL"], want)
+	}
+}
+
+// The vendor reaches the renderer, and comes from the CATALOGUE rather than
+// from the id's text. Claude on Bedrock keeps its geography prefix — there the
+// prefixed id IS the cross-region inference profile — so this case and the Nova
+// one above must disagree while going through identical code.
+func TestApplyAgentModelEnv_KeepsGeographyForAnthropicVendorModels(t *testing.T) {
+	resolve := modelResolver(func(_ context.Context, _ llm_provider_enums.Model) string {
+		return "eu.anthropic.claude-sonnet-4-5-20250929-v1:0"
+	})
+	env := map[string]string{}
+	applyAgentModelEnv(env, agentSpawn{
+		provider:  llm_provider_enums.AWSBedrock,
+		agentType: llm_provider_enums.Opencode,
+		model:     "claude-sonnet-4-5",
+	}, resolve, io.Discard)
+
+	if want := "amazon-bedrock/eu.anthropic.claude-sonnet-4-5-20250929-v1:0"; env["MODEL"] != want {
+		t.Errorf("MODEL = %q, want %q — stripping here would ask Bedrock for "+
+			"on-demand throughput the model may not offer", env["MODEL"], want)
+	}
+}
+
+// A model outside the catalogue has no vendor, and an unknown vendor must not
+// be rewritten on a guess — the id is passed through as the Task asked for it,
+// so the failure names what was requested.
+func TestApplyAgentModelEnv_UnknownModelKeepsItsIDVerbatim(t *testing.T) {
+	env := map[string]string{}
+	applyAgentModelEnv(env, agentSpawn{
+		provider:  llm_provider_enums.AWSBedrock,
+		agentType: llm_provider_enums.Opencode,
+		model:     "eu.acme.not-in-the-catalogue-v1:0",
+	}, nil, io.Discard)
+
+	if want := "amazon-bedrock/eu.acme.not-in-the-catalogue-v1:0"; env["MODEL"] != want {
 		t.Errorf("MODEL = %q, want %q", env["MODEL"], want)
 	}
 }
