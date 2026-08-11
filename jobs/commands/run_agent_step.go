@@ -423,7 +423,13 @@ func buildAgentSpawnEnvVars(parameters map[string]interface{}, logsWriter io.Wri
 	// Whatever this provider needs at spawn — credentials, discovery — is its
 	// own business; the call site does not know which provider it is.
 	resolve := prepareProvider(env, provider, logsWriter)
-	applyAgentModelEnv(env, spawn, resolve, logsWriter)
+	// Returns an error only when the model CANNOT be resolved and the run is
+	// therefore already lost — see applyAgentModelEnv. Propagated rather than
+	// logged so the Task's error names the cause, instead of the agent failing
+	// later on something that never mentions model access.
+	if err := applyAgentModelEnv(env, spawn, resolve, logsWriter); err != nil {
+		return nil, err
+	}
 	// Optionally swap the injected ANTHROPIC_API_KEY for a Claude Code
 	// subscription OAuth token read from this runner's own AWS Secrets Manager.
 	// OrganizationIDNamespace is best-effort here: it only enables the

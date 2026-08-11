@@ -137,16 +137,16 @@ func prepareProvider(env map[string]string, p llm_provider_enums.Provider, logsW
 //
 // Adding Vertex later means setting that property and supplying its discovery;
 // nothing here changes.
-func applyAgentModelEnv(env map[string]string, spawn agentSpawn, resolve modelResolver, logsWriter io.Writer) {
+func applyAgentModelEnv(env map[string]string, spawn agentSpawn, resolve modelResolver, logsWriter io.Writer) error {
 	provider := spawn.provider
 	logical := spawn.model
 	if logical == "" {
-		return
+		return nil
 	}
 	if !provider.IsValid() {
 		// No recognisable credential. Leave the model untouched so the agent
 		// fails on the missing credential rather than on a mangled id.
-		return
+		return nil
 	}
 
 	// The vendor travels with the id because opencode's rendering depends on
@@ -166,9 +166,40 @@ func applyAgentModelEnv(env map[string]string, spawn agentSpawn, resolve modelRe
 			// whether we can discover right now. Collapsing them would make a
 			// credential failure look like "this provider needs no discovery".
 			if resolve == nil {
+				// CREDENTIALS, not model access — and the two must not be
+				// collapsed, which is what the paragraph above is warning
+				// about. Degrades to the logical id so the agent reports a
+				// credential problem in its own words. Telling the user to
+				// enable model access here would name the wrong cause.
 				io.WriteString(logsWriter, fmt.Sprintf("%s: cannot resolve %q — credentials unavailable; leaving the model unchanged.\n", provider, logical))
 			} else if resolved := resolve(context.TODO(), model); resolved != "" {
 				id = resolved
+			} else if model.BedrockProfilePrefix() != "" {
+				// FAIL FAST: discovery RAN and found nothing.
+				//
+				// A profile prefix means the concrete id can ONLY come from
+				// discovery — the catalogue guarantees a model has a prefix or
+				// a declared id, never both. So an empty result leaves the
+				// LOGICAL id ("claude-opus-5"), which no provider accepts. The
+				// run is already lost; the only question is whether it is lost
+				// here or several minutes later.
+				//
+				// It used to be later: we logged the reason, spawned the
+				// container, cloned the repo, installed the CLI, and let the
+				// agent fail on an error that never mentioned model access. The
+				// explanation sat in the job logs while the Task error said
+				// nothing useful — a live opencode run showed exactly that
+				// shape. Returning here makes the actionable message the error
+				// itself.
+				//
+				// Guarded on the PREFIX, not the provider. The Bedrock-only
+				// lineup (Qwen, DeepSeek, GLM, MiniMax, Grok) has no profile
+				// and declares its id, so discovery finding nothing is CORRECT
+				// for them — guarding on provider would break every one.
+				return fmt.Errorf(
+					"model %q could not be resolved at %s: no matching inference profile in this account/region. "+
+						"Enable model access for it in the AWS console, or pick a different model",
+					logical, provider)
 			}
 		}
 	} else {
@@ -178,7 +209,13 @@ func applyAgentModelEnv(env map[string]string, spawn agentSpawn, resolve modelRe
 	if spawn.agentType == llm_provider_enums.Opencode {
 		rendered := llm_provider_enums.OpencodeModelID(id, provider, vendor)
 		if rendered == "" {
-			return // unroutable; leave what the Task asked for so the error names it
+			// Unroutable — opencode has no name for this provider. Returns
+			// WITHOUT writing the env, so MODEL keeps what the Task asked for
+			// and the resulting error names that rather than a half-resolved
+			// id. Deliberately not an error like the discovery case above:
+			// this is a catalogue contradiction, not an account problem, so
+			// there is nothing the user could act on.
+			return nil
 		}
 		id = rendered
 	}
@@ -190,4 +227,5 @@ func applyAgentModelEnv(env map[string]string, spawn agentSpawn, resolve modelRe
 	// variable, and once writing ANTHROPIC_MODEL *instead of* MODEL, which left
 	// agentbox passing the unresolved logical id as --model.
 	llm_provider_enums.ApplyModelEnv(env, id, provider, spawn.agentType)
+	return nil
 }

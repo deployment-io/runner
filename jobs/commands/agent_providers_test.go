@@ -3,6 +3,7 @@ package commands
 import (
 	"context"
 	"io"
+	"strings"
 	"testing"
 
 	"github.com/deployment-io/deployment-runner-kit/enums/llm_provider_enums"
@@ -299,5 +300,70 @@ func TestApplyAgentModelEnv_BedrockClaudeCodeGetsTheResolvedIDInBothVars(t *test
 	// The one that was wrong: agentbox turns this into --model.
 	if env["MODEL"] != resolved {
 		t.Errorf("MODEL = %q, want the resolved profile — agentbox passes it as --model, so a logical id here overrides ANTHROPIC_MODEL", env["MODEL"])
+	}
+}
+
+// A model that NEEDS discovery and did not get it fails HERE, not minutes later
+// inside a container that was always going to fail.
+//
+// The catalogue guarantees a Bedrock model has a profile prefix or a declared
+// id, never both — so an empty discovery result leaves the LOGICAL id, which no
+// provider accepts. Before this, the run continued: vendor phase, container
+// spawn, repo clone, CLI install, then an agent error that never mentioned
+// model access, with the real explanation only in the job logs.
+func TestApplyAgentModelEnv_FailsFastWhenDiscoveryFindsNothing(t *testing.T) {
+	found := modelResolver(func(context.Context, llm_provider_enums.Model) string { return "" })
+	env := map[string]string{"MODEL": "claude-sonnet-4-6"}
+	err := applyAgentModelEnv(env, agentSpawn{
+		provider:  llm_provider_enums.AWSBedrock,
+		agentType: llm_provider_enums.ClaudeCode,
+		model:     "claude-sonnet-4-6",
+	}, found, io.Discard)
+
+	if err == nil {
+		t.Fatal("no error; an unresolvable Bedrock model must fail before the container spawns")
+	}
+	// The message is the whole point — it has to name the model and the action.
+	for _, want := range []string{"claude-sonnet-4-6", "model access"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err, want)
+		}
+	}
+}
+
+// ⚠️ The boundary this must not cross. The Bedrock-only lineup has NO profile
+// and declares its concrete id, so discovery legitimately finds nothing for it.
+// Guarding on the provider instead of the prefix would fail every one of these
+// — seven models that work perfectly.
+func TestApplyAgentModelEnv_DeclaredIDModelsDoNotFailFast(t *testing.T) {
+	found := modelResolver(func(context.Context, llm_provider_enums.Model) string { return "" })
+	for _, m := range []string{"qwen3-coder-480b", "glm-5", "minimax-m2.5", "grok-4.3", "deepseek-v3.2"} {
+		env := map[string]string{"MODEL": m}
+		err := applyAgentModelEnv(env, agentSpawn{
+			provider:  llm_provider_enums.AWSBedrock,
+			agentType: llm_provider_enums.Opencode,
+			model:     m,
+		}, found, io.Discard)
+		if err != nil {
+			t.Errorf("%s: unexpected error %v — this model declares its id; discovery finding nothing is correct", m, err)
+			continue
+		}
+		if env["MODEL"] == m {
+			t.Errorf("%s: MODEL is still the logical id; the declared Bedrock id was not applied", m)
+		}
+	}
+}
+
+// Credentials missing is a DIFFERENT failure from model access, and must not
+// borrow its message. Telling someone to enable model access when the runner
+// could not assume the role sends them to the wrong console page.
+func TestApplyAgentModelEnv_MissingCredentialsIsNotAModelAccessError(t *testing.T) {
+	env := map[string]string{"MODEL": "claude-sonnet-4-6"}
+	if err := applyAgentModelEnv(env, agentSpawn{
+		provider:  llm_provider_enums.AWSBedrock,
+		agentType: llm_provider_enums.ClaudeCode,
+		model:     "claude-sonnet-4-6",
+	}, nil, io.Discard); err != nil {
+		t.Errorf("nil resolver produced %v; a credential failure must degrade and let the agent name it", err)
 	}
 }
