@@ -367,3 +367,61 @@ func TestApplyAgentModelEnv_MissingCredentialsIsNotAModelAccessError(t *testing.
 		t.Errorf("nil resolver produced %v; a credential failure must degrade and let the agent name it", err)
 	}
 }
+
+// EVERY route announces itself, not just the ones that break.
+//
+// Bedrock logs because it has a providerSetup; the API-key providers have none
+// and so logged nothing at all. That left the only self-announcing provider as
+// the one a Task lands on by ACCIDENT, and a Task that silently ran somewhere
+// unintended looking identical in the log to one that ran where it was told.
+// Asserted per provider rather than once, because the gap was never in the
+// shared code — it was in which providers happened to have a setup.
+func TestApplyAgentModelEnv_LogsTheRouteForEveryProvider(t *testing.T) {
+	for _, c := range []struct {
+		provider llm_provider_enums.Provider
+		model    string
+		want     string
+	}{
+		{llm_provider_enums.Novita, "qwen3-coder-next", "novita-ai/qwen/qwen3-coder-next"},
+		{llm_provider_enums.OpenRouter, "grok-4.3", "openrouter/x-ai/grok-4.3"},
+		{llm_provider_enums.AnthropicDirect, "claude-sonnet-4-6", "anthropic/claude-sonnet-4-6"},
+		{llm_provider_enums.OpenAIDirect, "gpt-5.5", "openai/gpt-5.5"},
+	} {
+		var logs strings.Builder
+		applyAgentModelEnv(map[string]string{}, agentSpawn{
+			provider:  c.provider,
+			agentType: llm_provider_enums.Opencode,
+			model:     c.model,
+		}, nil, &logs)
+
+		got := logs.String()
+		if !strings.Contains(got, c.provider.String()) {
+			t.Errorf("%s: log %q does not name the provider — the routing decision is invisible", c.provider, got)
+		}
+		if !strings.Contains(got, c.want) {
+			t.Errorf("%s: log %q does not carry the rendered model %q", c.provider, got, c.want)
+		}
+	}
+}
+
+// The logical id survives beside the rendered one when they differ. A Bedrock
+// discovery can resolve to a neighbouring version, so "asked for → will run" is
+// the only shape that makes such a substitution readable.
+func TestApplyAgentModelEnv_LogShowsTheSubstitution(t *testing.T) {
+	resolve := modelResolver(func(_ context.Context, _ llm_provider_enums.Model) string {
+		return "eu.anthropic.claude-sonnet-4-5-20250929-v1:0"
+	})
+	var logs strings.Builder
+	applyAgentModelEnv(map[string]string{}, agentSpawn{
+		provider:  llm_provider_enums.AWSBedrock,
+		agentType: llm_provider_enums.ClaudeCode,
+		model:     "claude-sonnet-4-5",
+	}, resolve, &logs)
+
+	got := logs.String()
+	for _, want := range []string{"claude-sonnet-4-5", "eu.anthropic.claude-sonnet-4-5-20250929-v1:0", "→"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("log %q is missing %q; a silent substitution is how the wrong version runs unnoticed", got, want)
+		}
+	}
+}

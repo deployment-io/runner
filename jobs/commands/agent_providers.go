@@ -215,9 +215,38 @@ func applyAgentModelEnv(env map[string]string, spawn agentSpawn, resolve modelRe
 			// id. Deliberately not an error like the discovery case above:
 			// this is a catalogue contradiction, not an account problem, so
 			// there is nothing the user could act on.
+			//
+			// Still SAID OUT LOUD. "Nothing to act on" is a reason not to fail
+			// the Step, not a reason to leave no trace: the agent then fails on
+			// a bare logical id, and without this line the job log gives no
+			// hint that a routing decision was involved at all.
+			io.WriteString(logsWriter, fmt.Sprintf("opencode cannot reach %s; leaving %q unrendered.\n", provider, logical))
 			return nil
 		}
 		id = rendered
+	}
+	// ANNOUNCE THE ROUTE ON THE WAY THROUGH, not only when something breaks.
+	//
+	// Every other write in this file is on a failure path, and provider setups
+	// log for themselves — but only Bedrock HAS a setup, because the API-key
+	// providers have nothing to prepare. So Bedrock was the one provider that
+	// announced itself and every other route ran silently, which is precisely
+	// inverted: a Task that quietly went somewhere unintended is the case that
+	// needs a trace, and a Task on Bedrock is the one that already had it.
+	//
+	// That inversion cost a real debugging session. A Task pinned to Novita ran
+	// on Bedrock and failed; the only reason the provider was visible at all is
+	// that Bedrock happens to log when it assumes its role. Pinned to OpenRouter
+	// instead, the same bug would have left nothing in the log to see.
+	//
+	// Prints the LOGICAL id beside the rendered one whenever they differ, since
+	// the substitution is itself a decision worth reading — a Bedrock discovery
+	// can resolve to a neighbouring version, and "what I asked for → what will
+	// run" is the shape that makes that legible.
+	if id != logical {
+		io.WriteString(logsWriter, fmt.Sprintf("Agent: %s via %s — %s → %s\n", spawn.agentType, provider, logical, id))
+	} else {
+		io.WriteString(logsWriter, fmt.Sprintf("Agent: %s via %s — %s\n", spawn.agentType, provider, id))
 	}
 	// WHERE the model goes is the catalogue's call, not ours: it is the same
 	// fact as claude-code's Bedrock switch, and the two must agree — an agent in
