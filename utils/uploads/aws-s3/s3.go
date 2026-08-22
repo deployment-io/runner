@@ -41,9 +41,15 @@ func isPathDirectory(directoryPath string) (bool, error) {
 }
 
 // we can assume that this function is called only for directory
-func (u *Uploader) uploadDirectory(directoryPath string, logsWriter io.Writer) error {
+//
+// Returns the set of object keys this upload is responsible for — every file
+// walked, not only the ones that reported success. Callers prune the bucket
+// down to this set, so it must describe the build in full: a key missing from
+// it is a live file the prune would delete.
+func (u *Uploader) uploadDirectory(directoryPath string, logsWriter io.Writer) (map[string]bool, error) {
 	fileUploadDoneSignals := make([]<-chan uploadFileDoneDTO, 0)
 	abortUploadSignal := make(chan interface{})
+	uploadedKeys := map[string]bool{}
 	root := directoryPath
 	//10 concurrent uploads sleep for 10 seconds after 10 requests for now
 	//TODO fix later
@@ -55,6 +61,12 @@ func (u *Uploader) uploadDirectory(directoryPath string, logsWriter io.Writer) e
 		if !d.IsDir() {
 			//	upload if it's not directory
 			outputS3ObjectKey := strings.TrimPrefix(path, directoryPath+"/")
+			// Recorded HERE, from the same expression that names the object,
+			// so the caller's view of the build cannot diverge from what was
+			// actually written. Re-deriving these keys from the directory
+			// somewhere else would usually agree and occasionally not, and the
+			// failure mode of disagreeing is deleting the live site.
+			uploadedKeys[outputS3ObjectKey] = true
 			fileUploadDoneSignal := u.UploadFile(path, outputS3ObjectKey, abortUploadSignal)
 			fileUploadDoneSignals = append(fileUploadDoneSignals, fileUploadDoneSignal)
 			i++
@@ -65,7 +77,7 @@ func (u *Uploader) uploadDirectory(directoryPath string, logsWriter io.Writer) e
 		return err
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
 	for _, fileUploadDoneSignal := range fileUploadDoneSignals {
 		done := <-fileUploadDoneSignal
@@ -75,21 +87,31 @@ func (u *Uploader) uploadDirectory(directoryPath string, logsWriter io.Writer) e
 			io.WriteString(logsWriter, fmt.Sprintf("Error uploading file: %s\n", done.objectKey))
 		}
 		if done.err != nil {
-			return err
+			// Was `return err` — the WalkDir error, which is always nil by the
+			// time this loop runs. So a failed file upload logged its line and
+			// then reported SUCCESS to the caller.
+			//
+			// Harmless while a deploy only ever added files. Not harmless now:
+			// the caller prunes everything absent from this build immediately
+			// afterwards, so a swallowed upload failure would delete the old
+			// file and leave nothing in its place. Prune-after-upload is only
+			// safe if a failed upload stops the deploy.
+			return nil, done.err
 		}
 	}
-	return nil
+	return uploadedKeys, nil
 }
 
 var DirectoryErr = fmt.Errorf("path is not a directory path")
 
-func (u *Uploader) UploadDirectory(directoryPath string, logsWriter io.Writer) error {
+// UploadDirectory uploads a tree and returns the object keys it wrote.
+func (u *Uploader) UploadDirectory(directoryPath string, logsWriter io.Writer) (map[string]bool, error) {
 	isDirectory, err := isPathDirectory(directoryPath)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if !isDirectory {
-		return DirectoryErr
+		return nil, DirectoryErr
 	}
 	return u.uploadDirectory(directoryPath, logsWriter)
 }
