@@ -79,6 +79,13 @@ func (u *Uploader) uploadDirectory(directoryPath string, logsWriter io.Writer) (
 	if err != nil {
 		return nil, err
 	}
+	// DRAIN EVERY CHANNEL, then fail. The done channels are unbuffered, so a
+	// return from inside this loop would leave every not-yet-received upload
+	// goroutine blocked on its send — forever, in a long-lived runner, one
+	// leaked goroutine per remaining file on every failed deploy. Collecting
+	// the first error and returning it after the loop keeps the abort without
+	// the leak.
+	var firstErr error
 	for _, fileUploadDoneSignal := range fileUploadDoneSignals {
 		done := <-fileUploadDoneSignal
 		if done.done {
@@ -86,18 +93,21 @@ func (u *Uploader) uploadDirectory(directoryPath string, logsWriter io.Writer) (
 		} else {
 			io.WriteString(logsWriter, fmt.Sprintf("Error uploading file: %s\n", done.objectKey))
 		}
-		if done.err != nil {
-			// Was `return err` — the WalkDir error, which is always nil by the
-			// time this loop runs. So a failed file upload logged its line and
-			// then reported SUCCESS to the caller.
-			//
-			// Harmless while a deploy only ever added files. Not harmless now:
-			// the caller prunes everything absent from this build immediately
-			// afterwards, so a swallowed upload failure would delete the old
-			// file and leave nothing in its place. Prune-after-upload is only
-			// safe if a failed upload stops the deploy.
-			return nil, done.err
+		if done.err != nil && firstErr == nil {
+			firstErr = done.err
 		}
+	}
+	if firstErr != nil {
+		// Was `return err` — the WalkDir error, which is always nil by the
+		// time this loop runs. So a failed file upload logged its line and
+		// then reported SUCCESS to the caller.
+		//
+		// Harmless while a deploy only ever added files. Not harmless now:
+		// the caller prunes everything absent from this build immediately
+		// afterwards, so a swallowed upload failure would delete the old
+		// file and leave nothing in its place. Prune-after-upload is only
+		// safe if a failed upload stops the deploy.
+		return nil, firstErr
 	}
 	return uploadedKeys, nil
 }

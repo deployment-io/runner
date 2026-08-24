@@ -120,6 +120,13 @@ func UploadToS3(directory, s3Region, s3Bucket string, s3Client *s3.Client, logsW
 // directory. The uploader names objects with strings.TrimPrefix(path, dir+"/"),
 // and a second implementation of that would usually agree — the failure mode
 // when it did not would be deleting the live site.
+//
+// ⚠️ ASSUMES THE BUCKET IS DEDICATED to this site — one bucket per deployment,
+// one per preview, which is how both callers provision them. That assumption is
+// what makes "delete everything this build did not produce" a safe sentence.
+// If a bucket is ever shared with anything else — another site, logs, user
+// uploads — this function deletes it, and no guard here can tell the
+// difference. Widen the keep set before widening the bucket.
 func PruneStaleS3Files(s3Client *s3.Client, bucketName string, keep map[string]bool, logsWriter io.Writer) error {
 	// An empty keep set would mean "delete everything", which is never a
 	// legitimate outcome here: the caller has just uploaded a build. Refusing
@@ -131,18 +138,26 @@ func PruneStaleS3Files(s3Client *s3.Client, bucketName string, keep map[string]b
 	if err != nil {
 		return err
 	}
-	var stale []s3Types.ObjectIdentifier
-	for _, object := range allS3Objects {
-		key := aws.ToString(object.Key)
-		if !keep[key] {
-			stale = append(stale, s3Types.ObjectIdentifier{Key: object.Key})
-		}
-	}
+	stale := staleS3Objects(allS3Objects, keep)
 	if len(stale) == 0 {
 		return nil
 	}
 	io.WriteString(logsWriter, fmt.Sprintf("Removing %d file(s) left over from the previous build\n", len(stale)))
 	return deleteS3ObjectsInBatches(s3Client, bucketName, stale)
+}
+
+// staleS3Objects is the set difference PruneStaleS3Files deletes: every listed
+// object whose key the current build did not produce. Split out because this is
+// the one computation whose bug deletes a live file, so it is the part that
+// must be testable without an S3 client.
+func staleS3Objects(objects []s3Types.Object, keep map[string]bool) []s3Types.ObjectIdentifier {
+	var stale []s3Types.ObjectIdentifier
+	for _, object := range objects {
+		if !keep[aws.ToString(object.Key)] {
+			stale = append(stale, s3Types.ObjectIdentifier{Key: object.Key})
+		}
+	}
+	return stale
 }
 
 func bucketExists(s3Client *s3.Client, s3Bucket string) bool {
