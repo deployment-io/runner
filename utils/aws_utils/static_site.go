@@ -140,6 +140,12 @@ func PruneStaleS3Files(s3Client *s3.Client, bucketName string, keep map[string]b
 	}
 	stale := staleS3Objects(allS3Objects, keep)
 	if len(stale) == 0 {
+		// SAY SO. This branch was silent, and the first live deploy after the
+		// prune shipped happened to be an unchanged redeploy — every hash
+		// identical, nothing stale — so the log looked exactly like a runner
+		// still on the old delete-then-upload code. "Ran, nothing to remove"
+		// and "didn't run" must not read the same to the person checking.
+		io.WriteString(logsWriter, "No files left over from the previous build.\n")
 		return nil
 	}
 	io.WriteString(logsWriter, fmt.Sprintf("Removing %d file(s) left over from the previous build\n", len(stale)))
