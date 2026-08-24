@@ -85,16 +85,79 @@ func CreateOriginAccessControl(name string, cloudFrontClient *cloudfront.Client)
 }
 
 // UploadToS3 uploads a local directory tree to an S3 bucket.
-func UploadToS3(directory, s3Region, s3Bucket string, s3Client *s3.Client, logsWriter io.Writer) error {
+// Returns the object keys written, for PruneStaleS3Files.
+func UploadToS3(directory, s3Region, s3Bucket string, s3Client *s3.Client, logsWriter io.Writer) (map[string]bool, error) {
 	uploader, err := awsS3Uploads.NewUploader(s3Region, s3Bucket, s3Client)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	err = uploader.UploadDirectory(directory, logsWriter)
+	uploadedKeys, err := uploader.UploadDirectory(directory, logsWriter)
+	if err != nil {
+		return nil, err
+	}
+	return uploadedKeys, nil
+}
+
+// PruneStaleS3Files removes objects the build just uploaded did not produce.
+//
+// REPLACES delete-then-upload, which had two failure modes that only appeared
+// once sites started code-splitting:
+//
+//   - Between the delete and the upload, the origin held NOTHING. CloudFront
+//     masked it for cached objects, but a first-time visitor in that window got
+//     a 404. On a build with hundreds of chunks the window is not brief.
+//   - Deleting the previous build's hashed chunks breaks every session still
+//     running it. A single-bundle app never noticed: it had already downloaded
+//     everything it would ever need. A code-split app fetches chunks on
+//     navigation, so it outlives its own build and then asks for a file that
+//     was deleted — "Failed to fetch dynamically imported module".
+//
+// Ordering is the fix, and it must be upload -> invalidate -> prune. Invalidate
+// BEFORE pruning: until the edge stops serving the previous index.html, the
+// files it names must still exist.
+//
+// keep is the upload's own key set rather than a re-walk of the build
+// directory. The uploader names objects with strings.TrimPrefix(path, dir+"/"),
+// and a second implementation of that would usually agree — the failure mode
+// when it did not would be deleting the live site.
+//
+// ⚠️ ASSUMES THE BUCKET IS DEDICATED to this site — one bucket per deployment,
+// one per preview, which is how both callers provision them. That assumption is
+// what makes "delete everything this build did not produce" a safe sentence.
+// If a bucket is ever shared with anything else — another site, logs, user
+// uploads — this function deletes it, and no guard here can tell the
+// difference. Widen the keep set before widening the bucket.
+func PruneStaleS3Files(s3Client *s3.Client, bucketName string, keep map[string]bool, logsWriter io.Writer) error {
+	// An empty keep set would mean "delete everything", which is never a
+	// legitimate outcome here: the caller has just uploaded a build. Refusing
+	// is what makes a set-difference delete safe to run against a live bucket.
+	if len(keep) == 0 {
+		return fmt.Errorf("refusing to prune %s: the uploaded key set is empty", bucketName)
+	}
+	allS3Objects, err := listAllS3Objects(s3Client, bucketName)
 	if err != nil {
 		return err
 	}
-	return nil
+	stale := staleS3Objects(allS3Objects, keep)
+	if len(stale) == 0 {
+		return nil
+	}
+	io.WriteString(logsWriter, fmt.Sprintf("Removing %d file(s) left over from the previous build\n", len(stale)))
+	return deleteS3ObjectsInBatches(s3Client, bucketName, stale)
+}
+
+// staleS3Objects is the set difference PruneStaleS3Files deletes: every listed
+// object whose key the current build did not produce. Split out because this is
+// the one computation whose bug deletes a live file, so it is the part that
+// must be testable without an S3 client.
+func staleS3Objects(objects []s3Types.Object, keep map[string]bool) []s3Types.ObjectIdentifier {
+	var stale []s3Types.ObjectIdentifier
+	for _, object := range objects {
+		if !keep[aws.ToString(object.Key)] {
+			stale = append(stale, s3Types.ObjectIdentifier{Key: object.Key})
+		}
+	}
+	return stale
 }
 
 func bucketExists(s3Client *s3.Client, s3Bucket string) bool {
@@ -184,7 +247,39 @@ func listAllS3Objects(s3Client *s3.Client, bucketName string) ([]s3Types.Object,
 	return objects, nil
 }
 
-// DeleteAllS3Files empties an S3 bucket (batched deletes, 9000 at a time).
+// s3DeleteObjectsLimit is the number of keys DeleteObjects accepts per request.
+//
+// ⚠️ 1000, NOT 10000. This batched at 9000 under a comment reading "Limit is
+// 10000", which S3 rejects outright. It never fired because these buckets held
+// a handful of files — a single-bundle SPA is a dozen objects. Code-splitting
+// changes that: one dashboard build is already 241 objects, and a site past
+// 1000 would have failed on both deploy and teardown.
+const s3DeleteObjectsLimit = 1000
+
+// deleteS3ObjectsInBatches deletes the given keys, respecting the per-request
+// limit. Shared by DeleteAllS3Files and PruneStaleS3Files so the cap is stated
+// once.
+func deleteS3ObjectsInBatches(s3Client *s3.Client, bucketName string, objectIds []s3Types.ObjectIdentifier) error {
+	for start := 0; start < len(objectIds); start += s3DeleteObjectsLimit {
+		end := start + s3DeleteObjectsLimit
+		if end > len(objectIds) {
+			end = len(objectIds)
+		}
+		_, err := s3Client.DeleteObjects(context.TODO(), &s3.DeleteObjectsInput{
+			Bucket: aws.String(bucketName),
+			Delete: &s3Types.Delete{Objects: objectIds[start:end]},
+		})
+		if err != nil {
+			return fmt.Errorf("error deleting objects from bucket %s : %s", bucketName, err)
+		}
+	}
+	return nil
+}
+
+// DeleteAllS3Files empties an S3 bucket.
+//
+// Still used by teardown (delete_aws_static_site), where emptying is the point.
+// The DEPLOY path no longer calls this — see PruneStaleS3Files.
 func DeleteAllS3Files(s3Client *s3.Client, bucketName string) error {
 	allS3Objects, err := listAllS3Objects(s3Client, bucketName)
 	if err != nil {
@@ -193,25 +288,10 @@ func DeleteAllS3Files(s3Client *s3.Client, bucketName string) error {
 	var objectIds []s3Types.ObjectIdentifier
 	for _, object := range allS3Objects {
 		objectIds = append(objectIds, s3Types.ObjectIdentifier{Key: object.Key})
-		if len(objectIds) == 9000 {
-			//delete 9000 at a time. Limit is 10000
-			_, err = s3Client.DeleteObjects(context.TODO(), &s3.DeleteObjectsInput{
-				Bucket: aws.String(bucketName),
-				Delete: &s3Types.Delete{Objects: objectIds},
-			})
-			if err != nil {
-				return fmt.Errorf("error deleting objects from bucket %s : %s", bucketName, err)
-			}
-			objectIds = nil
-		}
 	}
 	if len(objectIds) > 0 {
-		_, err = s3Client.DeleteObjects(context.TODO(), &s3.DeleteObjectsInput{
-			Bucket: aws.String(bucketName),
-			Delete: &s3Types.Delete{Objects: objectIds},
-		})
-		if err != nil {
-			return fmt.Errorf("error deleting objects from bucket %s : %s", bucketName, err)
+		if err = deleteS3ObjectsInBatches(s3Client, bucketName, objectIds); err != nil {
+			return err
 		}
 	}
 	return nil

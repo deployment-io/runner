@@ -316,14 +316,19 @@ func (d *DeployAwsStaticSite) Run(parameters map[string]interface{}, logsWriter 
 		}
 	}
 
-	err = aws_utils.DeleteAllS3Files(s3Client, bucketName)
-	if err != nil {
-		return parameters, err
-	}
-
+	// UPLOAD FIRST, PRUNE LAST — the bucket is never emptied.
+	//
+	// This used to delete every object and then upload, which left the origin
+	// holding nothing for the length of the upload and deleted the previous
+	// build's chunks outright. Both only started mattering once sites
+	// code-split: the stale files a running SPA asks for are exactly the ones
+	// the delete removed. Hashed filenames cannot collide, so uploading over
+	// the previous build is purely additive.
+	//
+	// The prune runs AFTER the CloudFront invalidation below, not here.
 	io.WriteString(logsWriter, fmt.Sprintf("Uploading site to S3 bucket: %s\n", bucketName))
 
-	err = aws_utils.UploadToS3(distDirectory, region_enums.Type(region).String(), bucketName, s3Client, logsWriter)
+	uploadedKeys, err := aws_utils.UploadToS3(distDirectory, region_enums.Type(region).String(), bucketName, s3Client, logsWriter)
 	if err != nil {
 		io.WriteString(logsWriter, fmt.Sprintf("Error uploading site to S3 bucket: %s\n", bucketName))
 		return parameters, err
@@ -496,6 +501,24 @@ func (d *DeployAwsStaticSite) Run(parameters map[string]interface{}, logsWriter 
 		}
 
 		jobs.SetParameterValue(parameters, parameters_enums.CloudfrontID, cloudfrontID)
+	}
+
+	// PRUNE LAST, AFTER THE INVALIDATION.
+	//
+	// Order is the whole point. Until the edge stops serving the previous
+	// index.html, the chunks that HTML names must still exist at the origin —
+	// pruning before invalidating would mean CloudFront advertising files the
+	// bucket no longer has, breaking visitors who have never loaded the site.
+	//
+	// A first deploy creates the distribution instead of invalidating it, and
+	// finds an empty bucket, so there is nothing to prune either way.
+	//
+	// Deliberately not fatal: the new build is already live and invalidated by
+	// this point, so a failure here leaves a working site carrying some dead
+	// files. Failing the deploy over that would report a successful rollout as
+	// broken.
+	if err = aws_utils.PruneStaleS3Files(s3Client, bucketName, uploadedKeys, logsWriter); err != nil {
+		io.WriteString(logsWriter, fmt.Sprintf("Could not remove previous build's files (the new site is live): %s\n", err))
 	}
 
 	//mark build done successfully

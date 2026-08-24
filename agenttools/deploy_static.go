@@ -94,13 +94,24 @@ func DeployStaticSitePreview(in StaticPreviewDeployInput, logsWriter io.Writer) 
 		return StaticPreviewDeployResult{}, fmt.Errorf("ensure preview bucket: %w", err)
 	}
 
-	// Re-upload the freshly built site (clear stale objects first).
-	if err = aws_utils.DeleteAllS3Files(in.S3Client, bucketName); err != nil {
-		return StaticPreviewDeployResult{}, fmt.Errorf("clear preview bucket: %w", err)
-	}
+	// Upload over the previous build, then remove what it left behind — never
+	// empty the bucket first. Hashed filenames cannot collide, so the upload is
+	// additive, and the origin is never missing files mid-deploy. Same reason as
+	// the deployment path: a code-split SPA fetches chunks on navigation, so a
+	// session running the previous build asks for files that clearing would
+	// already have deleted.
+	//
+	// No invalidation to sequence around here — this distribution uses the
+	// managed CachingDisabled policy, so the edge always reads through.
 	io.WriteString(logsWriter, fmt.Sprintf("Uploading preview to S3 bucket: %s\n", bucketName))
-	if err = aws_utils.UploadToS3(in.DistDirectory, in.Region, bucketName, in.S3Client, logsWriter); err != nil {
+	uploadedKeys, err := aws_utils.UploadToS3(in.DistDirectory, in.Region, bucketName, in.S3Client, logsWriter)
+	if err != nil {
 		return StaticPreviewDeployResult{}, fmt.Errorf("upload preview: %w", err)
+	}
+	// Not fatal: the preview is already serving the new build, and leftover
+	// files from the previous one do not break it.
+	if err = aws_utils.PruneStaleS3Files(in.S3Client, bucketName, uploadedKeys, logsWriter); err != nil {
+		io.WriteString(logsWriter, fmt.Sprintf("Could not remove previous preview files (the preview is live): %s\n", err))
 	}
 
 	cf := in.CloudfrontClient
