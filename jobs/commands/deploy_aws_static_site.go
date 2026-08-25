@@ -503,22 +503,29 @@ func (d *DeployAwsStaticSite) Run(parameters map[string]interface{}, logsWriter 
 		jobs.SetParameterValue(parameters, parameters_enums.CloudfrontID, cloudfrontID)
 	}
 
-	// PRUNE LAST, AFTER THE INVALIDATION.
+	// MARK LAST, AFTER THE INVALIDATION.
 	//
-	// Order is the whole point. Until the edge stops serving the previous
-	// index.html, the chunks that HTML names must still exist at the origin —
-	// pruning before invalidating would mean CloudFront advertising files the
-	// bucket no longer has, breaking visitors who have never loaded the site.
+	// The previous build's files are not deleted — they are tagged, and an S3
+	// lifecycle rule expires them a week later, so a browser tab loaded before
+	// this deploy can still fetch the code-split chunks its HTML names.
+	//
+	// Order is still the whole point, for two reasons. Until the edge stops
+	// serving the previous index.html, the chunks that HTML names must not be
+	// on an expiry clock — marking before invalidating would start the week
+	// while the edge is still handing that build out. And marking must come
+	// after the upload: a rollback re-uploads files a previous deploy tagged,
+	// and the upload is what clears the tag, so the marking pass has to see the
+	// bucket in its post-upload state.
 	//
 	// A first deploy creates the distribution instead of invalidating it, and
-	// finds an empty bucket, so there is nothing to prune either way.
+	// finds an empty bucket, so there is nothing to mark either way.
 	//
 	// Deliberately not fatal: the new build is already live and invalidated by
-	// this point, so a failure here leaves a working site carrying some dead
-	// files. Failing the deploy over that would report a successful rollout as
-	// broken.
-	if err = aws_utils.PruneStaleS3Files(s3Client, bucketName, uploadedKeys, logsWriter); err != nil {
-		io.WriteString(logsWriter, fmt.Sprintf("Could not remove previous build's files (the new site is live): %s\n", err))
+	// this point, so a failure here leaves a working site carrying some files
+	// that outlive their week. Failing the deploy over that would report a
+	// successful rollout as broken.
+	if err = aws_utils.MarkStaleS3Files(s3Client, bucketName, uploadedKeys, logsWriter); err != nil {
+		io.WriteString(logsWriter, fmt.Sprintf("Could not mark the previous build's files as stale (the new site is live): %s\n", err))
 	}
 
 	//mark build done successfully
