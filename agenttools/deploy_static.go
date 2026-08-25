@@ -94,12 +94,17 @@ func DeployStaticSitePreview(in StaticPreviewDeployInput, logsWriter io.Writer) 
 		return StaticPreviewDeployResult{}, fmt.Errorf("ensure preview bucket: %w", err)
 	}
 
-	// Upload over the previous build, then remove what it left behind — never
-	// empty the bucket first. Hashed filenames cannot collide, so the upload is
-	// additive, and the origin is never missing files mid-deploy. Same reason as
-	// the deployment path: a code-split SPA fetches chunks on navigation, so a
-	// session running the previous build asks for files that clearing would
-	// already have deleted.
+	// Upload over the previous build, then mark what it left behind for expiry
+	// a week out — never empty the bucket first, and never delete outright.
+	// Hashed filenames cannot collide, so the upload is additive, and the origin
+	// is never missing files mid-deploy. Same reason as the deployment path: a
+	// code-split SPA fetches chunks on navigation, so a session running the
+	// previous build asks for files that clearing would already have deleted,
+	// and a preview tab is exactly the kind of thing someone leaves open while
+	// a new build lands.
+	//
+	// Marking must follow the upload: it is the upload that clears the stale tag
+	// from any file a previous deploy marked and this build brought back.
 	//
 	// No invalidation to sequence around here — this distribution uses the
 	// managed CachingDisabled policy, so the edge always reads through.
@@ -109,9 +114,10 @@ func DeployStaticSitePreview(in StaticPreviewDeployInput, logsWriter io.Writer) 
 		return StaticPreviewDeployResult{}, fmt.Errorf("upload preview: %w", err)
 	}
 	// Not fatal: the preview is already serving the new build, and leftover
-	// files from the previous one do not break it.
-	if err = aws_utils.PruneStaleS3Files(in.S3Client, bucketName, uploadedKeys, logsWriter); err != nil {
-		io.WriteString(logsWriter, fmt.Sprintf("Could not remove previous preview files (the preview is live): %s\n", err))
+	// files from the previous one do not break it — they just sit there until a
+	// later deploy marks them.
+	if err = aws_utils.MarkStaleS3Files(in.S3Client, bucketName, uploadedKeys, logsWriter); err != nil {
+		io.WriteString(logsWriter, fmt.Sprintf("Could not mark previous preview files as stale (the preview is live): %s\n", err))
 	}
 
 	cf := in.CloudfrontClient

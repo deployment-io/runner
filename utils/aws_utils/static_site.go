@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/url"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/cloudfront"
@@ -85,7 +86,7 @@ func CreateOriginAccessControl(name string, cloudFrontClient *cloudfront.Client)
 }
 
 // UploadToS3 uploads a local directory tree to an S3 bucket.
-// Returns the object keys written, for PruneStaleS3Files.
+// Returns the object keys written, for MarkStaleS3Files.
 func UploadToS3(directory, s3Region, s3Bucket string, s3Client *s3.Client, logsWriter io.Writer) (map[string]bool, error) {
 	uploader, err := awsS3Uploads.NewUploader(s3Region, s3Bucket, s3Client)
 	if err != nil {
@@ -98,10 +99,25 @@ func UploadToS3(directory, s3Region, s3Bucket string, s3Client *s3.Client, logsW
 	return uploadedKeys, nil
 }
 
-// PruneStaleS3Files removes objects the build just uploaded did not produce.
+// staleObjectTagKey / staleObjectTagValue is the tag MarkStaleS3Files writes and
+// the lifecycle rule expires on. It is the whole contract between the two: the
+// marking pass and the rule never talk to each other otherwise.
+const (
+	staleObjectTagKey   = "deployment-io-stale"
+	staleObjectTagValue = "true"
+)
+
+// staleObjectExpiryDays is how long a superseded build's files stay served
+// before S3 expires them — the grace period a browser tab loaded against the
+// previous build gets to keep fetching its chunks.
+const staleObjectExpiryDays = 7
+
+// MarkStaleS3Files tags the objects the build just uploaded did not produce, so
+// an S3 lifecycle rule expires them after staleObjectExpiryDays instead of this
+// deploy deleting them.
 //
-// REPLACES delete-then-upload, which had two failure modes that only appeared
-// once sites started code-splitting:
+// REPLACES delete-then-upload, and then replaces the delete itself. The first
+// two failure modes only appeared once sites started code-splitting:
 //
 //   - Between the delete and the upload, the origin held NOTHING. CloudFront
 //     masked it for cached objects, but a first-time visitor in that window got
@@ -112,27 +128,42 @@ func UploadToS3(directory, s3Region, s3Bucket string, s3Client *s3.Client, logsW
 //     navigation, so it outlives its own build and then asks for a file that
 //     was deleted — "Failed to fetch dynamically imported module".
 //
-// Ordering is the fix, and it must be upload -> invalidate -> prune. Invalidate
-// BEFORE pruning: until the edge stops serving the previous index.html, the
-// files it names must still exist.
+// Reordering to upload -> invalidate -> delete fixed the first and only
+// narrowed the second: a tab open at the moment of the deploy still lost its
+// chunks, just a few seconds later. Vercel and Netlify keep superseded assets
+// around instead, and that is what this does — bounded, because "keep forever"
+// grows a bucket without limit. Old tabs work for a week; storage settles at
+// roughly the current build plus whatever the last week's builds superseded.
+//
+// Ordering still matters and is still upload -> invalidate -> mark: until the
+// edge stops serving the previous index.html, the files it names must not be
+// on an expiry clock any earlier than they have to be.
 //
 // keep is the upload's own key set rather than a re-walk of the build
 // directory. The uploader names objects with strings.TrimPrefix(path, dir+"/"),
 // and a second implementation of that would usually agree — the failure mode
-// when it did not would be deleting the live site.
+// when it did not would be putting the live site on an expiry clock.
 //
 // ⚠️ ASSUMES THE BUCKET IS DEDICATED to this site — one bucket per deployment,
 // one per preview, which is how both callers provision them. That assumption is
-// what makes "delete everything this build did not produce" a safe sentence.
+// what makes "mark everything this build did not produce" a safe sentence.
 // If a bucket is ever shared with anything else — another site, logs, user
-// uploads — this function deletes it, and no guard here can tell the
-// difference. Widen the keep set before widening the bucket.
-func PruneStaleS3Files(s3Client *s3.Client, bucketName string, keep map[string]bool, logsWriter io.Writer) error {
-	// An empty keep set would mean "delete everything", which is never a
+// uploads — this function schedules it for deletion, and no guard here can tell
+// the difference. Widen the keep set before widening the bucket.
+func MarkStaleS3Files(s3Client *s3.Client, bucketName string, keep map[string]bool, logsWriter io.Writer) error {
+	// An empty keep set would mean "mark everything", which is never a
 	// legitimate outcome here: the caller has just uploaded a build. Refusing
-	// is what makes a set-difference delete safe to run against a live bucket.
+	// is what makes a set-difference safe to run against a live bucket. It runs
+	// before anything touches S3, so a nil client never gets that far.
 	if len(keep) == 0 {
-		return fmt.Errorf("refusing to prune %s: the uploaded key set is empty", bucketName)
+		return fmt.Errorf("refusing to mark stale files in %s: the uploaded key set is empty", bucketName)
+	}
+	// Not fatal. Tags are inert until the rule exists: a later deploy lands it
+	// and everything already tagged becomes eligible then. The failure mode of
+	// giving up here — refusing to mark, so the previous build's files live
+	// forever — is strictly worse than marking a week early.
+	if err := ensureStaleLifecycleRule(s3Client, bucketName); err != nil {
+		io.WriteString(logsWriter, fmt.Sprintf("Could not ensure the stale-file expiry rule on %s (marking anyway): %s\n", bucketName, err))
 	}
 	allS3Objects, err := listAllS3Objects(s3Client, bucketName)
 	if err != nil {
@@ -148,14 +179,72 @@ func PruneStaleS3Files(s3Client *s3.Client, bucketName string, keep map[string]b
 		io.WriteString(logsWriter, "No files left over from the previous build.\n")
 		return nil
 	}
-	io.WriteString(logsWriter, fmt.Sprintf("Removing %d file(s) left over from the previous build\n", len(stale)))
-	return deleteS3ObjectsInBatches(s3Client, bucketName, stale)
+	marked := markObjectsStale(s3Client, bucketName, stale, logsWriter)
+	io.WriteString(logsWriter, fmt.Sprintf("Marked %d file(s) from the previous build as stale; S3 removes them in about %d days.\n",
+		marked, staleObjectExpiryDays))
+	return nil
 }
 
-// staleS3Objects is the set difference PruneStaleS3Files deletes: every listed
+// markObjectsStale tags each object with staleObjectTagKey, returning how many
+// it managed to tag.
+//
+// ⚠️ SELF-COPY, NOT PutObjectTagging, AND THAT IS THE POINT. Lifecycle
+// expiration counts its days from the object's LastModified — for a stale file
+// that is the *previous* deploy, not now. Plain tagging would therefore grant
+// "7 days minus however long ago the last deploy was", which is fine for a site
+// deployed daily and collapses to hours for one deployed after a month's pause
+// — exactly the tab-breaking behaviour this whole change exists to remove.
+// Copying an object onto itself rewrites it, resetting LastModified so the
+// window is measured from when the file actually became stale, and carries the
+// tag in the same call. (S3 rejects a self-copy that changes nothing; the
+// tagging directive is the change that makes it legal.)
+//
+// These objects are still being served for the next week, so the copy must not
+// disturb them: MetadataDirective defaults to COPY, which carries Content-Type
+// and the rest across unchanged. Only the tags are replaced.
+//
+// A per-object failure is logged and skipped rather than returned: the new
+// build is already live, and one un-tagged leftover file costs a little storage
+// until the next deploy marks it. Failing the deploy over that would report a
+// successful rollout as broken.
+func markObjectsStale(s3Client *s3.Client, bucketName string, stale []s3Types.ObjectIdentifier, logsWriter io.Writer) int {
+	var marked int
+	for _, object := range stale {
+		key := aws.ToString(object.Key)
+		// CopySource is bucket/key and the SDK sends it as a header verbatim,
+		// so keys with spaces or other header-hostile characters have to be
+		// escaped here. EscapedPath leaves the "/" separators intact.
+		source := (&url.URL{Path: bucketName + "/" + key}).EscapedPath()
+		_, err := s3Client.CopyObject(context.TODO(), &s3.CopyObjectInput{
+			Bucket:           aws.String(bucketName),
+			Key:              object.Key,
+			CopySource:       aws.String(source),
+			Tagging:          aws.String(staleObjectTagKey + "=" + staleObjectTagValue),
+			TaggingDirective: s3Types.TaggingDirectiveReplace,
+		})
+		if err != nil {
+			io.WriteString(logsWriter, fmt.Sprintf("Could not mark %s as stale (it will be marked by a later deploy): %s\n", key, err))
+			continue
+		}
+		marked++
+	}
+	return marked
+}
+
+// staleS3Objects is the set difference MarkStaleS3Files tags: every listed
 // object whose key the current build did not produce. Split out because this is
-// the one computation whose bug deletes a live file, so it is the part that
-// must be testable without an S3 client.
+// the one computation whose bug puts a live file on an expiry clock, so it is
+// the part that must be testable without an S3 client.
+//
+// ⚠️ LOAD-BEARING PROPERTY: nothing here ever removes the stale tag, and
+// nothing needs to. A rollback re-deploys a build whose files may already be
+// tagged, and an S3 overwrite with no explicit tagging replaces the object
+// outright — empty tag set, fresh LastModified — so a re-uploaded file stops
+// being expiry-eligible by the act of being uploaded. That works only because
+// the deploy uploads before it marks: by the time this difference is computed,
+// a re-included file is already back in place untagged and lands in keep, so it
+// is not stale here either. Reorder the deploy to mark before uploading and
+// rollbacks start deleting themselves a week later.
 func staleS3Objects(objects []s3Types.Object, keep map[string]bool) []s3Types.ObjectIdentifier {
 	var stale []s3Types.ObjectIdentifier
 	for _, object := range objects {
@@ -164,6 +253,80 @@ func staleS3Objects(objects []s3Types.Object, keep map[string]bool) []s3Types.Ob
 		}
 	}
 	return stale
+}
+
+// staleLifecycleRuleID identifies the rule this package owns. Rules are matched
+// by ID on every deploy, so it must never change — a new ID means a second copy
+// of the rule appended alongside the first, forever.
+const staleLifecycleRuleID = "deployment-io-expire-stale-build-files"
+
+// ensureStaleLifecycleRule makes sure the bucket has the rule that expires
+// tagged objects. Idempotent: run on every deploy, appends at most once.
+func ensureStaleLifecycleRule(s3Client *s3.Client, bucketName string) error {
+	var existing []s3Types.LifecycleRule
+	getOutput, err := s3Client.GetBucketLifecycleConfiguration(context.TODO(), &s3.GetBucketLifecycleConfigurationInput{
+		Bucket: aws.String(bucketName),
+	})
+	if err != nil {
+		// A bucket with no lifecycle configuration is an error, not an empty
+		// response — every bucket starts here, so this is the normal first-deploy
+		// path and not an exceptional one.
+		var apiErr smithy.APIError
+		if !errors.As(err, &apiErr) || apiErr.ErrorCode() != "NoSuchLifecycleConfiguration" {
+			return fmt.Errorf("error reading lifecycle configuration of bucket %s : %s", bucketName, err)
+		}
+	} else {
+		existing = getOutput.Rules
+	}
+	rules, changed := withStaleLifecycleRule(existing)
+	if !changed {
+		return nil
+	}
+	_, err = s3Client.PutBucketLifecycleConfiguration(context.TODO(), &s3.PutBucketLifecycleConfigurationInput{
+		Bucket:                 aws.String(bucketName),
+		LifecycleConfiguration: &s3Types.BucketLifecycleConfiguration{Rules: rules},
+	})
+	if err != nil {
+		return fmt.Errorf("error putting lifecycle configuration on bucket %s : %s", bucketName, err)
+	}
+	return nil
+}
+
+// withStaleLifecycleRule appends the expiry rule to a bucket's existing rules
+// unless it is already there, reporting whether anything changed.
+//
+// READ-MODIFY-WRITE, NEVER A BLIND PUT.
+// PutBucketLifecycleConfiguration replaces a bucket's entire configuration —
+// there is no "add one rule" API — so the existing rules have to be carried
+// through or a deploy silently deletes whatever else the bucket was configured
+// to do.
+//
+// ⚠️ THE FILTER MUST BE THE TAG, NOT AN AGE. A plain "expire everything older
+// than 7 days" rule on the bucket looks equivalent and is not: it depends on
+// deploys to keep the current build's LastModified fresh. Every deploy re-uploads
+// every file, so an actively deployed site refreshes itself and never notices.
+// A site deployed once and then left running refreshes nothing, and on day 7 the
+// rule deletes the live site out from under it. Tagging is what keeps a current
+// build categorically ineligible: only objects a later build superseded ever
+// carry the tag.
+func withStaleLifecycleRule(existing []s3Types.LifecycleRule) ([]s3Types.LifecycleRule, bool) {
+	for _, rule := range existing {
+		if aws.ToString(rule.ID) == staleLifecycleRuleID {
+			return existing, false
+		}
+	}
+	staleRule := s3Types.LifecycleRule{
+		ID:     aws.String(staleLifecycleRuleID),
+		Status: s3Types.ExpirationStatusEnabled,
+		Filter: &s3Types.LifecycleRuleFilterMemberTag{
+			Value: s3Types.Tag{
+				Key:   aws.String(staleObjectTagKey),
+				Value: aws.String(staleObjectTagValue),
+			},
+		},
+		Expiration: &s3Types.LifecycleExpiration{Days: aws.Int32(staleObjectExpiryDays)},
+	}
+	return append(append([]s3Types.LifecycleRule{}, existing...), staleRule), true
 }
 
 func bucketExists(s3Client *s3.Client, s3Bucket string) bool {
@@ -263,8 +426,8 @@ func listAllS3Objects(s3Client *s3.Client, bucketName string) ([]s3Types.Object,
 const s3DeleteObjectsLimit = 1000
 
 // deleteS3ObjectsInBatches deletes the given keys, respecting the per-request
-// limit. Shared by DeleteAllS3Files and PruneStaleS3Files so the cap is stated
-// once.
+// limit. Only teardown deletes now (DeleteAllS3Files) — the deploy path marks
+// instead, see MarkStaleS3Files.
 func deleteS3ObjectsInBatches(s3Client *s3.Client, bucketName string, objectIds []s3Types.ObjectIdentifier) error {
 	for start := 0; start < len(objectIds); start += s3DeleteObjectsLimit {
 		end := start + s3DeleteObjectsLimit
@@ -284,8 +447,9 @@ func deleteS3ObjectsInBatches(s3Client *s3.Client, bucketName string, objectIds 
 
 // DeleteAllS3Files empties an S3 bucket.
 //
-// Still used by teardown (delete_aws_static_site), where emptying is the point.
-// The DEPLOY path no longer calls this — see PruneStaleS3Files.
+// Still used by teardown (delete_aws_static_site), where emptying is the point
+// and nothing is left to keep serving. The DEPLOY path no longer deletes at all
+// — see MarkStaleS3Files.
 func DeleteAllS3Files(s3Client *s3.Client, bucketName string) error {
 	allS3Objects, err := listAllS3Objects(s3Client, bucketName)
 	if err != nil {
