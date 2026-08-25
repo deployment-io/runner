@@ -196,12 +196,20 @@ func MarkStaleS3Files(s3Client *s3.Client, bucketName string, keep map[string]bo
 // — exactly the tab-breaking behaviour this whole change exists to remove.
 // Copying an object onto itself rewrites it, resetting LastModified so the
 // window is measured from when the file actually became stale, and carries the
-// tag in the same call. (S3 rejects a self-copy that changes nothing; the
-// tagging directive is the change that makes it legal.)
+// tag in the same call.
 //
-// These objects are still being served for the next week, so the copy must not
-// disturb them: MetadataDirective defaults to COPY, which carries Content-Type
-// and the rest across unchanged. Only the tags are replaced.
+// ⚠️ AND THAT IS WHY THIS COSTS TWO REQUESTS PER OBJECT. S3 rejects a self-copy
+// that changes nothing, and the changes that qualify are metadata, storage
+// class, website redirect location and encryption — tags are *not* among them,
+// so a copy whose only difference is TaggingDirective comes back 400
+// InvalidRequest and the feature degrades silently to "nothing ever expires".
+// MetadataDirective: REPLACE is what makes the copy legal. But REPLACE means
+// exactly that: the headers on the new object are the ones in this request, not
+// the ones on the old object, so anything not restated here is dropped — and
+// these objects go on being served for the next week, which is the entire
+// point. A JS chunk that loses its Content-Type fails the browser's module MIME
+// check, breaking precisely the old tabs this feature exists to protect. So
+// HeadObject first and pass every header back through. Only the tags change.
 //
 // A per-object failure is logged and skipped rather than returned: the new
 // build is already live, and one un-tagged leftover file costs a little storage
@@ -215,12 +223,30 @@ func markObjectsStale(s3Client *s3.Client, bucketName string, stale []s3Types.Ob
 		// so keys with spaces or other header-hostile characters have to be
 		// escaped here. EscapedPath leaves the "/" separators intact.
 		source := (&url.URL{Path: bucketName + "/" + key}).EscapedPath()
-		_, err := s3Client.CopyObject(context.TODO(), &s3.CopyObjectInput{
-			Bucket:           aws.String(bucketName),
-			Key:              object.Key,
-			CopySource:       aws.String(source),
-			Tagging:          aws.String(staleObjectTagKey + "=" + staleObjectTagValue),
-			TaggingDirective: s3Types.TaggingDirectiveReplace,
+		head, err := s3Client.HeadObject(context.TODO(), &s3.HeadObjectInput{
+			Bucket: aws.String(bucketName),
+			Key:    object.Key,
+		})
+		if err != nil {
+			io.WriteString(logsWriter, fmt.Sprintf("Could not read %s before marking it stale (it will be marked by a later deploy): %s\n", key, err))
+			continue
+		}
+		_, err = s3Client.CopyObject(context.TODO(), &s3.CopyObjectInput{
+			Bucket:     aws.String(bucketName),
+			Key:        object.Key,
+			CopySource: aws.String(source),
+			// Restated from the head, not inherited: see above, REPLACE drops
+			// whatever is not named here.
+			MetadataDirective:  s3Types.MetadataDirectiveReplace,
+			ContentType:        head.ContentType,
+			CacheControl:       head.CacheControl,
+			ContentEncoding:    head.ContentEncoding,
+			ContentDisposition: head.ContentDisposition,
+			ContentLanguage:    head.ContentLanguage,
+			Expires:            head.Expires,
+			Metadata:           head.Metadata,
+			Tagging:            aws.String(staleObjectTagKey + "=" + staleObjectTagValue),
+			TaggingDirective:   s3Types.TaggingDirectiveReplace,
 		})
 		if err != nil {
 			io.WriteString(logsWriter, fmt.Sprintf("Could not mark %s as stale (it will be marked by a later deploy): %s\n", key, err))
