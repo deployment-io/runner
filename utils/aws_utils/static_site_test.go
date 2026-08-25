@@ -121,14 +121,19 @@ func TestWithStaleLifecycleRule_AppendsATagScopedSevenDayRule(t *testing.T) {
 		t.Fatal("withStaleLifecycleRule(nil) reported no change; a bucket with no " +
 			"configuration is the first-deploy case and must get the rule")
 	}
-	if len(rules) != 1 {
-		t.Fatalf("got %d rules, want 1", len(rules))
+	if len(rules) != 2 {
+		t.Fatalf("got %d rules, want 2 (stale expiry + incomplete-MPU cleanup)", len(rules))
 	}
-	rule := rules[0]
-	if aws.ToString(rule.ID) != staleLifecycleRuleID {
-		t.Errorf("rule ID = %q, want %q — the ID is how the next deploy recognises "+
-			"its own rule, so a mismatch appends a duplicate every time",
-			aws.ToString(rule.ID), staleLifecycleRuleID)
+	var rule s3Types.LifecycleRule
+	var found bool
+	for _, r := range rules {
+		if aws.ToString(r.ID) == staleLifecycleRuleID {
+			rule, found = r, true
+		}
+	}
+	if !found {
+		t.Fatalf("no rule with ID %q — the ID is how the next deploy recognises "+
+			"its own rule, so a mismatch appends a duplicate every time", staleLifecycleRuleID)
 	}
 	if rule.Status != s3Types.ExpirationStatusEnabled {
 		t.Errorf("rule status = %q, want Enabled; a disabled rule expires nothing "+
@@ -153,6 +158,73 @@ func TestWithStaleLifecycleRule_AppendsATagScopedSevenDayRule(t *testing.T) {
 	}
 }
 
+// The uploader writes every file via multipart upload, and a deploy that dies
+// mid-upload strands the finished parts invisibly: not listed, not deletable by
+// DeleteAllS3Files, billed forever, and able to fail teardown's DeleteBucket
+// with BucketNotEmpty on a bucket that lists as empty. The cleanup rule is what
+// makes that self-healing — and it must NOT be tag-scoped, both because S3
+// rejects AbortIncompleteMultipartUpload on a tag filter and because stranded
+// parts were never tagged by anything.
+func TestWithStaleLifecycleRule_AddsWholeBucketIncompleteMPUCleanup(t *testing.T) {
+	rules, _ := withStaleLifecycleRule(nil)
+	var rule s3Types.LifecycleRule
+	var found bool
+	for _, r := range rules {
+		if aws.ToString(r.ID) == abortIncompleteMPURuleID {
+			rule, found = r, true
+		}
+	}
+	if !found {
+		t.Fatalf("no rule with ID %q", abortIncompleteMPURuleID)
+	}
+	if rule.Status != s3Types.ExpirationStatusEnabled {
+		t.Errorf("rule status = %q, want Enabled", rule.Status)
+	}
+	if rule.AbortIncompleteMultipartUpload == nil ||
+		aws.ToInt32(rule.AbortIncompleteMultipartUpload.DaysAfterInitiation) != abortIncompleteMPUDays {
+		t.Errorf("AbortIncompleteMultipartUpload = %v, want DaysAfterInitiation=%d",
+			rule.AbortIncompleteMultipartUpload, abortIncompleteMPUDays)
+	}
+	prefix, ok := rule.Filter.(*s3Types.LifecycleRuleFilterMemberPrefix)
+	if !ok || prefix.Value != "" {
+		t.Errorf("filter = %#v, want an empty-prefix (whole bucket) filter — "+
+			"stranded parts belong to no tag and no prefix", rule.Filter)
+	}
+	if rule.Expiration != nil {
+		t.Errorf("cleanup rule carries Expiration %v; a whole-bucket rule that "+
+			"expires OBJECTS is the abandoned-site self-delete this package "+
+			"exists to avoid", rule.Expiration)
+	}
+}
+
+// A bucket configured by an older runner has the stale rule but not the MPU
+// cleanup. The next deploy must add only what is missing, not duplicate what
+// is there.
+func TestWithStaleLifecycleRule_UpgradesAPartiallyConfiguredBucket(t *testing.T) {
+	older, _ := withStaleLifecycleRule(nil)
+	justStale := older[:1]
+	if aws.ToString(justStale[0].ID) != staleLifecycleRuleID {
+		t.Fatalf("test setup: expected the stale rule first, got %q", aws.ToString(justStale[0].ID))
+	}
+
+	rules, changed := withStaleLifecycleRule(justStale)
+	if !changed {
+		t.Fatal("an older bucket gained no rules; fleets never converge")
+	}
+	if len(rules) != 2 {
+		t.Fatalf("got %d rules, want 2", len(rules))
+	}
+	count := 0
+	for _, r := range rules {
+		if aws.ToString(r.ID) == staleLifecycleRuleID {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Errorf("stale rule appears %d times; the upgrade duplicated an existing rule", count)
+	}
+}
+
 // This runs on every deploy of every site. Appending unconditionally would add
 // a rule per deploy until the bucket hit the 1000-rule limit and deploys began
 // failing on a bucket that was already configured correctly.
@@ -163,8 +235,8 @@ func TestWithStaleLifecycleRule_IsIdempotent(t *testing.T) {
 		t.Error("withStaleLifecycleRule reported a change on a bucket that already " +
 			"has the rule; that is a needless PutBucketLifecycleConfiguration per deploy")
 	}
-	if len(twice) != 1 {
-		t.Fatalf("got %d rules after two passes, want 1 — the rule is being appended repeatedly", len(twice))
+	if len(twice) != 2 {
+		t.Fatalf("got %d rules after two passes, want 2 — a rule is being appended repeatedly", len(twice))
 	}
 }
 
@@ -185,8 +257,8 @@ func TestWithStaleLifecycleRule_PreservesUnrelatedRules(t *testing.T) {
 	if !changed {
 		t.Fatal("withStaleLifecycleRule reported no change; the bucket has rules but not ours")
 	}
-	if len(rules) != 2 {
-		t.Fatalf("got %d rules, want 2 (theirs + ours)", len(rules))
+	if len(rules) != 3 {
+		t.Fatalf("got %d rules, want 3 (theirs + our two)", len(rules))
 	}
 	if aws.ToString(rules[0].ID) != "customers-own-rule" {
 		t.Errorf("the pre-existing rule is gone; a blind put of just our rule "+

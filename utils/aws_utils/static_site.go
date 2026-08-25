@@ -286,8 +286,9 @@ func staleS3Objects(objects []s3Types.Object, keep map[string]bool) []s3Types.Ob
 // of the rule appended alongside the first, forever.
 const staleLifecycleRuleID = "deployment-io-expire-stale-build-files"
 
-// ensureStaleLifecycleRule makes sure the bucket has the rule that expires
-// tagged objects. Idempotent: run on every deploy, appends at most once.
+// ensureStaleLifecycleRule makes sure the bucket has the rules this package
+// owns: expiry of tagged stale objects, and cleanup of incomplete multipart
+// uploads. Idempotent: run on every deploy, appends each at most once.
 func ensureStaleLifecycleRule(s3Client *s3.Client, bucketName string) error {
 	var existing []s3Types.LifecycleRule
 	getOutput, err := s3Client.GetBucketLifecycleConfiguration(context.TODO(), &s3.GetBucketLifecycleConfigurationInput{
@@ -318,8 +319,8 @@ func ensureStaleLifecycleRule(s3Client *s3.Client, bucketName string) error {
 	return nil
 }
 
-// withStaleLifecycleRule appends the expiry rule to a bucket's existing rules
-// unless it is already there, reporting whether anything changed.
+// withStaleLifecycleRule appends every rule this package owns to a bucket's
+// existing rules unless already present, reporting whether anything changed.
 //
 // READ-MODIFY-WRITE, NEVER A BLIND PUT.
 // PutBucketLifecycleConfiguration replaces a bucket's entire configuration —
@@ -336,23 +337,75 @@ func ensureStaleLifecycleRule(s3Client *s3.Client, bucketName string) error {
 // build categorically ineligible: only objects a later build superseded ever
 // carry the tag.
 func withStaleLifecycleRule(existing []s3Types.LifecycleRule) ([]s3Types.LifecycleRule, bool) {
-	for _, rule := range existing {
-		if aws.ToString(rule.ID) == staleLifecycleRuleID {
-			return existing, false
+	rules := existing
+	var changed bool
+	for _, owned := range ownedLifecycleRules() {
+		if hasLifecycleRule(rules, aws.ToString(owned.ID)) {
+			continue
+		}
+		if !changed {
+			// Copy-on-first-append so the caller's slice is never mutated.
+			rules = append([]s3Types.LifecycleRule{}, rules...)
+			changed = true
+		}
+		rules = append(rules, owned)
+	}
+	return rules, changed
+}
+
+func hasLifecycleRule(rules []s3Types.LifecycleRule, id string) bool {
+	for _, rule := range rules {
+		if aws.ToString(rule.ID) == id {
+			return true
 		}
 	}
-	staleRule := s3Types.LifecycleRule{
-		ID:     aws.String(staleLifecycleRuleID),
-		Status: s3Types.ExpirationStatusEnabled,
-		Filter: &s3Types.LifecycleRuleFilterMemberTag{
-			Value: s3Types.Tag{
-				Key:   aws.String(staleObjectTagKey),
-				Value: aws.String(staleObjectTagValue),
+	return false
+}
+
+// abortIncompleteMPURuleID / abortIncompleteMPUDays clean up multipart uploads
+// that never finished. Same never-change-the-ID contract as the stale rule.
+const (
+	abortIncompleteMPURuleID = "deployment-io-abort-incomplete-multipart-uploads"
+	abortIncompleteMPUDays   = 7
+)
+
+// ownedLifecycleRules is every rule this package maintains on a site bucket.
+// Checked by ID individually, so a bucket configured by an older runner gains
+// the newer rules on its next deploy without touching the ones it has.
+func ownedLifecycleRules() []s3Types.LifecycleRule {
+	return []s3Types.LifecycleRule{
+		{
+			ID:     aws.String(staleLifecycleRuleID),
+			Status: s3Types.ExpirationStatusEnabled,
+			Filter: &s3Types.LifecycleRuleFilterMemberTag{
+				Value: s3Types.Tag{
+					Key:   aws.String(staleObjectTagKey),
+					Value: aws.String(staleObjectTagValue),
+				},
+			},
+			Expiration: &s3Types.LifecycleExpiration{Days: aws.Int32(staleObjectExpiryDays)},
+		},
+		// Every file is uploaded via multipart upload, and a deploy that dies
+		// mid-upload strands the finished parts invisibly: ListObjectsV2 does
+		// not show them, DeleteAllS3Files cannot delete them, they cost
+		// storage forever, and they can fail teardown's DeleteBucket with
+		// BucketNotEmpty on a bucket that lists as empty. This makes both
+		// self-healing, per AWS's own hygiene recommendation for any bucket
+		// receiving multipart uploads.
+		//
+		// A SEPARATE RULE, not more fields on the stale rule, because S3
+		// rejects AbortIncompleteMultipartUpload on a tag-filtered rule — and
+		// it has to cover the whole bucket anyway: parts stranded by a failed
+		// deploy were never tagged by anything.
+		{
+			ID:     aws.String(abortIncompleteMPURuleID),
+			Status: s3Types.ExpirationStatusEnabled,
+			Filter: &s3Types.LifecycleRuleFilterMemberPrefix{Value: ""},
+			AbortIncompleteMultipartUpload: &s3Types.AbortIncompleteMultipartUpload{
+				DaysAfterInitiation: aws.Int32(abortIncompleteMPUDays),
 			},
 		},
-		Expiration: &s3Types.LifecycleExpiration{Days: aws.Int32(staleObjectExpiryDays)},
 	}
-	return append(append([]s3Types.LifecycleRule{}, existing...), staleRule), true
 }
 
 func bucketExists(s3Client *s3.Client, s3Bucket string) bool {
