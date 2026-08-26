@@ -114,13 +114,18 @@ func collectFilesToUpload(directoryPath string) ([]fileToUpload, map[string]bool
 // guarantee this scheduling needs.
 func (u *Uploader) uploadFiles(filesToUpload []fileToUpload, logsWriter io.Writer) error {
 	abortUploadSignal := make(chan interface{})
-	// Buffered to the whole list and closed up front, so no goroutine is left
-	// feeding it while the results below are being drained.
-	jobs := make(chan fileToUpload, len(filesToUpload))
-	for _, file := range filesToUpload {
-		jobs <- file
-	}
-	close(jobs)
+	// Unbuffered, like every other channel here: the feeder hands a file over
+	// only when a worker is free to take it, so nothing about this queue grows
+	// with the size of the build. The feeder cannot be left blocked, because
+	// the workers below take from jobs until it closes and the drain below
+	// keeps them from stalling on a send.
+	jobs := make(chan fileToUpload)
+	go func() {
+		defer close(jobs)
+		for _, file := range filesToUpload {
+			jobs <- file
+		}
+	}()
 
 	results := make(chan uploadFileDoneDTO)
 	workers := uploadConcurrency
