@@ -348,12 +348,57 @@ func (b *BuildStaticSite) Run(parameters map[string]interface{}, logsWriter io.W
 		return parameters, err
 	}
 
-	//if node version is missing install and use latest lts
-	//get node docker image id according to node version
-	imageId := "node:lts-buster"
+	// nodeVersion is read and defaulted here but is never used: imageId below is
+	// hardcoded, so every build runs on the same Node major no matter what the
+	// deployment's node version setting says. The comment that used to sit here
+	// claimed the image was chosen "according to node version" — it never was.
+	// The variable is kept, rather than deleted, as the input the version
+	// selector will consume (explicit setting → .nvmrc/.node-version →
+	// engines.node → default); that is separate work. Until it ships, customers
+	// have no way to override the Node version a build runs on.
 	if len(nodeVersion) == 0 {
 		nodeVersion = "--lts"
 	}
+
+	// Build image for customer static-site builds. Each part of this tag is a
+	// deliberate choice:
+	//
+	//   - Major-pinned ("22"), not a floating node:lts-* tag. Floating across
+	//     majors is what broke this. The previous pin, node:lts-buster, meant
+	//     "current LTS" until the Buster variant was discontinued; nothing
+	//     announced that, so it silently froze at Node 20.15.0 until a
+	//     dashboard deploy failed outright — Vite 8 requires
+	//     ^20.19.0 || >=22.12.0 and yarn refuses to run when the project's
+	//     engines field isn't satisfied. A floating tag is wrong in the other
+	//     direction too: Node 24 is already LTS, so node:lts-* would jump every
+	//     customer's build a major with no change on their side. A major pin
+	//     still collects patch and minor updates, so security fixes arrive
+	//     automatically while a major move stays a reviewed PR.
+	//
+	//   - 22 rather than 24, for now. Both are mature LTS. This change should
+	//     move exactly one variable — replacing a rotted pin — and customers
+	//     currently have no escape hatch (see nodeVersion above), so any
+	//     breakage from a two-major jump would land on them with no way out.
+	//     The default moves to 24 after the version selector ships.
+	//
+	//   - bookworm rather than trixie. Trixie ships a newer glibc, and prebuilt
+	//     native modules (sharp, node-gyp output, anything with a binary) are
+	//     most likely to be built against the older base. Conservative libc is
+	//     right for arbitrary customer builds.
+	//
+	//   - The full image, not -slim. -slim omits the build toolchain, and
+	//     node-gyp needs python3/make/g++ whenever npm install has to compile a
+	//     native module from source. We run a customer-supplied build command
+	//     against an arbitrary repo, and node:lts-buster was itself a full
+	//     buildpack-deps-based image — so -slim would break builds that work
+	//     today. A ~400MB pull, cached per host, is not worth that.
+	//
+	// Watch for: a tag that stops tracking what its name implies is invisible
+	// until a customer's build fails a version requirement — that is exactly
+	// how the Buster pin surfaced, years late. Revisit before Node 22 goes
+	// end-of-life (April 2027), and check the tag still exists and is being
+	// rebuilt on Docker Hub rather than assuming it.
+	imageId := "node:22-bookworm"
 
 	envVariables, err := jobs.GetParameterValue[string](parameters, parameters_enums.EnvironmentVariables)
 	var envVariablesSlice []string
