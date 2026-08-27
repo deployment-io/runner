@@ -12,17 +12,20 @@ import (
 )
 
 type Uploader struct {
-	s3Client *s3.Client
-	s3Region string
-	s3Bucket string
+	s3Client   *s3.Client
+	s3Region   string
+	s3Bucket   string
+	uploadFile func(string, string, chan interface{}) <-chan uploadFileDoneDTO
 }
 
 func NewUploader(s3Region, s3Bucket string, s3Client *s3.Client) (*Uploader, error) {
-	return &Uploader{
+	uploader := &Uploader{
 		s3Client: s3Client,
 		s3Region: s3Region,
 		s3Bucket: s3Bucket,
-	}, nil
+	}
+	uploader.uploadFile = uploader.UploadFile
+	return uploader, nil
 }
 
 func isPathDirectory(directoryPath string) (bool, error) {
@@ -141,7 +144,7 @@ func (u *Uploader) uploadFiles(filesToUpload []fileToUpload, logsWriter io.Write
 				// Receiving the done signal here, before taking the next job,
 				// is what holds each worker to one in-flight upload — and so
 				// the pool to uploadConcurrency of them.
-				results <- <-u.UploadFile(file.path, file.objectKey, abortUploadSignal)
+				results <- <-u.uploadFile(file.path, file.objectKey, abortUploadSignal)
 			}
 		}()
 	}
