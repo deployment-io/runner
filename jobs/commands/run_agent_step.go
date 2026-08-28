@@ -111,6 +111,31 @@ const (
 	agentboxResultFile      = "result.json"
 	agentboxResultPathInCtr = agentboxWorkDirInContainer + "/" + agentboxResultDirRel + "/" + agentboxResultFile
 
+	// agentboxTmpDirRel backs TMPDIR/GOTMPDIR inside the container, moving
+	// scratch off /tmp — a 512 MB RAM-backed tmpfs (tmpfsTmpOpts) — and onto
+	// the bind-mounted work dir, which sits on the host's 30 GB root volume.
+	//
+	// 512 MB is not enough for real installs and builds. Measured: a `yarn
+	// install` of one ordinary Next.js repo PEAKS at 504.8 MB of TMPDIR while
+	// Yarn extracts and re-zips a patched dependency — a 7 MB margin before
+	// anything else in the container touches /tmp. It ENOSPC'd in production
+	// on 2026-08-28. `go build` without -p 1 fails the same way, from the
+	// linker, and that is the long-standing GOTMPDIR failure too.
+	//
+	// Not /tmp-made-bigger: tmpfs is RAM, and it would be competing with the
+	// build that needs it. Not /cache either, though it is disk-backed and
+	// roomier — it is a fresh Docker volume per Step with no host path the
+	// runner can pre-create a directory in, whereas the work dir is already
+	// ours and already prepared here.
+	//
+	// Dot-prefixed for the same reason as .agentbox-output: agentbox's repo
+	// discovery skips dot-dirs at both levels (BuildPlan in
+	// internal/vendoring/plan.go), and CommitAndPush iterates
+	// /work/<idx>-<name>/ subdirs, so scratch can never be mistaken for a
+	// repo or staged into a Task's commit.
+	agentboxTmpDirRel   = ".agentbox-tmp"
+	agentboxTmpDirInCtr = agentboxWorkDirInContainer + "/" + agentboxTmpDirRel
+
 	// agentboxMCPSocketInContainer is where the per-task MCP tool socket is
 	// bind-mounted inside the agent container; agentbox reads its path from
 	// MCP_TOOL_RPC_SOCKET and bridges the agent's stdio MCP client to it. Tools
@@ -232,8 +257,8 @@ func (rs *RunAgentStep) Run(parameters map[string]interface{}, logsWriter io.Wri
 		return parameters, fmt.Errorf("error pulling agentbox image: %s", err)
 	}
 	workDirHost := commandUtils.GetTaskRepositoriesBaseDir(ctx.OrganizationID, ctx.TaskID)
-	if err := prepareAgentboxResultDir(workDirHost); err != nil {
-		return parameters, fmt.Errorf("error preparing agent result dir: %s", err)
+	if err := prepareAgentboxHostDirs(workDirHost); err != nil {
+		return parameters, fmt.Errorf("error preparing agentbox host dirs: %s", err)
 	}
 	// Two-phase model: a vendor container pre-fetches dependencies into a
 	// shared cache volume using the git token, then the credential-less
@@ -331,23 +356,30 @@ func pullAgentboxImage(imageRef string) error {
 	return nil
 }
 
-// prepareAgentboxResultDir creates the on-host directory that agentbox
-// writes /result.json into (via the bind mount). Pre-creating ensures the
-// directory exists and is writable before the container starts.
+// prepareAgentboxHostDirs creates the on-host directories agentbox writes
+// into through the bind mount: the result dir for /result.json, and the tmp
+// dir backing TMPDIR/GOTMPDIR (see agentboxTmpDirRel). Both must exist and be
+// writable before the container starts — TMPDIR pointing at a missing
+// directory fails every write with ENOENT rather than falling back to /tmp.
 //
-// Chowns both the work base and the result dir to the agentbox `agent`
-// user so the spawned container (UID 1000) can write through the bind
-// mount. CheckoutRepository chowns the cloned repo subtrees; this
-// function covers the result dir and the base it sits in.
-func prepareAgentboxResultDir(workDirHost string) error {
-	resultDir := filepath.Join(workDirHost, agentboxResultDirRel)
-	if err := os.MkdirAll(resultDir, 0755); err != nil {
-		return err
-	}
+// Chowns the work base and both dirs to the agentbox `agent` user so the
+// spawned container (UID 1000) can write through the bind mount.
+// CheckoutRepository chowns the cloned repo subtrees; this function covers
+// these two and the base they sit in.
+func prepareAgentboxHostDirs(workDirHost string) error {
 	if err := os.Chown(workDirHost, commandUtils.AgentboxUID, commandUtils.AgentboxGID); err != nil {
 		return err
 	}
-	return os.Chown(resultDir, commandUtils.AgentboxUID, commandUtils.AgentboxGID)
+	for _, rel := range []string{agentboxResultDirRel, agentboxTmpDirRel} {
+		dir := filepath.Join(workDirHost, rel)
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return err
+		}
+		if err := os.Chown(dir, commandUtils.AgentboxUID, commandUtils.AgentboxGID); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // buildAgentSpawnEnvVars assembles the env vars passed to the agentbox
@@ -362,6 +394,11 @@ func buildAgentSpawnEnvVars(parameters map[string]interface{}, logsWriter io.Wri
 		// The shared cache mount. agentbox maps it per language (GOMODCACHE,
 		// etc.) — the runner stays language-agnostic.
 		"AGENTBOX_CACHE_DIR": agentboxCacheDirInContainer,
+		// Scratch off the 512 MB tmpfs — see agentboxTmpDirRel. GOTMPDIR is
+		// set alongside TMPDIR because the Go toolchain reads it in
+		// preference, and the linker is the loudest victim of a small /tmp.
+		"TMPDIR":   agentboxTmpDirInCtr,
+		"GOTMPDIR": agentboxTmpDirInCtr,
 	}
 	if creds, err := jobs.GetParameterValue[map[string]string](parameters, parameters_enums.AgentEnvVars); err == nil {
 		for k, v := range creds {
@@ -1311,6 +1348,11 @@ func buildVendorSpec(imageRef, workDirHost, cacheVolume string, ctx commandUtils
 	env := map[string]string{
 		"WORK_DIR":           agentboxWorkDirInContainer,
 		"AGENTBOX_CACHE_DIR": agentboxCacheDirInContainer,
+		// The vendor phase is where a small /tmp actually bites: `yarn
+		// install` on one ordinary repo peaks at ~505 MB of scratch against a
+		// 512 MB tmpfs. See agentboxTmpDirRel.
+		"TMPDIR":   agentboxTmpDirInCtr,
+		"GOTMPDIR": agentboxTmpDirInCtr,
 	}
 	if token != "" {
 		env["GIT_TOKEN"] = token

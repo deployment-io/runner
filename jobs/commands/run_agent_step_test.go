@@ -289,3 +289,33 @@ func TestIsAccessDenied(t *testing.T) {
 		})
 	}
 }
+
+// TestAgentboxTmpDirIsOffTheTmpfsAndInvisibleToAgentbox pins the two
+// properties the TMPDIR redirect depends on, both of which are silent when
+// broken.
+//
+// Off the tmpfs: /tmp in the container is 512 MB of RAM (tmpfsTmpOpts), and a
+// `yarn install` of one ordinary repo peaks at ~505 MB of scratch. Pointing
+// TMPDIR back at /tmp — or anywhere not under the bind-mounted work dir —
+// reinstates an ENOSPC that surfaces as an unrelated-looking tool error.
+//
+// Invisible to agentbox: the dir sits inside /work, which agentbox scans for
+// repos and CommitAndPush iterates. The dot prefix is the only thing keeping
+// scratch from being treated as a repo or staged into a Task's commit —
+// agentbox's BuildPlan skips dot-prefixed entries at both levels.
+func TestAgentboxTmpDirIsOffTheTmpfsAndInvisibleToAgentbox(t *testing.T) {
+	if !strings.HasPrefix(agentboxTmpDirInCtr, agentboxWorkDirInContainer+"/") {
+		t.Errorf("tmp dir %q must live under the bind-mounted work dir %q — "+
+			"anywhere else lands on the 512 MB tmpfs", agentboxTmpDirInCtr, agentboxWorkDirInContainer)
+	}
+	if !strings.HasPrefix(agentboxTmpDirRel, ".") {
+		t.Errorf("tmp dir %q must be dot-prefixed or agentbox's repo discovery "+
+			"treats it as an owner dir and CommitAndPush may stage it", agentboxTmpDirRel)
+	}
+	if strings.HasPrefix(agentboxTmpDirInCtr, "/tmp") {
+		t.Errorf("tmp dir %q is on the tmpfs this redirect exists to avoid", agentboxTmpDirInCtr)
+	}
+	if agentboxTmpDirRel == agentboxResultDirRel {
+		t.Error("tmp dir and result dir must be distinct; scratch would collide with result.json")
+	}
+}

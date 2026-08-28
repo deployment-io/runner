@@ -117,7 +117,11 @@ func (rs *RunAssistantSession) Run(parameters map[string]interface{}, logsWriter
 func prepareSessionDirs(workDirHost string) error {
 	outDir := filepath.Join(workDirHost, ".agentbox-output", "messages")
 	inDir := filepath.Join(workDirHost, ".agentbox-input", "messages")
-	for _, d := range []string{outDir, inDir} {
+	// tmpDir backs TMPDIR/GOTMPDIR for the session container, exactly as the
+	// Step path does — buildSessionSpawnEnvVars points at it, and TMPDIR
+	// naming a missing directory fails every write with ENOENT.
+	tmpDir := filepath.Join(workDirHost, agentboxTmpDirRel)
+	for _, d := range []string{outDir, inDir, tmpDir} {
 		if err := os.MkdirAll(d, 0755); err != nil {
 			return err
 		}
@@ -129,6 +133,7 @@ func prepareSessionDirs(workDirHost string) error {
 	for _, p := range []string{
 		filepath.Join(workDirHost, ".agentbox-output"),
 		filepath.Join(workDirHost, ".agentbox-input"),
+		tmpDir,
 	} {
 		if err := chownTreeToAgentbox(p); err != nil {
 			return err
@@ -155,6 +160,11 @@ func buildSessionSpawnEnvVars(parameters map[string]interface{}, logsWriter io.W
 		// session whenever the user pauses longer than its timeout to think.
 		// The server-side idle cron (user-message-based) is the idle-killer.
 		"NO_ACTIVITY_TIMEOUT": "0",
+		// Scratch off the 512 MB tmpfs, same as the Step paths — a session
+		// spawns the same container with the same mounts, and its agent runs
+		// the same installs and builds. See agentboxTmpDirRel.
+		"TMPDIR":   agentboxTmpDirInCtr,
+		"GOTMPDIR": agentboxTmpDirInCtr,
 	}
 	if creds, err := jobs.GetParameterValue[map[string]string](parameters, parameters_enums.AgentEnvVars); err == nil {
 		for k, v := range creds {
