@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"io"
@@ -252,19 +251,30 @@ func (u *Uploader) uploadByteStreamToS3(filePath, outputS3ObjectKey string, data
 	fileDoneStream := make(chan uploadFileDoneDTO)
 	go func() {
 		defer close(fileDoneStream)
-		cfg, err := config.LoadDefaultConfig(context.TODO())
-		if err != nil {
-			fileDoneStream <- uploadFileDoneDTO{
-				err:       err,
-				done:      false,
-				objectKey: outputS3ObjectKey,
-			}
-			return
-		}
-
-		client := s3.NewFromConfig(cfg, func(o *s3.Options) {
-			o.Region = u.s3Region
-		})
+		// The Uploader's shared client, NOT a per-file one.
+		//
+		// This used to call config.LoadDefaultConfig + s3.NewFromConfig here,
+		// once per file. Each LoadDefaultConfig builds its own credentials
+		// provider with its own aws.CredentialsCache, so nothing was shared:
+		// every file resolved credentials from scratch. On EC2 that means a
+		// fresh IMDS round trip per file.
+		//
+		// It survived while uploads were effectively serialized (a
+		// time.Sleep every 10 files). Raising the pool to uploadConcurrency
+		// turned a slow trickle into a burst, and IMDS rate-limits hard:
+		//
+		//   operation error S3: CreateMultipartUpload, get identity: get
+		//   credentials: failed to refresh cached credentials, failed to load
+		//   credentials, exceeded maximum number of attempts, 3, : You have
+		//   reached maximum request limit.
+		//
+		// One shared client means one credentials cache for the whole
+		// directory: credentials are fetched once, reused by every worker,
+		// and concurrent refreshes coalesce instead of stampeding. The client
+		// is safe for concurrent use and already carries this region — the
+		// caller builds it from the same region_enums value passed as
+		// u.s3Region.
+		client := u.s3Client
 
 		f, err := os.Open(filePath)
 		if err != nil {

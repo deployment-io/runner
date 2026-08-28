@@ -10,7 +10,21 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
+
+// These tests replace uploader.uploadFile, so the client is never dialed —
+// but it must be non-nil, because every real upload now goes through the
+// Uploader's single shared client. That sharing is the whole point: a client
+// per file means a credentials cache per file, which rate-limits IMDS the
+// moment uploads run concurrently.
+func TestNewUploaderRequiresAClient(t *testing.T) {
+	if _, err := NewUploader("region", "bucket", nil); err == nil {
+		t.Error("NewUploader(nil client) must error — a nil client would have " +
+			"each file build its own, which is the IMDS-throttling bug")
+	}
+}
 
 // The uploaded-key set is what the caller prunes the bucket down to, so a file
 // walked but not listed is a live file put on the expiry clock. Check that the
@@ -78,7 +92,7 @@ func testFiles(count int) []fileToUpload {
 
 func TestUploadFilesLimitsConcurrencyAndUploadsEveryFileOnce(t *testing.T) {
 	files := testFiles(uploadConcurrency * 3)
-	uploader, err := NewUploader("region", "bucket", nil)
+	uploader, err := NewUploader("region", "bucket", &s3.Client{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -160,7 +174,7 @@ func (w *notifyingWriter) WriteString(s string) (int, error) {
 
 func TestUploadFilesReturnsFirstErrorAndDrainsRemainingUploads(t *testing.T) {
 	files := testFiles(uploadConcurrency + 5)
-	uploader, err := NewUploader("region", "bucket", nil)
+	uploader, err := NewUploader("region", "bucket", &s3.Client{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -222,7 +236,7 @@ func TestUploadFilesReturnsFirstErrorAndDrainsRemainingUploads(t *testing.T) {
 func TestUploadFilesHandlesDegenerateInputs(t *testing.T) {
 	for _, count := range []int{0, uploadConcurrency - 1} {
 		t.Run(fmt.Sprintf("files=%d", count), func(t *testing.T) {
-			uploader, err := NewUploader("region", "bucket", nil)
+			uploader, err := NewUploader("region", "bucket", &s3.Client{})
 			if err != nil {
 				t.Fatal(err)
 			}
