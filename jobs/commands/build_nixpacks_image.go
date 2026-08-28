@@ -7,6 +7,7 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/enums/deployment_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
+	"github.com/deployment-io/deployment-runner/utils/reclaim"
 	"github.com/docker/docker/api/types/registry"
 	"github.com/moby/moby/client"
 	"io"
@@ -38,6 +39,11 @@ func (b *BuildNixPacksImage) Run(parameters map[string]interface{}, logsWriter i
 	}
 	runtime := deployment_enums.Runtime(runtimeInt).String()
 
+	// Same reason as the Dockerfile path: say how much room the runner has
+	// before the build that might run out of it. The image this produces
+	// carries the same <orgID>-<deploymentID>:<commit> tag, so it is
+	// reclaimed by the same push-then-untag step.
+	reclaim.LogFreeDisk("before build", logsWriter)
 	io.WriteString(logsWriter, fmt.Sprintf("Building %s application\n", runtime))
 
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
