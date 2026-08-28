@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
+	"github.com/deployment-io/deployment-runner/utils/reclaim"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/mount"
@@ -52,6 +53,11 @@ const (
 	buildMemoryBytesEnvVar = "BUILD_MEMORY_BYTES"
 	buildCPUCoresEnvVar    = "BUILD_CPU_CORES"
 )
+
+// retiredBuildImages are static-site build images this runner used to pull
+// and no longer does. They sit on disk beside their replacement forever
+// otherwise. Add the old ref here whenever imageId below changes.
+var retiredBuildImages = []string{"node:lts-buster"}
 
 type BuildStaticSite struct {
 }
@@ -225,6 +231,10 @@ func startBuildContainer(imageId, repoDir string) (string, error) {
 		Image: imageId,
 		Cmd:   []string{"tail", "-f", "/dev/null"},
 		Tty:   false,
+		// Labelled so the startup sweep can reclaim this container if the
+		// deferred removal never runs — and so it can tell it apart from a
+		// customer's own containers on a shared daemon.
+		Labels: reclaim.Labels(reclaim.PurposeStaticSiteBuild),
 	}, &container.HostConfig{
 		Mounts: []mount.Mount{{
 			Type:   mount.TypeBind,
@@ -409,10 +419,20 @@ func (b *BuildStaticSite) Run(parameters map[string]interface{}, logsWriter io.W
 		}
 	}
 
+	// Held until the build container is gone, so no concurrent cleanup can
+	// remove the image between the pull and the container that runs it.
+	releaseImage := reclaim.MarkImageInUse(imageId)
+	defer releaseImage()
 	err = pullDockerImageForBuilding(imageId)
 	if err != nil {
 		return parameters, err
 	}
+	// node:lts-buster is still on every runner that built a site before the
+	// switch to node:22-bookworm, and nothing removes it. Retired refs are
+	// listed by name rather than sweeping the whole `node` repository — a
+	// customer sharing this daemon may have node tags of their own.
+	reclaim.PruneSupersededImages(imageId, reclaim.Supersession{RetiredRefs: retiredBuildImages}, logsWriter)
+	reclaim.LogFreeDisk("before build", logsWriter)
 
 	containerID, err := startBuildContainer(imageId, repoDirectoryPath)
 	if err != nil {

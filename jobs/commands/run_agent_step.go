@@ -35,6 +35,7 @@ import (
 	runnerclient "github.com/deployment-io/deployment-runner/client"
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
 	"github.com/deployment-io/deployment-runner/utils"
+	"github.com/deployment-io/deployment-runner/utils/reclaim"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/mount"
@@ -228,9 +229,21 @@ func (rs *RunAgentStep) Run(parameters map[string]interface{}, logsWriter io.Wri
 	if err != nil {
 		return parameters, fmt.Errorf("agentbox image missing: %s", err)
 	}
+	// Held for the whole Step. protectedImages only knows about an image
+	// once a container exists for it; between this pull and the
+	// ContainerCreate below there is a window where a concurrent Step
+	// pulling a newer agentbox tag would otherwise consider this one
+	// superseded and delete it out from under us.
+	releaseImage := reclaim.MarkImageInUse(imageRef)
+	defer releaseImage()
 	if err := pullAgentboxImage(imageRef); err != nil {
 		return parameters, fmt.Errorf("error pulling agentbox image: %s", err)
 	}
+	// Otherwise every agentbox release the runner has ever pulled stays on
+	// disk forever. Only the replacement's own repository is touched, and
+	// only tags nothing references.
+	reclaim.PruneSupersededImages(imageRef, reclaim.Supersession{SameRepository: true}, logsWriter)
+	reclaim.LogFreeDisk("before agent step", logsWriter)
 	workDirHost := commandUtils.GetTaskRepositoriesBaseDir(ctx.OrganizationID, ctx.TaskID)
 	if err := prepareAgentboxResultDir(workDirHost); err != nil {
 		return parameters, fmt.Errorf("error preparing agent result dir: %s", err)
@@ -736,6 +749,10 @@ func createAgentboxContainer(ctx context.Context, cli *client.Client, spec agent
 		Env:   spec.env,
 		User:  "1000:1000",
 		Tty:   false,
+		// Labelled so the startup sweep can tell this container apart from
+		// a customer's own on a shared daemon if the deferred removal
+		// below never runs (SIGKILL, OOM, host restart).
+		Labels: reclaim.Labels(reclaim.PurposeAgentbox),
 	}
 	// Empty Cmd → the image ENTRYPOINT runs agent mode; ["vendor"] selects
 	// the dependency pre-fetch subcommand.
@@ -1349,7 +1366,12 @@ func createCacheVolume(name string) error {
 		return err
 	}
 	defer cli.Close()
-	_, err = cli.VolumeCreate(context.Background(), volume.CreateOptions{Name: name})
+	_, err = cli.VolumeCreate(context.Background(), volume.CreateOptions{
+		Name: name,
+		// The name already encodes ownership; the label is what the sweep
+		// matches on first, and it keeps working if the name scheme moves.
+		Labels: reclaim.Labels(reclaim.PurposeAgentboxCache),
+	})
 	return err
 }
 

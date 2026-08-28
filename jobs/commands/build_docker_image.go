@@ -9,6 +9,7 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
+	"github.com/deployment-io/deployment-runner/utils/reclaim"
 	"github.com/docker/docker/api/types"
 	"github.com/moby/moby/client"
 	"github.com/moby/moby/pkg/archive"
@@ -80,8 +81,15 @@ func imageBuild(parameters map[string]interface{}, dockerClient *client.Client, 
 	opts := types.ImageBuildOptions{
 		Dockerfile: dockerFile,
 		Tags:       []string{dockerImageNameAndTag},
-		Remove:     true,
-		BuildArgs:  buildArgs,
+		// Remove discards the intermediate build containers, not the image
+		// this build produces — that one is untagged after it reaches ECR
+		// (UploadDockerImageToEcr.pushAndReclaim) and, if the runner died
+		// before it got there, by the startup sweep.
+		Remove:    true,
+		BuildArgs: buildArgs,
+		// Labelled so the sweep can recognize this image as ours once it
+		// has been untagged and only its digest is left.
+		Labels: reclaim.Labels(reclaim.PurposeDeploymentImage),
 	}
 	res, err := dockerClient.ImageBuild(ctx, tar, opts)
 	if err != nil {
@@ -123,6 +131,10 @@ func (b *BuildDockerImage) Run(parameters map[string]interface{}, logsWriter io.
 	if err != nil {
 		return parameters, err
 	}
+	// A build is the largest single consumer of disk on the runner, so the
+	// job log says how much room there was going in — the alternative is
+	// finding out from an ENOSPC with no context.
+	reclaim.LogFreeDisk("before build", logsWriter)
 	io.WriteString(logsWriter, fmt.Sprintf("Building docker image\n"))
 	err = imageBuild(parameters, cli, repoDirectoryPath, dockerImageNameAndTag, dockerFile, logsWriter)
 	if err != nil {

@@ -24,6 +24,7 @@ import (
 	"github.com/deployment-io/deployment-runner/jobs/commands"
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
 	"github.com/deployment-io/deployment-runner/utils/loggers"
+	"github.com/deployment-io/deployment-runner/utils/reclaim"
 )
 
 func allocateJobs(pendingJobs []pendingJobType) <-chan pendingJobType {
@@ -318,6 +319,13 @@ func Init() {
 	commandUtils.Init()
 	loggers.Init()
 	jobs.RegisterGobDataTypes()
+	// Synchronous, and before GetAndRunJobs starts polling: a previous
+	// process that was SIGKILLed or OOM-killed skipped every deferred
+	// cleanup it had, and startup is the one moment when nothing of ours is
+	// running, which is what makes reclaiming those orphans safe. Running
+	// it alongside live jobs would risk deleting a working directory out
+	// from under one.
+	reclaim.Sweep()
 }
 
 func GetRuntimeEnvironment() (cpu_architecture_enums.Type, os_enums.Type) {
