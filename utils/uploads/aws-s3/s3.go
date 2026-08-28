@@ -18,7 +18,16 @@ type Uploader struct {
 	uploadFile func(string, string, chan interface{}) <-chan uploadFileDoneDTO
 }
 
+// NewUploader builds an Uploader around a caller-supplied S3 client. The
+// client is REQUIRED: every file in a directory upload goes through it, so
+// that one client's credentials cache is what keeps a concurrent upload from
+// resolving credentials once per file and rate-limiting IMDS. It used to be
+// possible to pass nil and have the per-file path build its own — that is the
+// bug, so nil is now an error rather than a silent fallback.
 func NewUploader(s3Region, s3Bucket string, s3Client *s3.Client) (*Uploader, error) {
+	if s3Client == nil {
+		return nil, fmt.Errorf("s3 client is required to upload to %s", s3Bucket)
+	}
 	uploader := &Uploader{
 		s3Client: s3Client,
 		s3Region: s3Region,
