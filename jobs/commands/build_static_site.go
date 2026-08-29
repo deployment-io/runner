@@ -425,12 +425,18 @@ func (b *BuildStaticSite) Run(parameters map[string]interface{}, logsWriter io.W
 	// exec mid-run.
 	defer func() { _ = removeBuildContainer(containerID) }()
 
-	// Wall-clock cap on the npm install + build phase. A build that
+	// Install with whatever the repo's lockfile implies, not always npm —
+	// see static_site_install.go. Decided here, on the runner, from the
+	// cloned tree; the container only runs the result.
+	installCommand, installReason := installCommandForRepo(repoDirectoryPath)
+	logInstallChoice(logsWriter, installReason)
+
+	// Wall-clock cap on the install + build phase. A build that
 	// exceeds this is genuinely broken — surface the deadline as an
 	// error rather than tying up a runner slot indefinitely.
 	execCtx, cancelExec := context.WithTimeout(context.Background(), defaultBuildTimeout)
 	defer cancelExec()
-	err = execCommand(execCtx, containerID, repoDirectoryPath, []string{"bash", "-c", "npm install;" + buildCommand}, envVariablesSlice, logsWriter)
+	err = execCommand(execCtx, containerID, repoDirectoryPath, []string{"bash", "-c", installCommand + ";" + buildCommand}, envVariablesSlice, logsWriter)
 	if err != nil {
 		return parameters, err
 	}
