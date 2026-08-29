@@ -761,7 +761,7 @@ func (rs *RunAgentStep) spawnAgentboxAndWait(spec agentboxSpawnSpec, logsWriter 
 	}
 	waitCtx, cancelWait := context.WithTimeout(dockerCtx, defaultWallClockTimeout)
 	defer cancelWait()
-	_, waitErr := waitForContainerExit(waitCtx, cli, containerID, rs.stopSignal)
+	_, waitErr := waitForContainerExit(waitCtx, cli, containerID, rs.stopSignal, logsWriter)
 	// On user-stop, return the partial result (caller merges into
 	// JobOutput) plus the stop sentinel error so the caller can route
 	// to the stop UX path. On other errors, propagate as-is.
@@ -977,7 +977,7 @@ func streamContainerLogs(ctx context.Context, cli *client.Client, containerID st
 //
 // stopSignal can be nil — a nil channel never fires in select, so the
 // stop branch is silently skipped. Pre-Phase-5.5 behavior matches.
-func waitForContainerExit(ctx context.Context, cli *client.Client, containerID string, stopSignal <-chan struct{}) (int, error) {
+func waitForContainerExit(ctx context.Context, cli *client.Client, containerID string, stopSignal <-chan struct{}, logsWriter io.Writer) (int, error) {
 	statusCh, errCh := cli.ContainerWait(ctx, containerID, container.WaitConditionNotRunning)
 	select {
 	case err := <-errCh:
@@ -998,6 +998,11 @@ func waitForContainerExit(ctx context.Context, cli *client.Client, containerID s
 		// Container exited. Agent phase: the exit code is advisory (status
 		// flows via /result.json). Vendor phase: the caller treats a
 		// non-zero code as a dependency-fetch failure.
+		//
+		// Ask Docker HOW it died before the deferred removal destroys the
+		// answer. Silent on an ordinary exit; speaks only for an OOM or a
+		// signal, which are the deaths a bare exit code fails to explain.
+		reportContainerExit(cli, containerID, logsWriter)
 		return int(status.StatusCode), nil
 	case <-stopSignal:
 		// User stopped the Job mid-run. SIGTERM the container with grace
@@ -1356,7 +1361,7 @@ func (rs *RunAgentStep) spawnVendorAndWait(spec agentboxSpawnSpec, logsWriter io
 	}()
 	waitCtx, cancelWait := context.WithTimeout(dockerCtx, defaultVendorTimeout)
 	defer cancelWait()
-	code, waitErr := waitForContainerExit(waitCtx, cli, containerID, rs.stopSignal)
+	code, waitErr := waitForContainerExit(waitCtx, cli, containerID, rs.stopSignal, logsWriter)
 	if waitErr != nil {
 		return waitErr
 	}
