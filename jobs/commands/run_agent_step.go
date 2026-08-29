@@ -136,6 +136,33 @@ const (
 	agentboxTmpDirRel   = ".agentbox-tmp"
 	agentboxTmpDirInCtr = agentboxWorkDirInContainer + "/" + agentboxTmpDirRel
 
+	// agentboxCorepackHomeInCtr overrides the image's COREPACK_HOME
+	// (/opt/corepack), which the container cannot write to: we spawn with
+	// ReadonlyRootfs, so every path outside the mounts is read-only.
+	//
+	// corepack creates a scratch directory under COREPACK_HOME whenever it
+	// installs a package-manager version it hasn't cached, so any repo whose
+	// packageManager names something other than the image's pre-warmed Yarn
+	// Classic dies on the first `yarn` call:
+	//
+	//   EROFS: read-only file system, mkdir '/opt/corepack/v1/corepack-...'
+	//
+	// EROFS, not EACCES — the Dockerfile chowns /opt/corepack to the agent
+	// user correctly; the filesystem itself is the problem, so no permission
+	// change in the image can fix it.
+	//
+	// Cost of moving it: the image pre-warms Yarn Classic into /opt/corepack
+	// so unpinned repos never fetch a yarn binary, and corepack reads only
+	// COREPACK_HOME, so redirecting gives that up — such a repo now downloads
+	// Classic from registry.npmjs.org once per Step. That is ~1 MB against a
+	// vendor step that already pulls hundreds, and it buys correctness for
+	// every pinned repo. Preserving both would mean mounting a named volume
+	// over /opt/corepack (Docker seeds an empty one from the image layer),
+	// which is a second per-Step volume to create and reap for the sake of a
+	// megabyte.
+	agentboxCorepackHomeRel   = agentboxTmpDirRel + "/corepack"
+	agentboxCorepackHomeInCtr = agentboxWorkDirInContainer + "/" + agentboxCorepackHomeRel
+
 	// agentboxMCPSocketInContainer is where the per-task MCP tool socket is
 	// bind-mounted inside the agent container; agentbox reads its path from
 	// MCP_TOOL_RPC_SOCKET and bridges the agent's stdio MCP client to it. Tools
@@ -370,7 +397,7 @@ func prepareAgentboxHostDirs(workDirHost string) error {
 	if err := os.Chown(workDirHost, commandUtils.AgentboxUID, commandUtils.AgentboxGID); err != nil {
 		return err
 	}
-	for _, rel := range []string{agentboxResultDirRel, agentboxTmpDirRel} {
+	for _, rel := range []string{agentboxResultDirRel, agentboxTmpDirRel, agentboxCorepackHomeRel} {
 		dir := filepath.Join(workDirHost, rel)
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			return err
@@ -399,6 +426,9 @@ func buildAgentSpawnEnvVars(parameters map[string]interface{}, logsWriter io.Wri
 		// preference, and the linker is the loudest victim of a small /tmp.
 		"TMPDIR":   agentboxTmpDirInCtr,
 		"GOTMPDIR": agentboxTmpDirInCtr,
+		// corepack cannot write to the image's /opt/corepack under
+		// ReadonlyRootfs — see agentboxCorepackHomeInCtr.
+		"COREPACK_HOME": agentboxCorepackHomeInCtr,
 	}
 	if creds, err := jobs.GetParameterValue[map[string]string](parameters, parameters_enums.AgentEnvVars); err == nil {
 		for k, v := range creds {
@@ -1353,6 +1383,9 @@ func buildVendorSpec(imageRef, workDirHost, cacheVolume string, ctx commandUtils
 		// 512 MB tmpfs. See agentboxTmpDirRel.
 		"TMPDIR":   agentboxTmpDirInCtr,
 		"GOTMPDIR": agentboxTmpDirInCtr,
+		// corepack cannot write to the image's /opt/corepack under
+		// ReadonlyRootfs — see agentboxCorepackHomeInCtr.
+		"COREPACK_HOME": agentboxCorepackHomeInCtr,
 	}
 	if token != "" {
 		env["GIT_TOKEN"] = token

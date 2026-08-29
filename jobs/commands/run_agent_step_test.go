@@ -319,3 +319,25 @@ func TestAgentboxTmpDirIsOffTheTmpfsAndInvisibleToAgentbox(t *testing.T) {
 		t.Error("tmp dir and result dir must be distinct; scratch would collide with result.json")
 	}
 }
+
+// TestCorepackHomeIsWritableInTheContainer pins the override of the image's
+// COREPACK_HOME. /opt/corepack cannot be written under ReadonlyRootfs, and
+// corepack needs a scratch dir there for any version it hasn't cached — so
+// the home has to sit inside a mount. Failure mode if this regresses is
+// EROFS on the first `yarn` call in any repo pinning a packageManager, which
+// reads as a repo problem rather than a container one.
+func TestCorepackHomeIsWritableInTheContainer(t *testing.T) {
+	if !strings.HasPrefix(agentboxCorepackHomeInCtr, agentboxWorkDirInContainer+"/") {
+		t.Errorf("COREPACK_HOME %q must live under the bind-mounted work dir; "+
+			"everything outside the mounts is read-only", agentboxCorepackHomeInCtr)
+	}
+	if strings.HasPrefix(agentboxCorepackHomeInCtr, "/opt") {
+		t.Errorf("COREPACK_HOME %q is back on the read-only image filesystem", agentboxCorepackHomeInCtr)
+	}
+	// Nested under the tmp dir so one MkdirAll creates it and one RemoveAll
+	// at MarkStepDone reaps it.
+	if !strings.HasPrefix(agentboxCorepackHomeRel, agentboxTmpDirRel+"/") {
+		t.Errorf("COREPACK_HOME rel %q should nest under %q so it is created and "+
+			"cleaned up with it", agentboxCorepackHomeRel, agentboxTmpDirRel)
+	}
+}
