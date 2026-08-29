@@ -101,6 +101,56 @@ func TestInstallCommandForRepo(t *testing.T) {
 			wantReason: true,
 		},
 		{
+			// website-svc's shape until 2026-08-28, and the regression this
+			// nearly shipped: `yarn policies set-version` on Yarn 1 vendors a
+			// CLASSIC release and writes the same .yarnrc redirect a Berry repo
+			// uses. Choosing yarn here sends a Berry lockfile to Classic, which
+			// aborts — breaking a deploy that works today under npm.
+			name: "berry lockfile with a vendored CLASSIC release",
+			files: map[string]string{
+				"yarn.lock":                     berryYarnLock,
+				".yarnrc":                       "yarn-path \".yarn/releases/yarn-1.22.1.js\"\n",
+				".yarn/releases/yarn-1.22.1.js": "// yarn 1\n",
+			},
+			want:       npmInstall,
+			wantReason: true,
+		},
+		{
+			// A Classic lockfile with a Classic vendored release is the
+			// consistent Yarn 1 repo — yarn reads its own lockfile fine.
+			name: "classic lockfile with a vendored classic release",
+			files: map[string]string{
+				"yarn.lock":                     classicYarnLock,
+				".yarnrc":                       "yarn-path \".yarn/releases/yarn-1.22.1.js\"\n",
+				".yarn/releases/yarn-1.22.1.js": "// yarn 1\n",
+			},
+			want: "yarn install",
+		},
+		{
+			// Unrecognized filename means undetermined, and undetermined must
+			// mean "not Berry" — guessing Berry hands the lockfile to a yarn
+			// that may not read it, which is a failed deploy.
+			name: "berry lockfile with a release whose name carries no version",
+			files: map[string]string{
+				"yarn.lock":               berryYarnLock,
+				".yarnrc.yml":             "yarnPath: .yarn/releases/yarn.cjs\n",
+				".yarn/releases/yarn.cjs": "// yarn ?\n",
+			},
+			want:       npmInstall,
+			wantReason: true,
+		},
+		{
+			// packageManager is NOT a pin here: the build image has no enabled
+			// corepack, so nothing reads it and yarn stays Classic.
+			name: "berry lockfile with only a packageManager field",
+			files: map[string]string{
+				"yarn.lock":    berryYarnLock,
+				"package.json": `{"packageManager":"yarn@4.9.4"}`,
+			},
+			want:       npmInstall,
+			wantReason: true,
+		},
+		{
 			name:  "classic lockfile — the image's yarn understands it",
 			files: map[string]string{"yarn.lock": classicYarnLock},
 			want:  "yarn install",

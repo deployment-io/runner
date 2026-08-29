@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -55,18 +56,31 @@ func installCommandForRepo(repoDir string) (command, reason string) {
 		return npmInstall, "pnpm-lock.yaml found, but the build image has no pnpm — installing with npm (dependency versions will not match the lockfile)"
 
 	case fileExistsAt(repoDir, "yarn.lock"):
-		if yarnLockIsBerryAt(repoDir) && vendoredYarnReleaseAt(repoDir) == "" {
-			// Berry lockfile, nothing pinning a Berry binary. The image's
-			// yarn is Classic, which cannot parse this lockfile and aborts.
-			// Falling back keeps the deploy working — and the build command
-			// will resolve `yarn` to that same Classic yarn, which runs
-			// scripts happily against an npm tree, which is how these repos
-			// have always built here.
-			return npmInstall, "yarn.lock is Yarn Berry but the repo pins no Yarn version and the build image ships Yarn Classic — installing with npm (dependency versions will not match the lockfile)"
+		// A Classic lockfile is safe either way: the image's yarn reads it,
+		// and so does a vendored release of any version.
+		if !yarnLockIsBerryAt(repoDir) {
+			return "yarn install", "yarn.lock found — installing with yarn"
 		}
-		// Either a Classic lockfile the image's yarn understands, or a repo
-		// that ships its own release and redirects to it. `yarn install`
-		// lands on the right binary in both cases.
+		// A Berry lockfile only works if the yarn that will actually run is
+		// Berry. The image ships Classic and no enabled corepack, so the ONLY
+		// thing that makes it Berry is an in-tree release the repo's
+		// .yarnrc/.yarnrc.yml redirects to. A packageManager field alone does
+		// not, however precise it looks — nothing here reads it.
+		//
+		// Presence of a release is not enough, and this is the trap:
+		// `yarn policies set-version` on Yarn 1 vendors a CLASSIC release and
+		// writes the same .yarnrc redirect, a combination that outlives a
+		// migration to Berry. deployment-io/website-svc carried exactly that
+		// shape until 2026-08-28. Selecting `yarn install` there sends a Berry
+		// lockfile to Classic, which aborts — turning a deploy that works
+		// today into one that fails. So the release's own version decides.
+		release := vendoredYarnReleaseAt(repoDir)
+		if release == "" {
+			return npmInstall, "yarn.lock is Yarn Berry but the repo vendors no Yarn release, and the build image ships Yarn Classic — installing with npm (dependency versions will not match the lockfile)"
+		}
+		if yarnReleaseMajor(release) < 2 {
+			return npmInstall, "yarn.lock is Yarn Berry but " + filepath.Base(release) + " is Yarn Classic, which cannot read it — installing with npm (dependency versions will not match the lockfile)"
+		}
 		return "yarn install", "yarn.lock found — installing with yarn"
 
 	default:
@@ -160,4 +174,28 @@ func yarnConfigValue(path, key string) string {
 		return strings.Trim(strings.TrimSpace(strings.TrimPrefix(line, key)), `"'`)
 	}
 	return ""
+}
+
+// yarnReleaseMajor returns the Yarn major version named by a vendored
+// release's filename — yarn-4.9.4.cjs -> 4, yarn-1.22.1.js -> 1 — or 0 when
+// the name carries none. Both `yarn set version` and `yarn policies
+// set-version` write this yarn-<version>.<ext> shape.
+//
+// 0 means undetermined, and callers must treat that as "not Berry": guessing
+// Berry for an unrecognized name would hand a Berry lockfile to a yarn that
+// may not read it, which is a failed deploy. Guessing the other way only
+// costs the npm fallback.
+func yarnReleaseMajor(path string) int {
+	name := filepath.Base(path)
+	name = strings.TrimSuffix(name, filepath.Ext(name))
+	rest, ok := strings.CutPrefix(name, "yarn-")
+	if !ok {
+		return 0
+	}
+	major, _, _ := strings.Cut(rest, ".")
+	n, err := strconv.Atoi(major)
+	if err != nil {
+		return 0
+	}
+	return n
 }
