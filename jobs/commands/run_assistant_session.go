@@ -121,7 +121,11 @@ func prepareSessionDirs(workDirHost string) error {
 	// Step path does — buildSessionSpawnEnvVars points at it, and TMPDIR
 	// naming a missing directory fails every write with ENOENT.
 	tmpDir := filepath.Join(workDirHost, agentboxTmpDirRel)
-	for _, d := range []string{outDir, inDir, tmpDir} {
+	// corepackDir backs COREPACK_HOME; the image's /opt/corepack is
+	// unwritable under ReadonlyRootfs. Nested inside tmpDir, so MkdirAll
+	// covers both and the whole tree goes at cleanup.
+	corepackDir := filepath.Join(workDirHost, agentboxCorepackHomeRel)
+	for _, d := range []string{outDir, inDir, tmpDir, corepackDir} {
 		if err := os.MkdirAll(d, 0755); err != nil {
 			return err
 		}
@@ -134,6 +138,7 @@ func prepareSessionDirs(workDirHost string) error {
 		filepath.Join(workDirHost, ".agentbox-output"),
 		filepath.Join(workDirHost, ".agentbox-input"),
 		tmpDir,
+		corepackDir,
 	} {
 		if err := chownTreeToAgentbox(p); err != nil {
 			return err
@@ -165,6 +170,9 @@ func buildSessionSpawnEnvVars(parameters map[string]interface{}, logsWriter io.W
 		// the same installs and builds. See agentboxTmpDirRel.
 		"TMPDIR":   agentboxTmpDirInCtr,
 		"GOTMPDIR": agentboxTmpDirInCtr,
+		// corepack cannot write to the image's /opt/corepack under
+		// ReadonlyRootfs — see agentboxCorepackHomeInCtr.
+		"COREPACK_HOME": agentboxCorepackHomeInCtr,
 	}
 	if creds, err := jobs.GetParameterValue[map[string]string](parameters, parameters_enums.AgentEnvVars); err == nil {
 		for k, v := range creds {
