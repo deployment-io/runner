@@ -255,7 +255,7 @@ func (rs *RunAssistantSession) runSession(orgID, jobID, imageRef, workDirHost st
 
 	waitCtx, cancelWait := context.WithTimeout(dockerCtx, sessionWallClockHardCap)
 	defer cancelWait()
-	exitCode, waitErr := waitForContainerExit(waitCtx, cli, containerID, rs.stopSignal)
+	exitCode, waitErr := waitForContainerExit(waitCtx, cli, containerID, rs.stopSignal, logsWriter)
 	close(stopBridge)
 	bridgeWg.Wait()
 	mf.tick() // final drain of any buffered output
