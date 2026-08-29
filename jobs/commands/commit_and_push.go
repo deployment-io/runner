@@ -130,6 +130,14 @@ func (tcp *taskCommitPush) commitAndPushOne(repoDir string, entry tasks.Reposito
 	if err != nil {
 		return repoOutput{}, fmt.Errorf("error getting worktree: %s", err)
 	}
+	// Hand the worktree a pattern set collected with git's semantics before
+	// anything reads status or stages. go-git's own collection re-includes
+	// files under an excluded directory when something in there ships a
+	// negating .gitignore — see gitignore.go. This must precede Status(),
+	// which applies the same matcher and would otherwise report vendored
+	// files as changes.
+	worktree.Excludes = append(worktree.Excludes, gitSemanticsPatterns(worktree.Filesystem)...)
+
 	status, err := worktree.Status()
 	if err != nil {
 		return repoOutput{}, fmt.Errorf("error reading status: %s", err)
