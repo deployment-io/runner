@@ -428,7 +428,7 @@ func (b *BuildStaticSite) Run(parameters map[string]interface{}, logsWriter io.W
 	// Install with whatever the repo's lockfile implies, not always npm —
 	// see static_site_install.go. Decided here, on the runner, from the
 	// cloned tree; the container only runs the result.
-	installCommand, installReason := installCommandForRepo(repoDirectoryPath)
+	installCommand, installReason := installCommandForRepo(repoDirectoryPath, buildCommand)
 	logInstallChoice(logsWriter, installReason)
 
 	// Wall-clock cap on the install + build phase. A build that

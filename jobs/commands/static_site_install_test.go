@@ -38,10 +38,13 @@ func writeRepo(t *testing.T, files map[string]string) string {
 // currently succeed.
 func TestInstallCommandForRepo(t *testing.T) {
 	cases := []struct {
-		name       string
-		files      map[string]string
-		want       string
-		wantReason bool
+		name string
+		// buildCommand matters only for the PnP split; every other case is
+		// decided by the tree alone, so they leave it at the common default.
+		buildCommand string
+		files        map[string]string
+		want         string
+		wantReason   bool
 	}{
 		{
 			name:  "no lockfile — unchanged from before",
@@ -58,7 +61,8 @@ func TestInstallCommandForRepo(t *testing.T) {
 			// redirects yarn at a vendored Berry release, so the build
 			// command runs Berry, which validates the project against
 			// yarn.lock and rejects an npm-installed tree.
-			name: "berry lockfile with a vendored release via .yarnrc",
+			name:         "berry lockfile with a vendored release via .yarnrc",
+			buildCommand: "yarn build",
 			files: map[string]string{
 				"yarn.lock":                     berryYarnLock,
 				".yarnrc":                       "yarn-path \".yarn/releases/yarn-4.9.4.cjs\"\n",
@@ -76,7 +80,8 @@ func TestInstallCommandForRepo(t *testing.T) {
 			want: "yarn install",
 		},
 		{
-			name: "berry lockfile with a release but no yarnPath",
+			name:         "berry lockfile with a release but no yarnPath",
+			buildCommand: "yarn build",
 			files: map[string]string{
 				"yarn.lock":                     berryYarnLock,
 				".yarn/releases/yarn-4.9.4.cjs": "// yarn 4\n",
@@ -150,6 +155,55 @@ func TestInstallCommandForRepo(t *testing.T) {
 			want:       npmInstall,
 			wantReason: true,
 		},
+		// Plug'n'Play is the Yarn 2+ DEFAULT — no nodeLinker means no
+		// node_modules — so which install is correct depends on how the build
+		// is invoked. Both directions are live, which is why the build command
+		// is consulted at all.
+		{
+			name:         "PnP with a yarn build command",
+			buildCommand: "yarn build",
+			files: map[string]string{
+				"yarn.lock":                     berryYarnLock,
+				".yarnrc.yml":                   "yarnPath: .yarn/releases/yarn-4.9.4.cjs\n",
+				".yarn/releases/yarn-4.9.4.cjs": "// yarn 4\n",
+			},
+			want: "yarn install",
+		},
+		{
+			// Broken by a yarn install: PnP leaves no node_modules for
+			// `next build` to resolve through. npm is what works today.
+			name:         "PnP with a non-yarn build command",
+			buildCommand: "next build",
+			files: map[string]string{
+				"yarn.lock":                     berryYarnLock,
+				".yarnrc.yml":                   "yarnPath: .yarn/releases/yarn-4.9.4.cjs\n",
+				".yarn/releases/yarn-4.9.4.cjs": "// yarn 4\n",
+			},
+			want:       npmInstall,
+			wantReason: true,
+		},
+		{
+			// node-modules linker means the tree suits any build command.
+			name:         "node-modules linker with a non-yarn build command",
+			buildCommand: "npm run build",
+			files: map[string]string{
+				"yarn.lock":                     berryYarnLock,
+				".yarnrc.yml":                   "nodeLinker: node-modules\nyarnPath: .yarn/releases/yarn-4.9.4.cjs\n",
+				".yarn/releases/yarn-4.9.4.cjs": "// yarn 4\n",
+			},
+			want: "yarn install",
+		},
+		{
+			// Chained commands still count as running through yarn.
+			name:         "PnP with yarn later in a chained build command",
+			buildCommand: "echo building && yarn build",
+			files: map[string]string{
+				"yarn.lock":                     berryYarnLock,
+				".yarnrc.yml":                   "yarnPath: .yarn/releases/yarn-4.9.4.cjs\n",
+				".yarn/releases/yarn-4.9.4.cjs": "// yarn 4\n",
+			},
+			want: "yarn install",
+		},
 		{
 			name:  "classic lockfile — the image's yarn understands it",
 			files: map[string]string{"yarn.lock": classicYarnLock},
@@ -175,7 +229,7 @@ func TestInstallCommandForRepo(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, reason := installCommandForRepo(writeRepo(t, tc.files))
+			got, reason := installCommandForRepo(writeRepo(t, tc.files), tc.buildCommand)
 			if got != tc.want {
 				t.Errorf("install command = %q, want %q", got, tc.want)
 			}
@@ -190,7 +244,7 @@ func TestInstallCommandForRepo(t *testing.T) {
 // The ordinary npm repo must gain no narration it did not have before.
 func TestInstallChoiceIsSilentForThePlainCase(t *testing.T) {
 	var buf strings.Builder
-	_, reason := installCommandForRepo(writeRepo(t, map[string]string{"package.json": "{}"}))
+	_, reason := installCommandForRepo(writeRepo(t, map[string]string{"package.json": "{}"}), "npm run build")
 	logInstallChoice(&buf, reason)
 	if buf.String() != "" {
 		t.Errorf("plain npm repo logged %q, want nothing", buf.String())
