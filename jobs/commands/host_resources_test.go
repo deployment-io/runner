@@ -1,8 +1,9 @@
 package commands
 
 import (
-	"context"
+	"strings"
 	"testing"
+	"time"
 )
 
 // TestMemoryBudgetLeavesReserve is the invariant that separates a clean
@@ -63,7 +64,7 @@ func TestAdmissionWeightClampedToCapacity(t *testing.T) {
 func TestAcquireMemoryReleasesCapacity(t *testing.T) {
 	sem, capacity := admissionSemaphore()
 
-	release, err := acquireMemory(context.Background(), memoryBudget(), "test container", nil)
+	release, err := acquireMemory(nil, memoryBudget(), "test container", nil)
 	if err != nil {
 		t.Fatalf("acquireMemory: %v", err)
 	}
@@ -78,20 +79,108 @@ func TestAcquireMemoryReleasesCapacity(t *testing.T) {
 	sem.Release(capacity)
 }
 
-// TestAcquireMemoryHonoursCancelledContext ensures a stopped or
-// cancelled job stops queueing immediately instead of holding a worker
-// for the full admission timeout.
-func TestAcquireMemoryHonoursCancelledContext(t *testing.T) {
+// TestAdmissionWeightsAgainstCapacity is the test that was missing when
+// the sizing landed. The original suite only checked each CAP against the
+// budget, which passes trivially, and so never noticed that the derived
+// caps convert into admission WEIGHTS equal to 100% of capacity — meaning
+// a single Task silently serialized the entire runner.
+//
+// It asserts the real, intended shape rather than a number, so it stays
+// meaningful on any host: the two heavy workloads are expected to take
+// the whole pool (that IS what "may use all the memory the host can
+// spare" means), while static-site builds must remain small enough that
+// at least two run together — they are the workload that legitimately
+// fans out across concurrent deployments.
+func TestAdmissionWeightsAgainstCapacity(t *testing.T) {
+	t.Setenv(memoryBytesEnvVar, "")
+	t.Setenv(cpuCoresEnvVar, "")
+	t.Setenv(buildMemoryBytesEnvVar, "")
+	t.Setenv(imageBuildMemoryBytesEnvVar, "")
+
+	_, capacity := admissionSemaphore()
+
+	agentMem, _ := resolveContainerLimits()
+	imageMem, _ := resolveImageBuildLimits()
+	staticMem, _ := resolveBuildLimits()
+
+	agentWeight := admissionWeight(agentMem)
+	imageWeight := admissionWeight(imageMem)
+	staticWeight := admissionWeight(staticMem)
+
+	// No weight may exceed the pool, or Acquire would block forever.
+	for _, tc := range []struct {
+		name   string
+		weight int64
+	}{
+		{"agentbox", agentWeight},
+		{"image build", imageWeight},
+		{"static build", staticWeight},
+	} {
+		if tc.weight > capacity {
+			t.Errorf("%s weight %d exceeds capacity %d — Acquire would never be satisfied",
+				tc.name, tc.weight, capacity)
+		}
+		if tc.weight < 1 {
+			t.Errorf("%s weight %d must be at least one unit", tc.name, tc.weight)
+		}
+	}
+
+	// Static-site builds are the parallel workload; if they ever grow to
+	// more than half the pool, concurrent deployments silently serialize.
+	if staticWeight*2 > capacity {
+		t.Errorf("static build weight %d is more than half of capacity %d — two concurrent "+
+			"deployments would no longer fit", staticWeight, capacity)
+	}
+
+	// Documents the accepted trade-off rather than asserting against it:
+	// on a host whose whole budget goes to one agent container, nothing
+	// runs beside it. If this ever stops being true the comments in
+	// admission.go and the PR description need revisiting.
+	t.Logf("capacity=%d units; agentbox=%d image=%d static=%d; room beside an agent job: %d units",
+		capacity, agentWeight, imageWeight, staticWeight, capacity-agentWeight)
+}
+
+// TestAcquireMemoryHonoursStopSignal is the regression test for the
+// admission wait ignoring cancellation. Every call site used to pass
+// context.Background(), so a user pressing Stop on a queued job could not
+// interrupt it: the job held a worker until the admission timeout and
+// then failed with a resource error instead of reporting as stopped.
+func TestAcquireMemoryHonoursStopSignal(t *testing.T) {
 	sem, capacity := admissionSemaphore()
 	if !sem.TryAcquire(capacity) {
 		t.Fatal("could not drain the semaphore for the test")
 	}
 	defer sem.Release(capacity)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
+	stop := make(chan struct{})
+	close(stop)
 
-	if _, err := acquireMemory(ctx, memoryBudget(), "test container", nil); err == nil {
-		t.Error("acquireMemory succeeded on a cancelled context")
+	done := make(chan error, 1)
+	go func() {
+		_, err := acquireMemory(stop, memoryBudget(), "test container", nil)
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("acquireMemory succeeded while the pool was fully held")
+		}
+		if !strings.Contains(err.Error(), "stopped") {
+			t.Errorf("error = %q, want it to report the stop rather than a resource timeout", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("acquireMemory ignored the stop signal and kept waiting")
 	}
+}
+
+// TestAcquireMemoryNilStopIsSafe guards the default for commands that
+// never opt into StoppableCommand: a nil channel must simply mean "not
+// stoppable", not panic or fire immediately.
+func TestAcquireMemoryNilStopIsSafe(t *testing.T) {
+	release, err := acquireMemory(nil, minContainerMemoryBytes, "test container", nil)
+	if err != nil {
+		t.Fatalf("acquireMemory with a nil stop channel: %v", err)
+	}
+	release()
 }

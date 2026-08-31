@@ -223,7 +223,7 @@ func (rs *RunAssistantSession) runSession(orgID, jobID, imageRef, workDirHost st
 	// interactive session holding the budget is intentional: it is using
 	// that memory for as long as it is alive.
 	sessionMemoryBytes, _ := resolveContainerLimits()
-	releaseMemory, err := acquireMemory(dockerCtx, sessionMemoryBytes, "the assistant session container", logsWriter)
+	releaseMemory, err := acquireMemory(rs.stopSignal, sessionMemoryBytes, "the assistant session container", logsWriter)
 	if err != nil {
 		return err
 	}

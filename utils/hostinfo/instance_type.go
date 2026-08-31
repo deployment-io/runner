@@ -2,6 +2,8 @@ package hostinfo
 
 import (
 	"context"
+	"io"
+	"strings"
 	"sync"
 	"time"
 
@@ -15,6 +17,11 @@ import (
 // nicety and must never delay a runner's first ping to the control
 // plane, which is what marks the runner alive.
 const imdsTimeout = 2 * time.Second
+
+// maxInstanceTypeBytes bounds the metadata read. Real values are short
+// ("m6a.large"); the limit only exists so a misbehaving endpoint cannot
+// stream unbounded data into memory.
+const maxInstanceTypeBytes = 256
 
 var (
 	instanceTypeOnce  sync.Once
@@ -51,11 +58,21 @@ func InstanceType() string {
 		}
 		defer out.Content.Close()
 
-		buf := make([]byte, 64)
-		n, _ := out.Content.Read(buf)
-		if n > 0 {
-			instanceTypeCache = string(buf[:n])
+		// io.ReadAll, not a single Read into a fixed buffer. An io.Reader
+		// may return fewer bytes than are available, so one Read on an HTTP
+		// body can hand back a partial value — and because the result is
+		// memoized by sync.Once, a truncated "m6a." would be cached for the
+		// process lifetime, sent on the ping, persisted, and rendered in the
+		// dashboard with no error and no retry anywhere.
+		//
+		// The response is a short token like "m6a.large"; cap the read
+		// anyway so a misbehaving endpoint cannot stream unbounded data
+		// into memory.
+		body, err := io.ReadAll(io.LimitReader(out.Content, maxInstanceTypeBytes))
+		if err != nil {
+			return
 		}
+		instanceTypeCache = strings.TrimSpace(string(body))
 	})
 	return instanceTypeCache
 }

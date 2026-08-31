@@ -13,7 +13,18 @@ import (
 )
 
 type BuildNixPacksImage struct {
+	// stopSignal closes when the server reports the Job moved to Stopping.
+	// Used to cancel the admission wait; see BuildStaticSite.stopSignal.
+	stopSignal <-chan struct{}
 }
+
+// SetStopSignal satisfies jobs.StoppableCommand.
+func (b *BuildNixPacksImage) SetStopSignal(stop <-chan struct{}) {
+	b.stopSignal = stop
+}
+
+// See the note on BuildStaticSite.
+var _ jobs.StoppableCommand = (*BuildNixPacksImage)(nil)
 
 func (b *BuildNixPacksImage) Run(parameters map[string]interface{}, logsWriter io.Writer) (newParameters map[string]interface{}, err error) {
 	defer func() {
@@ -77,23 +88,37 @@ func (b *BuildNixPacksImage) Run(parameters map[string]interface{}, logsWriter i
 		return parameters, err
 	}
 
-	// KNOWN GAP: this build is NOT memory-capped and is NOT counted by
-	// admission control, unlike every other container the runner spawns.
+	// PARTIAL GAP: this build is COUNTED by admission control but is not
+	// memory-CAPPED, unlike every other container the runner spawns.
 	//
 	// nixpacks-go's BuildOptions exposes no memory or CPU fields, and it
 	// shells out to the `nixpacks` CLI binary, which runs its own
 	// `docker build` internally — there is no seam to pass --memory
-	// through. So a nixpacks build can still consume the whole host, and
-	// because it executes inside dockerd rather than in the runner's
-	// cgroup, nothing here can observe it either.
+	// through. So the build itself is unbounded, and because it executes
+	// inside dockerd rather than in the runner's cgroup, nothing here can
+	// observe its usage either.
 	//
-	// The fix is to stop letting nixpacks do the build: BuildOptions.Output
-	// makes it emit a Dockerfile instead of an image, which we could then
-	// build through imageBuild() in build_docker_image.go and inherit both
-	// the cap and the admission weight. That is a larger change than
-	// adding a limit, so it is called out here rather than done silently.
-	// Until then, a runner that uses nixpacks keeps the old unbounded
-	// behaviour on this path only.
+	// Reserving the weight anyway is worth doing even without a cap. It
+	// does not stop this build from overrunning, but it does stop it
+	// running CONCURRENTLY with an agent container or another build that
+	// have already been promised that memory. Without the reservation,
+	// admission control would believe the host was free while an unbounded
+	// build was consuming it — the budget would not be authoritative and
+	// the host OOM this whole mechanism exists to prevent would stay
+	// reachable via this one path.
+	//
+	// The real fix is to stop letting nixpacks do the build:
+	// BuildOptions.Output makes it emit a Dockerfile instead of an image,
+	// which we could then build through imageBuild() in
+	// build_docker_image.go and inherit the cap too. That is a larger
+	// change, so it is called out here rather than done silently.
+	nixpacksMemoryBytes, _ := resolveImageBuildLimits()
+	releaseMemory, err := acquireMemory(b.stopSignal, nixpacksMemoryBytes, "the nixpacks image build", logsWriter)
+	if err != nil {
+		return parameters, err
+	}
+	defer releaseMemory()
+
 	buildOptions := nixpacks.BuildOptions{
 		Path:       repoDirectoryPath,
 		Name:       dockerImageNameAndTag,

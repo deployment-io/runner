@@ -41,19 +41,45 @@ import (
 // This is also what makes the generous per-container sizing safe. Giving
 // agentbox the whole budget would be reckless if two could overlap;
 // admission control is the guarantee that they can't.
+//
+// TWO CONSEQUENCES WORTH KNOWING, both deliberate:
+//
+//  1. On the smallest instance we ship (m6a.large, ~7.7 GB) an agent
+//     container is sized to the ENTIRE budget, so its weight is 100% of
+//     capacity and nothing runs beside it. That is not an accident of the
+//     arithmetic — it is what "the agent may use all the memory the host
+//     can spare" means, and on a host that size the alternative is to
+//     shrink the agent back below the 4 GB that was already OOM-killing
+//     Tasks. Concurrency on a small runner is the thing being traded
+//     away; a larger instance buys it back with no code change, because
+//     both the caps and the capacity scale with the host.
+//
+//  2. golang.org/x/sync/semaphore is strict FIFO and deliberately leaves
+//     every waiter blocked behind one that does not fit (see the comment
+//     in its notifyWaiters). So a queued full-budget agent request stalls
+//     a small build that would otherwise fit. This is the RIGHT tradeoff
+//     and is not worked around: allowing small jobs to barge ahead would
+//     starve the large one indefinitely on a busy runner, turning a
+//     bounded delay into a job that never runs at all. It does mean the
+//     admission wait must be long enough to outlast the job in front —
+//     see admissionWaitTimeout.
 
 const (
 	// admissionWaitTimeout bounds how long a job waits for memory before
-	// giving up. Generous, because waiting is the CORRECT behaviour here:
-	// a queued job that starts three minutes late is a far better outcome
-	// than two jobs that start immediately and are both OOM-killed. It
-	// exists only so a leaked slot can't wedge a worker forever.
+	// giving up. Waiting is the CORRECT behaviour here: a deployment that
+	// starts late is a far better outcome than one that fails, or than two
+	// jobs that start at once and are both OOM-killed.
 	//
-	// Comfortably longer than a typical agentbox Step but well short of
-	// the runner's 4h job wall-clock, so a job that can't be admitted
-	// fails with a clear message rather than consuming its whole budget
-	// sitting in a queue.
-	admissionWaitTimeout = 30 * time.Minute
+	// Sized to outlast a realistic agentbox Task rather than a "typical"
+	// one. On the smallest instance we ship, an agent container is sized
+	// to the whole budget (see host_resources.go), so a build genuinely
+	// cannot start until the Task finishes — and at the previous 30m this
+	// turned every deploy dispatched during a longer Task into a HARD
+	// FAILURE rather than a delay. 2h covers essentially every Task while
+	// staying under the runner's 4h job wall-clock, so a job that truly
+	// cannot be admitted still fails with a clear message instead of
+	// wedging a worker forever.
+	admissionWaitTimeout = 2 * time.Hour
 )
 
 var (
@@ -107,15 +133,33 @@ func admissionWeight(memoryBytes int64) int64 {
 // room. Returns a release function the caller MUST call — via defer at
 // the call site, so it runs on every exit path including panics.
 //
-// ctx is the job's context, so a cancelled or stopped job stops waiting
-// immediately instead of holding a worker.
+// It takes the job's STOP CHANNEL rather than a context, deliberately.
+// An earlier version took the caller's context, which was wrong in both
+// directions:
+//
+//   - Callers passed context.Background(), so a user pressing Stop on a
+//     queued job could not interrupt the wait. The job sat holding a
+//     worker until the timeout and then failed with a resource error
+//     instead of reporting as cancelled.
+//
+//   - The one caller that did pass a real context (imageBuild) passed one
+//     already carrying the BUILD's 30-minute deadline, so time spent
+//     queueing was silently deducted from the build's own wall-clock. A
+//     25-minute wait left a 5-minute build, which then died mid-layer
+//     with a bare "context deadline exceeded" that named neither memory
+//     nor the build timeout.
+//
+// Taking the stop channel gets cancellation without importing anyone
+// else's deadline: the admission timeout is applied here and here only.
+// A nil channel is fine and means "not stoppable" — a nil channel never
+// fires in select.
 //
 // logsWriter gets a line only when the job actually has to wait. On an
 // idle runner this is silent; when it does print, "waiting for memory"
 // is exactly the explanation a user staring at a stalled job needs, and
 // the alternative (staying quiet) is what makes queueing feel like a
 // hang.
-func acquireMemory(ctx context.Context, memoryBytes int64, label string, logsWriter io.Writer) (release func(), err error) {
+func acquireMemory(stop <-chan struct{}, memoryBytes int64, label string, logsWriter io.Writer) (release func(), err error) {
 	sem, _ := admissionSemaphore()
 	weight := admissionWeight(memoryBytes)
 
@@ -127,20 +171,36 @@ func acquireMemory(ctx context.Context, memoryBytes int64, label string, logsWri
 
 	if logsWriter != nil {
 		_, _ = io.WriteString(logsWriter,
-			fmt.Sprintf("Waiting for memory on the runner before starting %s (needs %d MB)...\n",
-				label, memoryBytes/(1024*1024)))
+			fmt.Sprintf("Waiting for memory on the runner before starting %s (needs %d MB of a %d MB budget). "+
+				"Another job is using it; this job will start when that one finishes.\n",
+				label, memoryBytes/(1024*1024), memoryBudget()/(1024*1024)))
 	}
 
-	waitCtx, cancel := context.WithTimeout(ctx, admissionWaitTimeout)
+	waitCtx, cancel := context.WithTimeout(context.Background(), admissionWaitTimeout)
 	defer cancel()
+	// Translate the stop channel into cancellation of the wait. The
+	// goroutine exits via the deferred cancel on every return path, so it
+	// cannot outlive this call.
+	go func() {
+		select {
+		case <-stop:
+			cancel()
+		case <-waitCtx.Done():
+		}
+	}()
+
 	if err := sem.Acquire(waitCtx, weight); err != nil {
-		// Distinguish "the job was cancelled" from "we gave up waiting" —
-		// they need different responses from whoever reads the log.
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
+		// Distinguish "the user stopped this job" from "we gave up
+		// waiting" — they need different responses from whoever reads the
+		// log, and only the latter is a resource problem.
+		select {
+		case <-stop:
+			return nil, fmt.Errorf("stopped while waiting for memory on the runner to start %s", label)
+		default:
 		}
 		return nil, fmt.Errorf("timed out after %s waiting for memory on the runner to start %s "+
-			"(needs %d MB of a %d MB budget); other jobs on this runner are holding it",
+			"(needs %d MB of a %d MB budget). Another job held it for longer than that; "+
+			"a larger runner instance would let them run at the same time",
 			admissionWaitTimeout, label, memoryBytes/(1024*1024), memoryBudget()/(1024*1024))
 	}
 	if logsWriter != nil {

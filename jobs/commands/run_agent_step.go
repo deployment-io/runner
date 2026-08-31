@@ -732,7 +732,7 @@ func (rs *RunAgentStep) spawnAgentboxAndWait(spec agentboxSpawnSpec, logsWriter 
 	// through the spec: it is deterministic (memoized host read plus env
 	// lookups), so both call sites necessarily agree on the number.
 	agentMemoryBytes, _ := resolveContainerLimits()
-	releaseMemory, err := acquireMemory(dockerCtx, agentMemoryBytes, "the agent container", logsWriter)
+	releaseMemory, err := acquireMemory(rs.stopSignal, agentMemoryBytes, "the agent container", logsWriter)
 	if err != nil {
 		return agentResult{}, err
 	}
@@ -1417,7 +1417,7 @@ func (rs *RunAgentStep) spawnVendorAndWait(spec agentboxSpawnSpec, logsWriter io
 	// weight. It runs BEFORE the agent container in the same Step and the
 	// two never overlap, so this does not double-count the Step.
 	vendorMemoryBytes, _ := resolveContainerLimits()
-	releaseMemory, err := acquireMemory(dockerCtx, vendorMemoryBytes, "the dependency-vendoring container", logsWriter)
+	releaseMemory, err := acquireMemory(rs.stopSignal, vendorMemoryBytes, "the dependency-vendoring container", logsWriter)
 	if err != nil {
 		return err
 	}

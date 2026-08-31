@@ -52,7 +52,30 @@ const (
 )
 
 type BuildStaticSite struct {
+	// stopSignal closes when the server reports the Job moved to Stopping.
+	// Implemented so a build QUEUED behind another job's memory can be
+	// cancelled by the user: without it a stopped build sat in
+	// acquireMemory holding a worker until the admission timeout and then
+	// failed with a resource error instead of reporting as stopped.
+	//
+	// Scope is deliberately limited to the admission wait. Aborting a
+	// build already in flight is a separate change; the runner's outer
+	// loop still checks the signal between commands as before.
+	stopSignal <-chan struct{}
 }
+
+// SetStopSignal satisfies jobs.StoppableCommand.
+func (b *BuildStaticSite) SetStopSignal(stop <-chan struct{}) {
+	b.stopSignal = stop
+}
+
+// Compile-time proof that the POINTER satisfies StoppableCommand. The
+// runner's dispatcher discovers the stop signal through a type assertion
+// (`command.(jobs.StoppableCommand)`), which fails silently if the
+// registered value ever stops being a pointer -- stop would simply never
+// be delivered, with nothing to notice it. commands.go registers
+// &BuildStaticSite{}; this keeps that a compile error to change.
+var _ jobs.StoppableCommand = (*BuildStaticSite)(nil)
 
 // decodes envVariables map to key=value slice
 func decodeEnvironmentVariablesToSlice(envVariables string) ([]string, error) {
@@ -414,7 +437,7 @@ func (b *BuildStaticSite) Run(parameters map[string]interface{}, logsWriter io.W
 	// concurrently — this bounds how many, instead of letting the
 	// dispatcher start as many as it has workers.
 	buildMemoryBytes, _ := resolveBuildLimits()
-	releaseMemory, err := acquireMemory(context.Background(), buildMemoryBytes, "the build container", logsWriter)
+	releaseMemory, err := acquireMemory(b.stopSignal, buildMemoryBytes, "the build container", logsWriter)
 	if err != nil {
 		return parameters, err
 	}
