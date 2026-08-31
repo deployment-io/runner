@@ -11,20 +11,20 @@ import (
 	"github.com/moby/moby/client"
 	"io"
 	"os"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 
 // Defaults applied when the runner spawns a static-site build
-// container. All four are env-var-overridable so different runner
-// instance sizes can dial up/down without a runner redeploy.
+// container. Memory and CPU are derived from the host (see
+// resolveBuildLimits / host_resources.go) and remain env-var-overridable.
 //
-// Memory + CPU sized for typical npm/webpack workloads on m6a.large
-// (2 vCPU, 8 GB host) running alongside other Tasks/build containers.
-// Lower than the headroom of the ECS task to leave room for the runner
-// itself + concurrent jobs.
+// Builds are sized to a SHARE of the host budget rather than all of it,
+// because builds are the workload that legitimately runs in parallel — a
+// push can fan out across several deployments at once. Handing each
+// build the whole budget would make admission control serialize
+// deployments that run concurrently today.
 //
 // PidsLimit defends against fork-bomb-style npm scripts (malicious or
 // accidental) — webpack with parallel workers usually peaks around
@@ -36,10 +36,8 @@ import (
 // timeout as an error is preferable to indefinitely tying up a
 // runner slot.
 const (
-	defaultBuildMemoryBytes = 2 * 1024 * 1024 * 1024 // 2 GB
-	defaultBuildCPUCores    = int64(2)
-	defaultBuildPidsLimit   = int64(1024)
-	defaultBuildTimeout     = 1 * time.Hour
+	defaultBuildPidsLimit = int64(1024)
+	defaultBuildTimeout   = 1 * time.Hour
 	// defaultBuildImagePullTimeout bounds how long pullDockerImageFor-
 	// Building waits on Docker Hub before failing the build. Same
 	// rationale as defaultImagePullTimeout in run_agent_step.go: the
@@ -250,30 +248,25 @@ func startBuildContainer(imageId, repoDir string) (string, error) {
 }
 
 // resolveBuildLimits returns the memory (bytes) and CPU (NanoCPUs)
-// caps for the build container. Reads per-runner env-var overrides
-// before falling back to the defaults — different EC2 instance sizes
-// need different limits without redeploying the runner. Invalid env
-// values fall back silently (logging from a const-style helper would
-// obscure the actual runner logs).
+// caps for the build container, sized from the host. An explicit
+// BUILD_MEMORY_BYTES / BUILD_CPU_CORES wins; invalid env values are
+// ignored silently (logging from a const-style helper would obscure the
+// actual runner logs) and the derived value applies.
 //
 // 1 CPU core = 1e9 NanoCPUs in Docker's accounting.
 //
-// Mirrors resolveContainerLimits in run_agent_step.go but reads
-// BUILD_* env vars instead — keeps the build and Tasks knobs
-// independent so ops can tune them separately when concurrent
-// build/agentbox jobs need different resource shapes.
+// Mirrors resolveContainerLimits in run_agent_step.go but takes a SHARE
+// of the budget rather than all of it, and reads BUILD_* env vars — the
+// build and Tasks knobs stay independent so ops can tune them separately
+// when concurrent build/agentbox jobs need different resource shapes.
 func resolveBuildLimits() (memoryBytes int64, nanoCPUs int64) {
-	memoryBytes = defaultBuildMemoryBytes
-	if v := os.Getenv(buildMemoryBytesEnvVar); v != "" {
-		if parsed, err := strconv.ParseInt(v, 10, 64); err == nil && parsed > 0 {
-			memoryBytes = parsed
-		}
+	memoryBytes = clampMemory(memoryBudget()/buildBudgetDivisor, buildMemoryFloorBytes, buildMemoryCeilingBytes)
+	if override := envMemoryOverride(buildMemoryBytesEnvVar); override > 0 {
+		memoryBytes = override
 	}
-	cores := defaultBuildCPUCores
-	if v := os.Getenv(buildCPUCoresEnvVar); v != "" {
-		if parsed, err := strconv.ParseInt(v, 10, 64); err == nil && parsed > 0 {
-			cores = parsed
-		}
+	cores := hostCPUCores()
+	if override := envCoresOverride(buildCPUCoresEnvVar); override > 0 {
+		cores = override
 	}
 	nanoCPUs = cores * 1_000_000_000
 	return memoryBytes, nanoCPUs

@@ -77,11 +77,38 @@ func imageBuild(parameters map[string]interface{}, dockerClient *client.Client, 
 		return err
 	}
 
+	// Memory / CPU caps on the image build. Until these were added the
+	// build was the ONLY heavy workload on the runner with no limit at
+	// all: agentbox and the static-site build container were both capped,
+	// while `docker build` ran unbounded. That matters more than it looks
+	// because an image build executes inside DOCKERD, not in the runner's
+	// cgroup — so it is invisible to ECS accounting and to every
+	// runner-side limit, and a heavy build could consume the whole host
+	// and let the kernel OOM-killer pick a victim (potentially dockerd or
+	// the runner itself, killing every in-flight job with no useful
+	// error).
+	//
+	// Sized from the host and deliberately generous: this path has been
+	// unbounded for a long time, so a cap that is too tight turns builds
+	// that succeed today into failures. BUILD_IMAGE_MEMORY_BYTES is the
+	// escape hatch for a build that legitimately needs more.
+	buildMemoryBytes, buildCores := resolveImageBuildLimits()
 	opts := types.ImageBuildOptions{
 		Dockerfile: dockerFile,
 		Tags:       []string{dockerImageNameAndTag},
 		Remove:     true,
 		BuildArgs:  buildArgs,
+		Memory:     buildMemoryBytes,
+		// MemorySwap == Memory disables swap for the build. Without this
+		// Docker grants swap equal to twice Memory, which turns a memory
+		// overrun into minutes of thrashing instead of a fast, clearly
+		// attributed failure.
+		MemorySwap: buildMemoryBytes,
+		// ImageBuildOptions expresses CPU as a CFS quota/period pair in
+		// MICROSECONDS, unlike the NanoCPUs used by ContainerCreate
+		// elsewhere in this package. quota = cores * period.
+		CPUPeriod: cpuPeriodMicroseconds,
+		CPUQuota:  buildCores * cpuPeriodMicroseconds,
 	}
 	res, err := dockerClient.ImageBuild(ctx, tar, opts)
 	if err != nil {

@@ -220,21 +220,19 @@ const (
 	// ~30s, ~2-3min on constrained networks.
 	defaultImagePullTimeout = 10 * time.Minute
 
-	// Hardened HostConfig defaults. All four are env-var-overridable
-	// (see resolveContainerLimits) so different runner instance sizes
-	// can dial up/down without a runner redeploy. Phase 6 wires per-org
-	// overrides via Settings UI.
+	// Hardened HostConfig defaults. Memory and CPU are no longer
+	// constants — they are derived from the host the runner is on (see
+	// resolveContainerLimits / host_resources.go) and remain
+	// env-var-overridable. Phase 6 wires per-org overrides via Settings UI.
 	//
-	// Memory + CPU sized for typical Tasks workloads. The real ceiling is
-	// the production BUILD, not the agent's analysis working set (~1GB) or
-	// npm/pip install (~500MB): a Vite/webpack build of a real app
-	// (observed: the dashboard) gets OOM-killed at 2GB during chunk
-	// rendering — exit 137 (cgroup SIGKILL) / 134 (Node heap abort). 4GB
-	// covers typical builds; unusually heavy ones can raise it further via
-	// AGENTBOX_MEMORY_BYTES without a runner redeploy. CPU at 2 cores keeps
-	// multiple concurrent Step Jobs feasible on a 4-core runner.
-	defaultMemoryBytes = 4 * 1024 * 1024 * 1024 // 4 GB
-	defaultCPUCores    = int64(2)               // 2 cores
+	// The real memory ceiling for a Task is the production BUILD, not the
+	// agent's analysis working set (~1GB) or npm/pip install (~500MB): a
+	// Vite/webpack build of a real app (observed: the dashboard) gets
+	// OOM-killed at 2GB during chunk rendering — exit 137 (cgroup SIGKILL)
+	// / 134 (Node heap abort). The previous flat 4GB covered typical
+	// builds but was itself hit by a real Go build on the shipped
+	// m6a.large, which is why sizing now follows the host: see
+	// agentboxMemoryFloorBytes / agentboxMemoryCeilingBytes.
 
 	// Tmpfs sizes. /tmp covers general scratch (build artifacts, npm
 	// caches, etc.); /home/agent covers the agentbox runtime install
@@ -864,25 +862,33 @@ func createAgentboxContainer(ctx context.Context, cli *client.Client, spec agent
 }
 
 // resolveContainerLimits returns the memory (bytes) and CPU (NanoCPUs)
-// caps for the agentbox container. Reads per-runner env-var overrides
-// before falling back to the defaults — different EC2 instance sizes
-// need different limits without redeploying the runner. Invalid env
-// values fall back to defaults (silently — logging from a const-style
-// helper would obscure the actual runner logs).
+// caps for the agentbox container, sized from the host the runner is
+// running on. An explicit AGENTBOX_MEMORY_BYTES / AGENTBOX_CPU_CORES
+// wins over the derived value; invalid env values are ignored silently
+// (logging from a const-style helper would obscure the actual runner
+// logs) and the derived value applies.
+//
+// Deriving from the host rather than using a constant is what makes a
+// bigger runner instance actually mean bigger Tasks. Previously the cap
+// was a flat 4 GB, so upgrading the EC2 instance changed nothing at all
+// for a Task that was OOM-killed — the container stayed exactly as
+// small. The agentbox cap gets the WHOLE budget (bounded by the floor
+// and ceiling): it is the heaviest and most solitary workload, and
+// admission control is what prevents two of them overlapping.
 //
 // 1 CPU core = 1e9 NanoCPUs in Docker's accounting.
 func resolveContainerLimits() (memoryBytes int64, nanoCPUs int64) {
-	memoryBytes = defaultMemoryBytes
-	if v := os.Getenv(memoryBytesEnvVar); v != "" {
-		if parsed, err := strconv.ParseInt(v, 10, 64); err == nil && parsed > 0 {
-			memoryBytes = parsed
-		}
+	memoryBytes = clampMemory(memoryBudget(), agentboxMemoryFloorBytes, agentboxMemoryCeilingBytes)
+	if override := envMemoryOverride(memoryBytesEnvVar); override > 0 {
+		memoryBytes = override
 	}
-	cores := defaultCPUCores
-	if v := os.Getenv(cpuCoresEnvVar); v != "" {
-		if parsed, err := strconv.ParseInt(v, 10, 64); err == nil && parsed > 0 {
-			cores = parsed
-		}
+	// CPU is a throttle, not a kill: exceeding it slows the container
+	// rather than killing it, so handing the agent every core is safe
+	// even when jobs overlap. Memory gets the careful treatment above
+	// precisely because it is the one that kills.
+	cores := hostCPUCores()
+	if override := envCoresOverride(cpuCoresEnvVar); override > 0 {
+		cores = override
 	}
 	nanoCPUs = cores * 1_000_000_000
 	return memoryBytes, nanoCPUs
