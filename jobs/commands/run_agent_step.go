@@ -1070,13 +1070,21 @@ type agentResult struct {
 }
 
 // verifyResult mirrors the fields of agentbox's result.json verify_result
-// that the runner consumes for the commit gate. agentbox also emits
-// duration/stdout/stderr tails; the runner doesn't need them here.
+// that the runner consumes for the commit gate.
+//
+// The tails are here because their absence made a failing Step
+// undiagnosable: this struct used to declare only the first four fields,
+// so anything else in the JSON was dropped silently at decode, and the
+// failure message could name nothing but the command. The comment that
+// used to sit here said the runner "doesn't need them", which was the
+// assumption that cost a Task 23 minutes of finished work on 2026-08-29.
 type verifyResult struct {
 	Ran           bool   `json:"ran"`
 	Passed        bool   `json:"passed"`
 	Command       string `json:"command,omitempty"`
 	SkippedReason string `json:"skipped_reason,omitempty"`
+	StdoutTail    string `json:"stdout_tail,omitempty"`
+	StderrTail    string `json:"stderr_tail,omitempty"`
 }
 
 // tokenUsage mirrors agentbox's /result.json token_usage object. Agentbox
@@ -1115,16 +1123,54 @@ func formatAgentFailure(result agentResult) error {
 	)
 }
 
+// verifyTailMaxBytes caps the failure output carried into the Step error.
+// The error is surfaced in the dashboard and fed to Re-run-with-feedback,
+// so it has to stay readable; agentbox is asked for a few lines, and this
+// only guards against an agent that ignores that.
+const verifyTailMaxBytes = 2000
+
 // formatVerifyFailure is returned when the agent's self-verification ran and
 // failed — failing the Step before CommitAndPush so broken code never lands.
-// The agent's changes_summary (already merged into JobOutput) carries the
-// narrative; this names the command for the Re-run-with-feedback signal.
+//
+// Carries the failure OUTPUT, not just the command. Naming only the command
+// describes the ritual rather than the cause, and leaves the reader to
+// reproduce the failure themselves to find out what it was: on 2026-08-29 a
+// Step reported `agent self-verification failed: GOWORK=off go build ./...
+// && go vet ./... && go test ./...` and the actual reason was a single
+// pre-existing vet warning in a package the agent never touched.
+//
+// stderr is preferred because that is where build and test failures land;
+// stdout is the fallback for tools that report failures there instead.
+// Empty when the agent reported no tail at all, which is every agentbox
+// older than the release that started asking for one — hence the graceful
+// degradation to today's message rather than an empty separator.
 func formatVerifyFailure(vr *verifyResult) error {
 	cmd := vr.Command
 	if cmd == "" {
 		cmd = "(unspecified command)"
 	}
+	if tail := verifyFailureTail(vr); tail != "" {
+		return fmt.Errorf("agent self-verification failed: %s — %s", cmd, tail)
+	}
 	return fmt.Errorf("agent self-verification failed: %s", cmd)
+}
+
+// verifyFailureTail picks the most useful output the agent reported and
+// bounds it.
+func verifyFailureTail(vr *verifyResult) string {
+	tail := strings.TrimSpace(vr.StderrTail)
+	if tail == "" {
+		tail = strings.TrimSpace(vr.StdoutTail)
+	}
+	if tail == "" {
+		return ""
+	}
+	if len(tail) > verifyTailMaxBytes {
+		// Keep the END: a compiler or test runner puts the failure last,
+		// and the head is usually progress output.
+		tail = "…" + tail[len(tail)-verifyTailMaxBytes:]
+	}
+	return tail
 }
 
 func readAgentResult(workDirHost string) (agentResult, error) {
