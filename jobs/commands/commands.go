@@ -41,7 +41,7 @@ func Get(p commands_enums.Type) (jobs.Command, error) {
 	case commands_enums.CreateEcsCluster:
 		return &CreateEcsCluster{}, nil
 	case commands_enums.UploadImageToEcr:
-		return &UploadDockerImageToEcr{}, nil
+		return newUploadDockerImageToEcr(), nil
 	case commands_enums.AddAwsStaticSiteResponseHeaders:
 		return &AddAwsStaticSiteResponseHeaders{}, nil
 	case commands_enums.UpdateAwsStaticSiteDomains:
