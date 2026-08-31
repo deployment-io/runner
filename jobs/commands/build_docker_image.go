@@ -93,6 +93,18 @@ func imageBuild(parameters map[string]interface{}, dockerClient *client.Client, 
 	// that succeed today into failures. BUILD_IMAGE_MEMORY_BYTES is the
 	// escape hatch for a build that legitimately needs more.
 	buildMemoryBytes, buildCores := resolveImageBuildLimits()
+
+	// Reserve the memory before handing the build to dockerd, and hold it
+	// until the build finishes. Without this the cap above bounds one
+	// build but not several: the dispatcher can have many jobs in flight,
+	// and concurrent uncoordinated builds would each be individually
+	// within their cap while collectively exceeding the host.
+	releaseMemory, err := acquireMemory(ctx, buildMemoryBytes, "docker image build", logsWriter)
+	if err != nil {
+		return err
+	}
+	defer releaseMemory()
+
 	opts := types.ImageBuildOptions{
 		Dockerfile: dockerFile,
 		Tags:       []string{dockerImageNameAndTag},

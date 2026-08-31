@@ -218,6 +218,17 @@ func (rs *RunAssistantSession) runSession(orgID, jobID, imageRef, workDirHost st
 		return err
 	}
 	defer cli.Close()
+	// Assistant sessions share createAgentboxContainer with Tasks, so they
+	// carry the same memory cap and must reserve the same weight. A long
+	// interactive session holding the budget is intentional: it is using
+	// that memory for as long as it is alive.
+	sessionMemoryBytes, _ := resolveContainerLimits()
+	releaseMemory, err := acquireMemory(dockerCtx, sessionMemoryBytes, "the assistant session container", logsWriter)
+	if err != nil {
+		return err
+	}
+	defer releaseMemory()
+
 	containerID, err := createAgentboxContainer(dockerCtx, cli, agentboxSpawnSpec{imageRef: imageRef, workDirHost: workDirHost, env: envVars})
 	if err != nil {
 		return err

@@ -46,15 +46,65 @@ func TestSubscriptionAuth_ClaudeCodeOnly(t *testing.T) {
 	}
 }
 
-func TestResolveContainerLimits_Defaults(t *testing.T) {
+// TestResolveContainerLimits_DerivedFromHost pins the property that
+// replaced the old flat 4 GB constant: with no override, the cap comes
+// from the host and always lands inside the floor/ceiling band. The
+// exact value is machine-dependent (CI, a laptop and an m6a.large all
+// differ), so this asserts the invariants rather than a number.
+//
+// The floor is the important half. It is the pre-existing 4 GB default,
+// and deriving from the host must never hand a Task LESS memory than it
+// had before this change.
+func TestResolveContainerLimits_DerivedFromHost(t *testing.T) {
 	t.Setenv(memoryBytesEnvVar, "")
 	t.Setenv(cpuCoresEnvVar, "")
 	mem, nano := resolveContainerLimits()
-	if mem != defaultMemoryBytes {
-		t.Errorf("memory = %d, want default %d", mem, defaultMemoryBytes)
+
+	if want := clampMemory(memoryBudget(), agentboxMemoryFloorBytes, agentboxMemoryCeilingBytes); mem != want {
+		t.Errorf("memory = %d, want host-derived %d", mem, want)
 	}
-	if nano != defaultCPUCores*1_000_000_000 {
-		t.Errorf("nanoCPUs = %d, want default %d", nano, defaultCPUCores*1_000_000_000)
+	if mem > agentboxMemoryCeilingBytes {
+		t.Errorf("memory %d exceeds ceiling %d", mem, agentboxMemoryCeilingBytes)
+	}
+	// Only assert the floor when the host can actually back it — a small
+	// dev machine legitimately lands below it (clampMemory prefers a cap
+	// the machine can honour over a floor it cannot).
+	if memoryBudget() >= agentboxMemoryFloorBytes && mem < agentboxMemoryFloorBytes {
+		t.Errorf("memory %d regressed below the previous default %d on a host with budget %d",
+			mem, agentboxMemoryFloorBytes, memoryBudget())
+	}
+	if nano != hostCPUCores()*1_000_000_000 {
+		t.Errorf("nanoCPUs = %d, want host cores %d", nano, hostCPUCores()*1_000_000_000)
+	}
+}
+
+// TestResolveContainerLimits_NeverExceedsBudget is the regression test
+// for the bug this change set out to fix: caps that summed to more than
+// the machine had. No single container may be sized above the whole
+// budget, whatever the host reports.
+func TestResolveContainerLimits_NeverExceedsBudget(t *testing.T) {
+	t.Setenv(memoryBytesEnvVar, "")
+	t.Setenv(cpuCoresEnvVar, "")
+	agentMem, _ := resolveContainerLimits()
+	buildMem, _ := resolveBuildLimits()
+	imageMem, _ := resolveImageBuildLimits()
+	budget := memoryBudget()
+
+	for _, tc := range []struct {
+		name string
+		mem  int64
+	}{
+		{"agentbox", agentMem},
+		{"static build", buildMem},
+		{"image build", imageMem},
+	} {
+		if tc.mem > budget {
+			t.Errorf("%s cap %d exceeds the host budget %d", tc.name, tc.mem, budget)
+		}
+	}
+	// The budget itself must leave the host something to run on.
+	if budget >= hostMemoryBytes() {
+		t.Errorf("budget %d leaves no reserve out of host memory %d", budget, hostMemoryBytes())
 	}
 }
 
@@ -78,11 +128,11 @@ func TestResolveContainerLimits_InvalidEnvFallsBack(t *testing.T) {
 	t.Setenv(memoryBytesEnvVar, "not-a-number")
 	t.Setenv(cpuCoresEnvVar, "abc")
 	mem, nano := resolveContainerLimits()
-	if mem != defaultMemoryBytes {
-		t.Errorf("memory with invalid env = %d, want default %d", mem, defaultMemoryBytes)
+	if want := clampMemory(memoryBudget(), agentboxMemoryFloorBytes, agentboxMemoryCeilingBytes); mem != want {
+		t.Errorf("memory with invalid env = %d, want host-derived %d", mem, want)
 	}
-	if nano != defaultCPUCores*1_000_000_000 {
-		t.Errorf("nanoCPUs with invalid env = %d, want default %d", nano, defaultCPUCores*1_000_000_000)
+	if nano != hostCPUCores()*1_000_000_000 {
+		t.Errorf("nanoCPUs with invalid env = %d, want host cores %d", nano, hostCPUCores()*1_000_000_000)
 	}
 }
 
@@ -94,11 +144,11 @@ func TestResolveContainerLimits_NegativeEnvFallsBack(t *testing.T) {
 	t.Setenv(memoryBytesEnvVar, "-1")
 	t.Setenv(cpuCoresEnvVar, "0")
 	mem, nano := resolveContainerLimits()
-	if mem != defaultMemoryBytes {
-		t.Errorf("memory with negative env = %d, want default %d", mem, defaultMemoryBytes)
+	if want := clampMemory(memoryBudget(), agentboxMemoryFloorBytes, agentboxMemoryCeilingBytes); mem != want {
+		t.Errorf("memory with negative env = %d, want host-derived %d", mem, want)
 	}
-	if nano != defaultCPUCores*1_000_000_000 {
-		t.Errorf("nanoCPUs with zero env = %d, want default %d", nano, defaultCPUCores*1_000_000_000)
+	if nano != hostCPUCores()*1_000_000_000 {
+		t.Errorf("nanoCPUs with zero env = %d, want host cores %d", nano, hostCPUCores()*1_000_000_000)
 	}
 }
 

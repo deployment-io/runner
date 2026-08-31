@@ -407,6 +407,19 @@ func (b *BuildStaticSite) Run(parameters map[string]interface{}, logsWriter io.W
 		return parameters, err
 	}
 
+	// Reserve host memory before the container exists, released after it
+	// is removed (registered before the removal defer so LIFO ordering
+	// puts the release last). Static-site builds are sized to a share of
+	// the budget rather than all of it, so several are normally admitted
+	// concurrently — this bounds how many, instead of letting the
+	// dispatcher start as many as it has workers.
+	buildMemoryBytes, _ := resolveBuildLimits()
+	releaseMemory, err := acquireMemory(context.Background(), buildMemoryBytes, "the build container", logsWriter)
+	if err != nil {
+		return parameters, err
+	}
+	defer releaseMemory()
+
 	containerID, err := startBuildContainer(imageId, repoDirectoryPath)
 	if err != nil {
 		return parameters, err
