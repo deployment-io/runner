@@ -66,10 +66,15 @@ func (t *Tool) Name() string {
 }
 
 func (t *Tool) Description() string {
-	description := `Queries the source code, and returns the answer to the input query. The tool has access to the source code and checks out the source code from GitHub, GitLab, or Bitbucket.
+	// Returned directly. This used to round-trip through fmt.Sprintf with no
+	// arguments, which formatted nothing — the string carries no verbs — but
+	// tripped vet's non-constant-format-string check, and `go vet ./...`
+	// failing on master blocked EVERY agent Task on this repo: the Task
+	// self-verification gate runs build + vet + test over ./..., so no agent
+	// could pass it regardless of its own work. One such Task lost 23 minutes
+	// on 2026-08-29.
+	return `Queries the source code, and returns the answer to the input query. The tool has access to the source code and checks out the source code from GitHub, GitLab, or Bitbucket.
 	The tool requires the following inputs: query (the input query).`
-	description = fmt.Sprintf(description)
-	return description
 }
 
 func addEdges(dir, moduleName string, graph *types.CodeGraph, queryContent string) error {
