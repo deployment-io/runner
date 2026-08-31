@@ -1,12 +1,10 @@
 package commands
 
 import (
-	"bufio"
 	"os"
-	"runtime"
 	"strconv"
-	"strings"
-	"sync"
+
+	"github.com/deployment-io/deployment-runner/utils/hostinfo"
 )
 
 // Host resource detection and the container memory budget derived from it.
@@ -53,15 +51,6 @@ const (
 	// The effective reserve is the larger of the two — a flat 1.5 GB is
 	// right on an 8 GB box and too thin on a 64 GB one.
 	hostMemoryReserveFraction = 0.12
-
-	// fallbackHostMemoryBytes is used when /proc/meminfo can't be read
-	// (non-Linux dev machines, an unexpectedly restricted procfs). It is
-	// deliberately the size of the smallest instance we ship, so the
-	// derived caps land on today's known-safe values rather than on
-	// something optimistic that a small host can't honor.
-	fallbackHostMemoryBytes = 8 * 1024 * 1024 * 1024 // 8 GB
-
-	procMeminfoPath = "/proc/meminfo"
 
 	// minContainerMemoryBytes is the absolute floor for any container cap
 	// and for the budget itself. Below roughly this, nothing we run is
@@ -143,88 +132,14 @@ func resolveImageBuildLimits() (memoryBytes int64, cores int64) {
 	return memoryBytes, cores
 }
 
-var (
-	hostMemoryOnce  sync.Once
-	hostMemoryCache int64
-)
+// hostMemoryBytes and hostCPUCores delegate to the hostinfo package.
+// The detection lives there rather than here because the ping client
+// also needs it to report host specs to the control plane, and
+// jobs/commands already imports client — so keeping it in this package
+// would make that a cycle.
+func hostMemoryBytes() int64 { return hostinfo.MemoryBytes() }
 
-// hostMemoryBytes returns the TOTAL physical memory of the machine the
-// runner container is running on — deliberately the host's memory, not
-// the runner's own cgroup limit.
-//
-// The distinction matters and is easy to get backwards. The runner runs
-// as an ECS task with a 6 GB task-level limit, so reading its own cgroup
-// would report 6 GB on an 8 GB box. But the containers we're sizing are
-// NOT children of the runner: they're siblings created through the
-// mounted Docker socket, so they draw from host memory and are capped
-// independently. The number we need to divide up is the host's.
-//
-// /proc/meminfo is not namespaced by Docker, so MemTotal read from
-// inside the container is the host's MemTotal. That is exactly what we
-// want here, and is the reason this reads procfs directly rather than
-// using a cgroup-aware memory library.
-//
-// Cached: the value cannot change while the process lives, and this is
-// called on every container create.
-func hostMemoryBytes() int64 {
-	hostMemoryOnce.Do(func() {
-		hostMemoryCache = readMemTotalBytes(procMeminfoPath)
-		if hostMemoryCache <= 0 {
-			hostMemoryCache = fallbackHostMemoryBytes
-		}
-	})
-	return hostMemoryCache
-}
-
-// readMemTotalBytes parses the MemTotal line out of a meminfo-formatted
-// file and returns it in bytes. Returns 0 on any failure so the caller
-// applies its fallback — this runs on the container-create path and a
-// missing procfs must never fail a job.
-//
-// The line looks like "MemTotal:       16116496 kB" — the unit is always
-// kB in practice, but the suffix is checked rather than assumed so a
-// unitless or differently-suffixed value degrades to the fallback
-// instead of being silently misread by three orders of magnitude.
-func readMemTotalBytes(path string) int64 {
-	f, err := os.Open(path)
-	if err != nil {
-		return 0
-	}
-	defer f.Close()
-
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		line := scanner.Text()
-		if !strings.HasPrefix(line, "MemTotal:") {
-			continue
-		}
-		fields := strings.Fields(line)
-		// Expect exactly: ["MemTotal:", "<number>", "kB"]
-		if len(fields) != 3 || !strings.EqualFold(fields[2], "kB") {
-			return 0
-		}
-		kb, err := strconv.ParseInt(fields[1], 10, 64)
-		if err != nil || kb <= 0 {
-			return 0
-		}
-		return kb * 1024
-	}
-	return 0
-}
-
-// hostCPUCores returns the number of logical CPUs available to the
-// runner process.
-//
-// runtime.NumCPU respects CPU affinity but not cgroup CPU quota, and the
-// runner's task definition sets no task-level or container-level Cpu, so
-// on ECS this is the host's vCPU count — which is what we want for the
-// same sibling-container reason as hostMemoryBytes.
-func hostCPUCores() int64 {
-	if n := runtime.NumCPU(); n > 0 {
-		return int64(n)
-	}
-	return 1
-}
+func hostCPUCores() int64 { return hostinfo.CPUCores() }
 
 // memoryBudget returns the total bytes that may be handed out across ALL
 // concurrently running job containers. This is the number admission
