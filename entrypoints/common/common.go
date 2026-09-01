@@ -54,6 +54,38 @@ func getJobResult(job pendingJobType, error string, parameters map[string]interf
 	return result
 }
 
+// releaseJobAttempts / releaseJobRetryInterval bound the retry when handing
+// a job back to the server. The interval is deliberately longer than the
+// client's 5s reconnect cycle, so a release refused because the RPC
+// connection was momentarily down gets at least one attempt after it
+// returns.
+//
+// Retrying matters because the alternative is severe out of proportion to
+// the cause: a failed release leaves the job Running, the stuck-job cron
+// marks it TimedOut, and the user sees a FAILED deployment whose only
+// cause was the runner being briefly busy and briefly disconnected.
+// Holding a worker for a few seconds is far cheaper than that.
+const (
+	releaseJobAttempts      = 3
+	releaseJobRetryInterval = 6 * time.Second
+)
+
+// releaseJobWithRetry hands a job back to the pending queue, retrying a
+// bounded number of times. Returns the last error if every attempt fails.
+func releaseJobWithRetry(c *client.RunnerClient, pendingJob pendingJobType) error {
+	var err error
+	for attempt := 0; attempt < releaseJobAttempts; attempt++ {
+		if attempt > 0 {
+			time.Sleep(releaseJobRetryInterval)
+		}
+		if err = c.ReleaseJobs([]string{pendingJob.jobID}, pendingJob.organizationID,
+			"runner at memory capacity"); err == nil {
+			return nil
+		}
+	}
+	return err
+}
+
 func handleLogEnd(err error, jobID string, logsWriter io.Writer) {
 	if err != nil {
 		io.WriteString(logsWriter, fmt.Sprintf("Error in executing - %s - %s\n", jobID, err.Error()))
@@ -77,6 +109,65 @@ func executeJobs(jobsStream <-chan pendingJobType, noOfWorkers int, mode runner_
 				for pendingJob := range jobsStream {
 					func(pendingJob pendingJobType) {
 						parameters := pendingJob.parameters
+						// Reserve host memory for the WHOLE command sequence
+						// before doing ANYTHING else, and hand the job back if
+						// there is no room.
+						//
+						// First in the function on purpose. A requeued job must
+						// leave no trace: no logger, no job log stream, no
+						// heartbeat goroutine, and above all no log lines. The
+						// runner re-polls every 10s, so a job blocked behind a
+						// long Assistant session (up to 4h) is offered and
+						// returned ~1440 times — writing "at capacity" into the
+						// job's own log each time would bury the real output
+						// under a thousand identical lines and ship every one of
+						// them. The user's signal is that the job simply stays
+						// pending, which the dashboard already shows.
+						//
+						// Reserving here rather than beside each container spawn
+						// also means a job that cannot be admitted has done no
+						// work: reserve inside RunAgentStep and the Step would
+						// already have cloned its repo, and would redo that clone
+						// on every retry.
+						//
+						// Jobs that spawn no container (most of the 32 command
+						// types are AWS API calls) report zero and skip this
+						// entirely, so a busy runner never delays them.
+						if requiredMemory := commands.JobMemoryBytes(pendingJob.commandEnums); requiredMemory > 0 {
+							releaseMemory, admitted := commands.TryAcquireMemory(requiredMemory)
+							if !admitted {
+								// NOT a failure. No result is pushed to
+								// resultsStream — that path marks the job
+								// complete. The job returns to pending and is
+								// offered again once capacity frees.
+								// Logged to the RUNNER's log, not the job's.
+								// The job's log has to stay clean for its
+								// eventual real run (this fires ~1440 times
+								// behind a 4h session), but going silent would
+								// leave an operator unable to tell "runner at
+								// capacity" apart from a job that was never
+								// picked up at all. The runner's log is
+								// operator-facing and ships to CloudWatch,
+								// where this cadence is unremarkable.
+								log.Printf("runner at memory capacity (%d MB needed of a %d MB budget); "+
+									"returning job %s to the pending queue",
+									requiredMemory/(1024*1024), commands.MemoryBudgetBytes()/(1024*1024),
+									pendingJob.jobID)
+								if releaseErr := releaseJobWithRetry(c, pendingJob); releaseErr != nil {
+									// Every attempt failed, so the job stays
+									// Running and the server's stuck-job cron
+									// will time it out — a FAILED deployment
+									// caused only by the runner being busy,
+									// which is what this mechanism exists to
+									// remove. Nothing better is available from
+									// here, but it must be loud.
+									log.Printf("FAILED to return job %s to the pending queue after retries; "+
+										"the server will time it out: %s", pendingJob.jobID, releaseErr)
+								}
+								return
+							}
+							defer releaseMemory()
+						}
 						//add job id in parameters
 						_ = jobs.SetParameterValue(parameters, parameters_enums.JobID, pendingJob.jobID)
 						//add organization id from job in parameters

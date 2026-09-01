@@ -104,3 +104,31 @@ func (r *RunnerClient) UpdateJobOutputs(jobOutputs []jobs.UpdateJobOutputDtoV1, 
 	}
 	return nil
 }
+
+// ReleaseJobs returns jobs this runner accepted but could not start to the
+// pending queue on the server.
+//
+// Jobs are marked Running when GetPendingJobs hands them out, so without
+// this a runner that cannot start one has to either block a worker
+// waiting for capacity or abandon the job to the server's stuck-job cron,
+// which marks it TimedOut — a failed deployment caused by nothing but the
+// runner being busy. Releasing is not a failure: the job goes back to
+// pending and is offered again on a later poll.
+func (r *RunnerClient) ReleaseJobs(jobIDs []string, organizationID, reason string) error {
+	if !r.isConnected {
+		return ErrConnection
+	}
+	args := jobs.ReleasingJobsArgsV1{}
+	args.OrganizationID = r.GetComputedOrganizationID(organizationID)
+	args.Token = r.token
+	args.JobIDs = jobIDs
+	args.Reason = reason
+	var reply jobs.ReleasingJobsReplyV1
+	if err := r.c.Call("Jobs.ReleaseV1", args, &reply); err != nil {
+		return err
+	}
+	if !reply.Done {
+		return fmt.Errorf("error releasing jobs back to pending")
+	}
+	return nil
+}

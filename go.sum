@@ -157,6 +157,8 @@ github.com/deployment-io/deployment-runner-kit v0.0.0-20260826071108-1dd349d606f
 github.com/deployment-io/deployment-runner-kit v0.0.0-20260826071108-1dd349d606fd/go.mod h1:wKTz63GqLOHVXT173zlW/zJFRLi9krn7dqXoDm/BXFI=
 github.com/deployment-io/deployment-runner-kit v0.0.0-20260831155440-b084a56aeeb8 h1:QvaX2Lb9sj7SHKcuH7TUfdTlWupb7yxt46sb3+fYkDU=
 github.com/deployment-io/deployment-runner-kit v0.0.0-20260831155440-b084a56aeeb8/go.mod h1:wKTz63GqLOHVXT173zlW/zJFRLi9krn7dqXoDm/BXFI=
+github.com/deployment-io/deployment-runner-kit v0.0.0-20260901112417-3d5794838947 h1:DDAuErzJXvvlttJ9qKA9AJxEvH/E8c/zrtYZWp6+pyU=
+github.com/deployment-io/deployment-runner-kit v0.0.0-20260901112417-3d5794838947/go.mod h1:wKTz63GqLOHVXT173zlW/zJFRLi9krn7dqXoDm/BXFI=
 github.com/deployment-io/team-ai v0.0.0-20250917084912-bdbad6a834e1 h1:gfeNqym19IiO38sQ84WPMmZXrdDisu64qQP3Xs0N2RM=
 github.com/deployment-io/team-ai v0.0.0-20250917084912-bdbad6a834e1/go.mod h1:B0fxmLJICi0qP2R2m3I2tR1uRIKQxn4ekK67lyBRHjw=
 github.com/distribution/reference v0.6.0 h1:0IXCQ5g4/QMHHkarYzh5l+u8T3t73zM5QvfrDyIgxBk=
