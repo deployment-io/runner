@@ -40,11 +40,12 @@ func TestClampMemory(t *testing.T) {
 }
 
 // TestAdmissionWeightClampedToCapacity guards a liveness property rather
-// than a sizing one. Acquire does not deadlock on an oversized request —
-// its `n > s.size` branch parks on the context — but it can never be
-// satisfied either, so an operator who sets AGENTBOX_MEMORY_BYTES larger
-// than the host would get a job that waits out the whole admission
-// timeout and then fails. Clamping makes it run alone instead.
+// than a sizing one. TryAcquire can never succeed for a weight larger
+// than the semaphore, so without the clamp an operator who set
+// AGENTBOX_MEMORY_BYTES above what the host can back would get a job that
+// is refused on every single poll and requeued forever — never running,
+// no matter how idle the runner became, and with nothing to explain why.
+// Clamping to capacity makes it run alone instead.
 func TestAdmissionWeightClampedToCapacity(t *testing.T) {
 	_, capacity := admissionSemaphore()
 	if got := admissionWeight(1 << 62); got != capacity {
@@ -139,7 +140,8 @@ func TestAdmissionWeightsAgainstCapacity(t *testing.T) {
 	imageWeight := admissionWeight(imageMem)
 	staticWeight := admissionWeight(staticMem)
 
-	// No weight may exceed the pool, or Acquire would block forever.
+	// No weight may exceed the pool. TryAcquire would refuse such a job on
+	// every poll, so it would be requeued indefinitely and never run.
 	for _, tc := range []struct {
 		name   string
 		weight int64
