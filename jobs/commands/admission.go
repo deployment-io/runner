@@ -46,15 +46,33 @@ import (
 // no timeout, and no ordering policy to get wrong, because the server's
 // existing ScheduledTs-ascending sort already decides who goes next.
 //
-// One consequence worth knowing, and deliberate: on the smallest instance
-// we ship (m6a.large, ~7.7 GB) an agent container is sized to the ENTIRE
-// budget, so its weight is 100% of capacity and nothing runs beside it.
-// That is not an accident of the arithmetic — it is what "the agent may
-// use all the memory the host can spare" means, and the alternative on a
-// host that size is to shrink the agent back below the 4 GB that was
-// already OOM-killing Tasks. Concurrency on a small runner is the thing
-// traded away; a larger instance buys it back with no code change, since
-// both the caps and the capacity scale with the host.
+// TWO CONSEQUENCES ON A SMALL RUNNER, both deliberate and neither
+// fixable by retuning the numbers:
+//
+//  1. On the smallest instance we ship (m6a.large, ~7.7 GB) an agent
+//     container is sized to the ENTIRE budget, so its weight is 100% of
+//     capacity and nothing runs beside it. That is not an accident of the
+//     arithmetic — it is what "the agent may use all the memory the host
+//     can spare" means, and the alternative on a host that size is to
+//     shrink the agent back below the 4 GB that was already OOM-killing
+//     Tasks.
+//
+//  2. Following from 1: while an Assistant SESSION is alive it holds
+//     ~34% of capacity, so an agent job needing 100% can never be
+//     admitted until the session ends — up to the server's 4h idle /
+//     wall-clock cap. The Task is requeued, not failed, but it can stall
+//     for hours. The session→Task path is safe (converting a session
+//     MarkStopping's its Job first, freeing the memory), so this bites
+//     only a Task or image build dispatched while an unrelated session
+//     is left open.
+//
+//     There is no tuning that fixes this on a 7.7 GB host: an agent plus
+//     a session wants 8.23 GB of a 6.17 GB budget, and lowering the agent
+//     ceiling far enough to fit a session (6.17 - 3 = 3.17 GB) puts it
+//     below the 4 GB that was already OOM-killing Tasks. Concurrency on a
+//     small runner is the thing being traded away; a larger instance buys
+//     it back with no code change, since both the caps and the capacity
+//     scale with the host.
 
 // admissionUnitBytes is the granularity of the semaphore. Weights are
 // expressed in units rather than raw bytes purely to keep the numbers
@@ -121,3 +139,8 @@ func TryAcquireMemory(memoryBytes int64) (release func(), ok bool) {
 	}
 	return func() { sem.Release(weight) }, true
 }
+
+// MemoryBudgetBytes exposes the host memory budget for the dispatcher's
+// operator-facing log line, so "at capacity" reports what the capacity
+// actually was instead of leaving someone to guess at the host size.
+func MemoryBudgetBytes() int64 { return memoryBudget() }
