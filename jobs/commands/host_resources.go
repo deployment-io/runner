@@ -253,21 +253,23 @@ func envCoresOverride(key string) int64 {
 	return parsed
 }
 
-// resolveSessionLimits returns the memory (bytes) and CPU (NanoCPUs) caps
-// for an Assistant session container. Deliberately not resolveContainer-
-// Limits: a session never builds, and it holds its reservation for hours,
-// so it is sized for analysis rather than for a production build. See
+// resolveSessionMemoryBytes returns the memory cap for an Assistant
+// session container. Deliberately not resolveContainerLimits: a session
+// never builds, and it holds its reservation for hours, so it is sized
+// for analysis rather than for a production build. See
 // sessionMemoryFloorBytes.
-func resolveSessionLimits() (memoryBytes int64, nanoCPUs int64) {
-	memoryBytes = clampMemory(memoryBudget()/buildBudgetDivisor, sessionMemoryFloorBytes, sessionMemoryCeilingBytes)
+//
+// Memory only. CPU is left to resolveContainerLimits at container-create
+// time, because CPU is a throttle rather than a kill — a session sharing
+// the host's cores degrades, it does not die — so there is nothing to
+// gain from giving sessions a separate CPU figure, and an unused return
+// value would just invite someone to assume one was being applied.
+func resolveSessionMemoryBytes() int64 {
+	memoryBytes := clampMemory(memoryBudget()/buildBudgetDivisor, sessionMemoryFloorBytes, sessionMemoryCeilingBytes)
 	if override := envMemoryOverride(sessionMemoryBytesEnvVar); override > 0 {
-		memoryBytes = override
+		return override
 	}
-	cores := hostCPUCores()
-	if override := envCoresOverride(cpuCoresEnvVar); override > 0 {
-		cores = override
-	}
-	return memoryBytes, cores * 1_000_000_000
+	return memoryBytes
 }
 
 // JobMemoryBytes returns the host memory a job needs reserved for its
@@ -295,8 +297,7 @@ func JobMemoryBytes(commandEnums []commands_enums.Type) int64 {
 			bytes, _ := resolveContainerLimits()
 			consider(bytes)
 		case commands_enums.RunAssistantSession:
-			bytes, _ := resolveSessionLimits()
-			consider(bytes)
+			consider(resolveSessionMemoryBytes())
 		case commands_enums.BuildStaticSite:
 			bytes, _ := resolveBuildLimits()
 			consider(bytes)

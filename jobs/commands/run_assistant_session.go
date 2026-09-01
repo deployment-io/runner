@@ -222,7 +222,7 @@ func (rs *RunAssistantSession) runSession(orgID, jobID, imageRef, workDirHost st
 	// resolveSessionLimits. Without this they inherited the Task-Step cap
 	// (the whole host budget on a small runner) and held it for the
 	// conversation's lifetime, blocking every deploy behind them.
-	sessionMemoryBytes, _ := resolveSessionLimits()
+	sessionMemoryBytes := resolveSessionMemoryBytes()
 	containerID, err := createAgentboxContainer(dockerCtx, cli, agentboxSpawnSpec{
 		imageRef: imageRef, workDirHost: workDirHost, env: envVars, memoryBytes: sessionMemoryBytes,
 	})

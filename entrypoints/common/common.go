@@ -77,6 +77,51 @@ func executeJobs(jobsStream <-chan pendingJobType, noOfWorkers int, mode runner_
 				for pendingJob := range jobsStream {
 					func(pendingJob pendingJobType) {
 						parameters := pendingJob.parameters
+						// Reserve host memory for the WHOLE command sequence
+						// before doing ANYTHING else, and hand the job back if
+						// there is no room.
+						//
+						// First in the function on purpose. A requeued job must
+						// leave no trace: no logger, no job log stream, no
+						// heartbeat goroutine, and above all no log lines. The
+						// runner re-polls every 10s, so a job blocked behind a
+						// long Assistant session (up to 4h) is offered and
+						// returned ~1440 times — writing "at capacity" into the
+						// job's own log each time would bury the real output
+						// under a thousand identical lines and ship every one of
+						// them. The user's signal is that the job simply stays
+						// pending, which the dashboard already shows.
+						//
+						// Reserving here rather than beside each container spawn
+						// also means a job that cannot be admitted has done no
+						// work: reserve inside RunAgentStep and the Step would
+						// already have cloned its repo, and would redo that clone
+						// on every retry.
+						//
+						// Jobs that spawn no container (most of the 32 command
+						// types are AWS API calls) report zero and skip this
+						// entirely, so a busy runner never delays them.
+						if requiredMemory := commands.JobMemoryBytes(pendingJob.commandEnums); requiredMemory > 0 {
+							releaseMemory, admitted := commands.TryAcquireMemory(requiredMemory)
+							if !admitted {
+								// NOT a failure. No result is pushed to
+								// resultsStream — that path marks the job
+								// complete. The job returns to pending and is
+								// offered again once capacity frees.
+								if releaseErr := c.ReleaseJobs([]string{pendingJob.jobID}, pendingJob.organizationID,
+									"runner at memory capacity"); releaseErr != nil {
+									// Release failed, so the job stays Running
+									// and the server's stuck-job cron will time
+									// it out. Runner-side log only: this is an
+									// operator problem, and the job's own log
+									// must stay clean for its eventual real run.
+									log.Printf("error returning job %s to the pending queue: %s",
+										pendingJob.jobID, releaseErr)
+								}
+								return
+							}
+							defer releaseMemory()
+						}
 						//add job id in parameters
 						_ = jobs.SetParameterValue(parameters, parameters_enums.JobID, pendingJob.jobID)
 						//add organization id from job in parameters
@@ -124,48 +169,6 @@ func executeJobs(jobsStream <-chan pendingJobType, noOfWorkers int, mode runner_
 						// progress write.
 						var liveProgress atomic.Pointer[jobs.LiveProgressV1]
 						stopJobSignal := getJobStopSignal(pendingJob, jobDoneSignal, c, &liveProgress, logsWriter)
-						// Reserve host memory for the WHOLE command sequence
-						// before running any of it, and hand the job back if
-						// there is no room.
-						//
-						// Up here rather than beside each container spawn for
-						// two reasons. A job that cannot be admitted has then
-						// done no work, so requeuing it costs nothing — reserve
-						// inside RunAgentStep and the Step would already have
-						// cloned the repo, and would redo that clone on every
-						// retry. And it is the only place the job id is in
-						// scope to release.
-						//
-						// Jobs that spawn no container (most of the 32 command
-						// types are AWS API calls) get a zero requirement and
-						// skip this entirely, so a busy runner never delays
-						// them.
-						if requiredMemory := commands.JobMemoryBytes(pendingJob.commandEnums); requiredMemory > 0 {
-							releaseMemory, admitted := commands.TryAcquireMemory(requiredMemory)
-							if !admitted {
-								// NOT a failure. The job goes back to pending
-								// and is offered again once capacity frees;
-								// deliberately no result is pushed to
-								// resultsStream, because that path marks the
-								// job complete.
-								if releaseErr := c.ReleaseJobs([]string{pendingJob.jobID}, pendingJob.organizationID,
-									"runner at memory capacity"); releaseErr != nil {
-									// The release failed, so the job stays
-									// Running and the server's stuck-job cron
-									// will eventually time it out. Nothing
-									// better is available here, but say so.
-									io.WriteString(logsWriter, fmt.Sprintf(
-										"Runner is at memory capacity and returning this job to the queue failed: %s\n",
-										releaseErr))
-									return
-								}
-								io.WriteString(logsWriter,
-									"Runner is at memory capacity. Returning this job to the queue; "+
-										"it will start when a running job finishes.\n")
-								return
-							}
-							defer releaseMemory()
-						}
 						for _, commandEnum := range pendingJob.commandEnums {
 							select {
 							case <-stopJobSignal:
