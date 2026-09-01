@@ -18,21 +18,7 @@ import (
 )
 
 type BuildDockerImage struct {
-	// stopSignal closes when the server reports the Job moved to Stopping.
-	// Used to cancel the admission wait so a user can stop a build that is
-	// queued behind another job's memory; see BuildStaticSite.stopSignal
-	// for the full rationale.
-	stopSignal <-chan struct{}
 }
-
-// SetStopSignal satisfies jobs.StoppableCommand.
-func (b *BuildDockerImage) SetStopSignal(stop <-chan struct{}) {
-	b.stopSignal = stop
-}
-
-// See the note on BuildStaticSite: the dispatcher finds the stop signal
-// by type-asserting the POINTER, and a silent failure means stop stops working.
-var _ jobs.StoppableCommand = (*BuildDockerImage)(nil)
 
 type ErrorLine struct {
 	Error       string      `json:"error"`
@@ -174,26 +160,6 @@ func (b *BuildDockerImage) Run(parameters map[string]interface{}, logsWriter io.
 	if err != nil {
 		return parameters, err
 	}
-	// Reserve host memory before starting the build, held until it
-	// finishes. The cap inside imageBuild bounds ONE build; this is what
-	// stops several concurrent ones from each being individually within
-	// their cap while collectively exceeding the host.
-	//
-	// Acquired HERE rather than inside imageBuild on purpose. imageBuild
-	// opens with a 30-minute build deadline, and acquiring under that
-	// context made the queue wait eat the build's own wall-clock: a
-	// 25-minute wait left a 5-minute build that then died mid-layer with a
-	// bare "context deadline exceeded" naming neither memory nor the
-	// timeout. Out here the wait has only its own timeout, and the build
-	// gets its full 30 minutes once admitted. It also puts the acquire
-	// where b.stopSignal is in scope, so a user can cancel a queued build.
-	buildMemoryBytes, _ := resolveImageBuildLimits()
-	releaseMemory, err := acquireMemory(b.stopSignal, buildMemoryBytes, "the docker image build", logsWriter)
-	if err != nil {
-		return parameters, err
-	}
-	defer releaseMemory()
-
 	io.WriteString(logsWriter, fmt.Sprintf("Building docker image\n"))
 	err = imageBuild(parameters, cli, repoDirectoryPath, dockerImageNameAndTag, dockerFile, logsWriter)
 	if err != nil {

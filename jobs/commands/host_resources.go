@@ -4,12 +4,13 @@ import (
 	"os"
 	"strconv"
 
+	"github.com/deployment-io/deployment-runner-kit/enums/commands_enums"
 	"github.com/deployment-io/deployment-runner/utils/hostinfo"
 )
 
 // Host resource detection and the container memory budget derived from it.
 //
-// WHY THIS EXISTS
+// # WHY THIS EXISTS
 //
 // Every container the runner spawns (agentbox for Tasks and Assistant
 // sessions, the static-site build container, docker/nixpacks image
@@ -109,6 +110,29 @@ const (
 	//     the correct outcome rather than a regression.
 	imageBuildMemoryFloorBytes   = 4 * 1024 * 1024 * 1024 // 4 GB
 	imageBuildMemoryCeilingBytes = 8 * 1024 * 1024 * 1024 // 8 GB
+
+	// Assistant sessions get their OWN, much smaller cap despite sharing
+	// createAgentboxContainer with Task Steps. They are a different
+	// workload wearing the same container:
+	//
+	//   - A Step spawns with a cacheVolume and runs a vendor phase before
+	//     the agent, because the agent BUILDS and tests. A session spawns
+	//     with neither (see run_assistant_session.go) — it is read-only
+	//     planning, so it never builds.
+	//   - The sizing note in run_agent_step.go says the ceiling is the
+	//     production build, not "the agent's analysis working set (~1GB)".
+	//     A session is only ever the analysis half.
+	//   - A Step lasts minutes. A session stays alive for the whole
+	//     conversation, up to the server's 4h cron and an 8h hard cap.
+	//
+	// Sizing them like a Step meant one interactive session reserved the
+	// ENTIRE host budget for hours while a human typed, so every deploy
+	// and Task behind it was requeued for the session's lifetime. This is
+	// generous for analysis but small enough to leave the host usable.
+	sessionMemoryFloorBytes   = 2 * 1024 * 1024 * 1024 // 2 GB
+	sessionMemoryCeilingBytes = 3 * 1024 * 1024 * 1024 // 3 GB
+
+	sessionMemoryBytesEnvVar = "SESSION_MEMORY_BYTES"
 
 	// cpuPeriodMicroseconds is Docker's default CFS scheduling period.
 	// The image-build API takes a quota/period pair in microseconds
@@ -227,4 +251,59 @@ func envCoresOverride(key string) int64 {
 		return 0
 	}
 	return parsed
+}
+
+// resolveSessionLimits returns the memory (bytes) and CPU (NanoCPUs) caps
+// for an Assistant session container. Deliberately not resolveContainer-
+// Limits: a session never builds, and it holds its reservation for hours,
+// so it is sized for analysis rather than for a production build. See
+// sessionMemoryFloorBytes.
+func resolveSessionLimits() (memoryBytes int64, nanoCPUs int64) {
+	memoryBytes = clampMemory(memoryBudget()/buildBudgetDivisor, sessionMemoryFloorBytes, sessionMemoryCeilingBytes)
+	if override := envMemoryOverride(sessionMemoryBytesEnvVar); override > 0 {
+		memoryBytes = override
+	}
+	cores := hostCPUCores()
+	if override := envCoresOverride(cpuCoresEnvVar); override > 0 {
+		cores = override
+	}
+	return memoryBytes, cores * 1_000_000_000
+}
+
+// JobMemoryBytes returns the host memory a job needs reserved for its
+// whole command sequence, or 0 when it spawns no container.
+//
+// Keyed off the command enums so the DISPATCHER can reserve before
+// running anything. Reserving per-command instead would mean a job that
+// cannot get memory has already done its checkout, and would have to redo
+// it when requeued. Holding the reservation across the cheap commands
+// (checkout, commit, push) costs a little headroom and buys idempotence.
+//
+// The max, not the sum: a job's containers run one after another (the
+// vendor container exits before the agent starts), so the peak is what
+// has to fit.
+func JobMemoryBytes(commandEnums []commands_enums.Type) int64 {
+	var peak int64
+	consider := func(bytes int64) {
+		if bytes > peak {
+			peak = bytes
+		}
+	}
+	for _, commandEnum := range commandEnums {
+		switch commandEnum {
+		case commands_enums.RunAgentStep:
+			bytes, _ := resolveContainerLimits()
+			consider(bytes)
+		case commands_enums.RunAssistantSession:
+			bytes, _ := resolveSessionLimits()
+			consider(bytes)
+		case commands_enums.BuildStaticSite:
+			bytes, _ := resolveBuildLimits()
+			consider(bytes)
+		case commands_enums.BuildDockerImage, commands_enums.BuildNixPacksImage:
+			bytes, _ := resolveImageBuildLimits()
+			consider(bytes)
+		}
+	}
+	return peak
 }

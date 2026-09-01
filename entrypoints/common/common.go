@@ -124,6 +124,48 @@ func executeJobs(jobsStream <-chan pendingJobType, noOfWorkers int, mode runner_
 						// progress write.
 						var liveProgress atomic.Pointer[jobs.LiveProgressV1]
 						stopJobSignal := getJobStopSignal(pendingJob, jobDoneSignal, c, &liveProgress, logsWriter)
+						// Reserve host memory for the WHOLE command sequence
+						// before running any of it, and hand the job back if
+						// there is no room.
+						//
+						// Up here rather than beside each container spawn for
+						// two reasons. A job that cannot be admitted has then
+						// done no work, so requeuing it costs nothing — reserve
+						// inside RunAgentStep and the Step would already have
+						// cloned the repo, and would redo that clone on every
+						// retry. And it is the only place the job id is in
+						// scope to release.
+						//
+						// Jobs that spawn no container (most of the 32 command
+						// types are AWS API calls) get a zero requirement and
+						// skip this entirely, so a busy runner never delays
+						// them.
+						if requiredMemory := commands.JobMemoryBytes(pendingJob.commandEnums); requiredMemory > 0 {
+							releaseMemory, admitted := commands.TryAcquireMemory(requiredMemory)
+							if !admitted {
+								// NOT a failure. The job goes back to pending
+								// and is offered again once capacity frees;
+								// deliberately no result is pushed to
+								// resultsStream, because that path marks the
+								// job complete.
+								if releaseErr := c.ReleaseJobs([]string{pendingJob.jobID}, pendingJob.organizationID,
+									"runner at memory capacity"); releaseErr != nil {
+									// The release failed, so the job stays
+									// Running and the server's stuck-job cron
+									// will eventually time it out. Nothing
+									// better is available here, but say so.
+									io.WriteString(logsWriter, fmt.Sprintf(
+										"Runner is at memory capacity and returning this job to the queue failed: %s\n",
+										releaseErr))
+									return
+								}
+								io.WriteString(logsWriter,
+									"Runner is at memory capacity. Returning this job to the queue; "+
+										"it will start when a running job finishes.\n")
+								return
+							}
+							defer releaseMemory()
+						}
 						for _, commandEnum := range pendingJob.commandEnums {
 							select {
 							case <-stopJobSignal:

@@ -1,9 +1,10 @@
 package commands
 
 import (
-	"strings"
 	"testing"
 	"time"
+
+	"github.com/deployment-io/deployment-runner-kit/enums/commands_enums"
 )
 
 // TestMemoryBudgetLeavesReserve is the invariant that separates a clean
@@ -59,15 +60,15 @@ func TestAdmissionWeightClampedToCapacity(t *testing.T) {
 	}
 }
 
-// TestAcquireMemoryReleasesCapacity checks the acquire/release cycle
-// actually returns memory to the pool. A leaked slot would progressively
-// starve the runner until it could admit nothing at all.
-func TestAcquireMemoryReleasesCapacity(t *testing.T) {
+// TestTryAcquireMemoryReleasesCapacity checks the reserve/release cycle
+// returns memory to the pool. A leaked slot would progressively starve
+// the runner until every job was requeued forever.
+func TestTryAcquireMemoryReleasesCapacity(t *testing.T) {
 	sem, capacity := admissionSemaphore()
 
-	release, err := acquireMemory(nil, memoryBudget(), "test container", nil)
-	if err != nil {
-		t.Fatalf("acquireMemory: %v", err)
+	release, ok := TryAcquireMemory(memoryBudget())
+	if !ok {
+		t.Fatal("TryAcquireMemory failed on an idle pool")
 	}
 	// Whole budget held: nothing else of that size fits.
 	if sem.TryAcquire(capacity) {
@@ -78,6 +79,32 @@ func TestAcquireMemoryReleasesCapacity(t *testing.T) {
 		t.Error("capacity was not returned to the pool after release")
 	}
 	sem.Release(capacity)
+}
+
+// TestTryAcquireMemoryDoesNotBlock is the regression test for the design
+// this replaced. The old acquire waited for capacity, which held a runner
+// worker for hours and eventually FAILED the job. It must now refuse
+// immediately so the caller can hand the job back to the server instead.
+func TestTryAcquireMemoryDoesNotBlock(t *testing.T) {
+	sem, capacity := admissionSemaphore()
+	if !sem.TryAcquire(capacity) {
+		t.Fatal("could not drain the semaphore for the test")
+	}
+	defer sem.Release(capacity)
+
+	done := make(chan bool, 1)
+	go func() {
+		_, ok := TryAcquireMemory(memoryBudget())
+		done <- ok
+	}()
+	select {
+	case ok := <-done:
+		if ok {
+			t.Error("TryAcquireMemory succeeded while the pool was fully held")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("TryAcquireMemory blocked; it must refuse immediately so the job can be requeued")
+	}
 }
 
 // TestAdmissionWeightsAgainstCapacity is the test that was missing when
@@ -145,47 +172,47 @@ func TestAdmissionWeightsAgainstCapacity(t *testing.T) {
 		capacity, agentWeight, imageWeight, staticWeight, capacity-agentWeight)
 }
 
-// TestAcquireMemoryHonoursStopSignal is the regression test for the
-// admission wait ignoring cancellation. Every call site used to pass
-// context.Background(), so a user pressing Stop on a queued job could not
-// interrupt it: the job held a worker until the admission timeout and
-// then failed with a resource error instead of reporting as stopped.
-func TestAcquireMemoryHonoursStopSignal(t *testing.T) {
-	sem, capacity := admissionSemaphore()
-	if !sem.TryAcquire(capacity) {
-		t.Fatal("could not drain the semaphore for the test")
+// TestJobMemoryBytes pins the dispatcher's view of what a job needs.
+// Command sequences that spawn no container MUST come back as zero, or a
+// busy runner would start requeuing plain AWS API calls — the exact
+// over-throttling that gating by worker count would have caused.
+func TestJobMemoryBytes(t *testing.T) {
+	if got := JobMemoryBytes([]commands_enums.Type{
+		commands_enums.CreateAwsVpc, commands_enums.VerifyAcmCertificate, commands_enums.CommitAndPush,
+	}); got != 0 {
+		t.Errorf("container-free sequence = %d, want 0 so it is never gated", got)
 	}
-	defer sem.Release(capacity)
-
-	stop := make(chan struct{})
-	close(stop)
-
-	done := make(chan error, 1)
-	go func() {
-		_, err := acquireMemory(stop, memoryBudget(), "test container", nil)
-		done <- err
-	}()
-
-	select {
-	case err := <-done:
-		if err == nil {
-			t.Fatal("acquireMemory succeeded while the pool was fully held")
-		}
-		if !strings.Contains(err.Error(), "stopped") {
-			t.Errorf("error = %q, want it to report the stop rather than a resource timeout", err)
-		}
-	case <-time.After(10 * time.Second):
-		t.Fatal("acquireMemory ignored the stop signal and kept waiting")
+	if got := JobMemoryBytes(nil); got != 0 {
+		t.Errorf("empty sequence = %d, want 0", got)
 	}
-}
 
-// TestAcquireMemoryNilStopIsSafe guards the default for commands that
-// never opt into StoppableCommand: a nil channel must simply mean "not
-// stoppable", not panic or fire immediately.
-func TestAcquireMemoryNilStopIsSafe(t *testing.T) {
-	release, err := acquireMemory(nil, minContainerMemoryBytes, "test container", nil)
-	if err != nil {
-		t.Fatalf("acquireMemory with a nil stop channel: %v", err)
+	// A Task Step: the peak across its sequence is the agent container.
+	agentMem, _ := resolveContainerLimits()
+	step := JobMemoryBytes([]commands_enums.Type{
+		commands_enums.CheckoutRepo, commands_enums.MaterializeContext,
+		commands_enums.RunAgentStep, commands_enums.CommitAndPush, commands_enums.OpenPullRequest,
+	})
+	if step != agentMem {
+		t.Errorf("task step = %d, want the agent cap %d", step, agentMem)
 	}
-	release()
+
+	// A session is sized for analysis, not a build, so it must ask for
+	// materially less than a Step — otherwise one interactive session
+	// reserves the whole host for hours and blocks every deploy.
+	sessionMem, _ := resolveSessionLimits()
+	session := JobMemoryBytes([]commands_enums.Type{
+		commands_enums.CheckoutRepo, commands_enums.RunAssistantSession,
+	})
+	if session != sessionMem {
+		t.Errorf("session = %d, want the session cap %d", session, sessionMem)
+	}
+	if session >= step {
+		t.Errorf("session cap %d is not smaller than the task step cap %d", session, step)
+	}
+	// It must also leave room for something else to run alongside it.
+	_, capacity := admissionSemaphore()
+	if admissionWeight(session) >= capacity {
+		t.Errorf("a session takes the whole pool (%d of %d units); deploys would queue behind it for hours",
+			admissionWeight(session), capacity)
+	}
 }

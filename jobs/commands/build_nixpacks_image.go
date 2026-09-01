@@ -13,18 +13,7 @@ import (
 )
 
 type BuildNixPacksImage struct {
-	// stopSignal closes when the server reports the Job moved to Stopping.
-	// Used to cancel the admission wait; see BuildStaticSite.stopSignal.
-	stopSignal <-chan struct{}
 }
-
-// SetStopSignal satisfies jobs.StoppableCommand.
-func (b *BuildNixPacksImage) SetStopSignal(stop <-chan struct{}) {
-	b.stopSignal = stop
-}
-
-// See the note on BuildStaticSite.
-var _ jobs.StoppableCommand = (*BuildNixPacksImage)(nil)
 
 func (b *BuildNixPacksImage) Run(parameters map[string]interface{}, logsWriter io.Writer) (newParameters map[string]interface{}, err error) {
 	defer func() {
@@ -112,13 +101,6 @@ func (b *BuildNixPacksImage) Run(parameters map[string]interface{}, logsWriter i
 	// which we could then build through imageBuild() in
 	// build_docker_image.go and inherit the cap too. That is a larger
 	// change, so it is called out here rather than done silently.
-	nixpacksMemoryBytes, _ := resolveImageBuildLimits()
-	releaseMemory, err := acquireMemory(b.stopSignal, nixpacksMemoryBytes, "the nixpacks image build", logsWriter)
-	if err != nil {
-		return parameters, err
-	}
-	defer releaseMemory()
-
 	buildOptions := nixpacks.BuildOptions{
 		Path:       repoDirectoryPath,
 		Name:       dockerImageNameAndTag,

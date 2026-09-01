@@ -722,22 +722,6 @@ func (rs *RunAgentStep) spawnAgentboxAndWait(spec agentboxSpawnSpec, logsWriter 
 		}()
 		go func() { _ = mcpSrv.ServeListener(mcpCtx, ln) }()
 	}
-	// Reserve host memory before creating the container, and hold it until
-	// the container is gone. Registered BEFORE the removeContainer defer
-	// below so LIFO ordering releases the memory AFTER the container is
-	// actually removed — releasing while it still exists would let the
-	// next job in be admitted against memory that is still in use.
-	//
-	// resolveContainerLimits is called again here rather than threaded
-	// through the spec: it is deterministic (memoized host read plus env
-	// lookups), so both call sites necessarily agree on the number.
-	agentMemoryBytes, _ := resolveContainerLimits()
-	releaseMemory, err := acquireMemory(rs.stopSignal, agentMemoryBytes, "the agent container", logsWriter)
-	if err != nil {
-		return agentResult{}, err
-	}
-	defer releaseMemory()
-
 	containerID, err := createAgentboxContainer(dockerCtx, cli, spec)
 	if err != nil {
 		return agentResult{}, err
@@ -824,6 +808,9 @@ func createAgentboxContainer(ctx context.Context, cli *client.Client, spec agent
 		cfg.Cmd = spec.cmd
 	}
 	memoryBytes, nanoCPUs := resolveContainerLimits()
+	if spec.memoryBytes > 0 {
+		memoryBytes = spec.memoryBytes
+	}
 	mounts := []mount.Mount{{
 		Type:   mount.TypeBind,
 		Source: spec.workDirHost,
@@ -1305,6 +1292,12 @@ func mergeAgentResultIntoJobOutput(parameters map[string]interface{}, result age
 // shared module cache at /cache. Grouped into a struct to keep
 // createAgentboxContainer within the parameter limit.
 type agentboxSpawnSpec struct {
+	// memoryBytes overrides the agentbox memory cap for this spawn. Zero
+	// means "use the Task-Step sizing". Assistant sessions set it because
+	// they are a different workload in the same container: read-only
+	// planning that never builds, held for hours rather than minutes. See
+	// resolveSessionLimits.
+	memoryBytes int64
 	imageRef    string
 	workDirHost string
 	cacheVolume string
@@ -1412,17 +1405,6 @@ func (rs *RunAgentStep) spawnVendorAndWait(spec agentboxSpawnSpec, logsWriter io
 		return err
 	}
 	defer cli.Close()
-	// The vendor phase gets the same cap as the agent phase (both go
-	// through createAgentboxContainer), so it must reserve the same
-	// weight. It runs BEFORE the agent container in the same Step and the
-	// two never overlap, so this does not double-count the Step.
-	vendorMemoryBytes, _ := resolveContainerLimits()
-	releaseMemory, err := acquireMemory(rs.stopSignal, vendorMemoryBytes, "the dependency-vendoring container", logsWriter)
-	if err != nil {
-		return err
-	}
-	defer releaseMemory()
-
 	containerID, err := createAgentboxContainer(dockerCtx, cli, spec)
 	if err != nil {
 		return err
