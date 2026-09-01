@@ -66,10 +66,14 @@ const (
 
 	// agentboxMemoryCeilingBytes stops a very large host from sizing a
 	// single agent container so big that admission control can't fit
-	// anything beside it. Past ~8 GB an agent's own working set stops
-	// growing (it's the production BUILD inside the container that
-	// consumes memory, not the agent), so the extra would be reserved and
+	// anything beside it — past this point the extra is reserved but
 	// unused while blocking concurrent jobs.
+	//
+	// 8 GB is a CHOSEN bound, not a measured one: we have an observed
+	// lower bound (a real Go build hit the old 4 GB cap) but no data on
+	// where a Task's demand actually plateaus. It is set at twice the
+	// known-insufficient figure and should be revisited once cgroup peak
+	// reporting from agentbox gives real numbers.
 	agentboxMemoryCeilingBytes = 8 * 1024 * 1024 * 1024 // 8 GB
 
 	// buildMemoryFloorBytes is the pre-host-sizing static-site build
@@ -80,11 +84,16 @@ const (
 	buildMemoryCeilingBytes = 8 * 1024 * 1024 * 1024 // 8 GB
 
 	// buildBudgetDivisor keeps static-site builds small enough to still run
-	// several at once. They are the parallel workload (a push can fan out
-	// across several deployments) and are comparatively light —
-	// npm/webpack peaked well inside the previous 2 GB cap. Handing them
-	// the full budget would silently serialize deployments that run
-	// concurrently today.
+	// several at once. They are the workload that legitimately fans out —
+	// a push can trigger several deployments — so handing each the full
+	// budget would silently serialize deploys that run concurrently today.
+	//
+	// This is a CONCURRENCY choice, not a claim that builds are light.
+	// They are not: run_agent_step.go records a real Vite/webpack build
+	// (the dashboard) being OOM-killed at exactly 2 GB. A third of the
+	// budget is more than the old flat 2 GB on every host we ship and
+	// grows with the instance, but a genuinely heavy single build is
+	// still the case BUILD_MEMORY_BYTES exists for.
 	buildBudgetDivisor = 3
 
 	// Image builds (docker / nixpacks) get the WHOLE budget rather than a

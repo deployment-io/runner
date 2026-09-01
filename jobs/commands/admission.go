@@ -32,11 +32,16 @@ import (
 //
 // So concurrency is gated by WEIGHT rather than by count: only the jobs
 // that actually create a container acquire memory, and they acquire the
-// amount they were sized for. Everything else runs unimpeded. The
-// practical effect on the shipped m6a.large (2 vCPU, 8 GB) is that one
-// agentbox Task or one image build runs at a time, while several
-// static-site builds still run in parallel — and on a larger instance
-// the same code admits proportionally more, with no retuning.
+// amount they were sized for. Everything else runs unimpeded, and on a
+// larger instance the same code admits proportionally more with no
+// retuning.
+//
+// What that means concretely on the shipped m6a.large (2 vCPU, 8 GB):
+// two static-site builds fit together, but an agent container or an
+// image build is sized to the whole budget and so runs strictly alone.
+// See consequence 1 below — this was originally described here as "one
+// Task at a time while several builds still run in parallel", which was
+// wrong: the arithmetic leaves zero units beside an agent job.
 //
 // This is also what makes the generous per-container sizing safe. Giving
 // agentbox the whole budget would be reckless if two could overlap;
@@ -75,10 +80,16 @@ const (
 	// to the whole budget (see host_resources.go), so a build genuinely
 	// cannot start until the Task finishes — and at the previous 30m this
 	// turned every deploy dispatched during a longer Task into a HARD
-	// FAILURE rather than a delay. 2h covers essentially every Task while
-	// staying under the runner's 4h job wall-clock, so a job that truly
-	// cannot be admitted still fails with a clear message instead of
-	// wedging a worker forever.
+	// FAILURE rather than a delay.
+	//
+	// Note this does NOT sit inside some larger per-job envelope: there is
+	// no runner-wide job wall-clock. The 4h defaultWallClockTimeout in
+	// run_agent_step.go bounds the agent CONTAINER once it starts, and
+	// defaultBuildTimeout bounds a build the same way, both AFTER
+	// admission. So this timeout adds to a job's total time rather than
+	// fitting within it, which is the reason it is 2h and not longer: it
+	// has to outlast the job in front without letting a job that will
+	// never be admitted wedge a worker indefinitely.
 	admissionWaitTimeout = 2 * time.Hour
 )
 
@@ -86,9 +97,12 @@ var (
 	admissionOnce sync.Once
 	admissionSem  *semaphore.Weighted
 	// admissionCapacity is the semaphore's size, kept so acquire can clamp
-	// oversized requests. semaphore.Weighted.Acquire blocks FOREVER when
-	// asked for more than the total capacity rather than returning an
-	// error, so an unclamped oversized weight would deadlock the job.
+	// oversized requests. semaphore.Weighted.Acquire has an explicit
+	// `n > s.size` branch that parks on the context and returns its error
+	// — so an unclamped oversized weight would not deadlock, but it WOULD
+	// be doomed from the start: the job would sit for the whole admission
+	// timeout and then fail, having never been satisfiable. Clamping turns
+	// that guaranteed slow failure into a job that simply runs alone.
 	admissionCapacity int64
 )
 
@@ -112,10 +126,12 @@ func admissionSemaphore() (*semaphore.Weighted, int64) {
 // UP so a container is never admitted against less memory than it may
 // actually use, and clamping to the total capacity.
 //
-// The clamp is what keeps an operator-supplied override from wedging the
-// runner: someone who sets AGENTBOX_MEMORY_BYTES above what the host can
-// back gets a job that runs alone (weight == whole capacity) rather than
-// a job that blocks forever waiting for memory that will never exist.
+// The clamp is what keeps an operator-supplied override from producing a
+// doomed job: someone who sets AGENTBOX_MEMORY_BYTES above what the host
+// can back gets a job that runs alone (weight == whole capacity) rather
+// than one that parks for the full admission timeout and then fails,
+// having never been satisfiable (Acquire's `n > s.size` branch waits on
+// the context rather than returning immediately).
 func admissionWeight(memoryBytes int64) int64 {
 	_, capacity := admissionSemaphore()
 	units := (memoryBytes + admissionUnitBytes - 1) / admissionUnitBytes

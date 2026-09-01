@@ -38,11 +38,12 @@ func TestClampMemory(t *testing.T) {
 	}
 }
 
-// TestAdmissionWeightClampedToCapacity guards against a deadlock rather
-// than a sizing error. semaphore.Weighted.Acquire blocks forever when
-// asked for more than the total capacity, so an operator who sets
-// AGENTBOX_MEMORY_BYTES larger than the host must get a job that runs
-// alone, not a job that waits for memory that will never exist.
+// TestAdmissionWeightClampedToCapacity guards a liveness property rather
+// than a sizing one. Acquire does not deadlock on an oversized request —
+// its `n > s.size` branch parks on the context — but it can never be
+// satisfied either, so an operator who sets AGENTBOX_MEMORY_BYTES larger
+// than the host would get a job that waits out the whole admission
+// timeout and then fails. Clamping makes it run alone instead.
 func TestAdmissionWeightClampedToCapacity(t *testing.T) {
 	_, capacity := admissionSemaphore()
 	if got := admissionWeight(1 << 62); got != capacity {
@@ -86,11 +87,15 @@ func TestAcquireMemoryReleasesCapacity(t *testing.T) {
 // a single Task silently serialized the entire runner.
 //
 // It asserts the real, intended shape rather than a number, so it stays
-// meaningful on any host: the two heavy workloads are expected to take
-// the whole pool (that IS what "may use all the memory the host can
-// spare" means), while static-site builds must remain small enough that
-// at least two run together — they are the workload that legitimately
-// fans out across concurrent deployments.
+// meaningful on any host. Note the heavy workloads take the WHOLE pool
+// only while the budget is under their 8 GB ceiling, which is the case on
+// every instance we ship today but not on a large one: at a 56 GB budget
+// an 8 GB agent is a seventh of capacity and plenty runs beside it. So
+// the assertions here are the host-independent ones — nothing exceeds
+// capacity, and static-site builds stay small enough that at least two
+// run together, since they are the workload that legitimately fans out
+// across concurrent deployments. The actual split is logged, not
+// asserted.
 func TestAdmissionWeightsAgainstCapacity(t *testing.T) {
 	t.Setenv(memoryBytesEnvVar, "")
 	t.Setenv(cpuCoresEnvVar, "")
