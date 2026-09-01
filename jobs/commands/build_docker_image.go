@@ -18,7 +18,21 @@ import (
 )
 
 type BuildDockerImage struct {
+	// stopSignal closes when the server reports the Job moved to Stopping.
+	// Used to cancel the admission wait so a user can stop a build that is
+	// queued behind another job's memory; see BuildStaticSite.stopSignal
+	// for the full rationale.
+	stopSignal <-chan struct{}
 }
+
+// SetStopSignal satisfies jobs.StoppableCommand.
+func (b *BuildDockerImage) SetStopSignal(stop <-chan struct{}) {
+	b.stopSignal = stop
+}
+
+// See the note on BuildStaticSite: the dispatcher finds the stop signal
+// by type-asserting the POINTER, and a silent failure means stop stops working.
+var _ jobs.StoppableCommand = (*BuildDockerImage)(nil)
 
 type ErrorLine struct {
 	Error       string      `json:"error"`
@@ -77,11 +91,48 @@ func imageBuild(parameters map[string]interface{}, dockerClient *client.Client, 
 		return err
 	}
 
+	// Memory / CPU caps on the image build. Until these were added the
+	// build was the ONLY heavy workload on the runner with no limit at
+	// all: agentbox and the static-site build container were both capped,
+	// while `docker build` ran unbounded. That matters more than it looks
+	// because an image build executes inside DOCKERD, not in the runner's
+	// cgroup — so it is invisible to ECS accounting and to every
+	// runner-side limit, and a heavy build could consume the whole host
+	// and let the kernel OOM-killer pick a victim (potentially dockerd or
+	// the runner itself, killing every in-flight job with no useful
+	// error).
+	//
+	// Sized from the host and deliberately generous: this path has been
+	// unbounded for a long time, so a cap that is too tight turns builds
+	// that succeed today into failures. BUILD_IMAGE_MEMORY_BYTES is the
+	// escape hatch for a build that legitimately needs more.
+	buildMemoryBytes, buildCores := resolveImageBuildLimits()
+
 	opts := types.ImageBuildOptions{
 		Dockerfile: dockerFile,
 		Tags:       []string{dockerImageNameAndTag},
 		Remove:     true,
 		BuildArgs:  buildArgs,
+		Memory:     buildMemoryBytes,
+		// MemorySwap == Memory disables swap for the build. Without this
+		// Docker grants swap equal to twice Memory, which turns a memory
+		// overrun into minutes of thrashing instead of a fast, clearly
+		// attributed failure.
+		MemorySwap: buildMemoryBytes,
+		// ImageBuildOptions expresses CPU as a CFS quota/period pair in
+		// MICROSECONDS, unlike the NanoCPUs used by ContainerCreate
+		// elsewhere in this package. quota = cores * period.
+		CPUPeriod: cpuPeriodMicroseconds,
+		CPUQuota:  buildCores * cpuPeriodMicroseconds,
+		// Pin the classic builder EXPLICITLY. Memory, MemorySwap, CPUPeriod
+		// and CPUQuota above are honoured only by the v1 builder; BuildKit
+		// silently ignores them. Left unset, the builder is chosen by the
+		// daemon, so a host with `features: {"buildkit": true}` in
+		// daemon.json would run this build completely unbounded while every
+		// comment here, and admission control, assumed it was capped -- the
+		// exact host-OOM path this cap exists to close, in the one place
+		// nobody would look for it.
+		Version: types.BuilderV1,
 	}
 	res, err := dockerClient.ImageBuild(ctx, tar, opts)
 	if err != nil {
@@ -123,6 +174,26 @@ func (b *BuildDockerImage) Run(parameters map[string]interface{}, logsWriter io.
 	if err != nil {
 		return parameters, err
 	}
+	// Reserve host memory before starting the build, held until it
+	// finishes. The cap inside imageBuild bounds ONE build; this is what
+	// stops several concurrent ones from each being individually within
+	// their cap while collectively exceeding the host.
+	//
+	// Acquired HERE rather than inside imageBuild on purpose. imageBuild
+	// opens with a 30-minute build deadline, and acquiring under that
+	// context made the queue wait eat the build's own wall-clock: a
+	// 25-minute wait left a 5-minute build that then died mid-layer with a
+	// bare "context deadline exceeded" naming neither memory nor the
+	// timeout. Out here the wait has only its own timeout, and the build
+	// gets its full 30 minutes once admitted. It also puts the acquire
+	// where b.stopSignal is in scope, so a user can cancel a queued build.
+	buildMemoryBytes, _ := resolveImageBuildLimits()
+	releaseMemory, err := acquireMemory(b.stopSignal, buildMemoryBytes, "the docker image build", logsWriter)
+	if err != nil {
+		return parameters, err
+	}
+	defer releaseMemory()
+
 	io.WriteString(logsWriter, fmt.Sprintf("Building docker image\n"))
 	err = imageBuild(parameters, cli, repoDirectoryPath, dockerImageNameAndTag, dockerFile, logsWriter)
 	if err != nil {
