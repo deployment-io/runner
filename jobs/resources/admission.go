@@ -1,4 +1,4 @@
-package commands
+package resources
 
 import "sync"
 

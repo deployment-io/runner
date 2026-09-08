@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
+	"github.com/deployment-io/deployment-runner/jobs/resources"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/mount"
@@ -46,9 +47,6 @@ const (
 	// indefinitely (compounded by imagePullLock serializing concurrent
 	// builds onto the same upstream wait).
 	defaultBuildImagePullTimeout = 10 * time.Minute
-
-	buildMemoryBytesEnvVar = "BUILD_MEMORY_BYTES"
-	buildCPUCoresEnvVar    = "BUILD_CPU_CORES"
 )
 
 type BuildStaticSite struct {
@@ -218,7 +216,7 @@ func startBuildContainer(imageId, repoDir string) (string, error) {
 	}
 	defer cli.Close()
 
-	memoryBytes, nanoCPUs := resolveBuildLimits()
+	memoryBytes, nanoCPUs := resources.ResolveBuildLimits()
 	resp, err := cli.ContainerCreate(ctx, &container.Config{
 		Image: imageId,
 		Cmd:   []string{"tail", "-f", "/dev/null"},
@@ -245,31 +243,6 @@ func startBuildContainer(imageId, repoDir string) (string, error) {
 	}
 
 	return resp.ID, nil
-}
-
-// resolveBuildLimits returns the memory (bytes) and CPU (NanoCPUs)
-// caps for the build container, sized from the host. An explicit
-// BUILD_MEMORY_BYTES / BUILD_CPU_CORES wins; invalid env values are
-// ignored silently (logging from a const-style helper would obscure the
-// actual runner logs) and the derived value applies.
-//
-// 1 CPU core = 1e9 NanoCPUs in Docker's accounting.
-//
-// Mirrors resolveContainerLimits in run_agent_step.go but takes a SHARE
-// of the budget rather than all of it, and reads BUILD_* env vars — the
-// build and Tasks knobs stay independent so ops can tune them separately
-// when concurrent build/agentbox jobs need different resource shapes.
-func resolveBuildLimits() (memoryBytes int64, nanoCPUs int64) {
-	memoryBytes = clampMemory(memoryBudget()/buildBudgetDivisor, buildMemoryFloorBytes, buildMemoryCeilingBytes)
-	if override := envMemoryOverride(buildMemoryBytesEnvVar); override > 0 {
-		memoryBytes = override
-	}
-	cores := hostCPUCores()
-	if override := envCoresOverride(buildCPUCoresEnvVar); override > 0 {
-		cores = override
-	}
-	nanoCPUs = cores * 1_000_000_000
-	return memoryBytes, nanoCPUs
 }
 
 // cloudMetadataExtraHosts returns the /etc/hosts pins applied to every

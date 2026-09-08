@@ -23,6 +23,7 @@ import (
 	"github.com/deployment-io/deployment-runner/client"
 	"github.com/deployment-io/deployment-runner/jobs/commands"
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
+	"github.com/deployment-io/deployment-runner/jobs/resources"
 	"github.com/deployment-io/deployment-runner/utils/loggers"
 )
 
@@ -142,8 +143,8 @@ func executeJobs(jobsStream <-chan pendingJobType, noOfWorkers int, mode runner_
 						// Jobs that spawn no container (most of the 32 command
 						// types are AWS API calls) report zero and skip this
 						// entirely, so a busy runner never delays them.
-						if requiredMemory := commands.JobMemoryBytes(pendingJob.commandEnums); requiredMemory > 0 {
-							releaseMemory, admitted := commands.TryAcquireMemory(requiredMemory)
+						if requiredMemory := resources.JobMemoryBytes(pendingJob.commandEnums); requiredMemory > 0 {
+							releaseMemory, admitted := resources.TryAcquireMemory(requiredMemory)
 							if !admitted {
 								// NOT a failure. No result is pushed to
 								// resultsStream — that path marks the job
@@ -160,7 +161,7 @@ func executeJobs(jobsStream <-chan pendingJobType, noOfWorkers int, mode runner_
 								// where this cadence is unremarkable.
 								log.Printf("runner at memory capacity (%d MB needed of a %d MB budget); "+
 									"returning job %s to the pending queue",
-									requiredMemory/(1024*1024), commands.MemoryBudgetBytes()/(1024*1024),
+									requiredMemory/(1024*1024), resources.MemoryBudgetBytes()/(1024*1024),
 									pendingJob.jobID)
 								// Handed to the pipeline rather than sent
 								// here: it batches releases per org and

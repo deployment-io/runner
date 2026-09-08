@@ -9,6 +9,7 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
+	"github.com/deployment-io/deployment-runner/jobs/resources"
 	"github.com/docker/docker/api/types"
 	"github.com/moby/moby/client"
 	"github.com/moby/moby/pkg/archive"
@@ -92,7 +93,7 @@ func imageBuild(parameters map[string]interface{}, dockerClient *client.Client, 
 	// unbounded for a long time, so a cap that is too tight turns builds
 	// that succeed today into failures. BUILD_IMAGE_MEMORY_BYTES is the
 	// escape hatch for a build that legitimately needs more.
-	buildMemoryBytes, buildCores := resolveImageBuildLimits()
+	buildMemoryBytes, buildCores := resources.ResolveImageBuildLimits()
 
 	opts := types.ImageBuildOptions{
 		Dockerfile: dockerFile,
@@ -108,8 +109,8 @@ func imageBuild(parameters map[string]interface{}, dockerClient *client.Client, 
 		// ImageBuildOptions expresses CPU as a CFS quota/period pair in
 		// MICROSECONDS, unlike the NanoCPUs used by ContainerCreate
 		// elsewhere in this package. quota = cores * period.
-		CPUPeriod: cpuPeriodMicroseconds,
-		CPUQuota:  buildCores * cpuPeriodMicroseconds,
+		CPUPeriod: resources.CPUPeriodMicroseconds,
+		CPUQuota:  buildCores * resources.CPUPeriodMicroseconds,
 		// Pin the classic builder EXPLICITLY. Memory, MemorySwap, CPUPeriod
 		// and CPUQuota above are honoured only by the v1 builder; BuildKit
 		// silently ignores them. Left unset, the builder is chosen by the

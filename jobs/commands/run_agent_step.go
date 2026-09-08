@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/deployment-io/deployment-runner/jobs/resources"
 	"io"
 	"os"
 	"path/filepath"
@@ -258,10 +259,6 @@ const (
 	// security-relevant and we don't need either for the agent.
 	tmpfsTmpOpts  = "rw,exec,size=512m,uid=1000,gid=1000,mode=755"
 	tmpfsHomeOpts = "rw,exec,size=1g,uid=1000,gid=1000,mode=755"
-
-	// Env vars on the runner host that override the defaults above.
-	memoryBytesEnvVar = "AGENTBOX_MEMORY_BYTES"
-	cpuCoresEnvVar    = "AGENTBOX_CPU_CORES"
 )
 
 func (rs *RunAgentStep) Run(parameters map[string]interface{}, logsWriter io.Writer) (newParameters map[string]interface{}, err error) {
@@ -807,7 +804,7 @@ func createAgentboxContainer(ctx context.Context, cli *client.Client, spec agent
 	if len(spec.cmd) > 0 {
 		cfg.Cmd = spec.cmd
 	}
-	memoryBytes, nanoCPUs := resolveContainerLimits()
+	memoryBytes, nanoCPUs := resources.ResolveContainerLimits()
 	if spec.memoryBytes > 0 {
 		memoryBytes = spec.memoryBytes
 	}
@@ -862,39 +859,6 @@ func createAgentboxContainer(ctx context.Context, cli *client.Client, spec agent
 		return "", fmt.Errorf("error creating container: %s", err)
 	}
 	return resp.ID, nil
-}
-
-// resolveContainerLimits returns the memory (bytes) and CPU (NanoCPUs)
-// caps for the agentbox container, sized from the host the runner is
-// running on. An explicit AGENTBOX_MEMORY_BYTES / AGENTBOX_CPU_CORES
-// wins over the derived value; invalid env values are ignored silently
-// (logging from a const-style helper would obscure the actual runner
-// logs) and the derived value applies.
-//
-// Deriving from the host rather than using a constant is what makes a
-// bigger runner instance actually mean bigger Tasks. Previously the cap
-// was a flat 4 GB, so upgrading the EC2 instance changed nothing at all
-// for a Task that was OOM-killed — the container stayed exactly as
-// small. The agentbox cap gets the WHOLE budget (bounded by the floor
-// and ceiling): it is the heaviest and most solitary workload, and
-// admission control is what prevents two of them overlapping.
-//
-// 1 CPU core = 1e9 NanoCPUs in Docker's accounting.
-func resolveContainerLimits() (memoryBytes int64, nanoCPUs int64) {
-	memoryBytes = clampMemory(memoryBudget(), agentboxMemoryFloorBytes, agentboxMemoryCeilingBytes)
-	if override := envMemoryOverride(memoryBytesEnvVar); override > 0 {
-		memoryBytes = override
-	}
-	// CPU is a throttle, not a kill: exceeding it slows the container
-	// rather than killing it, so handing the agent every core is safe
-	// even when jobs overlap. Memory gets the careful treatment above
-	// precisely because it is the one that kills.
-	cores := hostCPUCores()
-	if override := envCoresOverride(cpuCoresEnvVar); override > 0 {
-		cores = override
-	}
-	nanoCPUs = cores * 1_000_000_000
-	return memoryBytes, nanoCPUs
 }
 
 // pollProgressFile reads agentbox's progress.json from the bind-mounted

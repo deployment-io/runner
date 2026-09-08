@@ -1,4 +1,4 @@
-package commands
+package resources
 
 import (
 	"testing"
@@ -144,9 +144,9 @@ func TestCapsAgainstBudget(t *testing.T) {
 
 	budget := memoryBudget()
 
-	agentMem, _ := resolveContainerLimits()
-	imageMem, _ := resolveImageBuildLimits()
-	staticMem, _ := resolveBuildLimits()
+	agentMem, _ := ResolveContainerLimits()
+	imageMem, _ := ResolveImageBuildLimits()
+	staticMem, _ := ResolveBuildLimits()
 
 	// No cap may exceed the budget. Such a job is clamped and so runs, but
 	// it would silently be reserved for less than its container is allowed
@@ -198,7 +198,7 @@ func TestJobMemoryBytes(t *testing.T) {
 	}
 
 	// A Task Step: the peak across its sequence is the agent container.
-	agentMem, _ := resolveContainerLimits()
+	agentMem, _ := ResolveContainerLimits()
 	step := JobMemoryBytes([]commands_enums.Type{
 		commands_enums.CheckoutRepo, commands_enums.MaterializeContext,
 		commands_enums.RunAgentStep, commands_enums.CommitAndPush, commands_enums.OpenPullRequest,
@@ -210,7 +210,7 @@ func TestJobMemoryBytes(t *testing.T) {
 	// A session is sized for analysis, not a build, so it must ask for
 	// materially less than a Step — otherwise one interactive session
 	// reserves the whole host for hours and blocks every deploy.
-	sessionMem := resolveSessionMemoryBytes()
+	sessionMem := ResolveSessionMemoryBytes()
 	session := JobMemoryBytes([]commands_enums.Type{
 		commands_enums.CheckoutRepo, commands_enums.RunAssistantSession,
 	})
@@ -233,5 +233,111 @@ func TestJobMemoryBytes(t *testing.T) {
 	if session >= memoryBudget() {
 		t.Errorf("a session takes the whole budget (%d of %d); deploys would queue behind it for hours",
 			session, memoryBudget())
+	}
+}
+
+// TestResolveContainerLimits_DerivedFromHost pins the property that
+// replaced the old flat 4 GB constant: with no override, the cap comes
+// from the host and always lands inside the floor/ceiling band. The
+// exact value is machine-dependent (CI, a laptop and an m6a.large all
+// differ), so this asserts the invariants rather than a number.
+//
+// The floor is the important half. It is the pre-existing 4 GB default,
+// and deriving from the host must never hand a Task LESS memory than it
+// had before this change.
+func TestResolveContainerLimits_DerivedFromHost(t *testing.T) {
+	t.Setenv(memoryBytesEnvVar, "")
+	t.Setenv(cpuCoresEnvVar, "")
+	mem, nano := ResolveContainerLimits()
+
+	if want := clampMemory(memoryBudget(), agentboxMemoryFloorBytes, agentboxMemoryCeilingBytes); mem != want {
+		t.Errorf("memory = %d, want host-derived %d", mem, want)
+	}
+	if mem > agentboxMemoryCeilingBytes {
+		t.Errorf("memory %d exceeds ceiling %d", mem, agentboxMemoryCeilingBytes)
+	}
+	// Only assert the floor when the host can actually back it — a small
+	// dev machine legitimately lands below it (clampMemory prefers a cap
+	// the machine can honour over a floor it cannot).
+	if memoryBudget() >= agentboxMemoryFloorBytes && mem < agentboxMemoryFloorBytes {
+		t.Errorf("memory %d regressed below the previous default %d on a host with budget %d",
+			mem, agentboxMemoryFloorBytes, memoryBudget())
+	}
+	if nano != hostCPUCores()*1_000_000_000 {
+		t.Errorf("nanoCPUs = %d, want host cores %d", nano, hostCPUCores()*1_000_000_000)
+	}
+}
+
+// TestResolveContainerLimits_NeverExceedsBudget is the regression test
+// for the bug this change set out to fix: caps that summed to more than
+// the machine had. No single container may be sized above the whole
+// budget, whatever the host reports.
+func TestResolveContainerLimits_NeverExceedsBudget(t *testing.T) {
+	t.Setenv(memoryBytesEnvVar, "")
+	t.Setenv(cpuCoresEnvVar, "")
+	agentMem, _ := ResolveContainerLimits()
+	buildMem, _ := ResolveBuildLimits()
+	imageMem, _ := ResolveImageBuildLimits()
+	budget := memoryBudget()
+
+	for _, tc := range []struct {
+		name string
+		mem  int64
+	}{
+		{"agentbox", agentMem},
+		{"static build", buildMem},
+		{"image build", imageMem},
+	} {
+		if tc.mem > budget {
+			t.Errorf("%s cap %d exceeds the host budget %d", tc.name, tc.mem, budget)
+		}
+	}
+	// The budget itself must leave the host something to run on.
+	if budget >= hostMemoryBytes() {
+		t.Errorf("budget %d leaves no reserve out of host memory %d", budget, hostMemoryBytes())
+	}
+}
+
+func TestResolveContainerLimits_EnvOverride(t *testing.T) {
+	t.Setenv(memoryBytesEnvVar, "4294967296") // 4 GB
+	t.Setenv(cpuCoresEnvVar, "4")
+	mem, nano := ResolveContainerLimits()
+	if mem != 4294967296 {
+		t.Errorf("memory = %d, want 4294967296 (4 GB)", mem)
+	}
+	if nano != 4_000_000_000 {
+		t.Errorf("nanoCPUs = %d, want 4e9 (4 cores)", nano)
+	}
+}
+
+// TestResolveContainerLimits_InvalidEnvFallsBack ensures malformed env
+// values don't break Step Job execution. A garbage string in the env
+// var falls back to the default rather than producing nonsense limits
+// (or, worse, NaN which Docker would reject).
+func TestResolveContainerLimits_InvalidEnvFallsBack(t *testing.T) {
+	t.Setenv(memoryBytesEnvVar, "not-a-number")
+	t.Setenv(cpuCoresEnvVar, "abc")
+	mem, nano := ResolveContainerLimits()
+	if want := clampMemory(memoryBudget(), agentboxMemoryFloorBytes, agentboxMemoryCeilingBytes); mem != want {
+		t.Errorf("memory with invalid env = %d, want host-derived %d", mem, want)
+	}
+	if nano != hostCPUCores()*1_000_000_000 {
+		t.Errorf("nanoCPUs with invalid env = %d, want host cores %d", nano, hostCPUCores()*1_000_000_000)
+	}
+}
+
+// TestResolveContainerLimits_NegativeEnvFallsBack covers the explicit-zero
+// and negative-value cases — Docker treats Memory=0 as "no limit" but we
+// want the fallback to apply (someone setting AGENTBOX_MEMORY_BYTES=0
+// almost certainly didn't mean "unlimited").
+func TestResolveContainerLimits_NegativeEnvFallsBack(t *testing.T) {
+	t.Setenv(memoryBytesEnvVar, "-1")
+	t.Setenv(cpuCoresEnvVar, "0")
+	mem, nano := ResolveContainerLimits()
+	if want := clampMemory(memoryBudget(), agentboxMemoryFloorBytes, agentboxMemoryCeilingBytes); mem != want {
+		t.Errorf("memory with negative env = %d, want host-derived %d", mem, want)
+	}
+	if nano != hostCPUCores()*1_000_000_000 {
+		t.Errorf("nanoCPUs with zero env = %d, want host cores %d", nano, hostCPUCores()*1_000_000_000)
 	}
 }
