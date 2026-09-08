@@ -109,11 +109,16 @@ func (r *RunnerClient) UpdateJobOutputs(jobOutputs []jobs.UpdateJobOutputDtoV1, 
 // pending queue on the server.
 //
 // Jobs are marked Running when GetPendingJobs hands them out, so without
-// this a runner that cannot start one has to either block a worker
-// waiting for capacity or abandon the job to the server's stuck-job cron,
-// which marks it TimedOut — a failed deployment caused by nothing but the
-// runner being busy. Releasing is not a failure: the job goes back to
-// pending and is offered again on a later poll.
+// this a runner that cannot start one has to block a worker waiting for
+// capacity, or abandon the job entirely. Abandoning is worse than it
+// looks: the server's stuck-job cron finds work through running_jobs
+// heartbeat records, and a job refused before its heartbeat goroutine
+// starts never creates one — so nothing would ever reap it and it would
+// sit in Running forever, invisible.
+//
+// Releasing is not a failure: the job goes back to pending and is offered
+// again on a later poll. JobIDs is a slice so a runner can return a whole
+// batch in one call; see releaseJobsPipeline on the runner side.
 func (r *RunnerClient) ReleaseJobs(jobIDs []string, organizationID, reason string) error {
 	if !r.isConnected {
 		return ErrConnection

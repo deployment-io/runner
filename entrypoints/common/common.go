@@ -54,37 +54,27 @@ func getJobResult(job pendingJobType, error string, parameters map[string]interf
 	return result
 }
 
-// releaseJobAttempts / releaseJobRetryInterval bound the retry when handing
-// a job back to the server. The interval is deliberately longer than the
-// client's 5s reconnect cycle, so a release refused because the RPC
-// connection was momentarily down gets at least one attempt after it
-// returns.
+// releaseJobsPipeline batches jobs the runner accepted but could not
+// start, and hands them back to the server keyed by organization.
 //
-// Retrying matters because the alternative is severe out of proportion to
-// the cause: a failed release leaves the job Running, the stuck-job cron
-// marks it TimedOut, and the user sees a FAILED deployment whose only
-// cause was the runner being briefly busy and briefly disconnected.
-// Holding a worker for a few seconds is far cheaper than that.
-const (
-	releaseJobAttempts      = 3
-	releaseJobRetryInterval = 6 * time.Second
-)
-
-// releaseJobWithRetry hands a job back to the pending queue, retrying a
-// bounded number of times. Returns the last error if every attempt fails.
-func releaseJobWithRetry(c *client.RunnerClient, pendingJob pendingJobType) error {
-	var err error
-	for attempt := 0; attempt < releaseJobAttempts; attempt++ {
-		if attempt > 0 {
-			time.Sleep(releaseJobRetryInterval)
-		}
-		if err = c.ReleaseJobs([]string{pendingJob.jobID}, pendingJob.organizationID,
-			"runner at memory capacity"); err == nil {
-			return nil
-		}
-	}
-	return err
-}
+// A pipeline rather than a direct call, matching jobsDonePipeline and
+// loggers.AddJobLogsPipeline, for two reasons:
+//
+//   - Batching. ReleasingJobsArgsV1.JobIDs is a slice precisely so one
+//     RPC can return many jobs; releasing them one at a time made N calls
+//     per poll where one would do.
+//   - It keeps the retry OFF the job worker. Retrying inline slept inside
+//     one of the runner's 15 workers, so a refused job tied up a worker
+//     doing nothing for the length of the backoff.
+//
+// The retry is UNBOUNDED, matching MarkJobsComplete, and that is not
+// belt-and-braces: a job whose release never lands is stranded forever.
+// It stays Running, and the server's stuck-job cron cannot rescue it —
+// that cron finds work through running_jobs heartbeat records, and a
+// requeued job returns before the heartbeat goroutine ever starts, so no
+// record exists. Nothing else reaps a Running job. Giving up here would
+// leave a job invisible, never retried and never failed.
+var releaseJobsPipeline *goPipeline.Pipeline[string, string]
 
 func handleLogEnd(err error, jobID string, logsWriter io.Writer) {
 	if err != nil {
@@ -153,17 +143,11 @@ func executeJobs(jobsStream <-chan pendingJobType, noOfWorkers int, mode runner_
 									"returning job %s to the pending queue",
 									requiredMemory/(1024*1024), commands.MemoryBudgetBytes()/(1024*1024),
 									pendingJob.jobID)
-								if releaseErr := releaseJobWithRetry(c, pendingJob); releaseErr != nil {
-									// Every attempt failed, so the job stays
-									// Running and the server's stuck-job cron
-									// will time it out — a FAILED deployment
-									// caused only by the runner being busy,
-									// which is what this mechanism exists to
-									// remove. Nothing better is available from
-									// here, but it must be loud.
-									log.Printf("FAILED to return job %s to the pending queue after retries; "+
-										"the server will time it out: %s", pendingJob.jobID, releaseErr)
-								}
+								// Handed to the pipeline rather than sent
+								// here: it batches releases per org and
+								// retries off the worker, so a refused job
+								// frees this worker immediately.
+								releaseJobsPipeline.Add(pendingJob.organizationID, pendingJob.jobID)
 								return
 							}
 							defer releaseMemory()
@@ -433,6 +417,20 @@ func GetAndRunJobs(c *client.RunnerClient, mode runner_enums.Mode, globalOrganiz
 		close(shutdownSignal)
 	})
 	shutdown := false
+	releaseJobsPipeline, _ = goPipeline.NewPipeline(10, time.Second*10, func(organizationId string, jobIDs []string) {
+		// Retry until it lands. See the note on releaseJobsPipeline: a
+		// release that never succeeds strands the job in Running with
+		// nothing to reap it, so giving up is worse than retrying forever.
+		for {
+			err := c.ReleaseJobs(jobIDs, organizationId, "runner at memory capacity")
+			if err == nil {
+				return
+			}
+			log.Printf("error returning %d job(s) to the pending queue, retrying: %s", len(jobIDs), err)
+			time.Sleep(2 * time.Second)
+		}
+	})
+
 	jobsDonePipeline, _ := goPipeline.NewPipeline(10, time.Second*10, func(organizationId string, completingJobs []jobs.CompletingJobDtoV1) {
 		e := true
 		for e {
@@ -516,6 +514,10 @@ func GetAndRunJobs(c *client.RunnerClient, mode runner_enums.Mode, globalOrganiz
 	commandUtils.Shutdown()
 	loggers.Shutdown()
 	jobsDonePipeline.Shutdown()
+	// After jobsDonePipeline: both drain to the same server, and a release
+	// left buffered at exit strands its job in Running with nothing to
+	// reap it.
+	releaseJobsPipeline.Shutdown()
 	goShutdownHook.Wait()
 	log.Println("No pending deployment jobs left - exiting now.")
 }
