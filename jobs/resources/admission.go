@@ -6,7 +6,7 @@ import "sync"
 //
 // WHY THIS EXISTS
 //
-// Sizing each container from the host (host_resources.go) bounds any
+// Sizing each container from the host (resources.go) bounds any
 // SINGLE container, but says nothing about what happens when several run
 // at once — and the runner is built to run several at once. The job
 // dispatcher is a 3-lane concurrent pipeline where each lane runs a

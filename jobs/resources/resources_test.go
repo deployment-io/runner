@@ -144,9 +144,9 @@ func TestCapsAgainstBudget(t *testing.T) {
 
 	budget := memoryBudget()
 
-	agentMem, _ := ResolveContainerLimits()
-	imageMem, _ := ResolveImageBuildLimits()
-	staticMem, _ := ResolveBuildLimits()
+	agentMem, _ := LimitsForAgentContainer()
+	imageMem, _ := LimitsForImageBuild()
+	staticMem, _ := LimitsForStaticSiteBuild()
 
 	// No cap may exceed the budget. Such a job is clamped and so runs, but
 	// it would silently be reserved for less than its container is allowed
@@ -198,7 +198,7 @@ func TestJobMemoryBytes(t *testing.T) {
 	}
 
 	// A Task Step: the peak across its sequence is the agent container.
-	agentMem, _ := ResolveContainerLimits()
+	agentMem, _ := LimitsForAgentContainer()
 	step := JobMemoryBytes([]commands_enums.Type{
 		commands_enums.CheckoutRepo, commands_enums.MaterializeContext,
 		commands_enums.RunAgentStep, commands_enums.CommitAndPush, commands_enums.OpenPullRequest,
@@ -210,7 +210,7 @@ func TestJobMemoryBytes(t *testing.T) {
 	// A session is sized for analysis, not a build, so it must ask for
 	// materially less than a Step — otherwise one interactive session
 	// reserves the whole host for hours and blocks every deploy.
-	sessionMem := ResolveSessionMemoryBytes()
+	sessionMem := MemoryForAssistantSession()
 	session := JobMemoryBytes([]commands_enums.Type{
 		commands_enums.CheckoutRepo, commands_enums.RunAssistantSession,
 	})
@@ -248,7 +248,7 @@ func TestJobMemoryBytes(t *testing.T) {
 func TestResolveContainerLimits_DerivedFromHost(t *testing.T) {
 	t.Setenv(memoryBytesEnvVar, "")
 	t.Setenv(cpuCoresEnvVar, "")
-	mem, nano := ResolveContainerLimits()
+	mem, nano := LimitsForAgentContainer()
 
 	if want := clampMemory(memoryBudget(), agentboxMemoryFloorBytes, agentboxMemoryCeilingBytes); mem != want {
 		t.Errorf("memory = %d, want host-derived %d", mem, want)
@@ -275,9 +275,9 @@ func TestResolveContainerLimits_DerivedFromHost(t *testing.T) {
 func TestResolveContainerLimits_NeverExceedsBudget(t *testing.T) {
 	t.Setenv(memoryBytesEnvVar, "")
 	t.Setenv(cpuCoresEnvVar, "")
-	agentMem, _ := ResolveContainerLimits()
-	buildMem, _ := ResolveBuildLimits()
-	imageMem, _ := ResolveImageBuildLimits()
+	agentMem, _ := LimitsForAgentContainer()
+	buildMem, _ := LimitsForStaticSiteBuild()
+	imageMem, _ := LimitsForImageBuild()
 	budget := memoryBudget()
 
 	for _, tc := range []struct {
@@ -301,7 +301,7 @@ func TestResolveContainerLimits_NeverExceedsBudget(t *testing.T) {
 func TestResolveContainerLimits_EnvOverride(t *testing.T) {
 	t.Setenv(memoryBytesEnvVar, "4294967296") // 4 GB
 	t.Setenv(cpuCoresEnvVar, "4")
-	mem, nano := ResolveContainerLimits()
+	mem, nano := LimitsForAgentContainer()
 	if mem != 4294967296 {
 		t.Errorf("memory = %d, want 4294967296 (4 GB)", mem)
 	}
@@ -317,7 +317,7 @@ func TestResolveContainerLimits_EnvOverride(t *testing.T) {
 func TestResolveContainerLimits_InvalidEnvFallsBack(t *testing.T) {
 	t.Setenv(memoryBytesEnvVar, "not-a-number")
 	t.Setenv(cpuCoresEnvVar, "abc")
-	mem, nano := ResolveContainerLimits()
+	mem, nano := LimitsForAgentContainer()
 	if want := clampMemory(memoryBudget(), agentboxMemoryFloorBytes, agentboxMemoryCeilingBytes); mem != want {
 		t.Errorf("memory with invalid env = %d, want host-derived %d", mem, want)
 	}
@@ -333,7 +333,7 @@ func TestResolveContainerLimits_InvalidEnvFallsBack(t *testing.T) {
 func TestResolveContainerLimits_NegativeEnvFallsBack(t *testing.T) {
 	t.Setenv(memoryBytesEnvVar, "-1")
 	t.Setenv(cpuCoresEnvVar, "0")
-	mem, nano := ResolveContainerLimits()
+	mem, nano := LimitsForAgentContainer()
 	if want := clampMemory(memoryBudget(), agentboxMemoryFloorBytes, agentboxMemoryCeilingBytes); mem != want {
 		t.Errorf("memory with negative env = %d, want host-derived %d", mem, want)
 	}

@@ -93,7 +93,7 @@ func imageBuild(parameters map[string]interface{}, dockerClient *client.Client, 
 	// unbounded for a long time, so a cap that is too tight turns builds
 	// that succeed today into failures. BUILD_IMAGE_MEMORY_BYTES is the
 	// escape hatch for a build that legitimately needs more.
-	buildMemoryBytes, buildCores := resources.ResolveImageBuildLimits()
+	buildMemoryBytes, buildCores := resources.LimitsForImageBuild()
 
 	opts := types.ImageBuildOptions{
 		Dockerfile: dockerFile,

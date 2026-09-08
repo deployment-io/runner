@@ -19,7 +19,7 @@ import (
 
 // Defaults applied when the runner spawns a static-site build
 // container. Memory and CPU are derived from the host (see
-// resolveBuildLimits / host_resources.go) and remain env-var-overridable.
+// resources.LimitsForStaticSiteBuild) and remain env-var-overridable.
 //
 // Builds are sized to a SHARE of the host budget rather than all of it,
 // because builds are the workload that legitimately runs in parallel — a
@@ -216,7 +216,7 @@ func startBuildContainer(imageId, repoDir string) (string, error) {
 	}
 	defer cli.Close()
 
-	memoryBytes, nanoCPUs := resources.ResolveBuildLimits()
+	memoryBytes, nanoCPUs := resources.LimitsForStaticSiteBuild()
 	resp, err := cli.ContainerCreate(ctx, &container.Config{
 		Image: imageId,
 		Cmd:   []string{"tail", "-f", "/dev/null"},

@@ -223,7 +223,7 @@ const (
 
 	// Hardened HostConfig defaults. Memory and CPU are no longer
 	// constants — they are derived from the host the runner is on (see
-	// resolveContainerLimits / host_resources.go) and remain
+	// resources.LimitsForAgentContainer) and remain
 	// env-var-overridable. Phase 6 wires per-org overrides via Settings UI.
 	//
 	// The real memory ceiling for a Task is the production BUILD, not the
@@ -804,7 +804,7 @@ func createAgentboxContainer(ctx context.Context, cli *client.Client, spec agent
 	if len(spec.cmd) > 0 {
 		cfg.Cmd = spec.cmd
 	}
-	memoryBytes, nanoCPUs := resources.ResolveContainerLimits()
+	memoryBytes, nanoCPUs := resources.LimitsForAgentContainer()
 	if spec.memoryBytes > 0 {
 		memoryBytes = spec.memoryBytes
 	}

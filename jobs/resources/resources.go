@@ -137,7 +137,7 @@ const (
 	// CPUPeriodMicroseconds is Docker's default CFS scheduling period.
 	// The image-build API takes a quota/period pair in microseconds
 	// instead of the NanoCPUs used by ContainerCreate, so the caller pairs
-	// this with the core count from ResolveImageBuildLimits:
+	// this with the core count from LimitsForImageBuild:
 	// quota = cores * period.
 	//
 	// Exported because that arithmetic reads more clearly at the call site
@@ -158,7 +158,7 @@ const (
 	buildCPUCoresEnvVar    = "BUILD_CPU_CORES"
 )
 
-// ResolveImageBuildLimits returns the memory cap (bytes) and CPU core
+// LimitsForImageBuild returns the memory cap (bytes) and CPU core
 // count for a docker/nixpacks image build. Returns CORES, not NanoCPUs,
 // because ImageBuildOptions wants a CFS quota/period pair — the caller
 // multiplies by CPUPeriodMicroseconds.
@@ -168,7 +168,7 @@ const (
 // needs more than the derived cap can be unblocked by an operator
 // without waiting for a runner release — this path was unbounded for a
 // long time and some build somewhere will be sized accordingly.
-func ResolveImageBuildLimits() (memoryBytes int64, cores int64) {
+func LimitsForImageBuild() (memoryBytes int64, cores int64) {
 	memoryBytes = clampMemory(memoryBudget(), imageBuildMemoryFloorBytes, imageBuildMemoryCeilingBytes)
 	if override := envMemoryOverride(imageBuildMemoryBytesEnvVar); override > 0 {
 		memoryBytes = override
@@ -268,18 +268,18 @@ func envCoresOverride(key string) int64 {
 	return parsed
 }
 
-// ResolveSessionMemoryBytes returns the memory cap for an Assistant
-// session container. Deliberately not ResolveContainerLimits: a session
+// MemoryForAssistantSession returns the memory cap for an Assistant
+// session container. Deliberately not LimitsForAgentContainer: a session
 // never builds, and it holds its reservation for hours, so it is sized
 // for analysis rather than for a production build. See
 // sessionMemoryFloorBytes.
 //
-// Memory only. CPU is left to ResolveContainerLimits at container-create
+// Memory only. CPU is left to LimitsForAgentContainer at container-create
 // time, because CPU is a throttle rather than a kill — a session sharing
 // the host's cores degrades, it does not die — so there is nothing to
 // gain from giving sessions a separate CPU figure, and an unused return
 // value would just invite someone to assume one was being applied.
-func ResolveSessionMemoryBytes() int64 {
+func MemoryForAssistantSession() int64 {
 	memoryBytes := clampMemory(memoryBudget()/buildBudgetDivisor, sessionMemoryFloorBytes, sessionMemoryCeilingBytes)
 	if override := envMemoryOverride(sessionMemoryBytesEnvVar); override > 0 {
 		return override
@@ -309,22 +309,22 @@ func JobMemoryBytes(commandEnums []commands_enums.Type) int64 {
 	for _, commandEnum := range commandEnums {
 		switch commandEnum {
 		case commands_enums.RunAgentStep:
-			bytes, _ := ResolveContainerLimits()
+			bytes, _ := LimitsForAgentContainer()
 			consider(bytes)
 		case commands_enums.RunAssistantSession:
-			consider(ResolveSessionMemoryBytes())
+			consider(MemoryForAssistantSession())
 		case commands_enums.BuildStaticSite:
-			bytes, _ := ResolveBuildLimits()
+			bytes, _ := LimitsForStaticSiteBuild()
 			consider(bytes)
 		case commands_enums.BuildDockerImage, commands_enums.BuildNixPacksImage:
-			bytes, _ := ResolveImageBuildLimits()
+			bytes, _ := LimitsForImageBuild()
 			consider(bytes)
 		}
 	}
 	return peak
 }
 
-// ResolveContainerLimits returns the memory (bytes) and CPU (NanoCPUs)
+// LimitsForAgentContainer returns the memory (bytes) and CPU (NanoCPUs)
 // caps for the agentbox container, sized from the host the runner is
 // running on. An explicit AGENTBOX_MEMORY_BYTES / AGENTBOX_CPU_CORES
 // wins over the derived value; invalid env values are ignored silently
@@ -340,7 +340,7 @@ func JobMemoryBytes(commandEnums []commands_enums.Type) int64 {
 // admission control is what prevents two of them overlapping.
 //
 // 1 CPU core = 1e9 NanoCPUs in Docker's accounting.
-func ResolveContainerLimits() (memoryBytes int64, nanoCPUs int64) {
+func LimitsForAgentContainer() (memoryBytes int64, nanoCPUs int64) {
 	memoryBytes = clampMemory(memoryBudget(), agentboxMemoryFloorBytes, agentboxMemoryCeilingBytes)
 	if override := envMemoryOverride(memoryBytesEnvVar); override > 0 {
 		memoryBytes = override
@@ -357,7 +357,7 @@ func ResolveContainerLimits() (memoryBytes int64, nanoCPUs int64) {
 	return memoryBytes, nanoCPUs
 }
 
-// ResolveBuildLimits returns the memory (bytes) and CPU (NanoCPUs)
+// LimitsForStaticSiteBuild returns the memory (bytes) and CPU (NanoCPUs)
 // caps for the build container, sized from the host. An explicit
 // BUILD_MEMORY_BYTES / BUILD_CPU_CORES wins; invalid env values are
 // ignored silently (logging from a const-style helper would obscure the
@@ -365,11 +365,11 @@ func ResolveContainerLimits() (memoryBytes int64, nanoCPUs int64) {
 //
 // 1 CPU core = 1e9 NanoCPUs in Docker's accounting.
 //
-// Mirrors ResolveContainerLimits in run_agent_step.go but takes a SHARE
+// Mirrors LimitsForAgentContainer in run_agent_step.go but takes a SHARE
 // of the budget rather than all of it, and reads BUILD_* env vars — the
 // build and Tasks knobs stay independent so ops can tune them separately
 // when concurrent build/agentbox jobs need different resource shapes.
-func ResolveBuildLimits() (memoryBytes int64, nanoCPUs int64) {
+func LimitsForStaticSiteBuild() (memoryBytes int64, nanoCPUs int64) {
 	memoryBytes = clampMemory(memoryBudget()/buildBudgetDivisor, buildMemoryFloorBytes, buildMemoryCeilingBytes)
 	if override := envMemoryOverride(buildMemoryBytesEnvVar); override > 0 {
 		memoryBytes = override
