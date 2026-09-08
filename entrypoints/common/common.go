@@ -103,9 +103,28 @@ func executeJobs(jobsStream <-chan pendingJobType, noOfWorkers int, mode runner_
 						// before doing ANYTHING else, and hand the job back if
 						// there is no room.
 						//
-						// First in the function on purpose. A requeued job must
-						// leave no trace: no logger, no job log stream, no
-						// heartbeat goroutine, and above all no log lines. The
+						// First in the function on purpose, and load-bearing in
+						// two directions — do not move it below getJobStopSignal.
+						//
+						// That call starts the heartbeat, and a heartbeat creates
+						// a running_jobs record. Those records are the ONLY thing
+						// the server's stuck-job cron looks at (FindTimedOut
+						// queries heartBeatTs), and MarkManyRunningTimedOut
+						// matches Pending as well as Running. So:
+						//
+						//   - Refusing BEFORE the heartbeat means a requeued job
+						//     has no record, and cannot be marked TimedOut while
+						//     it sits legitimately in the pending queue. Refuse
+						//     after it, and any job blocked for more than five
+						//     minutes gets failed — exactly what requeuing exists
+						//     to prevent.
+						//   - Because there is no record, nothing reaps a job
+						//     whose release never lands either, which is why
+						//     releaseJobsPipeline retries forever rather than
+						//     giving up.
+						//
+						// A requeued job must also leave no other trace: no
+						// logger, no job log stream, and above all no log lines. The
 						// runner re-polls every 10s, so a job blocked behind a
 						// long Assistant session (up to 4h) is offered and
 						// returned ~1440 times — writing "at capacity" into the
