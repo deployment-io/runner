@@ -1,10 +1,6 @@
 package commands
 
-import (
-	"sync"
-
-	"golang.org/x/sync/semaphore"
-)
+import "sync"
 
 // Memory admission control for container-spawning jobs.
 //
@@ -74,49 +70,27 @@ import (
 //     it back with no code change, since both the caps and the capacity
 //     scale with the host.
 
-// admissionUnitBytes is the granularity of the semaphore. Weights are
-// expressed in units rather than raw bytes purely to keep the numbers
-// small and readable in logs; the ratio is what matters.
-const admissionUnitBytes = 64 * 1024 * 1024 // 64 MB
-
+// admissionUsed is the memory currently reserved by running jobs, in
+// bytes, guarded by admissionMu. A plain counter is the whole mechanism:
+// reserve on admit, subtract on release, refuse when the total would
+// exceed the budget.
+//
+// This deliberately does NOT use a semaphore. An earlier version did,
+// back when admission waited for capacity, but once waiting was replaced
+// by requeueing the only calls left were the non-blocking ones — so the
+// waiter queue was permanently empty, its FIFO fairness ordered nothing,
+// and its blocking acquire was unreachable. Carrying that machinery
+// implied to a reader that jobs queue here, which is exactly what they
+// no longer do.
+//
+// Counting BYTES rather than fixed-size units follows from the same
+// simplification: the units only existed to keep semaphore weights
+// small, and they cost a rounding step that reserved slightly more than
+// a job asked for.
 var (
-	admissionOnce sync.Once
-	admissionSem  *semaphore.Weighted
-	// admissionCapacity is the semaphore's size, kept so acquire can clamp
-	// oversized requests. Without the clamp an operator-supplied override
-	// larger than the host would produce a weight that can never be
-	// satisfied, so the job could never start no matter how idle the
-	// runner became.
-	admissionCapacity int64
+	admissionMu   sync.Mutex
+	admissionUsed int64
 )
-
-func admissionSemaphore() (*semaphore.Weighted, int64) {
-	admissionOnce.Do(func() {
-		admissionCapacity = memoryBudget() / admissionUnitBytes
-		if admissionCapacity < 1 {
-			admissionCapacity = 1
-		}
-		admissionSem = semaphore.NewWeighted(admissionCapacity)
-	})
-	return admissionSem, admissionCapacity
-}
-
-// admissionWeight converts a byte figure into semaphore units, rounding
-// UP so a container is never admitted against less memory than it may
-// actually use, and clamping to the total capacity so an oversized
-// override yields a job that runs alone rather than one that can never
-// run at all.
-func admissionWeight(memoryBytes int64) int64 {
-	_, capacity := admissionSemaphore()
-	units := (memoryBytes + admissionUnitBytes - 1) / admissionUnitBytes
-	if units < 1 {
-		units = 1
-	}
-	if units > capacity {
-		units = capacity
-	}
-	return units
-}
 
 // TryAcquireMemory reserves memoryBytes of host memory for a job that is
 // about to run, WITHOUT blocking. It returns a release function the
@@ -125,19 +99,42 @@ func admissionWeight(memoryBytes int64) int64 {
 // Non-blocking is the whole point. An earlier version waited here, which
 // was wrong in three ways at once: it held one of the runner's job
 // workers for the duration, it eventually FAILED the job (turning a busy
-// runner into failed deployments), and because the semaphore is strict
-// FIFO a large waiter blocked smaller jobs that would have fit.
+// runner into failed deployments), and its queue let a large waiter block
+// smaller jobs that would have fit.
 //
 // The caller's answer to false is to hand the job back to the server, so
 // it returns to the pending queue and is offered again once capacity
 // frees. Nothing waits, nothing fails, and no worker is tied up.
+//
+// A request larger than the whole budget is clamped to it rather than
+// refused outright. Without the clamp — an operator setting
+// AGENTBOX_MEMORY_BYTES above what the host can back — the job could
+// never be admitted on any poll, so it would requeue forever and never
+// run, with nothing to explain why. Clamped, it runs alone.
 func TryAcquireMemory(memoryBytes int64) (release func(), ok bool) {
-	sem, _ := admissionSemaphore()
-	weight := admissionWeight(memoryBytes)
-	if !sem.TryAcquire(weight) {
+	budget := memoryBudget()
+	want := memoryBytes
+	if want > budget {
+		want = budget
+	}
+	if want < 1 {
+		want = 1
+	}
+
+	admissionMu.Lock()
+	defer admissionMu.Unlock()
+	if admissionUsed+want > budget {
 		return nil, false
 	}
-	return func() { sem.Release(weight) }, true
+	admissionUsed += want
+
+	// Called exactly once, via defer at the single call site in the
+	// dispatcher.
+	return func() {
+		admissionMu.Lock()
+		admissionUsed -= want
+		admissionMu.Unlock()
+	}, true
 }
 
 // MemoryBudgetBytes exposes the host memory budget for the dispatcher's

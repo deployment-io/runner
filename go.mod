@@ -41,7 +41,6 @@ require (
 	github.com/tree-sitter/tree-sitter-go v0.23.4
 	go.mongodb.org/mongo-driver v1.14.0
 	golang.org/x/net v0.47.0
-	golang.org/x/sync v0.19.0
 	gonum.org/v1/gonum v0.16.0
 )
 
@@ -140,6 +139,7 @@ require (
 	golang.org/x/crypto v0.46.0 // indirect
 	golang.org/x/exp v0.0.0-20241009180824-f66d83c29e7c // indirect
 	golang.org/x/mod v0.30.0 // indirect
+	golang.org/x/sync v0.19.0 // indirect
 	golang.org/x/sys v0.39.0 // indirect
 	golang.org/x/text v0.32.0 // indirect
 	golang.org/x/tools v0.39.0 // indirect
