@@ -36,8 +36,8 @@ const FallbackMemoryBytes = 8 * 1024 * 1024 * 1024 // 8 GB
 const procMeminfoPath = "/proc/meminfo"
 
 var (
-	memoryOnce  sync.Once
-	memoryCache int64
+	memoryOnce     sync.Once
+	measuredMemory int64 // 0 when detection failed
 )
 
 // MemoryBytes returns the TOTAL physical memory of the machine the
@@ -56,16 +56,38 @@ var (
 // want, and is why this reads procfs directly rather than using a
 // cgroup-aware memory library.
 //
+// Falls back to FallbackMemoryBytes when detection fails, so sizing
+// always has a number to work with. That fallback makes this the WRONG
+// function for reporting the host's specs — see MeasuredMemoryBytes.
+//
 // Cached: the value cannot change while the process lives, and this is
 // called on every container create.
 func MemoryBytes() int64 {
+	if measured := MeasuredMemoryBytes(); measured > 0 {
+		return measured
+	}
+	return FallbackMemoryBytes
+}
+
+// MeasuredMemoryBytes returns the host's total memory, or ZERO when it
+// could not be determined.
+//
+// Use this, never MemoryBytes, when the value is REPORTED rather than
+// used for sizing. The two differ only when detection fails, and that is
+// exactly the case where the difference matters: MemoryBytes substitutes
+// a conservative default so caps land somewhere safe, which is right for
+// a limit and wrong for a fact. Reporting the fallback tells the control
+// plane a laptop has 8 GB and paints that number in the dashboard beside
+// a vCPU count that IS measured, with nothing to say which is which.
+//
+// Callers that report should let zero mean "unknown" and pass it through
+// — the Runner model fields are omitempty and the dashboard renders a
+// dash, so an absent value stays visibly absent.
+func MeasuredMemoryBytes() int64 {
 	memoryOnce.Do(func() {
-		memoryCache = readMemTotalBytes(procMeminfoPath)
-		if memoryCache <= 0 {
-			memoryCache = FallbackMemoryBytes
-		}
+		measuredMemory = readMemTotalBytes(procMeminfoPath)
 	})
-	return memoryCache
+	return measuredMemory
 }
 
 // readMemTotalBytes parses the MemTotal line out of a meminfo-formatted

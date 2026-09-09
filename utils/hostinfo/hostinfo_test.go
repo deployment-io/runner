@@ -84,6 +84,39 @@ func TestMemoryBytesAlwaysPositive(t *testing.T) {
 	}
 }
 
+// TestMeasuredMemoryIsNeverFabricated pins the distinction between the
+// sizing accessor and the reporting one.
+//
+// They may only differ by the fallback: either detection worked and both
+// agree, or it failed and the measured value is ZERO while the sizing one
+// substitutes FallbackMemoryBytes. What must never happen is
+// MeasuredMemoryBytes returning the fallback, because a caller reporting
+// it would present a constant as a measurement — on a machine with no
+// /proc/meminfo that paints an invented memory figure into the dashboard
+// beside a vCPU count that IS real.
+func TestMeasuredMemoryIsNeverFabricated(t *testing.T) {
+	measured := MeasuredMemoryBytes()
+	sizing := MemoryBytes()
+
+	if measured < 0 {
+		t.Fatalf("MeasuredMemoryBytes() = %d, want zero or positive", measured)
+	}
+	if measured == 0 {
+		// Detection failed. Sizing must still have a usable number, and
+		// the reported value must stay zero so it renders as unknown.
+		if sizing != FallbackMemoryBytes {
+			t.Errorf("with detection failed, MemoryBytes() = %d, want the %d fallback",
+				sizing, FallbackMemoryBytes)
+		}
+		return
+	}
+	// Detection worked: the two must agree exactly, with no fallback in play.
+	if sizing != measured {
+		t.Errorf("MemoryBytes() = %d but MeasuredMemoryBytes() = %d; they must agree "+
+			"whenever detection succeeded", sizing, measured)
+	}
+}
+
 func TestCPUCoresAlwaysPositive(t *testing.T) {
 	if got := CPUCores(); got < 1 {
 		t.Errorf("CPUCores() = %d, want at least 1", got)

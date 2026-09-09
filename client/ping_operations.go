@@ -35,7 +35,11 @@ func (r *RunnerClient) Ping(firstPing bool, organizationID string) error {
 	// InstanceType may block for up to the IMDS timeout on its first call
 	// only; it is cached thereafter and returns empty rather than erroring
 	// off EC2.
-	args.HostMemoryBytes = hostinfo.MemoryBytes()
+	// MeasuredMemoryBytes, not MemoryBytes: this REPORTS the host rather
+	// than sizing against it, so a failed detection must arrive as zero
+	// ("unknown", rendered as a dash) instead of the 8 GB fallback, which
+	// would show a laptop as an 8 GB machine next to a real vCPU count.
+	args.HostMemoryBytes = hostinfo.MeasuredMemoryBytes()
 	args.HostCPUCores = hostinfo.CPUCores()
 	args.InstanceType = hostinfo.InstanceType()
 	var reply ping.ReplyV1
