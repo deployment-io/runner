@@ -60,9 +60,16 @@ const (
 	// which is the opposite of what a tiny host wants).
 	minContainerMemoryBytes = 1 * 1024 * 1024 * 1024 // 1 GB
 
-	// agentboxMemoryFloorBytes is the pre-host-sizing default. Deriving
-	// from the host must never hand a Task LESS than it got before, so
-	// this is a floor rather than a starting point.
+	// agentboxMemoryFloorBytes is the pre-host-sizing default, kept as a
+	// floor so a host that can back it never hands a Task less than it got
+	// before.
+	//
+	// It is a floor, NOT a guarantee. clampMemory bounds the ceiling by the
+	// budget first, so on a host too small to reach 4 GB the ceiling drops
+	// below this floor and the ceiling wins — a 4 GB machine gives an agent
+	// 2.5 GB, not 4. That is deliberate: the old flat 4 GB on a 4 GB host
+	// was a 100% over-commit, and a cap the machine can actually back is
+	// worth more than one it cannot.
 	agentboxMemoryFloorBytes = 4 * 1024 * 1024 * 1024 // 4 GB
 
 	// agentboxMemoryCeilingBytes stops a very large host from sizing a
@@ -84,18 +91,30 @@ const (
 	// buildMemoryCeilingBytes bounds a single build container.
 	buildMemoryCeilingBytes = 8 * 1024 * 1024 * 1024 // 8 GB
 
-	// buildBudgetDivisor keeps static-site builds small enough to still run
-	// several at once. They are the workload that legitimately fans out —
-	// a push can trigger several deployments — so handing each the full
-	// budget would silently serialize deploys that run concurrently today.
+	// staticBuildBudgetDivisor balances a static-site build's size against
+	// how many run at once. Builds are the workload that legitimately fans
+	// out — a push can trigger several deployments — so they take a share
+	// of the budget rather than all of it.
 	//
-	// This is a CONCURRENCY choice, not a claim that builds are light.
-	// They are not: run_agent_step.go records a real Vite/webpack build
-	// (the dashboard) being OOM-killed at exactly 2 GB. A third of the
-	// budget is more than the old flat 2 GB on every host we ship and
-	// grows with the instance, but a genuinely heavy single build is
-	// still the case BUILD_MEMORY_BYTES exists for.
-	buildBudgetDivisor = 3
+	// HALF, not a third, because of a measured failure. run_agent_step.go
+	// records a real Vite/webpack build — OUR dashboard, which is a static
+	// site and so builds in exactly this container — being OOM-killed at
+	// 2 GB during chunk rendering. A third of the budget is 2.06 GB on the
+	// shipped m6a.large: a 3% improvement on a cap already known to kill a
+	// real build, which is no improvement at all. Half gives 3.09 GB, and
+	// integer division means two always fit exactly.
+	//
+	// Two concurrent builds instead of three is the price, and it is worth
+	// paying: two builds that succeed beat three that OOM. Anything heavier
+	// still has BUILD_MEMORY_BYTES.
+	staticBuildBudgetDivisor = 2
+
+	// sessionBudgetDivisor is deliberately SEPARATE from the static-build
+	// divisor even though both were once the same constant. They answer
+	// different questions — how large a build may grow, versus how much an
+	// idle interactive session may hold for hours — so tuning one must not
+	// silently move the other.
+	sessionBudgetDivisor = 3
 
 	// Image builds (docker / nixpacks) get the WHOLE budget rather than a
 	// share, unlike static-site builds. Two reasons:
@@ -280,7 +299,7 @@ func envCoresOverride(key string) int64 {
 // gain from giving sessions a separate CPU figure, and an unused return
 // value would just invite someone to assume one was being applied.
 func MemoryForAssistantSession() int64 {
-	memoryBytes := clampMemory(memoryBudget()/buildBudgetDivisor, sessionMemoryFloorBytes, sessionMemoryCeilingBytes)
+	memoryBytes := clampMemory(memoryBudget()/sessionBudgetDivisor, sessionMemoryFloorBytes, sessionMemoryCeilingBytes)
 	if override := envMemoryOverride(sessionMemoryBytesEnvVar); override > 0 {
 		return override
 	}
@@ -370,7 +389,7 @@ func LimitsForAgentContainer() (memoryBytes int64, nanoCPUs int64) {
 // build and Tasks knobs stay independent so ops can tune them separately
 // when concurrent build/agentbox jobs need different resource shapes.
 func LimitsForStaticSiteBuild() (memoryBytes int64, nanoCPUs int64) {
-	memoryBytes = clampMemory(memoryBudget()/buildBudgetDivisor, buildMemoryFloorBytes, buildMemoryCeilingBytes)
+	memoryBytes = clampMemory(memoryBudget()/staticBuildBudgetDivisor, buildMemoryFloorBytes, buildMemoryCeilingBytes)
 	if override := envMemoryOverride(buildMemoryBytesEnvVar); override > 0 {
 		memoryBytes = override
 	}

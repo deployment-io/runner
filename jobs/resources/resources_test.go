@@ -167,11 +167,33 @@ func TestCapsAgainstBudget(t *testing.T) {
 		}
 	}
 
-	// Static-site builds are the parallel workload; if they ever grow to
-	// more than half the budget, concurrent deployments silently serialize.
+	// Static-site builds are the parallel workload; two must always fit.
+	// With a divisor of 2 this holds by integer division rather than by
+	// luck, so the assertion guards a future change to the divisor, the
+	// floor, or the ceiling rather than the current arithmetic.
 	if staticMem*2 > budget {
 		t.Errorf("static build cap %d is more than half the budget %d — two concurrent "+
 			"deployments would no longer fit", staticMem, budget)
+	}
+
+	// The cap must clear the one memory figure we have actually MEASURED.
+	// run_agent_step.go records our own dashboard — a Vite static site, so
+	// it builds in exactly this container — being OOM-killed at 2 GB during
+	// chunk rendering. A cap at or below that is known to fail a real
+	// build, so sizing must stay above it wherever the host can afford it.
+	// A MARGIN above it, not merely above it: a cap 3% over a figure known
+	// to kill a real build is not an improvement, it is the same failure
+	// with rounding. Require at least 1.5x, and only on a host whose budget
+	// can seat two builds that size — smaller hosts legitimately fall back
+	// to the floor.
+	const (
+		observedStaticBuildOOM = 2 * 1024 * 1024 * 1024
+		requiredStaticHeadroom = observedStaticBuildOOM * 3 / 2
+	)
+	if budget >= 2*requiredStaticHeadroom && staticMem < requiredStaticHeadroom {
+		t.Errorf("static build cap %d leaves no margin over the %d that OOM-killed a real "+
+			"build; want at least %d on a host with budget %d",
+			staticMem, observedStaticBuildOOM, requiredStaticHeadroom, budget)
 	}
 
 	// Documents the accepted trade-off rather than asserting against it:
