@@ -164,9 +164,34 @@ func executeJobs(jobsStream <-chan pendingJobType, noOfWorkers int, mode runner_
 									requiredMemory/(1024*1024), resources.MemoryBudgetBytes()/(1024*1024),
 									pendingJob.jobID)
 								// Handed to the pipeline rather than sent
-								// here: it batches releases per org and
-								// retries off the worker, so a refused job
-								// frees this worker immediately.
+								// here, so releases batch per org and the
+								// retry runs off this worker.
+								//
+								// Add is an UNBUFFERED send, and the pipeline
+								// invokes its handler synchronously, so this
+								// frees the worker only while the pipeline is
+								// healthy. If the control plane is unreachable
+								// the handler sits in its retry loop, stops
+								// reading, and this call blocks.
+								//
+								// That is back-pressure, and it is deliberate.
+								// While disconnected GetPendingJobs fails too,
+								// so no new work enters; a freed worker would
+								// only pick up another job and possibly start a
+								// container whose completion cannot be
+								// reported, leaving the cron to time it out.
+								// Blocking stops the runner accumulating work
+								// it cannot report. It is a stall, not a
+								// deadlock — everything drains on reconnect
+								// with nothing lost.
+								//
+								// It also matches what the runner already does:
+								// jobsDonePipeline retries forever the same
+								// way, so a disconnect already wedges the
+								// result workers on Add and, through the
+								// unbuffered resultsStream, the job workers
+								// behind them. This path is consistent with
+								// that rather than a new behaviour.
 								releaseJobsPipeline.Add(pendingJob.organizationID, pendingJob.jobID)
 								return
 							}
