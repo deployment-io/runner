@@ -167,11 +167,15 @@ func TestCapsAgainstBudget(t *testing.T) {
 		}
 	}
 
-	// Static-site builds are the parallel workload; two must always fit.
-	// With a divisor of 2 this holds by integer division rather than by
-	// luck, so the assertion guards a future change to the divisor, the
-	// floor, or the ceiling rather than the current arithmetic.
-	if staticMem*2 > budget {
+	// Static-site builds are the parallel workload, so two should fit —
+	// but only on a host where the DIVISOR decides the cap. Below roughly
+	// 6 GB of host, budget/2 falls under buildMemoryFloorBytes and
+	// clampMemory raises the cap back to the floor; two floor-sized builds
+	// then exceed the budget, correctly, and admission runs one. Asserting
+	// unconditionally would fail on an 8 GB laptop or a small CI container
+	// for a sizing decision that is right. Same guard as the margin check
+	// below and as TestJobMemoryBytes.
+	if budget >= 2*buildMemoryFloorBytes && staticMem*2 > budget {
 		t.Errorf("static build cap %d is more than half the budget %d — two concurrent "+
 			"deployments would no longer fit", staticMem, budget)
 	}

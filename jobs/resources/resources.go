@@ -101,8 +101,15 @@ const (
 	// site and so builds in exactly this container — being OOM-killed at
 	// 2 GB during chunk rendering. A third of the budget is 2.06 GB on the
 	// shipped m6a.large: a 3% improvement on a cap already known to kill a
-	// real build, which is no improvement at all. Half gives 3.09 GB, and
-	// integer division means two always fit exactly.
+	// real build, which is no improvement at all. Half gives 3.09 GB.
+	//
+	// Two then fit whenever the divisor actually decides the cap, since
+	// (budget/2)*2 <= budget. That is NOT a universal guarantee: below
+	// about 6 GB of host, budget/2 falls under buildMemoryFloorBytes and
+	// clampMemory raises the cap back to the 2 GB floor, at which point two
+	// builds want more than the budget and admission control runs one. That
+	// is the correct outcome on a host that small — it is only the "always"
+	// that would be wrong.
 	//
 	// Two concurrent builds instead of three is the price, and it is worth
 	// paying: two builds that succeed beat three that OOM. Anything heavier
