@@ -23,6 +23,7 @@ import (
 	"github.com/deployment-io/deployment-runner/client"
 	"github.com/deployment-io/deployment-runner/jobs/commands"
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
+	"github.com/deployment-io/deployment-runner/jobs/resources"
 	"github.com/deployment-io/deployment-runner/utils/loggers"
 )
 
@@ -54,6 +55,28 @@ func getJobResult(job pendingJobType, error string, parameters map[string]interf
 	return result
 }
 
+// releaseJobsPipeline batches jobs the runner accepted but could not
+// start, and hands them back to the server keyed by organization.
+//
+// A pipeline rather than a direct call, matching jobsDonePipeline and
+// loggers.AddJobLogsPipeline, for two reasons:
+//
+//   - Batching. ReleasingJobsArgsV1.JobIDs is a slice precisely so one
+//     RPC can return many jobs; releasing them one at a time made N calls
+//     per poll where one would do.
+//   - It keeps the retry OFF the job worker. Retrying inline slept inside
+//     one of the runner's 15 workers, so a refused job tied up a worker
+//     doing nothing for the length of the backoff.
+//
+// The retry is UNBOUNDED, matching MarkJobsComplete, and that is not
+// belt-and-braces: a job whose release never lands is stranded forever.
+// It stays Running, and the server's stuck-job cron cannot rescue it —
+// that cron finds work through running_jobs heartbeat records, and a
+// requeued job returns before the heartbeat goroutine ever starts, so no
+// record exists. Nothing else reaps a Running job. Giving up here would
+// leave a job invisible, never retried and never failed.
+var releaseJobsPipeline *goPipeline.Pipeline[string, string]
+
 func handleLogEnd(err error, jobID string, logsWriter io.Writer) {
 	if err != nil {
 		io.WriteString(logsWriter, fmt.Sprintf("Error in executing - %s - %s\n", jobID, err.Error()))
@@ -77,6 +100,103 @@ func executeJobs(jobsStream <-chan pendingJobType, noOfWorkers int, mode runner_
 				for pendingJob := range jobsStream {
 					func(pendingJob pendingJobType) {
 						parameters := pendingJob.parameters
+						// Reserve host memory for the WHOLE command sequence
+						// before doing ANYTHING else, and hand the job back if
+						// there is no room.
+						//
+						// First in the function on purpose, and load-bearing in
+						// two directions — do not move it below getJobStopSignal.
+						//
+						// That call starts the heartbeat, and a heartbeat creates
+						// a running_jobs record. Those records are the ONLY thing
+						// the server's stuck-job cron looks at (FindTimedOut
+						// queries heartBeatTs), and MarkManyRunningTimedOut
+						// matches Pending as well as Running. So:
+						//
+						//   - Refusing BEFORE the heartbeat means a requeued job
+						//     has no record, and cannot be marked TimedOut while
+						//     it sits legitimately in the pending queue. Refuse
+						//     after it, and any job blocked for more than five
+						//     minutes gets failed — exactly what requeuing exists
+						//     to prevent.
+						//   - Because there is no record, nothing reaps a job
+						//     whose release never lands either, which is why
+						//     releaseJobsPipeline retries forever rather than
+						//     giving up.
+						//
+						// A requeued job must also leave no other trace: no
+						// logger, no job log stream, and above all no log lines. The
+						// runner re-polls every 10s, so a job blocked behind a
+						// long Assistant session (up to 4h) is offered and
+						// returned ~1440 times — writing "at capacity" into the
+						// job's own log each time would bury the real output
+						// under a thousand identical lines and ship every one of
+						// them. The user's signal is that the job simply stays
+						// pending, which the dashboard already shows.
+						//
+						// Reserving here rather than beside each container spawn
+						// also means a job that cannot be admitted has done no
+						// work: reserve inside RunAgentStep and the Step would
+						// already have cloned its repo, and would redo that clone
+						// on every retry.
+						//
+						// Jobs that spawn no container (most of the 32 command
+						// types are AWS API calls) report zero and skip this
+						// entirely, so a busy runner never delays them.
+						if requiredMemory := resources.JobMemoryBytes(pendingJob.commandEnums); requiredMemory > 0 {
+							releaseMemory, admitted := resources.TryAcquireMemory(requiredMemory)
+							if !admitted {
+								// NOT a failure. No result is pushed to
+								// resultsStream — that path marks the job
+								// complete. The job returns to pending and is
+								// offered again once capacity frees.
+								// Logged to the RUNNER's log, not the job's.
+								// The job's log has to stay clean for its
+								// eventual real run (this fires ~1440 times
+								// behind a 4h session), but going silent would
+								// leave an operator unable to tell "runner at
+								// capacity" apart from a job that was never
+								// picked up at all. The runner's log is
+								// operator-facing and ships to CloudWatch,
+								// where this cadence is unremarkable.
+								log.Printf("runner at memory capacity (%d MB needed of a %d MB budget); "+
+									"returning job %s to the pending queue",
+									requiredMemory/(1024*1024), resources.MemoryBudgetBytes()/(1024*1024),
+									pendingJob.jobID)
+								// Handed to the pipeline rather than sent
+								// here, so releases batch per org and the
+								// retry runs off this worker.
+								//
+								// Add is an UNBUFFERED send, and the pipeline
+								// invokes its handler synchronously, so this
+								// frees the worker only while the pipeline is
+								// healthy. If the control plane is unreachable
+								// the handler sits in its retry loop, stops
+								// reading, and this call blocks.
+								//
+								// That is back-pressure, and it is deliberate.
+								// While disconnected GetPendingJobs fails too,
+								// so no new work enters; a freed worker would
+								// only pick up another job and possibly start a
+								// container whose completion cannot be
+								// reported, leaving the cron to time it out.
+								// Blocking stops the runner accumulating work
+								// it cannot report. It is a stall, not a
+								// deadlock — everything drains on reconnect
+								// with nothing lost.
+								//
+								// It also matches what the runner already does:
+								// jobsDonePipeline retries forever the same
+								// way, so a disconnect already wedges the
+								// result workers on Add and, through the
+								// unbuffered resultsStream, the job workers
+								// behind them. This path is consistent with
+								// that rather than a new behaviour.
+								releaseJobsPipeline.Add(pendingJob.organizationID, pendingJob.jobID)
+								return
+							}
+							defer releaseMemory()
+						}
 						//add job id in parameters
 						_ = jobs.SetParameterValue(parameters, parameters_enums.JobID, pendingJob.jobID)
 						//add organization id from job in parameters
@@ -342,6 +462,20 @@ func GetAndRunJobs(c *client.RunnerClient, mode runner_enums.Mode, globalOrganiz
 		close(shutdownSignal)
 	})
 	shutdown := false
+	releaseJobsPipeline, _ = goPipeline.NewPipeline(10, time.Second*10, func(organizationId string, jobIDs []string) {
+		// Retry until it lands. See the note on releaseJobsPipeline: a
+		// release that never succeeds strands the job in Running with
+		// nothing to reap it, so giving up is worse than retrying forever.
+		for {
+			err := c.ReleaseJobs(jobIDs, organizationId, "runner at memory capacity")
+			if err == nil {
+				return
+			}
+			log.Printf("error returning %d job(s) to the pending queue, retrying: %s", len(jobIDs), err)
+			time.Sleep(2 * time.Second)
+		}
+	})
+
 	jobsDonePipeline, _ := goPipeline.NewPipeline(10, time.Second*10, func(organizationId string, completingJobs []jobs.CompletingJobDtoV1) {
 		e := true
 		for e {
@@ -425,6 +559,10 @@ func GetAndRunJobs(c *client.RunnerClient, mode runner_enums.Mode, globalOrganiz
 	commandUtils.Shutdown()
 	loggers.Shutdown()
 	jobsDonePipeline.Shutdown()
+	// After jobsDonePipeline: both drain to the same server, and a release
+	// left buffered at exit strands its job in Running with nothing to
+	// reap it.
+	releaseJobsPipeline.Shutdown()
 	goShutdownHook.Wait()
 	log.Println("No pending deployment jobs left - exiting now.")
 }

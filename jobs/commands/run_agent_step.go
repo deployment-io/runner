@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/deployment-io/deployment-runner/jobs/resources"
 	"io"
 	"os"
 	"path/filepath"
@@ -220,21 +221,19 @@ const (
 	// ~30s, ~2-3min on constrained networks.
 	defaultImagePullTimeout = 10 * time.Minute
 
-	// Hardened HostConfig defaults. All four are env-var-overridable
-	// (see resolveContainerLimits) so different runner instance sizes
-	// can dial up/down without a runner redeploy. Phase 6 wires per-org
-	// overrides via Settings UI.
+	// Hardened HostConfig defaults. Memory and CPU are no longer
+	// constants — they are derived from the host the runner is on (see
+	// resources.LimitsForAgentContainer) and remain
+	// env-var-overridable. Phase 6 wires per-org overrides via Settings UI.
 	//
-	// Memory + CPU sized for typical Tasks workloads. The real ceiling is
-	// the production BUILD, not the agent's analysis working set (~1GB) or
-	// npm/pip install (~500MB): a Vite/webpack build of a real app
-	// (observed: the dashboard) gets OOM-killed at 2GB during chunk
-	// rendering — exit 137 (cgroup SIGKILL) / 134 (Node heap abort). 4GB
-	// covers typical builds; unusually heavy ones can raise it further via
-	// AGENTBOX_MEMORY_BYTES without a runner redeploy. CPU at 2 cores keeps
-	// multiple concurrent Step Jobs feasible on a 4-core runner.
-	defaultMemoryBytes = 4 * 1024 * 1024 * 1024 // 4 GB
-	defaultCPUCores    = int64(2)               // 2 cores
+	// The real memory ceiling for a Task is the production BUILD, not the
+	// agent's analysis working set (~1GB) or npm/pip install (~500MB): a
+	// Vite/webpack build of a real app (observed: the dashboard) gets
+	// OOM-killed at 2GB during chunk rendering — exit 137 (cgroup SIGKILL)
+	// / 134 (Node heap abort). The previous flat 4GB covered typical
+	// builds but was itself hit by a real Go build on the shipped
+	// m6a.large, which is why sizing now follows the host: see
+	// agentboxMemoryFloorBytes / agentboxMemoryCeilingBytes.
 
 	// Tmpfs sizes. /tmp covers general scratch (build artifacts, npm
 	// caches, etc.); /home/agent covers the agentbox runtime install
@@ -260,10 +259,6 @@ const (
 	// security-relevant and we don't need either for the agent.
 	tmpfsTmpOpts  = "rw,exec,size=512m,uid=1000,gid=1000,mode=755"
 	tmpfsHomeOpts = "rw,exec,size=1g,uid=1000,gid=1000,mode=755"
-
-	// Env vars on the runner host that override the defaults above.
-	memoryBytesEnvVar = "AGENTBOX_MEMORY_BYTES"
-	cpuCoresEnvVar    = "AGENTBOX_CPU_CORES"
 )
 
 func (rs *RunAgentStep) Run(parameters map[string]interface{}, logsWriter io.Writer) (newParameters map[string]interface{}, err error) {
@@ -809,7 +804,10 @@ func createAgentboxContainer(ctx context.Context, cli *client.Client, spec agent
 	if len(spec.cmd) > 0 {
 		cfg.Cmd = spec.cmd
 	}
-	memoryBytes, nanoCPUs := resolveContainerLimits()
+	memoryBytes, nanoCPUs := resources.LimitsForAgentContainer()
+	if spec.memoryBytes > 0 {
+		memoryBytes = spec.memoryBytes
+	}
 	mounts := []mount.Mount{{
 		Type:   mount.TypeBind,
 		Source: spec.workDirHost,
@@ -861,31 +859,6 @@ func createAgentboxContainer(ctx context.Context, cli *client.Client, spec agent
 		return "", fmt.Errorf("error creating container: %s", err)
 	}
 	return resp.ID, nil
-}
-
-// resolveContainerLimits returns the memory (bytes) and CPU (NanoCPUs)
-// caps for the agentbox container. Reads per-runner env-var overrides
-// before falling back to the defaults — different EC2 instance sizes
-// need different limits without redeploying the runner. Invalid env
-// values fall back to defaults (silently — logging from a const-style
-// helper would obscure the actual runner logs).
-//
-// 1 CPU core = 1e9 NanoCPUs in Docker's accounting.
-func resolveContainerLimits() (memoryBytes int64, nanoCPUs int64) {
-	memoryBytes = defaultMemoryBytes
-	if v := os.Getenv(memoryBytesEnvVar); v != "" {
-		if parsed, err := strconv.ParseInt(v, 10, 64); err == nil && parsed > 0 {
-			memoryBytes = parsed
-		}
-	}
-	cores := defaultCPUCores
-	if v := os.Getenv(cpuCoresEnvVar); v != "" {
-		if parsed, err := strconv.ParseInt(v, 10, 64); err == nil && parsed > 0 {
-			cores = parsed
-		}
-	}
-	nanoCPUs = cores * 1_000_000_000
-	return memoryBytes, nanoCPUs
 }
 
 // pollProgressFile reads agentbox's progress.json from the bind-mounted
@@ -1283,6 +1256,12 @@ func mergeAgentResultIntoJobOutput(parameters map[string]interface{}, result age
 // shared module cache at /cache. Grouped into a struct to keep
 // createAgentboxContainer within the parameter limit.
 type agentboxSpawnSpec struct {
+	// memoryBytes overrides the agentbox memory cap for this spawn. Zero
+	// means "use the Task-Step sizing". Assistant sessions set it because
+	// they are a different workload in the same container: read-only
+	// planning that never builds, held for hours rather than minutes. See
+	// resolveSessionLimits.
+	memoryBytes int64
 	imageRef    string
 	workDirHost string
 	cacheVolume string

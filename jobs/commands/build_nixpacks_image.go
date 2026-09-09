@@ -77,6 +77,30 @@ func (b *BuildNixPacksImage) Run(parameters map[string]interface{}, logsWriter i
 		return parameters, err
 	}
 
+	// PARTIAL GAP: this build is COUNTED by admission control but is not
+	// memory-CAPPED, unlike every other container the runner spawns.
+	//
+	// nixpacks-go's BuildOptions exposes no memory or CPU fields, and it
+	// shells out to the `nixpacks` CLI binary, which runs its own
+	// `docker build` internally — there is no seam to pass --memory
+	// through. So the build itself is unbounded, and because it executes
+	// inside dockerd rather than in the runner's cgroup, nothing here can
+	// observe its usage either.
+	//
+	// Reserving the weight anyway is worth doing even without a cap. It
+	// does not stop this build from overrunning, but it does stop it
+	// running CONCURRENTLY with an agent container or another build that
+	// have already been promised that memory. Without the reservation,
+	// admission control would believe the host was free while an unbounded
+	// build was consuming it — the budget would not be authoritative and
+	// the host OOM this whole mechanism exists to prevent would stay
+	// reachable via this one path.
+	//
+	// The real fix is to stop letting nixpacks do the build:
+	// BuildOptions.Output makes it emit a Dockerfile instead of an image,
+	// which we could then build through imageBuild() in
+	// build_docker_image.go and inherit the cap too. That is a larger
+	// change, so it is called out here rather than done silently.
 	buildOptions := nixpacks.BuildOptions{
 		Path:       repoDirectoryPath,
 		Name:       dockerImageNameAndTag,
