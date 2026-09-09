@@ -206,11 +206,12 @@ func LimitsForImageBuild() (memoryBytes int64, cores int64) {
 	return memoryBytes, cores
 }
 
-// hostMemoryBytes and hostCPUCores delegate to the hostinfo package.
-// The detection lives there rather than here because the ping client
-// also needs it to report host specs to the control plane, and
-// jobs/commands already imports client — so keeping it in this package
-// would make that a cycle.
+// hostMemoryBytes and hostCPUCores delegate to the hostinfo package,
+// which the ping client also uses to report host specs to the control
+// plane. Keeping raw detection there and policy here means the client
+// depends on the facts without dragging in the sizing rules. See the
+// hostinfo package comment for why that separation is deliberate rather
+// than the import-cycle workaround it started out as.
 func hostMemoryBytes() int64 { return hostinfo.MemoryBytes() }
 
 func hostCPUCores() int64 { return hostinfo.CPUCores() }

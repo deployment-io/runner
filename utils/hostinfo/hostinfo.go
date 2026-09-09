@@ -1,11 +1,20 @@
 // Package hostinfo reports the physical resources of the machine the
 // runner is running on.
 //
-// It exists as its own package because two callers need it and they sit
-// on opposite sides of an existing import edge: jobs/commands sizes
-// containers from these numbers, and client reports them to the control
-// plane on ping. jobs/commands already imports client, so the detection
-// cannot live in either without creating a cycle.
+// It is separate from its two callers — jobs/resources sizes containers
+// from these numbers, and client reports them to the control plane on
+// ping — because facts about the machine and policy derived from them
+// are different concerns, and only the facts are wanted by both.
+//
+// Note the split is a LAYERING choice today, not a compiler constraint.
+// It began as one: the detection originally lived in jobs/commands,
+// which imports client, so the ping client could not reach it without a
+// cycle. That pressure is gone now that sizing lives in jobs/resources,
+// which imports neither client nor anything reaching it — merging the
+// two would compile. It should still not be merged: hostinfo answers
+// "what does this machine have", jobs/resources answers "who may use how
+// much of it", and keeping the second out of the client's import graph
+// is what stops sizing policy leaking into the RPC layer.
 package hostinfo
 
 import (
