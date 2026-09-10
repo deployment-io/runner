@@ -364,6 +364,17 @@ func (b *BuildStaticSite) Run(parameters map[string]interface{}, logsWriter io.W
 	// how the Buster pin surfaced, years late. Revisit before Node 22 goes
 	// end-of-life (April 2027), and check the tag still exists and is being
 	// rebuilt on Docker Hub rather than assuming it.
+	//
+	// LOAD-BEARING BEYOND THE NODE VERSION: static_site_install.go picks the
+	// install command on the assumption that this image ships (a) Yarn Classic
+	// on the PATH and (b) corepack, which is how a repo's packageManager pin
+	// and any pnpm repo get the right binary. Node bundles corepack today but
+	// has been moving to unbundle it, and a -slim or non-official base may
+	// carry neither. Changing this tag without checking both silently costs
+	// every yarn and pnpm customer their lockfile again — the exact failure
+	// mode #115 and the install step were written to end. That step tests for
+	// corepack rather than assuming it, and logs the fallback, so the loss
+	// shows up in the build log rather than in the shipped bundle.
 	imageId := "node:22-bookworm"
 
 	envVariables, err := jobs.GetParameterValue[string](parameters, parameters_enums.EnvironmentVariables)
@@ -391,9 +402,9 @@ func (b *BuildStaticSite) Run(parameters map[string]interface{}, logsWriter io.W
 	// exec mid-run.
 	defer func() { _ = removeBuildContainer(containerID) }()
 
-	// Install with whatever the repo's lockfile implies, not always npm —
-	// see static_site_install.go. Decided here, on the runner, from the
-	// cloned tree; the container only runs the result.
+	// Install with the repo's own toolchain, not always npm — see
+	// static_site_install.go. Decided here, on the runner, from the cloned
+	// tree; the container only runs the result.
 	installCommand, installReason := installCommandForRepo(repoDirectoryPath, buildCommand)
 	logInstallChoice(logsWriter, installReason)
 
@@ -402,7 +413,15 @@ func (b *BuildStaticSite) Run(parameters map[string]interface{}, logsWriter io.W
 	// error rather than tying up a runner slot indefinitely.
 	execCtx, cancelExec := context.WithTimeout(context.Background(), defaultBuildTimeout)
 	defer cancelExec()
-	err = execCommand(execCtx, containerID, repoDirectoryPath, []string{"bash", "-c", installCommand + ";" + buildCommand}, envVariablesSlice, logsWriter)
+	// Newline, not ";", between the two. The install command is no longer one
+	// word: it is a small shell program (a corepack test, a frozen install, a
+	// drift fallback) spanning several lines, and `;` after a multi-line block
+	// is only valid while that block happens not to end in a newline — a
+	// trailing one turns every deploy's install into `;` at the start of a
+	// line, which is a bash syntax error. A newline separator is correct
+	// whatever the block ends with. Sequencing is otherwise identical: the
+	// build still runs whether or not the install succeeded, as before.
+	err = execCommand(execCtx, containerID, repoDirectoryPath, []string{"bash", "-c", installCommand + "\n" + buildCommand}, envVariablesSlice, logsWriter)
 	if err != nil {
 		return parameters, err
 	}

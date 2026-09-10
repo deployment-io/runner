@@ -2,6 +2,7 @@ package commands
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -31,36 +32,139 @@ func writeRepo(t *testing.T, files map[string]string) string {
 	return dir
 }
 
-// TestInstallCommandForRepo pins which install a repo shape earns. The
-// npm-install fallbacks are not laziness: the build image ships neither pnpm
-// nor a Berry-capable yarn, so for those shapes npm is the only thing that
-// produces a working tree, and failing instead would break deploys that
-// currently succeed.
-func TestInstallCommandForRepo(t *testing.T) {
+// TestInstallPlanForRepo pins which install a repo shape earns: the manager,
+// the frozen flag, and whether a corepack shim has to be enabled first.
+//
+// The frozen command is asserted per case rather than derived, because the
+// per-manager flags are the thing most likely to be "fixed" into each other by
+// someone working from memory — Yarn Classic accepts Berry's `--immutable`
+// without complaint and installs permissively anyway, so a swap there fails no
+// test that only checks the exit status of a build.
+//
+// The npm-install fallbacks are not laziness: for those shapes there is no
+// binary that can read the lockfile, and failing instead would break deploys
+// that currently succeed.
+func TestInstallPlanForRepo(t *testing.T) {
 	cases := []struct {
 		name string
-		// buildCommand matters only for the PnP split; every other case is
-		// decided by the tree alone, so they leave it at the common default.
-		buildCommand string
-		files        map[string]string
-		want         string
-		wantReason   bool
+		// buildCommand matters only for the Plug'n'Play split; every other case
+		// is decided by the tree alone, so they leave it at the common default.
+		buildCommand   string
+		files          map[string]string
+		wantManager    string
+		wantFrozen     string
+		wantPermissive string
+		wantCorepack   string
+		wantReason     bool
 	}{
 		{
-			name:  "no lockfile — unchanged from before",
-			files: map[string]string{"package.json": "{}"},
-			want:  npmInstall,
+			name:           "no lockfile — nothing to freeze against",
+			files:          map[string]string{"package.json": "{}"},
+			wantManager:    "npm",
+			wantPermissive: npmInstall,
 		},
 		{
-			name:  "package-lock",
-			files: map[string]string{"package.json": "{}", "package-lock.json": "{}"},
-			want:  npmInstall,
+			name:           "package-lock",
+			files:          map[string]string{"package.json": "{}", "package-lock.json": "{}"},
+			wantManager:    "npm",
+			wantFrozen:     npmFrozen,
+			wantPermissive: npmInstall,
 		},
 		{
-			// The case that broke deployment-io/website-svc: .yarnrc
-			// redirects yarn at a vendored Berry release, so the build
-			// command runs Berry, which validates the project against
-			// yarn.lock and rejects an npm-installed tree.
+			// npm ci reads a shrinkwrap the same way, and a repo that ships one
+			// is asking for exactly this.
+			name:           "npm-shrinkwrap",
+			files:          map[string]string{"package.json": "{}", "npm-shrinkwrap.json": "{}"},
+			wantManager:    "npm",
+			wantFrozen:     npmFrozen,
+			wantPermissive: npmInstall,
+		},
+		{
+			name:           "classic lockfile — the image's yarn understands it",
+			files:          map[string]string{"yarn.lock": classicYarnLock},
+			wantManager:    "yarn",
+			wantFrozen:     yarnClassicFrozen,
+			wantPermissive: yarnInstall,
+			wantReason:     true,
+		},
+		{
+			// The pin is Classic, so the flag must stay Classic's even though
+			// corepack is now involved.
+			name: "classic lockfile pinned to a classic yarn",
+			files: map[string]string{
+				"yarn.lock":    classicYarnLock,
+				"package.json": `{"packageManager":"yarn@1.22.22"}`,
+			},
+			wantManager:    "yarn",
+			wantFrozen:     yarnClassicFrozen,
+			wantPermissive: yarnInstall,
+			wantCorepack:   "yarn",
+			wantReason:     true,
+		},
+		{
+			// The gap #115 left, and the reason this change exists: a
+			// packageManager pin with no vendored release used to fall back to
+			// npm because nothing read the field.
+			name:         "berry lockfile pinned only by packageManager",
+			buildCommand: "yarn build",
+			files: map[string]string{
+				"yarn.lock":    berryYarnLock,
+				"package.json": `{"packageManager":"yarn@4.9.4"}`,
+			},
+			wantManager:    "yarn",
+			wantFrozen:     yarnBerryFrozen,
+			wantPermissive: yarnInstall,
+			wantCorepack:   "yarn",
+			wantReason:     true,
+		},
+		{
+			// A corepack-fetched Berry is still Berry: PnP writes no
+			// node_modules, so #115's build-command split applies here too.
+			name:         "berry pinned by packageManager, PnP, non-yarn build",
+			buildCommand: "next build",
+			files: map[string]string{
+				"yarn.lock":    berryYarnLock,
+				"package.json": `{"packageManager":"yarn@4.9.4"}`,
+			},
+			wantManager:    "npm",
+			wantPermissive: npmInstall,
+			wantReason:     true,
+		},
+		{
+			name:         "berry pinned by packageManager, node-modules linker, non-yarn build",
+			buildCommand: "next build",
+			files: map[string]string{
+				"yarn.lock":    berryYarnLock,
+				"package.json": `{"packageManager":"yarn@4.9.4"}`,
+				".yarnrc.yml":  "nodeLinker: node-modules\n",
+			},
+			wantManager:    "yarn",
+			wantFrozen:     yarnBerryFrozen,
+			wantPermissive: yarnInstall,
+			wantCorepack:   "yarn",
+			wantReason:     true,
+		},
+		{
+			// A Berry binary migrates a Classic lockfile as it installs, so a
+			// frozen install would abort on a repo that is mid-migration rather
+			// than drifted. Permissive, and the log says why.
+			name:         "classic lockfile with a berry pin",
+			buildCommand: "yarn build",
+			files: map[string]string{
+				"yarn.lock":    classicYarnLock,
+				"package.json": `{"packageManager":"yarn@4.9.4"}`,
+			},
+			wantManager:    "yarn",
+			wantPermissive: yarnInstall,
+			wantCorepack:   "yarn",
+			wantReason:     true,
+		},
+		{
+			// The case that broke deployment-io/website-svc: .yarnrc redirects
+			// yarn at a vendored Berry release, so the build command runs Berry,
+			// which validates the project against yarn.lock and rejects an
+			// npm-installed tree. The release runs whatever corepack would have
+			// picked, so no shim is enabled.
 			name:         "berry lockfile with a vendored release via .yarnrc",
 			buildCommand: "yarn build",
 			files: map[string]string{
@@ -68,7 +172,10 @@ func TestInstallCommandForRepo(t *testing.T) {
 				".yarnrc":                       "yarn-path \".yarn/releases/yarn-4.9.4.cjs\"\n",
 				".yarn/releases/yarn-4.9.4.cjs": "// yarn 4\n",
 			},
-			want: "yarn install",
+			wantManager:    "yarn",
+			wantFrozen:     yarnBerryFrozen,
+			wantPermissive: yarnInstall,
+			wantReason:     true,
 		},
 		{
 			name: "berry lockfile with yarnPath in .yarnrc.yml",
@@ -77,7 +184,10 @@ func TestInstallCommandForRepo(t *testing.T) {
 				".yarnrc.yml":                   "nodeLinker: node-modules\nyarnPath: .yarn/releases/yarn-4.9.4.cjs\n",
 				".yarn/releases/yarn-4.9.4.cjs": "// yarn 4\n",
 			},
-			want: "yarn install",
+			wantManager:    "yarn",
+			wantFrozen:     yarnBerryFrozen,
+			wantPermissive: yarnInstall,
+			wantReason:     true,
 		},
 		{
 			name:         "berry lockfile with a release but no yarnPath",
@@ -86,24 +196,26 @@ func TestInstallCommandForRepo(t *testing.T) {
 				"yarn.lock":                     berryYarnLock,
 				".yarn/releases/yarn-4.9.4.cjs": "// yarn 4\n",
 			},
-			want: "yarn install",
+			wantManager:    "yarn",
+			wantFrozen:     yarnBerryFrozen,
+			wantPermissive: yarnInstall,
+			wantReason:     true,
 		},
 		{
-			// Nothing in the image can run this: Classic cannot parse a
-			// Berry lockfile. npm keeps the deploy alive, and the build
-			// command's `yarn` resolves to Classic, which runs scripts
-			// against an npm tree — which is how these repos have always
-			// built here.
-			name:       "berry lockfile, nothing pinning a berry binary",
-			files:      map[string]string{"yarn.lock": berryYarnLock, "package.json": "{}"},
-			want:       npmInstall,
-			wantReason: true,
-		},
-		{
-			name:       "yarnPath naming a file that isn't there",
-			files:      map[string]string{"yarn.lock": berryYarnLock, ".yarnrc.yml": "yarnPath: .yarn/releases/yarn-4.9.4.cjs\n"},
-			want:       npmInstall,
-			wantReason: true,
+			// A vendored release wins over a pin because it wins at runtime:
+			// the .yarnrc redirect is what the yarn on the PATH obeys.
+			name:         "vendored release outranks a conflicting packageManager pin",
+			buildCommand: "yarn build",
+			files: map[string]string{
+				"yarn.lock":                     berryYarnLock,
+				"package.json":                  `{"packageManager":"yarn@3.6.4"}`,
+				".yarnrc.yml":                   "yarnPath: .yarn/releases/yarn-4.9.4.cjs\n",
+				".yarn/releases/yarn-4.9.4.cjs": "// yarn 4\n",
+			},
+			wantManager:    "yarn",
+			wantFrozen:     yarnBerryFrozen,
+			wantPermissive: yarnInstall,
+			wantReason:     true,
 		},
 		{
 			// website-svc's shape until 2026-08-28, and the regression this
@@ -117,19 +229,35 @@ func TestInstallCommandForRepo(t *testing.T) {
 				".yarnrc":                       "yarn-path \".yarn/releases/yarn-1.22.1.js\"\n",
 				".yarn/releases/yarn-1.22.1.js": "// yarn 1\n",
 			},
-			want:       npmInstall,
-			wantReason: true,
+			wantManager:    "npm",
+			wantPermissive: npmInstall,
+			wantReason:     true,
 		},
 		{
-			// A Classic lockfile with a Classic vendored release is the
-			// consistent Yarn 1 repo — yarn reads its own lockfile fine.
-			name: "classic lockfile with a vendored classic release",
+			// A pin can be Classic too, and then it cannot read a Berry
+			// lockfile any more than the image's yarn could.
+			name: "berry lockfile pinned to a classic yarn",
 			files: map[string]string{
-				"yarn.lock":                     classicYarnLock,
-				".yarnrc":                       "yarn-path \".yarn/releases/yarn-1.22.1.js\"\n",
-				".yarn/releases/yarn-1.22.1.js": "// yarn 1\n",
+				"yarn.lock":    berryYarnLock,
+				"package.json": `{"packageManager":"yarn@1.22.22"}`,
 			},
-			want: "yarn install",
+			wantManager:    "npm",
+			wantPermissive: npmInstall,
+			wantReason:     true,
+		},
+		{
+			name:           "berry lockfile, nothing pinning a berry binary",
+			files:          map[string]string{"yarn.lock": berryYarnLock, "package.json": "{}"},
+			wantManager:    "npm",
+			wantPermissive: npmInstall,
+			wantReason:     true,
+		},
+		{
+			name:           "yarnPath naming a file that isn't there",
+			files:          map[string]string{"yarn.lock": berryYarnLock, ".yarnrc.yml": "yarnPath: .yarn/releases/yarn-4.9.4.cjs\n"},
+			wantManager:    "npm",
+			wantPermissive: npmInstall,
+			wantReason:     true,
 		},
 		{
 			// Unrecognized filename means undetermined, and undetermined must
@@ -141,57 +269,23 @@ func TestInstallCommandForRepo(t *testing.T) {
 				".yarnrc.yml":             "yarnPath: .yarn/releases/yarn.cjs\n",
 				".yarn/releases/yarn.cjs": "// yarn ?\n",
 			},
-			want:       npmInstall,
-			wantReason: true,
+			wantManager:    "npm",
+			wantPermissive: npmInstall,
+			wantReason:     true,
 		},
 		{
-			// packageManager is NOT a pin here: the build image has no enabled
-			// corepack, so nothing reads it and yarn stays Classic.
-			name: "berry lockfile with only a packageManager field",
+			// A Classic lockfile with a Classic vendored release is the
+			// consistent Yarn 1 repo — yarn reads its own lockfile fine.
+			name: "classic lockfile with a vendored classic release",
 			files: map[string]string{
-				"yarn.lock":    berryYarnLock,
-				"package.json": `{"packageManager":"yarn@4.9.4"}`,
+				"yarn.lock":                     classicYarnLock,
+				".yarnrc":                       "yarn-path \".yarn/releases/yarn-1.22.1.js\"\n",
+				".yarn/releases/yarn-1.22.1.js": "// yarn 1\n",
 			},
-			want:       npmInstall,
-			wantReason: true,
-		},
-		// Plug'n'Play is the Yarn 2+ DEFAULT — no nodeLinker means no
-		// node_modules — so which install is correct depends on how the build
-		// is invoked. Both directions are live, which is why the build command
-		// is consulted at all.
-		{
-			name:         "PnP with a yarn build command",
-			buildCommand: "yarn build",
-			files: map[string]string{
-				"yarn.lock":                     berryYarnLock,
-				".yarnrc.yml":                   "yarnPath: .yarn/releases/yarn-4.9.4.cjs\n",
-				".yarn/releases/yarn-4.9.4.cjs": "// yarn 4\n",
-			},
-			want: "yarn install",
-		},
-		{
-			// Broken by a yarn install: PnP leaves no node_modules for
-			// `next build` to resolve through. npm is what works today.
-			name:         "PnP with a non-yarn build command",
-			buildCommand: "next build",
-			files: map[string]string{
-				"yarn.lock":                     berryYarnLock,
-				".yarnrc.yml":                   "yarnPath: .yarn/releases/yarn-4.9.4.cjs\n",
-				".yarn/releases/yarn-4.9.4.cjs": "// yarn 4\n",
-			},
-			want:       npmInstall,
-			wantReason: true,
-		},
-		{
-			// node-modules linker means the tree suits any build command.
-			name:         "node-modules linker with a non-yarn build command",
-			buildCommand: "npm run build",
-			files: map[string]string{
-				"yarn.lock":                     berryYarnLock,
-				".yarnrc.yml":                   "nodeLinker: node-modules\nyarnPath: .yarn/releases/yarn-4.9.4.cjs\n",
-				".yarn/releases/yarn-4.9.4.cjs": "// yarn 4\n",
-			},
-			want: "yarn install",
+			wantManager:    "yarn",
+			wantFrozen:     yarnClassicFrozen,
+			wantPermissive: yarnInstall,
+			wantReason:     true,
 		},
 		{
 			// Chained commands still count as running through yarn.
@@ -202,42 +296,273 @@ func TestInstallCommandForRepo(t *testing.T) {
 				".yarnrc.yml":                   "yarnPath: .yarn/releases/yarn-4.9.4.cjs\n",
 				".yarn/releases/yarn-4.9.4.cjs": "// yarn 4\n",
 			},
-			want: "yarn install",
+			wantManager:    "yarn",
+			wantFrozen:     yarnBerryFrozen,
+			wantPermissive: yarnInstall,
+			wantReason:     true,
 		},
 		{
-			name:  "classic lockfile — the image's yarn understands it",
-			files: map[string]string{"yarn.lock": classicYarnLock},
-			want:  "yarn install",
+			// Berry does not read .npmrc, so a repo whose private registry
+			// lives only there installs today under npm and would fail under
+			// the Berry this change would otherwise newly select.
+			name:         "berry pin with private registry auth only in .npmrc",
+			buildCommand: "yarn build",
+			files: map[string]string{
+				"yarn.lock":    berryYarnLock,
+				"package.json": `{"packageManager":"yarn@4.9.4"}`,
+				".npmrc":       "//npm.pkg.github.com/:_authToken=${NPM_TOKEN}\n@acme:registry=https://npm.pkg.github.com\n",
+			},
+			wantManager:    "npm",
+			wantPermissive: npmInstall,
+			wantReason:     true,
 		},
 		{
-			name:       "pnpm — no pnpm in the build image",
-			files:      map[string]string{"pnpm-lock.yaml": "lockfileVersion: '9.0'\n"},
-			want:       npmInstall,
-			wantReason: true,
+			// The same repo once .yarnrc.yml carries the same settings in the
+			// form Berry reads.
+			name:         "berry pin with the registry migrated to .yarnrc.yml",
+			buildCommand: "yarn build",
+			files: map[string]string{
+				"yarn.lock":    berryYarnLock,
+				"package.json": `{"packageManager":"yarn@4.9.4"}`,
+				".npmrc":       "//npm.pkg.github.com/:_authToken=${NPM_TOKEN}\n",
+				".yarnrc.yml":  "npmScopes:\n  acme:\n    npmRegistryServer: \"https://npm.pkg.github.com\"\n",
+			},
+			wantManager:    "yarn",
+			wantFrozen:     yarnBerryFrozen,
+			wantPermissive: yarnInstall,
+			wantCorepack:   "yarn",
+			wantReason:     true,
 		},
 		{
-			name:       "pnpm wins over yarn and npm, still falls back",
-			files:      map[string]string{"pnpm-lock.yaml": "x\n", "yarn.lock": classicYarnLock, "package-lock.json": "{}"},
-			want:       npmInstall,
-			wantReason: true,
+			// An .npmrc of ordinary knobs is not registry configuration and
+			// must not cost the repo its yarn install.
+			name:         "berry pin with a harmless .npmrc",
+			buildCommand: "yarn build",
+			files: map[string]string{
+				"yarn.lock":    berryYarnLock,
+				"package.json": `{"packageManager":"yarn@4.9.4"}`,
+				".npmrc":       "# our defaults\nengine-strict=true\nsave-exact=true\nregistry=https://registry.npmjs.org/\n",
+			},
+			wantManager:    "yarn",
+			wantFrozen:     yarnBerryFrozen,
+			wantPermissive: yarnInstall,
+			wantCorepack:   "yarn",
+			wantReason:     true,
 		},
 		{
-			name:  "yarn wins over npm",
-			files: map[string]string{"yarn.lock": classicYarnLock, "package-lock.json": "{}"},
-			want:  "yarn install",
+			// The .npmrc guard covers repos this change newly routes into
+			// Berry. A repo that already ran Berry through a vendored release
+			// is not one of them, and quietly demoting it to npm would be this
+			// change breaking a working deploy.
+			name:         "vendored berry release with auth only in .npmrc is left alone",
+			buildCommand: "yarn build",
+			files: map[string]string{
+				"yarn.lock":                     berryYarnLock,
+				".yarnrc":                       "yarn-path \".yarn/releases/yarn-4.9.4.cjs\"\n",
+				".yarn/releases/yarn-4.9.4.cjs": "// yarn 4\n",
+				".npmrc":                        "//npm.pkg.github.com/:_authToken=${NPM_TOKEN}\n",
+			},
+			wantManager:    "yarn",
+			wantFrozen:     yarnBerryFrozen,
+			wantPermissive: yarnInstall,
+			wantReason:     true,
+		},
+		{
+			// The other half of the change: pnpm now actually runs.
+			name:           "pnpm",
+			files:          map[string]string{"pnpm-lock.yaml": "lockfileVersion: '9.0'\n"},
+			wantManager:    "pnpm",
+			wantFrozen:     pnpmFrozen,
+			wantPermissive: pnpmInstall,
+			wantCorepack:   "pnpm",
+			wantReason:     true,
+		},
+		{
+			name: "pnpm pinned by packageManager",
+			files: map[string]string{
+				"pnpm-lock.yaml": "lockfileVersion: '9.0'\n",
+				"package.json":   `{"packageManager":"pnpm@10.4.1+sha512.abc123"}`,
+			},
+			wantManager:    "pnpm",
+			wantFrozen:     pnpmFrozen,
+			wantPermissive: pnpmInstall,
+			wantCorepack:   "pnpm",
+			wantReason:     true,
+		},
+		{
+			// Corepack refuses to run pnpm in a project pinned to yarn, so
+			// there is no pnpm to be had and npm keeps the deploy alive.
+			name: "pnpm lockfile in a repo pinned to yarn",
+			files: map[string]string{
+				"pnpm-lock.yaml": "lockfileVersion: '9.0'\n",
+				"package.json":   `{"packageManager":"yarn@4.9.4"}`,
+			},
+			wantManager:    "npm",
+			wantPermissive: npmInstall,
+			wantReason:     true,
+		},
+		{
+			name:           "pnpm wins over yarn and npm",
+			files:          map[string]string{"pnpm-lock.yaml": "x\n", "yarn.lock": classicYarnLock, "package-lock.json": "{}"},
+			wantManager:    "pnpm",
+			wantFrozen:     pnpmFrozen,
+			wantPermissive: pnpmInstall,
+			wantCorepack:   "pnpm",
+			wantReason:     true,
+		},
+		{
+			name:           "yarn wins over npm",
+			files:          map[string]string{"yarn.lock": classicYarnLock, "package-lock.json": "{}"},
+			wantManager:    "yarn",
+			wantFrozen:     yarnClassicFrozen,
+			wantPermissive: yarnInstall,
+			wantReason:     true,
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, reason := installCommandForRepo(writeRepo(t, tc.files), tc.buildCommand)
-			if got != tc.want {
-				t.Errorf("install command = %q, want %q", got, tc.want)
+			p := planInstall(writeRepo(t, tc.files), tc.buildCommand)
+			if p.manager != tc.wantManager {
+				t.Errorf("manager = %q, want %q", p.manager, tc.wantManager)
 			}
-			if tc.wantReason && reason == "" {
-				t.Error("a fallback must say why in the build log — the deploy " +
-					"succeeds but the lockfile is being ignored, and silence hides that")
+			if p.frozen != tc.wantFrozen {
+				t.Errorf("frozen install = %q, want %q", p.frozen, tc.wantFrozen)
+			}
+			if p.permissive != tc.wantPermissive {
+				t.Errorf("permissive install = %q, want %q", p.permissive, tc.wantPermissive)
+			}
+			if p.corepack != tc.wantCorepack {
+				t.Errorf("corepack shim = %q, want %q", p.corepack, tc.wantCorepack)
+			}
+			if tc.wantReason && p.reason == "" {
+				t.Error("this shape must say what it chose in the build log — a deploy " +
+					"that succeeds while ignoring a lockfile is the failure mode that hid all of this")
+			}
+			if !tc.wantReason && p.reason != "" {
+				t.Errorf("the ordinary npm repo gained narration it never had: %q", p.reason)
+			}
+			if p.frozen != "" && p.drift == "" {
+				t.Error("a frozen install with no drift marker cannot tell a stale lockfile " +
+					"from a real failure, which is the whole basis of the fallback")
 			}
 		})
+	}
+}
+
+// The frozen install must fall back ONLY on lockfile drift. Every other
+// failure has to stay failed: a permissive retry that "recovers" from a
+// network blip or a broken postinstall is how a broken install becomes a
+// silent one again.
+func TestFrozenInstallFallsBackOnDriftAndNothingElse(t *testing.T) {
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("bash not available; the install command is bash-only by construction")
+	}
+	repo := writeRepo(t, map[string]string{"package.json": "{}", "package-lock.json": "{}"})
+	command, _ := installCommandForRepo(repo, "npm run build")
+	// Stub npm: the first call fails with the output under test, the second
+	// (the permissive fallback, if it runs) leaves a marker behind.
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "permissive-ran")
+	cases := []struct {
+		name         string
+		output       string
+		wantFallback bool
+	}{
+		{
+			name: "drift",
+			output: "npm error `npm ci` can only install packages when your package.json and package-lock.json " +
+				"or npm-shrinkwrap.json are in sync. Please update your lock file with `npm install` before continuing.",
+			wantFallback: true,
+		},
+		{name: "network failure", output: "npm error network request to https://registry.npmjs.org/lodash failed"},
+		{name: "failing postinstall", output: "npm error command sh -c node-gyp rebuild\nnpm error gyp ERR! build error"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			os.Remove(marker)
+			stub := "#!/bin/bash\nif [ \"$1\" = ci ]; then echo " + shellQuote(tc.output) + "; exit 1; fi\ntouch " + marker + "\n"
+			if err := os.WriteFile(filepath.Join(dir, "npm"), []byte(stub), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			cmd := exec.Command(bash, "-c", command)
+			cmd.Env = append(os.Environ(), "PATH="+dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("install command exited %v; output:\n%s", err, out)
+			}
+			_, statErr := os.Stat(marker)
+			if ranFallback := statErr == nil; ranFallback != tc.wantFallback {
+				t.Errorf("permissive fallback ran = %v, want %v; output:\n%s", ranFallback, tc.wantFallback, out)
+			}
+			if tc.wantFallback && !strings.Contains(string(out), "NOT reproducible") {
+				t.Errorf("the drift fallback must be loud about what it did; got:\n%s", out)
+			}
+		})
+	}
+}
+
+// Every install command is a shell program now, and a syntax error in one is a
+// syntax error in every deploy of that shape. `bash -n` on the exact string
+// build_static_site.go hands the container — install, newline, build command —
+// is the cheapest way to keep that from shipping.
+func TestInstallCommandIsValidShell(t *testing.T) {
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("bash not available; the install command is bash-only by construction")
+	}
+	repos := map[string]map[string]string{
+		"npm":              {"package.json": "{}"},
+		"npm with lock":    {"package.json": "{}", "package-lock.json": "{}"},
+		"yarn classic":     {"yarn.lock": classicYarnLock},
+		"yarn berry pin":   {"yarn.lock": berryYarnLock, "package.json": `{"packageManager":"yarn@4.9.4"}`},
+		"yarn classic pin": {"yarn.lock": classicYarnLock, "package.json": `{"packageManager":"yarn@1.22.22"}`},
+		"pnpm":             {"pnpm-lock.yaml": "lockfileVersion: '9.0'\n"},
+	}
+	for name, files := range repos {
+		t.Run(name, func(t *testing.T) {
+			command, _ := installCommandForRepo(writeRepo(t, files), "yarn build")
+			full := command + "\n" + "next build && echo done"
+			cmd := exec.Command(bash, "-n")
+			cmd.Stdin = strings.NewReader(full)
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Errorf("bash rejected the install command: %v\n%s\n--- command ---\n%s", err, out, full)
+			}
+		})
+	}
+}
+
+// A corepack path must degrade rather than explode: if the image has no
+// corepack, or nowhere writable to put a shim, the deploy falls back to what it
+// did before corepack existed and says so in the log.
+func TestCorepackFallbackWhenTheImageHasNone(t *testing.T) {
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("bash not available; the install command is bash-only by construction")
+	}
+	repo := writeRepo(t, map[string]string{"pnpm-lock.yaml": "lockfileVersion: '9.0'\n"})
+	command, _ := installCommandForRepo(repo, "next build")
+	dir := t.TempDir()
+	// A corepack that cannot enable anything (read-only install dir, or no
+	// corepack at all, both land here) and an npm that records that it ran.
+	if err := os.WriteFile(filepath.Join(dir, "corepack"), []byte("#!/bin/bash\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(dir, "npm-ran")
+	if err := os.WriteFile(filepath.Join(dir, "npm"), []byte("#!/bin/bash\ntouch "+marker+"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(bash, "-c", command)
+	cmd.Env = append(os.Environ(), "PATH="+dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("install command exited %v; output:\n%s", err, out)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Errorf("npm did not run as the no-corepack fallback; output:\n%s", out)
+	}
+	if !strings.Contains(string(out), "corepack is not available") {
+		t.Errorf("losing corepack must be loud, not silent; output:\n%s", out)
 	}
 }
 
@@ -248,6 +573,37 @@ func TestInstallChoiceIsSilentForThePlainCase(t *testing.T) {
 	logInstallChoice(&buf, reason)
 	if buf.String() != "" {
 		t.Errorf("plain npm repo logged %q, want nothing", buf.String())
+	}
+}
+
+// packageManager is what corepack reads, so misreading it selects the wrong
+// binary — or, for a hash-suffixed pin, no binary at all.
+func TestPackageManagerPin(t *testing.T) {
+	cases := []struct {
+		name             string
+		files            map[string]string
+		manager, version string
+	}{
+		{"yarn", map[string]string{"package.json": `{"packageManager":"yarn@4.9.4"}`}, "yarn", "4.9.4"},
+		{
+			"with corepack's integrity suffix",
+			map[string]string{"package.json": `{"packageManager":"pnpm@10.4.1+sha512.deadbeef"}`},
+			"pnpm", "10.4.1",
+		},
+		{"npm", map[string]string{"package.json": `{"packageManager":"npm@10.9.0"}`}, "npm", "10.9.0"},
+		{"absent", map[string]string{"package.json": `{"name":"site"}`}, "", ""},
+		{"no package.json", map[string]string{}, "", ""},
+		{"malformed json", map[string]string{"package.json": "{not json"}, "", ""},
+		{"no version", map[string]string{"package.json": `{"packageManager":"yarn"}`}, "", ""},
+		{"a manager corepack does not proxy", map[string]string{"package.json": `{"packageManager":"bun@1.1.0"}`}, "", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			manager, version := packageManagerPin(writeRepo(t, tc.files))
+			if manager != tc.manager || version != tc.version {
+				t.Errorf("packageManagerPin() = (%q, %q), want (%q, %q)", manager, version, tc.manager, tc.version)
+			}
+		})
 	}
 }
 
