@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -128,5 +129,43 @@ func TestPlanModePromptMentionsUploadsAndUntrustedAttachments(t *testing.T) {
 		if !strings.Contains(planModePrompt, want) {
 			t.Errorf("planModePrompt missing %q", want)
 		}
+	}
+}
+
+func TestInputPump_TracksDeliveredIDsAtWatermark(t *testing.T) {
+	ip, _ := newTestPump(t)
+	msg := func(id string, ts int64) sessions.UserMessageDtoV1 {
+		return sessions.UserMessageDtoV1{ID: id, Ts: ts, Content: id}
+	}
+	if !ip.deliver(msg("a", 10)) {
+		t.Fatal("deliver a")
+	}
+	if ip.afterTs != 10 || !reflect.DeepEqual(ip.deliveredAtAfterTs, []string{"a"}) {
+		t.Fatalf("after a: afterTs=%d delivered=%v", ip.afterTs, ip.deliveredAtAfterTs)
+	}
+	// a same-second sibling accumulates at the same watermark
+	if !ip.deliver(msg("b", 10)) {
+		t.Fatal("deliver b")
+	}
+	if ip.afterTs != 10 || !reflect.DeepEqual(ip.deliveredAtAfterTs, []string{"a", "b"}) {
+		t.Fatalf("after b: afterTs=%d delivered=%v", ip.afterTs, ip.deliveredAtAfterTs)
+	}
+	// a later second moves the watermark and resets the list
+	if !ip.deliver(msg("c", 11)) {
+		t.Fatal("deliver c")
+	}
+	if ip.afterTs != 11 || !reflect.DeepEqual(ip.deliveredAtAfterTs, []string{"c"}) {
+		t.Fatalf("after c: afterTs=%d delivered=%v", ip.afterTs, ip.deliveredAtAfterTs)
+	}
+	// a failed delivery changes nothing
+	ip.uploadsDir = filepath.Join(ip.uploadsDir, "nope")
+	_ = os.WriteFile(ip.uploadsDir, []byte("file"), 0644)
+	bad := msg("d", 12)
+	bad.Attachments = []sessions.SessionAttachmentDtoV1{{Name: "x", Path: "x.txt", Content: "y"}}
+	if ip.deliver(bad) {
+		t.Fatal("expected failure")
+	}
+	if ip.afterTs != 11 || !reflect.DeepEqual(ip.deliveredAtAfterTs, []string{"c"}) {
+		t.Fatalf("failed delivery moved state: afterTs=%d delivered=%v", ip.afterTs, ip.deliveredAtAfterTs)
 	}
 }

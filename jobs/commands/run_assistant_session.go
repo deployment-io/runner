@@ -457,12 +457,16 @@ type inputPump struct {
 	orgID, jobID string
 	logsWriter   io.Writer
 	afterTs      int64
-	seq          int
-	seen         map[string]bool // delivered message ids — dedup the inclusive ($gte) AfterTs boundary
+	// deliveredAtAfterTs: ids delivered whose Ts == afterTs. Sent with each
+	// poll so the server can exclude them instead of re-sending the boundary
+	// turn (with its attachment text) every 750 ms. Reset when afterTs moves.
+	deliveredAtAfterTs []string
+	seq                int
+	seen               map[string]bool // delivered message ids — dedup as a second line of defense
 }
 
 func (ip *inputPump) tick() {
-	msgs, err := runnerclient.Get().GetSessionInput(ip.jobID, ip.afterTs, ip.orgID)
+	msgs, err := runnerclient.Get().GetSessionInput(ip.jobID, ip.afterTs, ip.deliveredAtAfterTs, ip.orgID)
 	if err != nil {
 		io.WriteString(ip.logsWriter, fmt.Sprintf("session: error pulling input: %s\n", err))
 		return
@@ -484,8 +488,12 @@ func (ip *inputPump) deliver(m sessions.UserMessageDtoV1) bool {
 		return false
 	}
 	ip.seen[m.ID] = true
-	if m.Ts > ip.afterTs {
+	switch {
+	case m.Ts > ip.afterTs:
 		ip.afterTs = m.Ts
+		ip.deliveredAtAfterTs = []string{m.ID}
+	case m.Ts == ip.afterTs:
+		ip.deliveredAtAfterTs = append(ip.deliveredAtAfterTs, m.ID)
 	}
 	return true
 }
