@@ -169,3 +169,43 @@ func TestInputPump_TracksDeliveredIDsAtWatermark(t *testing.T) {
 		t.Fatalf("failed delivery moved state: afterTs=%d delivered=%v", ip.afterTs, ip.deliveredAtAfterTs)
 	}
 }
+
+func TestInputPump_BatchStopsAtFirstFailure(t *testing.T) {
+	ip, _ := newTestPump(t)
+	// M2's attachment path is a directory-as-file so its write fails.
+	blocker := filepath.Join(ip.uploadsDir, "blocked")
+	if err := os.MkdirAll(filepath.Join(blocker, "child"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	batch := []sessions.UserMessageDtoV1{
+		{ID: "m3", Ts: 3, Content: "three"},
+		{ID: "m1", Ts: 1, Content: "one"},
+		{ID: "m2", Ts: 2, Content: "two", Attachments: []sessions.SessionAttachmentDtoV1{{Name: "b", Path: "blocked", Content: "x"}}},
+	}
+	ip.deliverBatch(batch)
+	if !ip.seen["m1"] || ip.seen["m2"] || ip.seen["m3"] {
+		t.Errorf("seen = %v, want only m1", ip.seen)
+	}
+	if ip.afterTs != 1 || !reflect.DeepEqual(ip.deliveredAtAfterTs, []string{"m1"}) {
+		t.Errorf("watermark advanced past the failed turn: afterTs=%d delivered=%v", ip.afterTs, ip.deliveredAtAfterTs)
+	}
+	if entries, _ := os.ReadDir(ip.dir); len(entries) != 1 {
+		t.Errorf("only m1's record should exist: %v", entries)
+	}
+	// once the obstacle is gone the next poll picks up from m2, in order
+	if err := os.RemoveAll(blocker); err != nil {
+		t.Fatal(err)
+	}
+	ip.deliverBatch(batch)
+	if !ip.seen["m2"] || !ip.seen["m3"] || ip.afterTs != 3 {
+		t.Errorf("retry did not complete in order: seen=%v afterTs=%d", ip.seen, ip.afterTs)
+	}
+	names := []string{}
+	entries, _ := os.ReadDir(ip.dir)
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	if !reflect.DeepEqual(names, []string{"0000000001.json", "0000000002.json", "0000000003.json"}) {
+		t.Errorf("records = %v", names)
+	}
+}

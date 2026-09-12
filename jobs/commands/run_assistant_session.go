@@ -471,9 +471,19 @@ func (ip *inputPump) tick() {
 		io.WriteString(ip.logsWriter, fmt.Sprintf("session: error pulling input: %s\n", err))
 		return
 	}
+	ip.deliverBatch(msgs)
+}
+
+// deliverBatch delivers a poll's turns oldest-first and stops at the first
+// failure. Delivering the turns after a failed one would advance the
+// watermark past it — which then never comes back — and would hand the agent
+// turns out of order. The next tick re-fetches from the failed turn.
+func (ip *inputPump) deliverBatch(msgs []sessions.UserMessageDtoV1) {
 	sort.Slice(msgs, func(i, j int) bool { return msgs[i].Ts < msgs[j].Ts })
 	for _, m := range filterUndelivered(msgs, ip.seen) {
-		ip.deliver(m)
+		if !ip.deliver(m) {
+			return
+		}
 	}
 }
 
