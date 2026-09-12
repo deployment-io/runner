@@ -28,15 +28,18 @@ func (r *RunnerClient) UpdateSessionMessages(messages []sessions.AppendMessageDt
 	return nil
 }
 
-// GetSessionInput pulls the session thread's user turns newer than afterTs so
-// the runner can feed them to the live agent. Returns oldest-first.
-func (r *RunnerClient) GetSessionInput(jobID string, afterTs int64, organizationID string) ([]sessions.UserMessageDtoV1, error) {
+// GetSessionInput pulls the session thread's user turns at or after afterTs,
+// excluding deliveredAtAfterTs (the IDs already delivered at that second, so
+// the server doesn't re-send the boundary turn — and its attachment text —
+// every poll). Returns oldest-first, at most a server-side page per call.
+func (r *RunnerClient) GetSessionInput(jobID string, afterTs int64, deliveredAtAfterTs []string, organizationID string) ([]sessions.UserMessageDtoV1, error) {
 	if !r.isConnected {
 		return nil, ErrConnection
 	}
 	args := sessions.GetInputArgsV1{
-		JobID:   jobID,
-		AfterTs: afterTs,
+		JobID:              jobID,
+		AfterTs:            afterTs,
+		DeliveredAtAfterTs: deliveredAtAfterTs,
 	}
 	args.OrganizationID = r.GetComputedOrganizationID(organizationID)
 	args.Token = r.token
