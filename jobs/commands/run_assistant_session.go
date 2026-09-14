@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"github.com/deployment-io/deployment-runner/jobs/resources"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
@@ -46,8 +47,9 @@ func (rs *RunAssistantSession) SetStopSignal(stop <-chan struct{}) {
 
 const (
 	sessionPromptInContainer = agentboxWorkDirInContainer + "/.agentbox-input/system-prompt.txt"
-	// sessionUploadsDirRel is where attachment text lands, relative to the
-	// session base dir (bind-mounted as /work/uploads in the container).
+	// sessionUploadsDirRel is where attachment text and image files land,
+	// relative to the session base dir (bind-mounted as /work/uploads in the
+	// container).
 	sessionUploadsDirRel = "uploads"
 	sessionPollInterval  = 750 * time.Millisecond
 	// sessionWallClockHardCap is the runner-side backstop on a session
@@ -66,7 +68,7 @@ const (
 // in sync with agentbox/cmd/interactive-harness planModePrompt; production
 // injects it via APPEND_SYSTEM_PROMPT_FILE at spawn. Built with string
 // concatenation because the task-spec fence uses backticks.
-const planModePrompt = `You are in plan mode for one or more code repositories, each checked out as a subdirectory of your working directory. Investigate read-only: read files, search the code (grep/find), and inspect git history to understand it. Pre-built context may be available at /work/context — if present, start with index.md (its table of contents), then grep/jq only the files relevant to the outcome before exploring live (cheaper and more grounded than rediscovering); don't read large files whole. Files the user attaches to a message arrive under /work/uploads, and the message lists their paths — grep them for what matters rather than reading a whole report; a "[Page N] (...)" annotation saying no text or images were not extracted means your view of that page is incomplete: say so, don't conclude the document is silent on something that may be there. Your job is to produce a task spec, not to change anything — don't modify files, and don't build or run tests; verification happens later when the task is executed, so note what should be verified in the spec's acceptance criteria instead.
+const planModePrompt = `You are in plan mode for one or more code repositories, each checked out as a subdirectory of your working directory. Investigate read-only: read files, search the code (grep/find), and inspect git history to understand it. Pre-built context may be available at /work/context — if present, start with index.md (its table of contents), then grep/jq only the files relevant to the outcome before exploring live (cheaper and more grounded than rediscovering); don't read large files whole. Files the user attaches to a message arrive under /work/uploads, and the message lists their paths — grep them for what matters rather than reading a whole report; a "[Page N] (...)" annotation saying no text or images were not extracted means your view of that page is incomplete: say so, don't conclude the document is silent on something that may be there. Images the user attaches are shown to you directly with the message and are also saved under /work/uploads if you need to look again. Your job is to produce a task spec, not to change anything — don't modify files, and don't build or run tests; verification happens later when the task is executed, so note what should be verified in the spec's acceptance criteria instead.
 
 Each turn, judge what the user is doing:
 - Just asking a question, exploring, or discussing — answer normally and DO NOT emit a task-spec block.
@@ -530,6 +532,11 @@ func (ip *inputPump) write(m sessions.UserMessageDtoV1) error {
 		}
 	}
 	rec := map[string]any{"id": m.ID, "content": m.Content, "ts": m.Ts}
+	// Additive: only a turn that carries images gets the key, so a text-only
+	// turn is byte-for-byte the record older agentboxes already consume.
+	if images := imageRecords(m.Attachments); len(images) > 0 {
+		rec["images"] = images
+	}
 	b, err := json.Marshal(rec)
 	if err != nil {
 		return err
@@ -542,6 +549,43 @@ func (ip *inputPump) write(m sessions.UserMessageDtoV1) error {
 	return nil
 }
 
+// imageRecords describes a turn's image attachments for agentbox, which
+// attaches them to the agent's turn directly (and re-reads them from disk
+// later). Text attachments are pointed at by the turn's content and never
+// appear here; an image is the one kind that carries bytes instead of already-
+// extracted text. Paths are in-container — agentbox reads them through the
+// bind mount, not at the host location the pump wrote them to. The media type
+// is sniffed from the bytes rather than taken from the file name: the server
+// re-encodes a GIF or WebP to PNG, so the name's extension can disagree with
+// what the agent will actually decode. Pure.
+func imageRecords(atts []sessions.SessionAttachmentDtoV1) []map[string]any {
+	var out []map[string]any
+	for _, a := range atts {
+		if len(a.Bytes) == 0 {
+			continue
+		}
+		mediaType, _, _ := strings.Cut(http.DetectContentType(a.Bytes), ";")
+		if !strings.HasPrefix(mediaType, "image/") {
+			continue
+		}
+		out = append(out, map[string]any{
+			"path":      agentboxWorkDirInContainer + "/" + sessionUploadsDirRel + anchoredUploadPath(a.Path),
+			"mediaType": mediaType,
+			"width":     a.Width,
+			"height":    a.Height,
+		})
+	}
+	return out
+}
+
+// anchoredUploadPath re-anchors a server-assigned attachment path under the
+// uploads dir — it derives from a user-supplied filename, so it is never
+// trusted. Returns a leading-slash relative path ("/abc-1-shot.png"), the same
+// value writeAttachment writes to, so the record and the file always agree.
+func anchoredUploadPath(path string) string {
+	return filepath.Clean("/" + path)
+}
+
 // writeAttachment materializes one attachment under uploadsDir. Path is
 // server-assigned but derives from a user-supplied filename, so it is
 // re-anchored here (filepath.Clean("/"+Path) — the same defense
@@ -552,7 +596,7 @@ func (ip *inputPump) writeAttachment(a sessions.SessionAttachmentDtoV1) error {
 	if ip.uploadsDir == "" {
 		return fmt.Errorf("uploads dir not configured")
 	}
-	rel := filepath.Clean("/" + a.Path)
+	rel := anchoredUploadPath(a.Path)
 	if rel == "/" || rel == "." {
 		return fmt.Errorf("empty attachment path")
 	}
