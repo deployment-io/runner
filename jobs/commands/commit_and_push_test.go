@@ -2,11 +2,17 @@ package commands
 
 import (
 	"encoding/json"
+	"io"
 	"testing"
+	"time"
 
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
+	"github.com/go-git/go-billy/v5/util"
+	"github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v5/plumbing/object"
 )
 
 // TestMergeRepoOutputs_PreservesCommitSHAAcrossCommands pins the
@@ -341,4 +347,211 @@ func splitLines(s string) []string {
 		out = append(out, s[start:])
 	}
 	return out
+}
+
+// initRepoWithCommit creates a repo with one commit on master and returns it
+// with that commit's hash.
+func initRepoWithCommit(t *testing.T) (*git.Repository, *git.Worktree, plumbing.Hash) {
+	t.Helper()
+	repo, err := git.PlainInit(t.TempDir(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wt, err := repo.Worktree()
+	if err != nil {
+		t.Fatal(err)
+	}
+	commit := func(name string) plumbing.Hash {
+		if err := util.WriteFile(wt.Filesystem, name, []byte(name), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := wt.Add(name); err != nil {
+			t.Fatal(err)
+		}
+		h, err := wt.Commit(name, &git.CommitOptions{Author: &object.Signature{Name: "t", Email: "t@t", When: time.Now()}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return h
+	}
+	return repo, wt, commit("base.txt")
+}
+
+func setRemoteRef(t *testing.T, repo *git.Repository, name string, h plumbing.Hash) {
+	t.Helper()
+	if err := repo.Storer.SetReference(plumbing.NewHashReference(plumbing.NewRemoteReferenceName("origin", name), h)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// The agent may commit on the task branch itself (a task description that says
+// "open a PR" reliably produces this). A clean worktree must then still be
+// pushed, judged against origin/<task branch> when it exists and origin/<base>
+// on a first Step — and never when there is nothing to compare against.
+func TestUnpushedCommits(t *testing.T) {
+	repo, wt, base := initRepoWithCommit(t)
+	// First Step shape: task branch created locally off base; origin only has base.
+	if err := wt.Checkout(&git.CheckoutOptions{Create: true, Branch: plumbing.NewBranchReferenceName("tasks/x")}); err != nil {
+		t.Fatal(err)
+	}
+	setRemoteRef(t, repo, "master", base)
+
+	ahead, sha, err := unpushedCommits(repo, "tasks/x", "master", io.Discard)
+	if err != nil || ahead || sha != base.String() {
+		t.Fatalf("fresh task branch: ahead=%v sha=%s err=%v, want not ahead at base", ahead, sha, err)
+	}
+
+	// The agent commits.
+	if err := util.WriteFile(wt.Filesystem, "agent.txt", []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wt.Add("agent.txt"); err != nil {
+		t.Fatal(err)
+	}
+	agentCommit, err := wt.Commit("agent commit", &git.CommitOptions{Author: &object.Signature{Name: "a", Email: "a@a", When: time.Now()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ahead, sha, err = unpushedCommits(repo, "tasks/x", "master", io.Discard)
+	if err != nil || !ahead || sha != agentCommit.String() {
+		t.Fatalf("after agent commit: ahead=%v sha=%s err=%v, want ahead at the agent's commit", ahead, sha, err)
+	}
+
+	// A later Step: origin has the task branch at the agent's commit → nothing to push,
+	// even though the branch is ahead of base.
+	setRemoteRef(t, repo, "tasks/x", agentCommit)
+	ahead, _, err = unpushedCommits(repo, "tasks/x", "master", io.Discard)
+	if err != nil || ahead {
+		t.Fatalf("origin task branch at head: ahead=%v err=%v, want not ahead", ahead, err)
+	}
+
+	// No remote refs at all: nothing to compare against, so never a spurious push.
+	bare, bareWt, _ := initRepoWithCommit(t)
+	if err := bareWt.Checkout(&git.CheckoutOptions{Create: true, Branch: plumbing.NewBranchReferenceName("tasks/y")}); err != nil {
+		t.Fatal(err)
+	}
+	ahead, _, err = unpushedCommits(bare, "tasks/y", "master", io.Discard)
+	if err != nil || ahead {
+		t.Fatalf("no remote refs: ahead=%v err=%v, want not ahead", ahead, err)
+	}
+}
+
+// "Create a branch feature/x for this" makes the agent commit on a branch of
+// its own. The task branch is the only ref we push, so it must be
+// fast-forwarded to that work; a HEAD that doesn't descend from the task
+// branch must be left alone.
+func TestUnpushedCommits_ReconcilesHeadWithTaskBranch(t *testing.T) {
+	repo, wt, base := initRepoWithCommit(t)
+	setRemoteRef(t, repo, "master", base)
+	if err := wt.Checkout(&git.CheckoutOptions{Create: true, Branch: plumbing.NewBranchReferenceName("tasks/x")}); err != nil {
+		t.Fatal(err)
+	}
+	// Agent branches off the task branch and commits there.
+	if err := wt.Checkout(&git.CheckoutOptions{Create: true, Branch: plumbing.NewBranchReferenceName("feature/x")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := util.WriteFile(wt.Filesystem, "f.txt", []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wt.Add("f.txt"); err != nil {
+		t.Fatal(err)
+	}
+	featureCommit, err := wt.Commit("on feature/x", &git.CommitOptions{Author: &object.Signature{Name: "a", Email: "a@a", When: time.Now()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ahead, sha, err := unpushedCommits(repo, "tasks/x", "master", io.Discard)
+	if err != nil || !ahead || sha != featureCommit.String() {
+		t.Fatalf("feature branch off task branch: ahead=%v sha=%s err=%v, want ahead at the feature commit", ahead, sha, err)
+	}
+	taskRef, err := repo.Reference(plumbing.NewBranchReferenceName("tasks/x"), true)
+	if err != nil || taskRef.Hash() != featureCommit {
+		t.Fatalf("task branch = %v (%v), want fast-forwarded to %s", taskRef, err, featureCommit)
+	}
+
+	// HEAD on an unrelated line: a second root commit on an orphan branch.
+	if err := wt.Checkout(&git.CheckoutOptions{Create: true, Branch: plumbing.NewBranchReferenceName("orphan"), Hash: base}); err != nil {
+		t.Fatal(err)
+	}
+	if err := util.WriteFile(wt.Filesystem, "o.txt", []byte("o"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wt.Add("o.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wt.Commit("unrelated", &git.CommitOptions{Author: &object.Signature{Name: "a", Email: "a@a", When: time.Now()}}); err != nil {
+		t.Fatal(err)
+	}
+	// orphan descends from base but not from tasks/x (which is at featureCommit).
+	ahead, sha, err = unpushedCommits(repo, "tasks/x", "master", io.Discard)
+	if err != nil || !ahead || sha != featureCommit.String() {
+		t.Fatalf("unrelated HEAD: ahead=%v sha=%s err=%v, want the task branch untouched at the feature commit", ahead, sha, err)
+	}
+	taskRef, _ = repo.Reference(plumbing.NewBranchReferenceName("tasks/x"), true)
+	if taskRef.Hash() != featureCommit {
+		t.Fatalf("task branch moved to %s on an unrelated HEAD", taskRef.Hash())
+	}
+}
+
+// The clone fetches every remote branch, so a stale origin/<task branch> from
+// an abandoned earlier run can sit next to a fresh task branch that equals
+// base. That is "nothing to push", not "ahead" — pushing base onto the stale
+// ref would fail non-fast-forward where the old code cleanly skipped.
+func TestUnpushedCommits_StaleRemoteTaskBranchIsNotAhead(t *testing.T) {
+	repo, wt, base := initRepoWithCommit(t)
+	setRemoteRef(t, repo, "master", base)
+	// Stale remote task branch at some other commit.
+	if err := util.WriteFile(wt.Filesystem, "old.txt", []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wt.Add("old.txt"); err != nil {
+		t.Fatal(err)
+	}
+	stale, err := wt.Commit("abandoned run", &git.CommitOptions{Author: &object.Signature{Name: "a", Email: "a@a", When: time.Now()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	setRemoteRef(t, repo, "tasks/x", stale)
+	// Fresh first Step: task branch created off base.
+	if err := wt.Checkout(&git.CheckoutOptions{Hash: base}); err != nil {
+		t.Fatal(err)
+	}
+	if err := wt.Checkout(&git.CheckoutOptions{Create: true, Branch: plumbing.NewBranchReferenceName("tasks/x"), Hash: base}); err != nil {
+		t.Fatal(err)
+	}
+	ahead, sha, err := unpushedCommits(repo, "tasks/x", "master", io.Discard)
+	if err != nil || ahead || sha != base.String() {
+		t.Fatalf("fresh branch at base beside a stale remote task branch: ahead=%v sha=%s err=%v, want not ahead", ahead, sha, err)
+	}
+}
+
+// Dirty path: the agent switched to its own branch and left uncommitted work.
+// Our commit lands on HEAD; the task branch must follow it before the push.
+func TestReconcileTaskBranch_AfterCommitOnAgentBranch(t *testing.T) {
+	repo, wt, base := initRepoWithCommit(t)
+	setRemoteRef(t, repo, "master", base)
+	if err := wt.Checkout(&git.CheckoutOptions{Create: true, Branch: plumbing.NewBranchReferenceName("tasks/x")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := wt.Checkout(&git.CheckoutOptions{Create: true, Branch: plumbing.NewBranchReferenceName("feature/x")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := util.WriteFile(wt.Filesystem, "dirty.txt", []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := wt.AddGlob("."); err != nil {
+		t.Fatal(err)
+	}
+	ours, err := wt.Commit("ours", &git.CommitOptions{Author: &object.Signature{Name: "d", Email: "d@d", When: time.Now()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tip, err := reconcileTaskBranch(repo, "tasks/x", io.Discard)
+	if err != nil || tip != ours {
+		t.Fatalf("tip = %s err=%v, want our commit %s", tip, err, ours)
+	}
+	taskRef, _ := repo.Reference(plumbing.NewBranchReferenceName("tasks/x"), true)
+	if taskRef.Hash() != ours {
+		t.Fatalf("task branch = %s, want fast-forwarded to %s", taskRef.Hash(), ours)
+	}
 }
