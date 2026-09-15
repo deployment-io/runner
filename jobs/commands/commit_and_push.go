@@ -14,6 +14,7 @@ import (
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/config"
+	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/object"
 	"github.com/go-git/go-git/v5/plumbing/transport/http"
 )
@@ -143,8 +144,32 @@ func (tcp *taskCommitPush) commitAndPushOne(repoDir string, entry tasks.Reposito
 		return repoOutput{}, fmt.Errorf("error reading status: %s", err)
 	}
 	if status.IsClean() {
-		io.WriteString(tcp.logsWriter, fmt.Sprintf("No changes in repo %s — skipping commit/push\n", entry.Name))
-		return repoOutput{Index: idx, Name: entry.Name, HasChanges: false}, nil
+		// A clean worktree is not the same as no work: an agent told to
+		// "open a PR" runs git commit itself (push is blocked by the egress
+		// allowlist, so the commits sit on the local task branch). Push those
+		// as they are rather than reporting no changes — which used to fail
+		// the Step as "written outside the repository", the one diagnosis
+		// that was certainly wrong.
+		ahead, headSHA, err := unpushedCommits(repository, tcp.ctx.BranchName, entry.BaseBranch)
+		if err != nil {
+			return repoOutput{}, fmt.Errorf("error comparing local branch to origin: %s", err)
+		}
+		if !ahead {
+			io.WriteString(tcp.logsWriter, fmt.Sprintf("No changes in repo %s — skipping commit/push\n", entry.Name))
+			return repoOutput{Index: idx, Name: entry.Name, HasChanges: false}, nil
+		}
+		io.WriteString(tcp.logsWriter, fmt.Sprintf("Repo %s has no uncommitted changes but the agent committed on %s itself — pushing as-is\n", entry.Name, tcp.ctx.BranchName))
+		if err := tcp.pushWithRetry(repository, entry); err != nil {
+			return repoOutput{}, fmt.Errorf("error pushing: %s", err)
+		}
+		io.WriteString(tcp.logsWriter, fmt.Sprintf("Pushed %s (%s) for repo %s\n", headSHA[:7], tcp.ctx.BranchName, entry.Name))
+		return repoOutput{
+			Index:      idx,
+			Name:       entry.Name,
+			HasChanges: true,
+			CommitSHA:  headSHA,
+			Branch:     tcp.ctx.BranchName,
+		}, nil
 	}
 	if err := worktree.AddGlob("."); err != nil {
 		return repoOutput{}, fmt.Errorf("error staging changes: %s", err)
@@ -311,6 +336,28 @@ func (tcp *taskCommitPush) push(repository *git.Repository, entry tasks.Reposito
 		},
 		Progress: tcp.logsWriter,
 	})
+}
+
+// unpushedCommits reports whether the local task branch holds commits origin
+// doesn't, and returns the local head SHA. The reference point is
+// origin/<task branch> when it exists (later Steps and re-runs fetch it) and
+// origin/<base branch> otherwise (a first Step creates the task branch locally
+// off base, so any divergence from base is the agent's). With neither remote
+// ref present there is nothing to compare against, and the answer is "no" —
+// the pre-existing behaviour, never a spurious push.
+func unpushedCommits(repository *git.Repository, branchName, baseBranch string) (bool, string, error) {
+	head, err := repository.Head()
+	if err != nil {
+		return false, "", fmt.Errorf("error reading HEAD: %s", err)
+	}
+	for _, name := range []string{branchName, baseBranch} {
+		ref, err := repository.Reference(plumbing.NewRemoteReferenceName("origin", name), true)
+		if err != nil {
+			continue
+		}
+		return ref.Hash() != head.Hash(), head.Hash().String(), nil
+	}
+	return false, head.Hash().String(), nil
 }
 
 // repoOutput is one entry in the JobOutput repositories block.
