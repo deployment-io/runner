@@ -492,3 +492,66 @@ func TestUnpushedCommits_ReconcilesHeadWithTaskBranch(t *testing.T) {
 		t.Fatalf("task branch moved to %s on an unrelated HEAD", taskRef.Hash())
 	}
 }
+
+// The clone fetches every remote branch, so a stale origin/<task branch> from
+// an abandoned earlier run can sit next to a fresh task branch that equals
+// base. That is "nothing to push", not "ahead" — pushing base onto the stale
+// ref would fail non-fast-forward where the old code cleanly skipped.
+func TestUnpushedCommits_StaleRemoteTaskBranchIsNotAhead(t *testing.T) {
+	repo, wt, base := initRepoWithCommit(t)
+	setRemoteRef(t, repo, "master", base)
+	// Stale remote task branch at some other commit.
+	if err := util.WriteFile(wt.Filesystem, "old.txt", []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wt.Add("old.txt"); err != nil {
+		t.Fatal(err)
+	}
+	stale, err := wt.Commit("abandoned run", &git.CommitOptions{Author: &object.Signature{Name: "a", Email: "a@a", When: time.Now()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	setRemoteRef(t, repo, "tasks/x", stale)
+	// Fresh first Step: task branch created off base.
+	if err := wt.Checkout(&git.CheckoutOptions{Hash: base}); err != nil {
+		t.Fatal(err)
+	}
+	if err := wt.Checkout(&git.CheckoutOptions{Create: true, Branch: plumbing.NewBranchReferenceName("tasks/x"), Hash: base}); err != nil {
+		t.Fatal(err)
+	}
+	ahead, sha, err := unpushedCommits(repo, "tasks/x", "master", io.Discard)
+	if err != nil || ahead || sha != base.String() {
+		t.Fatalf("fresh branch at base beside a stale remote task branch: ahead=%v sha=%s err=%v, want not ahead", ahead, sha, err)
+	}
+}
+
+// Dirty path: the agent switched to its own branch and left uncommitted work.
+// Our commit lands on HEAD; the task branch must follow it before the push.
+func TestReconcileTaskBranch_AfterCommitOnAgentBranch(t *testing.T) {
+	repo, wt, base := initRepoWithCommit(t)
+	setRemoteRef(t, repo, "master", base)
+	if err := wt.Checkout(&git.CheckoutOptions{Create: true, Branch: plumbing.NewBranchReferenceName("tasks/x")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := wt.Checkout(&git.CheckoutOptions{Create: true, Branch: plumbing.NewBranchReferenceName("feature/x")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := util.WriteFile(wt.Filesystem, "dirty.txt", []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := wt.AddGlob("."); err != nil {
+		t.Fatal(err)
+	}
+	ours, err := wt.Commit("ours", &git.CommitOptions{Author: &object.Signature{Name: "d", Email: "d@d", When: time.Now()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tip, err := reconcileTaskBranch(repo, "tasks/x", io.Discard)
+	if err != nil || tip != ours {
+		t.Fatalf("tip = %s err=%v, want our commit %s", tip, err, ours)
+	}
+	taskRef, _ := repo.Reference(plumbing.NewBranchReferenceName("tasks/x"), true)
+	if taskRef.Hash() != ours {
+		t.Fatalf("task branch = %s, want fast-forwarded to %s", taskRef.Hash(), ours)
+	}
+}

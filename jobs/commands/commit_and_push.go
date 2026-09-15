@@ -178,6 +178,13 @@ func (tcp *taskCommitPush) commitAndPushOne(repoDir string, entry tasks.Reposito
 	if err != nil {
 		return repoOutput{}, err
 	}
+	// The commit landed on HEAD, which is the task branch unless the agent
+	// switched branches; either way the task branch is what gets pushed.
+	if tip, err := reconcileTaskBranch(repository, tcp.ctx.BranchName, tcp.logsWriter); err != nil {
+		return repoOutput{}, err
+	} else {
+		commitSHA = tip.String()
+	}
 	if err := tcp.pushWithRetry(repository, entry); err != nil {
 		return repoOutput{}, fmt.Errorf("error pushing: %s", err)
 	}
@@ -338,53 +345,71 @@ func (tcp *taskCommitPush) push(repository *git.Repository, entry tasks.Reposito
 	})
 }
 
-// unpushedCommits reports whether the task branch holds commits origin
-// doesn't, and returns the task branch's SHA. Before comparing it reconciles
-// HEAD with the task branch: an agent told to "create a branch feature/x"
-// commits on that branch, so HEAD descends from the task branch but the task
-// branch ref — the only ref we push — never moved. Fast-forward it to HEAD in
-// that case. A HEAD that is not a descendant (the agent checked out something
-// unrelated) is left alone and logged; only the task branch is ever pushed.
-//
-// The remote reference point is origin/<task branch> when it exists (later
-// Steps and re-runs fetch it) and origin/<base branch> otherwise (a first Step
-// creates the task branch locally off base, so any divergence from base is the
-// agent's). With neither present there is nothing to compare against, and the
-// answer is "no" — never a spurious push.
-func unpushedCommits(repository *git.Repository, branchName, baseBranch string, logsWriter io.Writer) (bool, string, error) {
+// reconcileTaskBranch makes refs/heads/<task branch> — the only ref we ever
+// push — point at the agent's work, and returns its tip. An agent told to
+// "create a branch feature/x" commits on that branch, so HEAD descends from
+// the task branch but the task branch never moved; fast-forward it to HEAD.
+// A HEAD that does not descend from the task branch (the agent checked out
+// something unrelated) is left alone and logged.
+func reconcileTaskBranch(repository *git.Repository, branchName string, logsWriter io.Writer) (plumbing.Hash, error) {
 	taskRefName := plumbing.NewBranchReferenceName(branchName)
 	taskRef, err := repository.Reference(taskRefName, true)
 	if err != nil {
-		return false, "", fmt.Errorf("error reading task branch %s: %s", branchName, err)
+		return plumbing.ZeroHash, fmt.Errorf("error reading task branch %s: %s", branchName, err)
 	}
 	head, err := repository.Head()
 	if err != nil {
-		return false, "", fmt.Errorf("error reading HEAD: %s", err)
+		return plumbing.ZeroHash, fmt.Errorf("error reading HEAD: %s", err)
 	}
 	tip := taskRef.Hash()
-	if head.Hash() != tip {
-		descends, err := isAncestor(repository, tip, head.Hash())
-		if err != nil {
-			return false, "", err
-		}
-		if descends {
-			if err := repository.Storer.SetReference(plumbing.NewHashReference(taskRefName, head.Hash())); err != nil {
-				return false, "", fmt.Errorf("error fast-forwarding task branch %s: %s", branchName, err)
-			}
-			io.WriteString(logsWriter, fmt.Sprintf("HEAD (%s) moved off the task branch but descends from it — fast-forwarded %s to %s\n", head.Name().Short(), branchName, head.Hash().String()[:7]))
-			tip = head.Hash()
-		} else {
-			io.WriteString(logsWriter, fmt.Sprintf("HEAD (%s at %s) is not on the task branch and does not descend from it — only %s is pushed\n", head.Name().Short(), head.Hash().String()[:7], branchName))
-		}
+	if head.Hash() == tip {
+		return tip, nil
 	}
+	descends, err := isAncestor(repository, tip, head.Hash())
+	if err != nil {
+		return plumbing.ZeroHash, err
+	}
+	if !descends {
+		io.WriteString(logsWriter, fmt.Sprintf("HEAD (%s at %s) is not on the task branch and does not descend from it — only %s is pushed\n", head.Name().Short(), head.Hash().String()[:7], branchName))
+		return tip, nil
+	}
+	if err := repository.Storer.SetReference(plumbing.NewHashReference(taskRefName, head.Hash())); err != nil {
+		return plumbing.ZeroHash, fmt.Errorf("error fast-forwarding task branch %s: %s", branchName, err)
+	}
+	io.WriteString(logsWriter, fmt.Sprintf("HEAD (%s) moved off the task branch but descends from it — fast-forwarded %s to %s\n", head.Name().Short(), branchName, head.Hash().String()[:7]))
+	return head.Hash(), nil
+}
+
+// unpushedCommits reports whether the task branch holds commits origin
+// doesn't, after reconcileTaskBranch, and returns the task branch's SHA.
+//
+// The tip is "already on origin" if it equals ANY remote reference point that
+// exists: origin/<task branch> (later Steps and re-runs fetch it) or
+// origin/<base branch> (a first Step creates the task branch locally off base).
+// Both are checked, not the first found: the clone fetches every remote
+// branch, so a stale origin/<task branch> from an earlier, abandoned run can
+// sit next to a fresh task branch that still equals base — comparing against
+// the stale ref alone would call that "ahead" and push base onto it
+// (non-fast-forward, Step fails) where the right answer is "nothing to push".
+// With no remote reference point at all the answer is "no" — never a spurious
+// push.
+func unpushedCommits(repository *git.Repository, branchName, baseBranch string, logsWriter io.Writer) (bool, string, error) {
+	tip, err := reconcileTaskBranch(repository, branchName, logsWriter)
+	if err != nil {
+		return false, "", err
+	}
+	found := false
 	for _, name := range []string{branchName, baseBranch} {
 		ref, err := repository.Reference(plumbing.NewRemoteReferenceName("origin", name), true)
 		if err != nil {
 			continue
 		}
-		return ref.Hash() != tip, tip.String(), nil
+		found = true
+		if ref.Hash() == tip {
+			return false, tip.String(), nil
+		}
 	}
-	return false, tip.String(), nil
+	return found, tip.String(), nil
 }
 
 // isAncestor reports whether commit a is an ancestor of (or equal to) commit b.
