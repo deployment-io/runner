@@ -150,7 +150,7 @@ func (tcp *taskCommitPush) commitAndPushOne(repoDir string, entry tasks.Reposito
 		// as they are rather than reporting no changes — which used to fail
 		// the Step as "written outside the repository", the one diagnosis
 		// that was certainly wrong.
-		ahead, headSHA, err := unpushedCommits(repository, tcp.ctx.BranchName, entry.BaseBranch)
+		ahead, headSHA, err := unpushedCommits(repository, tcp.ctx.BranchName, entry.BaseBranch, tcp.logsWriter)
 		if err != nil {
 			return repoOutput{}, fmt.Errorf("error comparing local branch to origin: %s", err)
 		}
@@ -338,26 +338,66 @@ func (tcp *taskCommitPush) push(repository *git.Repository, entry tasks.Reposito
 	})
 }
 
-// unpushedCommits reports whether the local task branch holds commits origin
-// doesn't, and returns the local head SHA. The reference point is
-// origin/<task branch> when it exists (later Steps and re-runs fetch it) and
-// origin/<base branch> otherwise (a first Step creates the task branch locally
-// off base, so any divergence from base is the agent's). With neither remote
-// ref present there is nothing to compare against, and the answer is "no" —
-// the pre-existing behaviour, never a spurious push.
-func unpushedCommits(repository *git.Repository, branchName, baseBranch string) (bool, string, error) {
+// unpushedCommits reports whether the task branch holds commits origin
+// doesn't, and returns the task branch's SHA. Before comparing it reconciles
+// HEAD with the task branch: an agent told to "create a branch feature/x"
+// commits on that branch, so HEAD descends from the task branch but the task
+// branch ref — the only ref we push — never moved. Fast-forward it to HEAD in
+// that case. A HEAD that is not a descendant (the agent checked out something
+// unrelated) is left alone and logged; only the task branch is ever pushed.
+//
+// The remote reference point is origin/<task branch> when it exists (later
+// Steps and re-runs fetch it) and origin/<base branch> otherwise (a first Step
+// creates the task branch locally off base, so any divergence from base is the
+// agent's). With neither present there is nothing to compare against, and the
+// answer is "no" — never a spurious push.
+func unpushedCommits(repository *git.Repository, branchName, baseBranch string, logsWriter io.Writer) (bool, string, error) {
+	taskRefName := plumbing.NewBranchReferenceName(branchName)
+	taskRef, err := repository.Reference(taskRefName, true)
+	if err != nil {
+		return false, "", fmt.Errorf("error reading task branch %s: %s", branchName, err)
+	}
 	head, err := repository.Head()
 	if err != nil {
 		return false, "", fmt.Errorf("error reading HEAD: %s", err)
+	}
+	tip := taskRef.Hash()
+	if head.Hash() != tip {
+		descends, err := isAncestor(repository, tip, head.Hash())
+		if err != nil {
+			return false, "", err
+		}
+		if descends {
+			if err := repository.Storer.SetReference(plumbing.NewHashReference(taskRefName, head.Hash())); err != nil {
+				return false, "", fmt.Errorf("error fast-forwarding task branch %s: %s", branchName, err)
+			}
+			io.WriteString(logsWriter, fmt.Sprintf("HEAD (%s) moved off the task branch but descends from it — fast-forwarded %s to %s\n", head.Name().Short(), branchName, head.Hash().String()[:7]))
+			tip = head.Hash()
+		} else {
+			io.WriteString(logsWriter, fmt.Sprintf("HEAD (%s at %s) is not on the task branch and does not descend from it — only %s is pushed\n", head.Name().Short(), head.Hash().String()[:7], branchName))
+		}
 	}
 	for _, name := range []string{branchName, baseBranch} {
 		ref, err := repository.Reference(plumbing.NewRemoteReferenceName("origin", name), true)
 		if err != nil {
 			continue
 		}
-		return ref.Hash() != head.Hash(), head.Hash().String(), nil
+		return ref.Hash() != tip, tip.String(), nil
 	}
-	return false, head.Hash().String(), nil
+	return false, tip.String(), nil
+}
+
+// isAncestor reports whether commit a is an ancestor of (or equal to) commit b.
+func isAncestor(repository *git.Repository, a, b plumbing.Hash) (bool, error) {
+	ca, err := repository.CommitObject(a)
+	if err != nil {
+		return false, fmt.Errorf("error reading commit %s: %s", a.String()[:7], err)
+	}
+	cb, err := repository.CommitObject(b)
+	if err != nil {
+		return false, fmt.Errorf("error reading commit %s: %s", b.String()[:7], err)
+	}
+	return ca.IsAncestor(cb)
 }
 
 // repoOutput is one entry in the JobOutput repositories block.

@@ -2,6 +2,7 @@ package commands
 
 import (
 	"encoding/json"
+	"io"
 	"testing"
 	"time"
 
@@ -395,7 +396,7 @@ func TestUnpushedCommits(t *testing.T) {
 	}
 	setRemoteRef(t, repo, "master", base)
 
-	ahead, sha, err := unpushedCommits(repo, "tasks/x", "master")
+	ahead, sha, err := unpushedCommits(repo, "tasks/x", "master", io.Discard)
 	if err != nil || ahead || sha != base.String() {
 		t.Fatalf("fresh task branch: ahead=%v sha=%s err=%v, want not ahead at base", ahead, sha, err)
 	}
@@ -411,7 +412,7 @@ func TestUnpushedCommits(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ahead, sha, err = unpushedCommits(repo, "tasks/x", "master")
+	ahead, sha, err = unpushedCommits(repo, "tasks/x", "master", io.Discard)
 	if err != nil || !ahead || sha != agentCommit.String() {
 		t.Fatalf("after agent commit: ahead=%v sha=%s err=%v, want ahead at the agent's commit", ahead, sha, err)
 	}
@@ -419,7 +420,7 @@ func TestUnpushedCommits(t *testing.T) {
 	// A later Step: origin has the task branch at the agent's commit → nothing to push,
 	// even though the branch is ahead of base.
 	setRemoteRef(t, repo, "tasks/x", agentCommit)
-	ahead, _, err = unpushedCommits(repo, "tasks/x", "master")
+	ahead, _, err = unpushedCommits(repo, "tasks/x", "master", io.Discard)
 	if err != nil || ahead {
 		t.Fatalf("origin task branch at head: ahead=%v err=%v, want not ahead", ahead, err)
 	}
@@ -429,8 +430,65 @@ func TestUnpushedCommits(t *testing.T) {
 	if err := bareWt.Checkout(&git.CheckoutOptions{Create: true, Branch: plumbing.NewBranchReferenceName("tasks/y")}); err != nil {
 		t.Fatal(err)
 	}
-	ahead, _, err = unpushedCommits(bare, "tasks/y", "master")
+	ahead, _, err = unpushedCommits(bare, "tasks/y", "master", io.Discard)
 	if err != nil || ahead {
 		t.Fatalf("no remote refs: ahead=%v err=%v, want not ahead", ahead, err)
+	}
+}
+
+// "Create a branch feature/x for this" makes the agent commit on a branch of
+// its own. The task branch is the only ref we push, so it must be
+// fast-forwarded to that work; a HEAD that doesn't descend from the task
+// branch must be left alone.
+func TestUnpushedCommits_ReconcilesHeadWithTaskBranch(t *testing.T) {
+	repo, wt, base := initRepoWithCommit(t)
+	setRemoteRef(t, repo, "master", base)
+	if err := wt.Checkout(&git.CheckoutOptions{Create: true, Branch: plumbing.NewBranchReferenceName("tasks/x")}); err != nil {
+		t.Fatal(err)
+	}
+	// Agent branches off the task branch and commits there.
+	if err := wt.Checkout(&git.CheckoutOptions{Create: true, Branch: plumbing.NewBranchReferenceName("feature/x")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := util.WriteFile(wt.Filesystem, "f.txt", []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wt.Add("f.txt"); err != nil {
+		t.Fatal(err)
+	}
+	featureCommit, err := wt.Commit("on feature/x", &git.CommitOptions{Author: &object.Signature{Name: "a", Email: "a@a", When: time.Now()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ahead, sha, err := unpushedCommits(repo, "tasks/x", "master", io.Discard)
+	if err != nil || !ahead || sha != featureCommit.String() {
+		t.Fatalf("feature branch off task branch: ahead=%v sha=%s err=%v, want ahead at the feature commit", ahead, sha, err)
+	}
+	taskRef, err := repo.Reference(plumbing.NewBranchReferenceName("tasks/x"), true)
+	if err != nil || taskRef.Hash() != featureCommit {
+		t.Fatalf("task branch = %v (%v), want fast-forwarded to %s", taskRef, err, featureCommit)
+	}
+
+	// HEAD on an unrelated line: a second root commit on an orphan branch.
+	if err := wt.Checkout(&git.CheckoutOptions{Create: true, Branch: plumbing.NewBranchReferenceName("orphan"), Hash: base}); err != nil {
+		t.Fatal(err)
+	}
+	if err := util.WriteFile(wt.Filesystem, "o.txt", []byte("o"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wt.Add("o.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wt.Commit("unrelated", &git.CommitOptions{Author: &object.Signature{Name: "a", Email: "a@a", When: time.Now()}}); err != nil {
+		t.Fatal(err)
+	}
+	// orphan descends from base but not from tasks/x (which is at featureCommit).
+	ahead, sha, err = unpushedCommits(repo, "tasks/x", "master", io.Discard)
+	if err != nil || !ahead || sha != featureCommit.String() {
+		t.Fatalf("unrelated HEAD: ahead=%v sha=%s err=%v, want the task branch untouched at the feature commit", ahead, sha, err)
+	}
+	taskRef, _ = repo.Reference(plumbing.NewBranchReferenceName("tasks/x"), true)
+	if taskRef.Hash() != featureCommit {
+		t.Fatalf("task branch moved to %s on an unrelated HEAD", taskRef.Hash())
 	}
 }
