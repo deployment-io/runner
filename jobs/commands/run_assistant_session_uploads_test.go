@@ -1,7 +1,10 @@
 package commands
 
 import (
+	"bytes"
 	"encoding/json"
+	"image"
+	"image/png"
 	"io"
 	"os"
 	"path/filepath"
@@ -207,5 +210,142 @@ func TestInputPump_BatchStopsAtFirstFailure(t *testing.T) {
 	}
 	if !reflect.DeepEqual(names, []string{"0000000001.json", "0000000002.json", "0000000003.json"}) {
 		t.Errorf("records = %v", names)
+	}
+}
+
+// tinyPNG is a 1x1 PNG — enough for http.DetectContentType to classify the
+// bytes, which is how the pump labels an image's media type.
+func tinyPNG(t *testing.T) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, image.NewRGBA(image.Rect(0, 0, 1, 1))); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+func TestInputPump_ImagesAreListedWithInContainerPaths(t *testing.T) {
+	ip, _ := newTestPump(t)
+	shot := tinyPNG(t)
+	m := sessions.UserMessageDtoV1{ID: "m1", Ts: 10, Content: "what's wrong here?",
+		Attachments: []sessions.SessionAttachmentDtoV1{
+			{Name: "notes.md", Path: "abc-1-notes.md.txt", Content: "todo"},
+			{Name: "shot.png", Path: "abc-2-shot.png", Bytes: shot, Width: 1280, Height: 800},
+		}}
+	if !ip.deliver(m) {
+		t.Fatal("deliver failed")
+	}
+	// Both files are on disk, the image byte-for-byte.
+	if b, err := os.ReadFile(filepath.Join(ip.uploadsDir, "abc-1-notes.md.txt")); err != nil || string(b) != "todo" {
+		t.Errorf("text attachment: got (%q, %v)", b, err)
+	}
+	if b, err := os.ReadFile(filepath.Join(ip.uploadsDir, "abc-2-shot.png")); err != nil || !bytes.Equal(b, shot) {
+		t.Errorf("image attachment: got (%d bytes, %v)", len(b), err)
+	}
+
+	var rec map[string]any
+	b, err := os.ReadFile(filepath.Join(ip.dir, "0000000001.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(b, &rec); err != nil {
+		t.Fatal(err)
+	}
+	if rec["id"] != "m1" || rec["content"] != m.Content {
+		t.Errorf("record = %s", b)
+	}
+	want := []any{map[string]any{
+		"path":      "/work/uploads/abc-2-shot.png",
+		"mediaType": "image/png",
+		"width":     float64(1280),
+		"height":    float64(800),
+	}}
+	if !reflect.DeepEqual(rec["images"], want) {
+		t.Errorf("images = %#v, want %#v", rec["images"], want)
+	}
+}
+
+func TestInputPump_TurnWithoutImagesHasNoImagesKey(t *testing.T) {
+	ip, _ := newTestPump(t)
+	m := sessions.UserMessageDtoV1{ID: "m1", Ts: 5, Content: "see the report",
+		Attachments: []sessions.SessionAttachmentDtoV1{{Name: "r.pdf", Path: "abc-1-r.pdf.txt", Content: "[Page 1]"}}}
+	if !ip.deliver(m) {
+		t.Fatal("deliver failed")
+	}
+	b, err := os.ReadFile(filepath.Join(ip.dir, "0000000001.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Byte-for-byte the record an older agentbox already consumes.
+	if string(b) != `{"content":"see the report","id":"m1","ts":5}` {
+		t.Errorf("record = %s", b)
+	}
+}
+
+func TestInputPump_FailedImageWriteLeavesTurnUndelivered(t *testing.T) {
+	ip, _ := newTestPump(t)
+	// The image's path is a directory, so its write fails.
+	if err := os.MkdirAll(filepath.Join(ip.uploadsDir, "abc-1-shot.png", "child"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	m := sessions.UserMessageDtoV1{ID: "m1", Ts: 7, Content: "look",
+		Attachments: []sessions.SessionAttachmentDtoV1{{Name: "shot.png", Path: "abc-1-shot.png", Bytes: tinyPNG(t), Width: 4, Height: 3}}}
+	if ip.deliver(m) {
+		t.Fatal("deliver should fail when the image cannot be written")
+	}
+	if ip.seen["m1"] || ip.afterTs != 0 || ip.seq != 0 {
+		t.Errorf("failed delivery must not advance state: seen=%v afterTs=%d seq=%d", ip.seen, ip.afterTs, ip.seq)
+	}
+	if entries, _ := os.ReadDir(ip.dir); len(entries) != 0 {
+		t.Errorf("no record must be written for a failed turn: %v", entries)
+	}
+	// Once the obstacle is gone the retry delivers the whole turn.
+	if err := os.RemoveAll(filepath.Join(ip.uploadsDir, "abc-1-shot.png")); err != nil {
+		t.Fatal(err)
+	}
+	if !ip.deliver(m) {
+		t.Fatal("retry failed")
+	}
+	b, err := os.ReadFile(filepath.Join(ip.dir, "0000000001.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), `"/work/uploads/abc-1-shot.png"`) {
+		t.Errorf("record = %s", b)
+	}
+}
+
+func TestImageRecords(t *testing.T) {
+	png1 := tinyPNG(t)
+	jpg := []byte{0xFF, 0xD8, 0xFF, 0xE0, 0, 0, 0, 0, 0, 0, 0, 0}
+	cases := []struct {
+		name string
+		atts []sessions.SessionAttachmentDtoV1
+		want []map[string]any
+	}{
+		{"no attachments", nil, nil},
+		{"text only", []sessions.SessionAttachmentDtoV1{{Name: "a.txt", Path: "a.txt", Content: "x"}}, nil},
+		{"a jpeg keeps its own media type", []sessions.SessionAttachmentDtoV1{{Name: "p.jpg", Path: "x-p.jpg", Bytes: jpg, Width: 2, Height: 1}},
+			[]map[string]any{{"path": "/work/uploads/x-p.jpg", "mediaType": "image/jpeg", "width": 2, "height": 1}}},
+		{"a gif re-encoded to png is labelled by its bytes, not its name",
+			[]sessions.SessionAttachmentDtoV1{{Name: "anim.gif", Path: "x-anim.gif", Bytes: png1, Width: 1, Height: 1}},
+			[]map[string]any{{"path": "/work/uploads/x-anim.gif", "mediaType": "image/png", "width": 1, "height": 1}}},
+		{"a traversing path is anchored under uploads, like the file is",
+			[]sessions.SessionAttachmentDtoV1{{Name: "e", Path: "../../etc/shot.png", Bytes: png1, Width: 1, Height: 1}},
+			[]map[string]any{{"path": "/work/uploads/etc/shot.png", "mediaType": "image/png", "width": 1, "height": 1}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := imageRecords(tc.atts); !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("imageRecords = %#v, want %#v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestPlanModePromptMentionsAttachedImages(t *testing.T) {
+	want := "Images the user attaches are shown to you directly with the message and are also saved under /work/uploads if you need to look again."
+	if !strings.Contains(planModePrompt, want) {
+		t.Errorf("planModePrompt missing the image sentence")
 	}
 }
