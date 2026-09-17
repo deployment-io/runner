@@ -31,5 +31,18 @@ func GetSessionRepositoriesBaseDir(orgID, sessionJobID string) string {
 // repos out identically to a Task (the agent's cwd is /work; each repo is an
 // <idx>-<name> subdirectory).
 func GetSessionRepositoryDir(orgID, sessionJobID string, idx int, name string) string {
-	return fmt.Sprintf("%s/%d-%s", GetSessionRepositoriesBaseDir(orgID, sessionJobID), idx, name)
+	return SessionRepositoryDir(GetSessionRepositoriesBaseDir(orgID, sessionJobID), idx, name)
+}
+
+// SessionRepositoryDir is GetSessionRepositoryDir against an already-resolved
+// base dir — what the mid-session repository add uses, since RunAssistantSession
+// already holds the base dir it bind-mounted as /work. Both paths must produce
+// the SAME name, or a repo added mid-session would land somewhere else after a
+// crash-recovery re-pickup (which clones through GetSessionRepositoryDir).
+//
+// The name is used as given: an "<owner>/<repo>" name nests on disk, exactly as
+// it does at session start. The caller is responsible for checking the result
+// still resolves under baseDir.
+func SessionRepositoryDir(baseDir string, idx int, name string) string {
+	return fmt.Sprintf("%s/%d-%s", baseDir, idx, name)
 }

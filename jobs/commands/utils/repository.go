@@ -24,6 +24,7 @@ package utils
 // picking it up doesn't have to re-derive it.
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"github.com/deployment-io/deployment-runner-kit/enums/git_provider_enums"
@@ -238,6 +239,53 @@ func CloneRepository(repoDirectoryPath, repoCloneUrlWithToken, repoProviderToken
 		return nil, err
 	}
 
+	return repository, nil
+}
+
+// CloneOptions groups what a clone needs besides its destination directory
+// (Rule 2.3). CloneURLWithToken already carries the credential; Token is passed
+// separately because submodule updates authenticate on their own.
+type CloneOptions struct {
+	CloneURLWithToken string
+	Token             string
+	Provider          string
+	LogsWriter        io.Writer
+}
+
+// CloneRepositoryWithContext is CloneRepository bounded by ctx: PlainCloneContext
+// aborts the fetch when ctx is cancelled or its deadline passes, instead of
+// hanging on a huge or unreachable repository.
+//
+// It exists alongside CloneRepository rather than replacing it because only ONE
+// caller wants a deadline — the mid-session repository add, where a stuck clone
+// would hold back every later turn in a live conversation. Tasks, deployments
+// and session-START clones keep CloneRepository's unbounded behaviour
+// unchanged; the session path reaches this through a context with no deadline.
+func CloneRepositoryWithContext(ctx context.Context, repoDirectoryPath string, opts CloneOptions) (*git.Repository, error) {
+	username := GetUsernameForProvider(opts.Provider)
+
+	repository, err := git.PlainCloneContext(ctx, repoDirectoryPath, false, &git.CloneOptions{
+		URL: opts.CloneURLWithToken,
+		Auth: &http.BasicAuth{
+			Username: username,
+			Password: opts.Token,
+		},
+		RecurseSubmodules: git.DefaultSubmoduleRecursionDepth,
+	})
+	if err != nil {
+		if err == git.ErrRepositoryAlreadyExists {
+			repository, err = git.PlainOpen(repoDirectoryPath)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			return nil, err
+		}
+	}
+
+	if err := UpdateSubmodules(repository, username, opts.Token, opts.LogsWriter); err != nil {
+		return nil, err
+	}
 	return repository, nil
 }
 
