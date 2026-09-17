@@ -14,10 +14,12 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner-kit/sessions"
+	"github.com/deployment-io/deployment-runner-kit/tasks"
 	"github.com/deployment-io/deployment-runner-kit/types"
 	runnerclient "github.com/deployment-io/deployment-runner/client"
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
@@ -52,6 +54,18 @@ const (
 	// container).
 	sessionUploadsDirRel = "uploads"
 	sessionPollInterval  = 750 * time.Millisecond
+	// sessionCloneDeadline bounds a clone requested MID-SESSION (a repository
+	// the user added to a live session). Session-start clones stay unbounded —
+	// nothing is waiting on them — but here a stuck clone leaves the turn
+	// undelivered, and deliverBatch stops at the first undelivered turn, so it
+	// would hold back every later turn in the conversation.
+	sessionCloneDeadline = 5 * time.Minute
+	// maxSessionCloneAttempts is how many times a turn's repository checkout is
+	// attempted before the turn is delivered anyway, with a failure line in
+	// place of that repo's pointer line. Retrying forever would block every
+	// later turn at deliverBatch; a permanently unclonable repo must not be
+	// able to wedge the conversation.
+	maxSessionCloneAttempts = 3
 	// sessionWallClockHardCap is the runner-side backstop on a session
 	// container's lifetime. The REAL wall-clock enforcement is the
 	// deployment-server idle/wall-clock cron (default 4h, honors the session's
@@ -68,7 +82,7 @@ const (
 // in sync with agentbox/cmd/interactive-harness planModePrompt; production
 // injects it via APPEND_SYSTEM_PROMPT_FILE at spawn. Built with string
 // concatenation because the task-spec fence uses backticks.
-const planModePrompt = `You are in plan mode for one or more code repositories, each checked out as a subdirectory of your working directory. Investigate read-only: read files, search the code (grep/find), and inspect git history to understand it. Pre-built context may be available at /work/context — if present, start with index.md (its table of contents), then grep/jq only the files relevant to the outcome before exploring live (cheaper and more grounded than rediscovering); don't read large files whole. Files the user attaches to a message arrive under /work/uploads, and the message lists their paths — grep them for what matters rather than reading a whole report; a "[Page N] (...)" annotation saying no text or images were not extracted means your view of that page is incomplete: say so, don't conclude the document is silent on something that may be there. Images the user attaches are shown to you directly with the message and are also saved under /work/uploads if you need to look again. Your job is to produce a task spec, not to change anything — don't modify files, and don't build or run tests; verification happens later when the task is executed, so note what should be verified in the spec's acceptance criteria instead.
+const planModePrompt = `You are in plan mode for one or more code repositories, each checked out as a subdirectory of your working directory. Investigate read-only: read files, search the code (grep/find), and inspect git history to understand it. Pre-built context may be available at /work/context — if present, start with index.md (its table of contents), then grep/jq only the files relevant to the outcome before exploring live (cheaper and more grounded than rediscovering); don't read large files whole. Files the user attaches to a message arrive under /work/uploads, and the message lists their paths — grep them for what matters rather than reading a whole report; a "[Page N] (...)" annotation saying no text or images were not extracted means your view of that page is incomplete: say so, don't conclude the document is silent on something that may be there. Images the user attaches are shown to you directly with the message and are also saved under /work/uploads if you need to look again. Repositories can be added to the session while it runs: a turn carrying a <repositories-added> block means those repositories are already checked out read-only at the paths it lists, so investigate them the same way as the ones you started with (a line saying a repository could not be checked out means it is NOT on disk — say so rather than guessing at its contents). Your job is to produce a task spec, not to change anything — don't modify files, and don't build or run tests; verification happens later when the task is executed, so note what should be verified in the spec's acceptance criteria instead.
 
 Each turn, judge what the user is doing:
 - Just asking a question, exploring, or discussing — answer normally and DO NOT emit a task-spec block.
@@ -116,7 +130,24 @@ func (rs *RunAssistantSession) Run(parameters map[string]interface{}, logsWriter
 	if err != nil {
 		return parameters, err
 	}
-	return parameters, rs.runSession(orgID, jobID, imageRef, workDirHost, envVars, logsWriter)
+	return parameters, rs.runSession(sessionRun{
+		orgID: orgID, workDirOrg: workDirOrg, jobID: jobID,
+		imageRef: imageRef, workDirHost: workDirHost, envVars: envVars, logsWriter: logsWriter,
+	})
+}
+
+// sessionRun groups what one interactive session run needs (Rule 2.3). The two
+// org ids are deliberately separate: under saas-runner mode the namespace is
+// rewritten to the global org, so the work dir and the installation tokens are
+// keyed by one and the message bridge by the other.
+type sessionRun struct {
+	orgID       string // OrganizationIdFromJob — the org the message bridge posts to
+	workDirOrg  string // OrganizationIDNamespace — the org /work and git tokens are keyed by
+	jobID       string
+	imageRef    string
+	workDirHost string
+	envVars     []string
+	logsWriter  io.Writer
 }
 
 // prepareSessionDirs creates the bind-mounted input/output message dirs and the
@@ -224,7 +255,8 @@ func buildSessionSpawnEnvVars(parameters map[string]interface{}, logsWriter io.W
 // runSession spawns the interactive container, runs the output-forward and
 // input-pump bridge loops alongside it, and blocks until the container exits or
 // the session is stopped (the normal end). A stop is not a failure.
-func (rs *RunAssistantSession) runSession(orgID, jobID, imageRef, workDirHost string, envVars []string, logsWriter io.Writer) error {
+func (rs *RunAssistantSession) runSession(run sessionRun) error {
+	orgID, jobID, workDirHost, logsWriter := run.orgID, run.jobID, run.workDirHost, run.logsWriter
 	dockerCtx := context.Background()
 	cli, err := dockerclient.NewClientWithOpts(dockerclient.FromEnv, dockerclient.WithAPIVersionNegotiation())
 	if err != nil {
@@ -237,7 +269,7 @@ func (rs *RunAssistantSession) runSession(orgID, jobID, imageRef, workDirHost st
 	// conversation's lifetime, blocking every deploy behind them.
 	sessionMemoryBytes := resources.MemoryForAssistantSession()
 	containerID, err := createAgentboxContainer(dockerCtx, cli, agentboxSpawnSpec{
-		imageRef: imageRef, workDirHost: workDirHost, env: envVars, memoryBytes: sessionMemoryBytes,
+		imageRef: run.imageRef, workDirHost: workDirHost, env: run.envVars, memoryBytes: sessionMemoryBytes,
 	})
 	if err != nil {
 		return err
@@ -261,7 +293,17 @@ func (rs *RunAssistantSession) runSession(orgID, jobID, imageRef, workDirHost st
 	ip := &inputPump{
 		dir:        filepath.Join(workDirHost, ".agentbox-input", "messages"),
 		uploadsDir: filepath.Join(workDirHost, sessionUploadsDirRel),
+		// baseDir is the session's /work: a repo added mid-session is cloned
+		// into <baseDir>/<index>-<name>, alongside the ones CheckoutRepo put
+		// there. workDirOrg (OrganizationIDNamespace) is the org runForSession
+		// clones under and mints installation tokens for, which under
+		// saas-runner mode is NOT orgID (OrganizationIdFromJob) — that one
+		// stays the message-bridge org.
+		baseDir:    workDirHost,
+		workDirOrg: run.workDirOrg,
 		orgID:      orgID, jobID: jobID, logsWriter: logsWriter, seen: map[string]bool{},
+		tokenCache: map[string]string{},
+		clones:     map[string]*sessionCloneState{},
 	}
 	sf := &specForwarder{
 		path:  filepath.Join(workDirHost, ".agentbox-output", "task-spec.json"),
@@ -454,11 +496,35 @@ func rotateOutputBatch(records []outputRec, jobID, startMsgID string) (batch []s
 // inputPump pulls the user's new turns from deployment-server and writes them
 // into agentbox's input dir (atomic temp+rename) for the live agent to consume.
 type inputPump struct {
-	dir          string
-	uploadsDir   string // attachment text lands here (bind-mounted /work/uploads)
+	dir        string
+	uploadsDir string // attachment text lands here (bind-mounted /work/uploads)
+	// baseDir is the session base dir (bind-mounted as /work). A repo the user
+	// added mid-session is cloned into <baseDir>/<index>-<name>. The pump NEVER
+	// wipes it — unlike CheckoutRepo's runForSession, which starts a session
+	// from a clean base; here the agent is live and every other repo, the
+	// uploads dir and both agentbox IO dirs are in use.
+	baseDir string
+	// workDirOrg is OrganizationIDNamespace — the org the repos are cloned
+	// under and installation tokens are minted for (what runForSession uses).
+	// orgID is OrganizationIdFromJob, used only to forward messages.
+	workDirOrg   string
 	orgID, jobID string
 	logsWriter   io.Writer
-	afterTs      int64
+	tokenCache   map[string]string // installation id → token, like the session-start clone
+	// clones tracks per-(message id, repo) checkout attempts so a failing clone
+	// backs off instead of retrying on every 750 ms poll, and eventually gives
+	// up. In-memory only: a runner restart mid-backoff restarts the attempts,
+	// which is fine — the bound is per process and the give-up path still
+	// terminates.
+	clones map[string]*sessionCloneState
+	// now, cloneRepository and notifyFailure are seams for the pump's tests:
+	// the retry / give-up / notify-once paths would otherwise need real time, a
+	// live GitHub installation and a live deployment-server. All three are nil
+	// in production, where the real clock, clone and RPC client are used.
+	now             func() time.Time
+	cloneRepository func(ctx context.Context, repoDir string, entry tasks.RepositoryEntry) error
+	notifyFailure   func(content string)
+	afterTs         int64
 	// deliveredAtAfterTs: ids delivered whose Ts == afterTs. Sent with each
 	// poll so the server can exclude them instead of re-sending the boundary
 	// turn (with its attachment text) every 750 ms. Reset when afterTs moves.
@@ -489,14 +555,18 @@ func (ip *inputPump) deliverBatch(msgs []sessions.UserMessageDtoV1) {
 	}
 }
 
-// deliver writes a turn (attachments first, then the record) and marks it
-// delivered. On a write failure it marks nothing — not seen, not afterTs — so
-// the next tick retries; advancing afterTs past a failed message would drop it
-// permanently, and a turn whose pointer block names a file that doesn't exist
-// is worse than a late turn.
+// deliver writes a turn (attachments and repository checkouts first, then the
+// record) and marks it delivered. On a write failure it marks nothing — not
+// seen, not afterTs — so the next tick retries; advancing afterTs past a failed
+// message would drop it permanently, and a turn whose pointer block names a
+// file or a directory that doesn't exist is worse than a late turn.
 func (ip *inputPump) deliver(m sessions.UserMessageDtoV1) bool {
 	if err := ip.write(m); err != nil {
-		io.WriteString(ip.logsWriter, fmt.Sprintf("session: error writing input %s (will retry): %s\n", m.ID, err))
+		// A backoff wait is the expected state between checkout attempts, not
+		// an error worth a line on every 750 ms poll.
+		if !errors.Is(err, errCloneBackoff) {
+			io.WriteString(ip.logsWriter, fmt.Sprintf("session: error writing input %s (will retry): %s\n", m.ID, err))
+		}
 		return false
 	}
 	ip.seen[m.ID] = true
@@ -531,7 +601,19 @@ func (ip *inputPump) write(m sessions.UserMessageDtoV1) error {
 			return fmt.Errorf("attachment %q: %w", a.Name, err)
 		}
 	}
-	rec := map[string]any{"id": m.ID, "content": m.Content, "ts": m.Ts}
+	// Then the repositories this turn added, for the same reason: the turn's
+	// <repositories-added> block names directories that must already exist.
+	content := m.Content
+	for _, r := range m.RepositoriesAdded {
+		reason, err := ip.checkoutAddedRepository(m.ID, r)
+		if err != nil {
+			return err // still retrying — the turn stays undelivered
+		}
+		if reason != "" {
+			content = replaceCheckoutLine(content, r, reason)
+		}
+	}
+	rec := map[string]any{"id": m.ID, "content": content, "ts": m.Ts}
 	// Additive: only a turn that carries images gets the key, so a text-only
 	// turn is byte-for-byte the record older agentboxes already consume.
 	if images := imageRecords(m.Attachments); len(images) > 0 {
@@ -547,6 +629,251 @@ func (ip *inputPump) write(m sessions.UserMessageDtoV1) error {
 	}
 	ip.seq++ // only a delivered record consumes a sequence number
 	return nil
+}
+
+// errCloneBackoff means a repository checkout failed and its next attempt isn't
+// due yet. The turn stays undelivered, but it is not a new failure.
+var errCloneBackoff = errors.New("waiting to retry repository checkout")
+
+// sessionCloneBackoff is the wait before each retry of a failed mid-session
+// checkout: ~5 s before the second attempt and ~15 s before the third (the 45 s
+// tail is the next step should maxSessionCloneAttempts ever rise). Without it
+// the checkout would be retried on every 750 ms poll, hammering the provider
+// while the conversation is already stalled.
+var sessionCloneBackoff = []time.Duration{5 * time.Second, 15 * time.Second, 45 * time.Second}
+
+// sessionCloneState is one (message id, repository) checkout's progress.
+type sessionCloneState struct {
+	failures int
+	nextAt   time.Time
+	// gaveUp records that the attempts ran out; reason is the user-facing
+	// explanation that replaces this repo's pointer line from then on.
+	gaveUp bool
+	reason string
+	// notified records that the failure was posted to the chat, so it is
+	// forwarded exactly once per message id across every retry and the
+	// eventual give-up delivery.
+	notified bool
+}
+
+// checkoutAddedRepository makes one repository the turn added present on disk.
+//
+// It returns ("", nil) when the repo is checked out (or already was), a
+// non-empty reason when the attempts ran out and the turn should be delivered
+// with a failure line in place of this repo's pointer line, and an error while
+// the checkout is still being retried — which leaves the whole turn undelivered.
+func (ip *inputPump) checkoutAddedRepository(messageID string, r sessions.SessionRepositoryDtoV1) (string, error) {
+	state := ip.cloneState(messageID, r)
+	if state.gaveUp {
+		return state.reason, nil
+	}
+	repoDir, err := ip.repositoryDir(r)
+	if err != nil {
+		// A name that can't become a directory under the session's /work will
+		// never become one — fail it out immediately rather than burn retries.
+		return ip.giveUp(state, r, err), nil
+	}
+	// Idempotent across a retried turn: a directory that already has a .git is
+	// this repo, checked out by an earlier attempt or by the session-start
+	// checkout after a re-pickup.
+	if _, statErr := os.Stat(filepath.Join(repoDir, ".git")); statErr == nil {
+		return "", nil
+	}
+	if now := ip.clock(); state.failures > 0 && now.Before(state.nextAt) {
+		return "", errCloneBackoff
+	}
+	// Same log line as session start, so one session's checkouts read alike.
+	io.WriteString(ip.logsWriter, fmt.Sprintf("Cloning %s (%s) read-only into %s\n", r.Name, r.Branch, repoDir))
+	ctx, cancel := context.WithTimeout(context.Background(), sessionCloneDeadline)
+	defer cancel()
+	cloneErr := ip.cloneInto(ctx, repoDir, tasks.RepositoryEntry{
+		Name:           r.Name,
+		CloneURL:       r.CloneURL,
+		BaseBranch:     r.Branch,
+		Provider:       r.Provider,
+		InstallationID: r.InstallationID,
+	})
+	if cloneErr == nil {
+		return "", nil
+	}
+	state.failures++
+	if !state.notified {
+		// Once per message id, on the first failure: the user sees the problem
+		// while the runner is still retrying, and never sees it again.
+		state.notified = true
+		ip.forwardCloneFailure(r.Name, cloneErr)
+	}
+	if state.failures >= maxSessionCloneAttempts {
+		return ip.giveUp(state, r, cloneErr), nil
+	}
+	state.nextAt = ip.clock().Add(sessionCloneBackoff[min(state.failures-1, len(sessionCloneBackoff)-1)])
+	return "", fmt.Errorf("repository %q: %w", r.Name, cloneErr)
+}
+
+// giveUp records the final failure and returns the reason the turn's pointer
+// line is replaced with. The turn IS then delivered: a repo that can never be
+// checked out must not wedge every later turn at deliverBatch.
+func (ip *inputPump) giveUp(state *sessionCloneState, r sessions.SessionRepositoryDtoV1, cause error) string {
+	state.gaveUp = true
+	state.reason = cause.Error()
+	if !state.notified {
+		state.notified = true
+		ip.forwardCloneFailure(r.Name, cause)
+	}
+	io.WriteString(ip.logsWriter, fmt.Sprintf("session: giving up on %s after %d attempt(s): %s\n",
+		r.Name, state.failures, cause))
+	return state.reason
+}
+
+// cloneState returns the checkout state for one (message id, repository),
+// creating it on first sight. Keyed by message id AND repo so a turn carrying
+// two repos tracks them independently.
+func (ip *inputPump) cloneState(messageID string, r sessions.SessionRepositoryDtoV1) *sessionCloneState {
+	if ip.clones == nil {
+		ip.clones = map[string]*sessionCloneState{}
+	}
+	key := fmt.Sprintf("%s\x00%d\x00%s", messageID, r.Index, r.Name)
+	state, ok := ip.clones[key]
+	if !ok {
+		state = &sessionCloneState{}
+		ip.clones[key] = state
+	}
+	return state
+}
+
+// repositoryDir resolves one added repo's checkout directory. The path is built
+// ONLY from the server-assigned index and the repo name as given (matching
+// creation-time naming, so an interior '/' nests on disk), and the result must
+// still resolve under the session base dir — the name reaches here from a
+// request body, so neither the shape check nor the containment check is
+// redundant.
+func (ip *inputPump) repositoryDir(r sessions.SessionRepositoryDtoV1) (string, error) {
+	if ip.baseDir == "" {
+		return "", fmt.Errorf("session base dir not configured")
+	}
+	if err := checkRepositoryName(r.Name); err != nil {
+		return "", err
+	}
+	base := filepath.Clean(ip.baseDir)
+	dir := filepath.Clean(commandUtils.SessionRepositoryDir(base, r.Index, r.Name))
+	if dir == base || !strings.HasPrefix(dir, base+string(os.PathSeparator)) {
+		return "", fmt.Errorf("repository %q would be checked out outside the session directory", r.Name)
+	}
+	return dir, nil
+}
+
+// checkRepositoryName rejects the name shapes that must never become a
+// directory: a '..' segment or a leading '/' would escape the session's /work,
+// and a control character would let a name forge a line in the agent's turn.
+// An interior '/' is fine — "<owner>/<repo>" nests, as it does at session start.
+func checkRepositoryName(name string) error {
+	if strings.TrimSpace(name) == "" {
+		return fmt.Errorf("empty repository name")
+	}
+	if strings.HasPrefix(name, "/") {
+		return fmt.Errorf("repository name %q is an absolute path", name)
+	}
+	for _, segment := range strings.Split(name, "/") {
+		if segment == ".." {
+			return fmt.Errorf("repository name %q traverses out of the session directory", name)
+		}
+	}
+	for _, c := range name {
+		if unicode.IsControl(c) {
+			return fmt.Errorf("repository name contains a control character")
+		}
+	}
+	return nil
+}
+
+// cloneInto runs the real read-only session clone unless a test supplied its
+// own. It goes through cloneSessionRepoReadOnly — the same helper session start
+// uses, which never touches anything outside repoDir — and NEVER through
+// runForSession, whose first act is to wipe the base dir.
+func (ip *inputPump) cloneInto(ctx context.Context, repoDir string, entry tasks.RepositoryEntry) error {
+	if ip.cloneRepository != nil {
+		return ip.cloneRepository(ctx, repoDir, entry)
+	}
+	if ip.tokenCache == nil {
+		ip.tokenCache = map[string]string{}
+	}
+	return cloneSessionRepoReadOnly(ctx, repoDir, sessionCloneRequest{
+		entry: entry, orgID: ip.workDirOrg, tokenCache: ip.tokenCache, logsWriter: ip.logsWriter,
+	})
+}
+
+// forwardCloneFailure posts the checkout failure to the session thread so the
+// user learns about it while the agent is still mid-conversation. No turn-end
+// rides along (unlike forwardSessionFailure): the agent is alive and its own
+// turn boundary is still coming.
+func (ip *inputPump) forwardCloneFailure(name string, cause error) {
+	content := fmt.Sprintf("⚠️ Could not check out `%s`: %s", pointerSafe(name), pointerSafe(cause.Error()))
+	if ip.notifyFailure != nil {
+		ip.notifyFailure(content)
+		return
+	}
+	err := runnerclient.Get().UpdateSessionMessages([]sessions.AppendMessageDtoV1{{
+		JobID:     ip.jobID,
+		MessageID: primitive.NewObjectID().Hex(),
+		Content:   content,
+		IsDone:    true,
+	}}, ip.orgID)
+	if err != nil {
+		io.WriteString(ip.logsWriter, fmt.Sprintf("session: error forwarding checkout failure: %s\n", err))
+	}
+}
+
+// clock is time.Now unless a test injected its own.
+func (ip *inputPump) clock() time.Time {
+	if ip.now != nil {
+		return ip.now()
+	}
+	return time.Now()
+}
+
+// replaceCheckoutLine swaps one repository's pointer line in the turn for a
+// failure line, so the agent is told the repo is missing instead of being sent
+// to an empty directory.
+//
+// The line is located by the IN-CONTAINER path the runner builds itself from
+// the server-assigned index — never by parsing the name out of the content —
+// and both the name and the reason are neutralised the way deployment-server
+// neutralises them, so a hostile name can't forge or close the block from here
+// either. If no line matches (an older server, a hand-built turn), the failure
+// is appended inside the block rather than dropped: silently delivering a turn
+// that still claims the checkout succeeded is the one outcome worse than a
+// clumsy line.
+func replaceCheckoutLine(content string, r sessions.SessionRepositoryDtoV1, reason string) string {
+	marker := fmt.Sprintf("%s/%d-%s", agentboxWorkDirInContainer, r.Index, pointerSafe(r.Name))
+	failure := fmt.Sprintf("- %s could not be checked out: %s", pointerSafe(r.Name), pointerSafe(reason))
+	lines := strings.Split(content, "\n")
+	for i, line := range lines {
+		if strings.Contains(line, marker) {
+			lines[i] = failure
+			return strings.Join(lines, "\n")
+		}
+	}
+	if at := strings.LastIndex(content, repositoriesAddedCloseTag); at >= 0 {
+		return content[:at] + failure + "\n" + content[at:]
+	}
+	return content + "\n" + failure
+}
+
+// repositoriesAddedCloseTag closes the turn's repository pointer block — see
+// deployment-server's inputContent, which renders it.
+const repositoriesAddedCloseTag = "</repositories-added>"
+
+// pointerSafe mirrors deployment-server's pointerSafeName: the turn text is
+// plain text the agent reads, not XML, but quotes and control characters coming
+// from a repository name or a git error must not be able to fake a line or
+// close a block.
+func pointerSafe(s string) string {
+	return strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) || r == '"' || r == '<' || r == '>' {
+			return '\''
+		}
+		return r
+	}, s)
 }
 
 // imageRecords describes a turn's image attachments for agentbox, which
