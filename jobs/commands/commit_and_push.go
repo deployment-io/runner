@@ -534,6 +534,13 @@ type agentOutput struct {
 	// field; OpenPullRequest falls back to truncated first line of
 	// ChangesSummary in that case.
 	PRTitle string `json:"pr_title,omitempty"`
+	// VerifyResult is agentbox's verify_result carried onto the envelope so
+	// OpenPullRequest — a separate command that sees only JobOutput, never
+	// /result.json — can put a pre-existing verification failure in the PR
+	// body. Without this field the PR is the one place the failure ISN'T
+	// mentioned, which is the place the reviewer is actually looking.
+	// Nil for older agentbox images and for runs that reported no verify.
+	VerifyResult *verifyResult `json:"verify_result,omitempty"`
 }
 
 // mergeRepositoriesIntoJobOutput reads existing JobOutput JSON (any prior
