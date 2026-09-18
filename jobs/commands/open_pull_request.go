@@ -60,6 +60,7 @@ func (opr *OpenPullRequest) Run(parameters map[string]interface{}, logsWriter io
 		deniedHosts:  deniedHosts,
 		agentSummary: readAgentSummaryFromJobOutput(parameters),
 		agentPRTitle: readAgentPRTitleFromJobOutput(parameters),
+		verifyResult: readVerifyResultFromJobOutput(parameters),
 	}
 	prOutputs, err := opener.openAll(hasChangesByIndex)
 	if err != nil {
@@ -91,6 +92,11 @@ type taskOpenPR struct {
 	// image predates the field — subjectAndLeadIn falls through to the
 	// truncated-first-line-of-changes_summary path.
 	agentPRTitle string
+	// verifyResult is agentbox's verify_result for this Step run, read back
+	// off the same envelope. Non-nil with pre-existing steps only when the
+	// commit gate let a failing verification through — the case the PR body
+	// has to explain. Nil otherwise (including for older agentbox images).
+	verifyResult *verifyResult
 }
 
 // openAll iterates the Job's repositories. Skips repos where
@@ -175,7 +181,35 @@ func (opr *taskOpenPR) buildPRTitleAndBody() (string, string) {
 			sb.WriteString(fmt.Sprintf("- `%s`\n", h))
 		}
 	}
+	sb.WriteString(opr.verificationSection())
 	return subject, sb.String()
+}
+
+// verificationSection reports a verification that failed but was allowed
+// through because the same failure is present on the base commit.
+//
+// This PR exists only because of that exemption — without it the Step would
+// have been discarded — so the exemption belongs where the reviewer is, not
+// buried in a job log they'd have to know to open. Empty string when nothing
+// was pre-existing, which is every ordinary PR: a green verify has nothing to
+// say and a genuinely new failure never reaches PR-open at all.
+func (opr *taskOpenPR) verificationSection() string {
+	steps := preExistingVerifySteps(opr.verifyResult)
+	if len(steps) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	sb.WriteString("\n---\n")
+	sb.WriteString("**Verification: failing before this Step**\n\n")
+	sb.WriteString("The agent's build/test check failed, but the same command fails on the base commit too — so this Step didn't introduce it, and the work was committed rather than discarded:\n\n")
+	for _, s := range steps {
+		sb.WriteString(fmt.Sprintf("- `%s` in `%s` — fails on the base commit as well\n",
+			verifyCommandLabel(s.Command), verifyStepRepoLabel(s.Repo)))
+		if tail := boundVerifyTail(verifyStepTail(s)); tail != "" {
+			sb.WriteString("\n```\n" + tail + "\n```\n")
+		}
+	}
+	return sb.String()
 }
 
 // subjectAndLeadIn picks the PR subject + body lead-in from whichever
@@ -293,6 +327,27 @@ func readAgentPRTitleFromJobOutput(parameters map[string]interface{}) string {
 		return ""
 	}
 	return data.Agent.PRTitle
+}
+
+// readVerifyResultFromJobOutput pulls agentbox's verify_result that
+// RunAgentStep wrote to the accumulated JobOutput. Nil on a missing or
+// malformed payload — the PR is the user-facing artifact and must still land;
+// the worst case is a PR body without the Verification section, and the job
+// log still carries the warning. Mirrors readDeniedHostsFromJobOutput; both
+// read different fields off the same envelope.
+func readVerifyResultFromJobOutput(parameters map[string]interface{}) *verifyResult {
+	existing, err := jobs.GetParameterValue[string](parameters, parameters_enums.JobOutput)
+	if err != nil || len(existing) == 0 {
+		return nil
+	}
+	var data jobOutputData
+	if err := json.Unmarshal([]byte(existing), &data); err != nil {
+		return nil
+	}
+	if data.Agent == nil {
+		return nil
+	}
+	return data.Agent.VerifyResult
 }
 
 // readHasChangesFromJobOutput pulls the per-repo HasChanges flags that

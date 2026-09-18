@@ -341,10 +341,57 @@ func (rs *RunAgentStep) Run(parameters map[string]interface{}, logsWriter io.Wri
 	// never reaches a commit or PR. ran==false is deliberately NOT gated — a
 	// docs-only or no-build change legitimately skips verify, and CI on PR
 	// open remains the backstop (see PLAN_tasks_verification.md Open Q6).
-	if vr := result.VerifyResult; vr != nil && vr.Ran && !vr.Passed {
-		return parameters, formatVerifyFailure(vr)
+	//
+	// pre_existing is the third exemption. agentbox replayed every failed
+	// step on the commit its repo was checked out at when the run began and
+	// found the same failure there, so the Step didn't cause it. Discarding
+	// the work over a build that was already red punishes the wrong run; the
+	// failure is instead carried into the job log and the PR body, where the
+	// reviewer can act on it. agentbox is failure-closed about this — an
+	// unknown baseline never sets the flag — so trusting it here does not
+	// widen the gate.
+	switch decideVerifyGate(result.VerifyResult) {
+	case verifyGateFail:
+		return parameters, formatVerifyFailure(result.VerifyResult)
+	case verifyGateWarnPreExisting:
+		io.WriteString(logsWriter, formatPreExistingVerifyWarning(result.VerifyResult))
 	}
 	return parameters, nil
+}
+
+// verifyGateDecision is what the commit gate does with an agent's
+// self-verification.
+type verifyGateDecision int
+
+const (
+	// verifyGateProceed: nothing to gate on — verify passed, was skipped, or
+	// wasn't reported at all.
+	verifyGateProceed verifyGateDecision = iota
+	// verifyGateFail: the run introduced a failure. Stop before
+	// CommitAndPush; the work is discarded.
+	verifyGateFail
+	// verifyGateWarnPreExisting: the failure predates the run. Continue to
+	// CommitAndPush and say so in the job log and PR body.
+	verifyGateWarnPreExisting
+)
+
+// decideVerifyGate is the gate's whole decision, extracted so it can be
+// exercised without a Docker daemon.
+//
+// ran==false is deliberately NOT gated: a docs-only or no-build change
+// legitimately skips verify, and CI on PR open remains the backstop.
+// PreExisting is only ever set by agentbox after a successful baseline
+// replay of EVERY failed step, and never when a baseline couldn't be
+// established — a legacy payload with no steps therefore decodes to false
+// and fails exactly as it did before this field existed.
+func decideVerifyGate(vr *verifyResult) verifyGateDecision {
+	if vr == nil || !vr.Ran || vr.Passed {
+		return verifyGateProceed
+	}
+	if vr.PreExisting {
+		return verifyGateWarnPreExisting
+	}
+	return verifyGateFail
 }
 
 // agentboxImagePullLock serializes image pulls across concurrent Step Jobs
@@ -1051,6 +1098,14 @@ type agentResult struct {
 // failure message could name nothing but the command. The comment that
 // used to sit here said the runner "doesn't need them", which was the
 // assumption that cost a Task 23 minutes of finished work on 2026-08-29.
+//
+// Steps and PreExisting arrived with agentbox's baseline replay. A
+// multi-repo Task verifies once per repository, so the rollup above can only
+// ever describe one of them; Steps carries the rest. PreExisting is
+// agentbox's own verdict — not the agent's — on whether every FAILED step
+// also fails on the commit each repo was checked out at when agentbox
+// started. Older images emit neither, which decodes to nil/false and gates
+// exactly as before.
 type verifyResult struct {
 	Ran           bool   `json:"ran"`
 	Passed        bool   `json:"passed"`
@@ -1058,6 +1113,29 @@ type verifyResult struct {
 	SkippedReason string `json:"skipped_reason,omitempty"`
 	StdoutTail    string `json:"stdout_tail,omitempty"`
 	StderrTail    string `json:"stderr_tail,omitempty"`
+
+	Steps       []verifyStep `json:"steps,omitempty"`
+	PreExisting bool         `json:"pre_existing,omitempty"`
+}
+
+// verifyStep is one repository's verification within a Step run, with
+// agentbox's baseline comparison attached.
+//
+// BaselineRan false means no baseline could be established — no recorded
+// start commit, an unresolvable repo path, an unreachable commit, a replay
+// that errored or timed out. agentbox never sets PreExisting in that case,
+// so the runner needs no separate handling: an unknown baseline keeps the
+// gate closed.
+type verifyStep struct {
+	Repo       string `json:"repo,omitempty"`
+	Command    string `json:"command,omitempty"`
+	Passed     bool   `json:"passed"`
+	StdoutTail string `json:"stdout_tail,omitempty"`
+	StderrTail string `json:"stderr_tail,omitempty"`
+
+	BaselineRan        bool   `json:"baseline_ran,omitempty"`
+	BaselinePassed     bool   `json:"baseline_passed,omitempty"`
+	BaselineStderrTail string `json:"baseline_stderr_tail,omitempty"`
 }
 
 // tokenUsage mirrors agentbox's /result.json token_usage object. Agentbox
@@ -1118,14 +1196,82 @@ const verifyTailMaxBytes = 2000
 // older than the release that started asking for one — hence the graceful
 // degradation to today's message rather than an empty separator.
 func formatVerifyFailure(vr *verifyResult) error {
-	cmd := vr.Command
-	if cmd == "" {
-		cmd = "(unspecified command)"
-	}
+	cmd := verifyCommandLabel(vr.Command)
 	if tail := verifyFailureTail(vr); tail != "" {
 		return fmt.Errorf("agent self-verification failed: %s — %s", cmd, tail)
 	}
 	return fmt.Errorf("agent self-verification failed: %s", cmd)
+}
+
+// preExistingVerifySteps returns the failed steps agentbox confirmed also
+// fail on the base commit. These are the ones the Step is being allowed to
+// push over, so they are exactly what the job log and PR body must name.
+func preExistingVerifySteps(vr *verifyResult) []verifyStep {
+	if vr == nil {
+		return nil
+	}
+	var out []verifyStep
+	for _, s := range vr.Steps {
+		if !s.Passed && s.BaselineRan && !s.BaselinePassed {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// formatPreExistingVerifyWarning is written to the job log when the Step is
+// allowed through a failing verify. It has to name the repo, the command and
+// the failure output: the whole point of continuing is that a human decides
+// what to do about the failure, and they can only do that if the log says
+// what the failure WAS. A bare "verification failed but looks pre-existing"
+// would trade a lost Step for an unexplained green one.
+func formatPreExistingVerifyWarning(vr *verifyResult) string {
+	steps := preExistingVerifySteps(vr)
+	var sb strings.Builder
+	sb.WriteString("warning: agent self-verification failed, but the same failure is present on the base commit — committing and opening the PR anyway.\n")
+	if len(steps) == 0 {
+		// Defensive: agentbox sets pre_existing only from per-step verdicts,
+		// so this is unreachable with a well-formed payload. Say what we know
+		// rather than printing a header with nothing under it.
+		sb.WriteString(fmt.Sprintf("  %s: %s\n", verifyStepRepoLabel(""), verifyCommandLabel(vr.Command)))
+		if tail := boundVerifyTail(verifyFailureTail(vr)); tail != "" {
+			sb.WriteString("    " + tail + "\n")
+		}
+		return sb.String()
+	}
+	for _, s := range steps {
+		sb.WriteString(fmt.Sprintf("  %s: %s — fails on the base commit as well\n",
+			verifyStepRepoLabel(s.Repo), verifyCommandLabel(s.Command)))
+		if tail := boundVerifyTail(verifyStepTail(s)); tail != "" {
+			sb.WriteString("    " + tail + "\n")
+		}
+	}
+	return sb.String()
+}
+
+// verifyStepTail picks the most useful output for one step, preferring what
+// the agent saw over the baseline replay's copy of the same failure.
+func verifyStepTail(s verifyStep) string {
+	for _, candidate := range []string{s.StderrTail, s.StdoutTail, s.BaselineStderrTail} {
+		if tail := strings.TrimSpace(candidate); tail != "" {
+			return tail
+		}
+	}
+	return ""
+}
+
+func verifyStepRepoLabel(repo string) string {
+	if strings.TrimSpace(repo) == "" {
+		return "(unnamed repo)"
+	}
+	return repo
+}
+
+func verifyCommandLabel(command string) string {
+	if strings.TrimSpace(command) == "" {
+		return "(unspecified command)"
+	}
+	return command
 }
 
 // verifyFailureTail picks the most useful output the agent reported and
@@ -1135,6 +1281,13 @@ func verifyFailureTail(vr *verifyResult) string {
 	if tail == "" {
 		tail = strings.TrimSpace(vr.StdoutTail)
 	}
+	return boundVerifyTail(tail)
+}
+
+// boundVerifyTail trims and caps a tail for embedding in a Step error, a job
+// log line or a PR body.
+func boundVerifyTail(tail string) string {
+	tail = strings.TrimSpace(tail)
 	if tail == "" {
 		return ""
 	}
@@ -1242,6 +1395,7 @@ func mergeAgentResultIntoJobOutput(parameters map[string]interface{}, result age
 		ExitCode:       result.ExitCode,
 		DeniedHosts:    result.DeniedHosts,
 		PRTitle:        result.PRTitle,
+		VerifyResult:   result.VerifyResult,
 	}
 	merged, err := json.Marshal(data)
 	if err != nil {
