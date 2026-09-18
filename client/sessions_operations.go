@@ -51,6 +51,28 @@ func (r *RunnerClient) GetSessionInput(jobID string, afterTs int64, deliveredAtA
 	return reply.Messages, nil
 }
 
+// SetSessionRepoSuggestion forwards the latest repository suggestion the
+// planning agent emitted to deployment-server, which persists it to
+// Session.RepoSuggestion. The dashboard reads it back off the session GET and
+// offers each named repository as a one-click add.
+func (r *RunnerClient) SetSessionRepoSuggestion(suggestion sessions.SetRepoSuggestionDtoV1, organizationID string) error {
+	if !r.isConnected {
+		return ErrConnection
+	}
+	args := sessions.SetRepoSuggestionArgsV1{Suggestion: suggestion}
+	args.OrganizationID = r.GetComputedOrganizationID(organizationID)
+	args.Token = r.token
+	var reply sessions.SetRepoSuggestionReplyV1
+	err := r.c.Call("Sessions.SetRepoSuggestionV1", args, &reply)
+	if err != nil {
+		return err
+	}
+	if !reply.Done {
+		return fmt.Errorf("error receiving done from the server")
+	}
+	return nil
+}
+
 // UpdateSessionSpec forwards the latest structured task-spec the planning agent
 // emitted to deployment-server, which persists it to Session.StructuredSpec.
 func (r *RunnerClient) UpdateSessionSpec(spec sessions.UpdateSpecDtoV1, organizationID string) error {
