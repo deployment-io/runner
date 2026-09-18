@@ -148,15 +148,22 @@ func TestRepoSuggestionForwarder_DrainsOnExit(t *testing.T) {
 	}
 }
 
-// An empty repositories list still forwards; the server decides what to do with
-// it (it rejects it rather than blanking a good suggestion). The runner stays a
-// dumb pipe so the policy lives in one place.
-func TestRepoSuggestionForwarder_ForwardsEmptyListVerbatim(t *testing.T) {
+// An empty repositories list is not forwarded: the server would reject it
+// (rather than blank a good suggestion) and the forwarder would then retry and
+// log on every tick. It is treated as forwarded, so the tick goes quiet, and a
+// later real suggestion still goes through.
+func TestRepoSuggestionForwarder_SkipsEmptyList(t *testing.T) {
 	rf, sink, path := newSuggestionForwarder(t)
 	writeSuggestionFile(t, path, `{"repositories":[]}`)
 	rf.tick()
-	if len(sink.sent) != 1 || len(sink.sent[0].Repositories) != 0 {
-		t.Errorf("sent = %+v, want one empty payload", sink.sent)
+	rf.tick()
+	if len(sink.sent) != 0 {
+		t.Fatalf("an empty suggestion was forwarded: %+v", sink.sent)
+	}
+	writeSuggestionFile(t, path, oneRepoSuggestion)
+	rf.tick()
+	if len(sink.sent) != 1 {
+		t.Errorf("a real suggestion after an empty one did not forward: %d sends", len(sink.sent))
 	}
 }
 

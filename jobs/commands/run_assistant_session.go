@@ -1069,6 +1069,14 @@ func (rf *repoSuggestionForwarder) tick() {
 			Name: r.Name, Reason: r.Reason, Confidence: r.Confidence,
 		})
 	}
+	if len(repos) == 0 {
+		// The server rejects an empty suggestion rather than blanking a good
+		// one, and agentbox never writes one (its extractor drops blocks that
+		// name nothing). Sending it anyway would fail every tick until the
+		// content changed, logging each time. Treat it as forwarded.
+		rf.lastContent = string(b)
+		return
+	}
 	send := rf.send
 	if send == nil {
 		send = runnerclient.Get().SetSessionRepoSuggestion
