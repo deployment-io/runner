@@ -463,6 +463,16 @@ type jobOutputData struct {
 	SchemaVersion int          `json:"schema_version"`
 	Agent         *agentOutput `json:"agent,omitempty"`
 	Repositories  []repoOutput `json:"repositories,omitempty"`
+	// BaseCommits is each repository's commit at checkout, recorded by
+	// CheckoutRepository before any agent could move it. The Review stage
+	// diffs against these; see recordBaseCommit for why HEAD at review time
+	// is not a substitute.
+	BaseCommits []baseCommitOutput `json:"base_commits,omitempty"`
+	// Review is the Review stage's record: every round, what was fixed
+	// inside the loop, and whether a must-fix finding was still open at the
+	// end. Nil when the stage did not run (participation Off, or a runner
+	// older than the stage).
+	Review *reviewOutput `json:"review,omitempty"`
 	// Cost is what the run cost, RESOLVED ONCE HERE and never recomputed.
 	//
 	// Deliberately outside Agent: that block is agentbox's result.json passed
@@ -500,6 +510,77 @@ const (
 	costSourceAgent     = "agent"
 	costSourceEstimated = "estimated"
 )
+
+// baseCommitOutput is one repository's start-of-run commit.
+//
+// Index is the position in Task.Repositories — the stable identifier every
+// other block in this envelope merges on. Dir is the directory name relative
+// to /work ("0-acme-api"), which is what the review container needs: it sees
+// the repository at that path and nowhere else.
+type baseCommitOutput struct {
+	Index     int    `json:"index"`
+	Name      string `json:"name,omitempty"`
+	Dir       string `json:"dir,omitempty"`
+	CommitSHA string `json:"commit_sha,omitempty"`
+}
+
+// reviewFindingOutput mirrors agentbox's review finding, plus the one field
+// agentbox cannot supply: whether this finding meets the org's must-fix
+// threshold. That is the runner's decision, made from the thresholds stamped
+// into the Job, and is never read from the agent.
+type reviewFindingOutput struct {
+	Key       string `json:"key,omitempty"`
+	Parameter string `json:"parameter,omitempty"`
+	Severity  string `json:"severity,omitempty"`
+	Location  string `json:"location,omitempty"`
+	What      string `json:"what,omitempty"`
+	Why       string `json:"why,omitempty"`
+	Stage     string `json:"stage,omitempty"`
+	Pass      string `json:"pass,omitempty"`
+	MustFix   bool   `json:"must_fix,omitempty"`
+	// New marks a finding no earlier round reported. On a second or third
+	// round it is the difference between "the fix did not work" and "the fix
+	// introduced something else" — two very different things for a reader to
+	// see, and indistinguishable from the finding alone.
+	New bool `json:"new,omitempty"`
+}
+
+// reviewCoverageOutput mirrors agentbox's coverage entry: what happened to one
+// review parameter, and why.
+type reviewCoverageOutput struct {
+	Parameter string `json:"parameter,omitempty"`
+	State     string `json:"state,omitempty"`
+	Reason    string `json:"reason,omitempty"`
+}
+
+// reviewRoundOutput is one review run. Completed=false with an Error is a
+// round that did not produce a usable report — never a failed Step, but
+// something the PR body has to say out loud rather than pass over.
+type reviewRoundOutput struct {
+	Round      int                    `json:"round"`
+	Findings   []reviewFindingOutput  `json:"findings,omitempty"`
+	Coverage   []reviewCoverageOutput `json:"coverage,omitempty"`
+	AgentType  string                 `json:"agent_type,omitempty"`
+	Model      string                 `json:"model,omitempty"`
+	TokenUsage tokenUsage             `json:"token_usage"`
+	CostUSD    *float64               `json:"cost_usd,omitempty"`
+	Completed  bool                   `json:"completed"`
+	Error      string                 `json:"error,omitempty"`
+}
+
+// reviewOutput is the Review stage's whole record for this Step run.
+//
+// FixedInLoop is what the implementer resolved without a human ever seeing it
+// — the stage's actual product, and the thing a reader most wants to know.
+// MustFixOpen is the decision that follows from the last round: true means the
+// work still carries an unresolved must-fix finding and the pull request says
+// so.
+type reviewOutput struct {
+	Participation string                `json:"participation,omitempty"`
+	Rounds        []reviewRoundOutput   `json:"rounds,omitempty"`
+	FixedInLoop   []reviewFindingOutput `json:"fixed_in_loop,omitempty"`
+	MustFixOpen   bool                  `json:"must_fix_open"`
+}
 
 type agentOutput struct {
 	ChangesSummary string `json:"changes_summary,omitempty"`

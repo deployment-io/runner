@@ -67,26 +67,25 @@ func (r *RunnerClient) GetOpenPullRequestForBranch(organizationID, installationI
 //   - GitLab:    "namespace/path" (server URL-encodes); numeric ID also works
 //   - BitBucket: "workspace/repo_slug"
 //
-// Returns (prURL, prNumber, error). prURL is the user-facing web URL
-// (e.g., https://github.com/.../pull/42); prNumber is the
-// provider-scoped PR/MR number the user would type in chat.
-func (r *RunnerClient) OpenPullRequest(organizationID, installationID, repoName,
-	baseBranch, headBranch, title, body string) (string, int, error) {
+// Takes the request as a struct rather than seven positional strings, and
+// returns the server's DTO whole: the call now answers three things at once —
+// which pull request this is, whether a requested draft could be honoured, and
+// whether it already existed — and a caller that has to remember which of five
+// return values is which will eventually get it wrong.
+//
+// dto.URL is the user-facing web URL (e.g., https://github.com/.../pull/42);
+// dto.Number is the provider-scoped PR/MR number the user would type in chat.
+// Both are populated on every successful call, INCLUDING when
+// DraftUnsupported or AlreadyExisted is set — neither is a failure.
+func (r *RunnerClient) OpenPullRequest(organizationID string, args oauth.OpenPullRequestArgsV1) (oauth.OpenPullRequestDtoV1, error) {
+	var dto oauth.OpenPullRequestDtoV1
 	if !r.isConnected {
-		return "", 0, ErrConnection
+		return dto, ErrConnection
 	}
-	args := oauth.OpenPullRequestArgsV1{}
 	args.OrganizationID = r.GetComputedOrganizationID(organizationID)
 	args.Token = r.token
-	args.InstallationID = installationID
-	args.RepoName = repoName
-	args.BaseBranch = baseBranch
-	args.HeadBranch = headBranch
-	args.Title = title
-	args.Body = body
-	var dto oauth.OpenPullRequestDtoV1
 	if err := r.c.Call("Oauth.OpenPullRequestV1", args, &dto); err != nil {
-		return "", 0, err
+		return dto, err
 	}
-	return dto.URL, dto.Number, nil
+	return dto, nil
 }

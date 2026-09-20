@@ -9,6 +9,7 @@ import (
 
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
+	"github.com/deployment-io/deployment-runner-kit/oauth"
 	"github.com/deployment-io/deployment-runner-kit/tasks"
 	"github.com/deployment-io/deployment-runner/client"
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
@@ -61,6 +62,7 @@ func (opr *OpenPullRequest) Run(parameters map[string]interface{}, logsWriter io
 		agentSummary: readAgentSummaryFromJobOutput(parameters),
 		agentPRTitle: readAgentPRTitleFromJobOutput(parameters),
 		verifyResult: readVerifyResultFromJobOutput(parameters),
+		review:       readReviewFromJobOutput(parameters),
 	}
 	prOutputs, err := opener.openAll(hasChangesByIndex)
 	if err != nil {
@@ -97,6 +99,11 @@ type taskOpenPR struct {
 	// commit gate let a failing verification through — the case the PR body
 	// has to explain. Nil otherwise (including for older agentbox images).
 	verifyResult *verifyResult
+	// review is the Review stage's record for this Step run. Nil when the
+	// stage did not run — a Task with review participation Off, or a Job
+	// created before the stage existed — in which case the PR body carries no
+	// Review section and looks exactly as it did before.
+	review *reviewOutput
 }
 
 // openAll iterates the Job's repositories. Skips repos where
@@ -135,20 +142,89 @@ func (opr *taskOpenPR) openOne(idx int, entry tasks.RepositoryEntry) (repoOutput
 		return repoOutput{}, fmt.Errorf("repo %s has no base branch configured; set the default branch on the provider or use the per-Task override", entry.Name)
 	}
 	title, body := opr.buildPRTitleAndBody()
-	prURL, prNumber, err := client.Get().OpenPullRequest(opr.ctx.OrganizationID, entry.InstallationID,
-		entry.Name, entry.BaseBranch, opr.ctx.BranchName, title, body)
+	// A draft is REQUESTED, never required. Where the provider honours it on
+	// a new pull request, the unresolved findings arrive as a draft with an
+	// ordinary title; where it cannot — no draft concept, or a pull request
+	// that already exists and whose draft state can no longer be set — the
+	// same signal goes in the title instead. Either way a pull request exists
+	// and the work is not discarded.
+	needsFixes := opr.needsFixes()
+	dto, err := client.Get().OpenPullRequest(opr.ctx.OrganizationID, oauth.OpenPullRequestArgsV1{
+		InstallationID: entry.InstallationID,
+		RepoName:       entry.Name,
+		BaseBranch:     entry.BaseBranch,
+		HeadBranch:     opr.ctx.BranchName,
+		Title:          title,
+		Body:           body,
+		Draft:          needsFixes,
+	})
 	if err != nil {
 		return repoOutput{}, err
 	}
-	io.WriteString(opr.logsWriter, fmt.Sprintf("Opened PR #%d for repo %s: %s\n", prNumber, entry.Name, prURL))
+	if prefixed, needed := needsFixesTitleFor(needsFixes, dto, title); needed {
+		// The draft could not be honoured, so the title carries the signal.
+		// Applied as a SECOND call rather than guessed up front: whether the
+		// pull request already existed is not knowable until the provider
+		// answers, and prefixing every needs-fixes title up front would
+		// prefix the drafts too — which are already saying it another way.
+		retry, retryErr := client.Get().OpenPullRequest(opr.ctx.OrganizationID, oauth.OpenPullRequestArgsV1{
+			InstallationID: entry.InstallationID,
+			RepoName:       entry.Name,
+			BaseBranch:     entry.BaseBranch,
+			HeadBranch:     opr.ctx.BranchName,
+			Title:          prefixed,
+			Body:           body,
+		})
+		if retryErr != nil {
+			// The pull request exists and carries the findings in its body;
+			// only the title prefix was lost. Say so and carry on rather than
+			// failing a Step whose work is already pushed and reviewed.
+			io.WriteString(opr.logsWriter, fmt.Sprintf("warning: could not mark PR #%d for repo %s as needing fixes in its title: %s\n", dto.Number, entry.Name, retryErr))
+		} else {
+			dto = retry
+		}
+	}
+	io.WriteString(opr.logsWriter, fmt.Sprintf("Opened PR #%d for repo %s: %s\n", dto.Number, entry.Name, dto.URL))
 	return repoOutput{
 		Index:      idx,
 		Name:       entry.Name,
 		HasChanges: true,
 		Branch:     opr.ctx.BranchName,
-		PRURL:      prURL,
-		PRNumber:   prNumber,
+		PRURL:      dto.URL,
+		PRNumber:   dto.Number,
 	}, nil
+}
+
+// needsFixesTitleFor decides whether the pull request has to say "needs
+// fixes" in its TITLE, and what that title is.
+//
+// Four cases, and only the middle two need the prefix:
+//
+//	no open must-fix finding — nothing to say. The plain title stands, with
+//	                           any prefix from a previous attempt already
+//	                           stripped by subjectAndLeadIn.
+//	draft honoured on a NEW  — the draft state is the signal; a prefix would
+//	                           say it twice.
+//	draft unsupported        — the provider has no drafts, so the title is
+//	                           the only place left to put it.
+//	already existed          — draft state cannot be set after creation, so
+//	                           a pull request opened non-draft on attempt one
+//	                           stays non-draft and says so in its title.
+func needsFixesTitleFor(needsFixes bool, dto oauth.OpenPullRequestDtoV1, title string) (string, bool) {
+	if !needsFixes || !(dto.DraftUnsupported || dto.AlreadyExisted) {
+		return title, false
+	}
+	return prefixNeedsFixes(title), true
+}
+
+// needsFixes reports whether this pull request carries an unresolved must-fix
+// finding — the one condition that asks for a draft and, failing that, for a
+// title that says so.
+//
+// Advisory never qualifies: its findings are annotations, and holding a pull
+// request open over them is precisely what the Task opted out of.
+func (opr *taskOpenPR) needsFixes() bool {
+	return opr.review != nil && opr.review.MustFixOpen && opr.review.Participation == "on"
 }
 
 // buildPRTitleAndBody assembles the PR subject + body. Subject source
@@ -182,6 +258,7 @@ func (opr *taskOpenPR) buildPRTitleAndBody() (string, string) {
 		}
 	}
 	sb.WriteString(opr.verificationSection())
+	sb.WriteString(opr.reviewSection())
 	return subject, sb.String()
 }
 
@@ -228,12 +305,19 @@ func (opr *taskOpenPR) verificationSection() string {
 // title regardless of length. A 119-char single-line narrative ended
 // up as the literal PR title. capTitle prevents that recurrence even
 // if the agent doesn't follow the instruction.
+// Every path strips a "[Needs fixes] " prefix before capping. The title is
+// regenerated each attempt from the agent's own words, and an agent that read
+// the previous attempt's title off the pull request would hand the marker
+// back — leaving a resolved Step still announcing that it needs fixes. The
+// marker is re-applied, once, only when this attempt still has an open
+// must-fix finding (see openOne).
 func (opr *taskOpenPR) subjectAndLeadIn() (string, string) {
 	if len(opr.agentPRTitle) > 0 {
-		return capTitle(opr.agentPRTitle, prTitleMaxRunes), strings.TrimSpace(opr.agentSummary)
+		return capTitle(stripNeedsFixesPrefix(opr.agentPRTitle), prTitleMaxRunes), strings.TrimSpace(opr.agentSummary)
 	}
 	if len(opr.agentSummary) > 0 {
 		first, rest := splitFirstLine(opr.agentSummary)
+		first = stripNeedsFixesPrefix(first)
 		if utf8.RuneCountInString(first) <= prTitleMaxRunes {
 			return first, rest
 		}
