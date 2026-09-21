@@ -75,7 +75,8 @@ func (opr *taskOpenPR) reviewSection() string {
 	sb.WriteString("**Review**\n\n")
 
 	latest := latestCompletedRound(opr.review)
-	if failed := failedFinalRound(opr.review); failed != nil {
+	failed := failedFinalRound(opr.review)
+	if failed != nil {
 		// Fail-open, said out loud. A review that could not complete must not
 		// leave a body that reads as a clean review.
 		sb.WriteString(fmt.Sprintf("The review did not complete: %s. The change was committed and this pull request opened anyway; nothing here has been gated on a review verdict.\n\n", failed.Error))
@@ -93,7 +94,7 @@ func (opr *taskOpenPR) reviewSection() string {
 	// is written from what is LEFT OVER — so the note that says how much was
 	// dropped is never itself the thing that gets dropped.
 	budget := &renderBudget{items: reviewSectionMaxItems, runes: reviewSectionMaxRunes - utf8.RuneCountInString(sb.String()) - reviewSectionReserveRunes}
-	writeFindingGroup(&sb, "Still open and must be fixed", stillOpen, budget)
+	writeFindingGroup(&sb, mustFixHeading(failed != nil), stillOpen, budget)
 	writeFindingGroup(&sb, "Fixed during review", fixed, budget)
 	writeFindingGroup(&sb, "Noted", annotated, budget)
 	if omitted := len(stillOpen) + len(fixed) + len(annotated) - budget.rendered; omitted > 0 {
@@ -104,6 +105,22 @@ func (opr *taskOpenPR) reviewSection() string {
 	}
 	sb.WriteString("\n" + coverageLine(latest.Coverage))
 	return boundSection(sb.String())
+}
+
+// mustFixHeading names what the must-fix findings actually are, which depends
+// on whether the LAST round completed.
+//
+// When it did, these findings are the last review's verdict on the current
+// tree: still open, and they must be fixed. When it did not, they are an
+// EARLIER round's verdict, and a fix run may well have addressed them since —
+// the round that would have confirmed that is the one that failed. Saying
+// "still open" there asserts something nobody checked, and sends a reader
+// looking for a problem that may no longer exist.
+func mustFixHeading(finalRoundFailed bool) string {
+	if finalRoundFailed {
+		return "Reported by the last completed review, fix not verified"
+	}
+	return "Still open and must be fixed"
 }
 
 // latestCompletedRound returns the newest round that produced a report. A

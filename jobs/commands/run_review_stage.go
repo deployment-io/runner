@@ -99,7 +99,7 @@ func (rs *RunReviewStage) Run(parameters map[string]interface{}, logsWriter io.W
 			<-MarkStepDone(parameters, err)
 		}
 	}()
-	participation := readReviewParticipation(parameters)
+	participation := readReviewParticipation(parameters, logsWriter)
 	if participation == participationOff {
 		return parameters, nil
 	}
@@ -117,6 +117,11 @@ func (rs *RunReviewStage) Run(parameters map[string]interface{}, logsWriter io.W
 		io.WriteString(logsWriter, fmt.Sprintf("warning: could not create the review stage's cache volume: %s\n", err))
 	}
 	defer removeCacheVolume(cacheVolume)
+	// The stage parks directories beside the work dir — the implementer's
+	// stash and one per round. Each round removes its own on the way out;
+	// this sweeps whatever a failed restore left, however the stage ends,
+	// so a Step cannot leak host directories nothing else ever collects.
+	defer cleanupReviewStageSiblings(commandUtils.GetTaskRepositoriesBaseDir(ctx.OrganizationID, ctx.TaskID))
 	stage := &reviewStage{
 		ctx:           ctx,
 		parameters:    parameters,
@@ -635,9 +640,30 @@ func participationName(participation int64) string {
 // creation. An absent or unreadable value means Off: every Job created before
 // this stage existed carries no such parameter, and those Steps must behave
 // exactly as they did.
-func readReviewParticipation(parameters map[string]interface{}) int64 {
+//
+// A value that is PRESENT but not a usable int64 is a different thing entirely
+// — a stamping bug, or a parameter that crossed the wire as a float64 — and it
+// is logged. Silently reading the same as "this Task opted out" is how a
+// mistyped parameter turns the whole stage off across every Task without
+// anyone noticing that it had ever been on.
+func readReviewParticipation(parameters map[string]interface{}, logsWriter io.Writer) int64 {
+	// Keyed through Key(), which is the persisted decimal string the
+	// parameter map actually uses — not String(), which is the display name.
+	key, err := parameters_enums.ReviewParticipation.Key()
+	if err != nil {
+		return participationOff
+	}
+	raw, present := parameters[key]
+	if !present {
+		return participationOff
+	}
 	v, err := jobs.GetParameterValue[int64](parameters, parameters_enums.ReviewParticipation)
-	if err != nil || v < participationOn || v > participationOff {
+	if err != nil {
+		io.WriteString(logsWriter, fmt.Sprintf("warning: the review participation parameter is present but unreadable (%T: %v) — running this Step without the Review stage\n", raw, err))
+		return participationOff
+	}
+	if v < participationOn || v > participationOff {
+		io.WriteString(logsWriter, fmt.Sprintf("warning: the review participation parameter is %d, which names no participation mode — running this Step without the Review stage\n", v))
 		return participationOff
 	}
 	return v

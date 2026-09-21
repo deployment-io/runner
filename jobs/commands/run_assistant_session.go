@@ -334,7 +334,7 @@ func (rs *RunAssistantSession) runSession(run sessionRun) error {
 
 	waitCtx, cancelWait := context.WithTimeout(dockerCtx, sessionWallClockHardCap)
 	defer cancelWait()
-	exitCode, waitErr := waitForContainerExit(waitCtx, cli, containerID, rs.stopSignal, logsWriter)
+	exitCode, waitErr := waitForContainerExit(waitCtx, cli, containerID, rs.stopSignal, sessionWallClockHardCap, logsWriter)
 	close(stopBridge)
 	bridgeWg.Wait()
 	mf.tick() // final drain of any buffered output

@@ -136,6 +136,31 @@ func TestReviewSectionKeepsEarlierRoundsFindingsWhenTheLastRoundFails(t *testing
 	if !strings.Contains(body, "did not complete") {
 		t.Errorf("the failed final round is not mentioned:\n%s", body)
 	}
+	// And they are NOT presented as the current verdict. A fix run may well
+	// have addressed them since; the round that would have confirmed it is
+	// the one that failed, so "still open" asserts something nobody checked.
+	if strings.Contains(body, "Still open and must be fixed") {
+		t.Errorf("an earlier round's findings are labelled as still open after the last round failed:\n%s", body)
+	}
+	if !strings.Contains(body, "fix not verified") {
+		t.Errorf("the body does not say these findings are unverified:\n%s", body)
+	}
+}
+
+// When the last round DID complete, its must-fix findings are the current
+// verdict on the current tree and are labelled as such.
+func TestReviewSectionLabelsMustFixFindingsAsStillOpenWhenTheLastRoundCompleted(t *testing.T) {
+	review := completedReview(true,
+		reviewFindingOutput{Parameter: "security", Severity: "high", Location: "handler.go:41", What: "no session check", MustFix: true},
+	)
+
+	_, body := reviewTestOpener(review).buildPRTitleAndBody()
+	if !strings.Contains(body, "Still open and must be fixed") {
+		t.Errorf("a completed round's must-fix findings are not labelled as still open:\n%s", body)
+	}
+	if strings.Contains(body, "fix not verified") {
+		t.Errorf("a completed round's verdict is hedged as unverified:\n%s", body)
+	}
 }
 
 // The section is bounded: a review that reported forty things renders twenty

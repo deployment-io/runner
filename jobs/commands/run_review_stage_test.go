@@ -18,6 +18,17 @@ import (
 
 // --- the blind-to boundary -------------------------------------------------
 
+// testPrepareOutputDir is the preparer these tests inject: it creates the fresh
+// round directory exactly as the real one does, but does NOT chown it.
+//
+// The chown is to UID 1000 and fails for an unprivileged process, so calling
+// the real preparer here would make every test of the rename logic — which is
+// the half with the interesting failure modes — a root-only test. Ownership is
+// still covered, by the one euid-gated case below.
+func testPrepareOutputDir(workDirHost string) error {
+	return os.MkdirAll(filepath.Join(workDirHost, agentboxResultDirRel), 0o755)
+}
+
 // The review must not be able to read what the implement run wrote. The
 // enforcement is a host-side RENAME rather than mount layering, so it depends
 // on no Docker daemon behaviour and can be exercised here.
@@ -27,7 +38,7 @@ func TestSwapInReviewOutputDirHidesTheImplementRunsOutput(t *testing.T) {
 	writeFile(t, filepath.Join(implementerDir, "result.json"), `{"status":"success"}`)
 	writeFile(t, filepath.Join(implementerDir, "progress.json"), `{"turns":7}`)
 
-	swap, err := swapInReviewOutputDir(workDir, 1)
+	swap, err := swapInReviewOutputDir(workDir, 1, testPrepareOutputDir)
 	if err != nil {
 		t.Fatalf("swapInReviewOutputDir: %s", err)
 	}
@@ -69,26 +80,58 @@ func TestSwapInReviewOutputDirHidesTheImplementRunsOutput(t *testing.T) {
 	}
 }
 
-// The round's own output survives for the job log — as a SIBLING of the work
-// dir, so restoring the implementer's directory does not have to overwrite it.
-func TestRestoreKeepsTheRoundsOwnOutput(t *testing.T) {
+// The round's own output reaches the JOB LOG and then leaves the host. Keeping
+// the directory as a sibling left one per round per Step on a volume nothing
+// ever swept; the log is the durable record.
+func TestRestoreLogsTheRoundsOutputAndLeavesNothingBehind(t *testing.T) {
 	workDir := t.TempDir()
 	implementerDir := filepath.Join(workDir, agentboxResultDirRel)
 	writeFile(t, filepath.Join(implementerDir, "result.json"), `{"status":"success"}`)
 
-	swap, err := swapInReviewOutputDir(workDir, 2)
+	swap, err := swapInReviewOutputDir(workDir, 2, testPrepareOutputDir)
 	if err != nil {
 		t.Fatalf("swapInReviewOutputDir: %s", err)
 	}
 	writeFile(t, filepath.Join(implementerDir, "result.json"), `{"status":"success","review_result":{}}`)
-	swap.restore(io.Discard)
+	var logs strings.Builder
+	swap.restore(&logs)
 
-	roundDir := reviewRoundOutputPath(workDir, 2)
-	if got := readFile(t, filepath.Join(roundDir, "result.json")); !strings.Contains(got, "review_result") {
-		t.Errorf("round 2's own result.json was not kept, got %q", got)
+	if !strings.Contains(logs.String(), "review_result") {
+		t.Errorf("round 2's result.json did not reach the job log:\n%s", logs.String())
+	}
+	if _, err := os.Stat(reviewRoundOutputPath(workDir, 2)); !os.IsNotExist(err) {
+		t.Errorf("round 2's output directory survived on the host: %v", err)
 	}
 	if got := readFile(t, filepath.Join(implementerDir, "result.json")); got != `{"status":"success"}` {
 		t.Errorf("the implement run's result.json was not restored, got %q", got)
+	}
+}
+
+// Whatever a failed restore left beside the work dir is swept when the stage
+// ends — a host directory nothing else collects is a leak, however it got
+// there.
+func TestCleanupReviewStageSiblingsRemovesEveryParkedDirectory(t *testing.T) {
+	base := t.TempDir()
+	workDir := filepath.Join(base, "work")
+	writeFile(t, filepath.Join(workDir, agentboxResultDirRel, "result.json"), `{"status":"success"}`)
+	writeFile(t, filepath.Join(implementerOutputStashPath(workDir), "result.json"), `{}`)
+	writeFile(t, filepath.Join(reviewRoundOutputPath(workDir, 1), "result.json"), `{}`)
+	writeFile(t, filepath.Join(reviewRoundOutputPath(workDir, 2), "result.json"), `{}`)
+
+	cleanupReviewStageSiblings(workDir)
+
+	for _, dir := range []string{
+		implementerOutputStashPath(workDir),
+		reviewRoundOutputPath(workDir, 1),
+		reviewRoundOutputPath(workDir, 2),
+	} {
+		if _, err := os.Stat(dir); !os.IsNotExist(err) {
+			t.Errorf("%s survived the sweep: %v", dir, err)
+		}
+	}
+	// And the work dir's own output is untouched — it is not a sibling.
+	if got := readFile(t, filepath.Join(workDir, agentboxResultDirRel, "result.json")); got != `{"status":"success"}` {
+		t.Errorf("the sweep removed the Step's own output: %q", got)
 	}
 }
 
@@ -102,7 +145,7 @@ func TestRestoreRunsEvenWhenTheRoundFails(t *testing.T) {
 	writeFile(t, filepath.Join(implementerDir, "result.json"), `{"status":"success"}`)
 
 	func() {
-		swap, err := swapInReviewOutputDir(workDir, 1)
+		swap, err := swapInReviewOutputDir(workDir, 1, testPrepareOutputDir)
 		if err != nil {
 			t.Fatalf("swapInReviewOutputDir: %s", err)
 		}
@@ -119,7 +162,7 @@ func TestRestoreIsIdempotent(t *testing.T) {
 	workDir := t.TempDir()
 	writeFile(t, filepath.Join(workDir, agentboxResultDirRel, "result.json"), `{"status":"success"}`)
 
-	swap, err := swapInReviewOutputDir(workDir, 1)
+	swap, err := swapInReviewOutputDir(workDir, 1, testPrepareOutputDir)
 	if err != nil {
 		t.Fatalf("swapInReviewOutputDir: %s", err)
 	}
@@ -140,10 +183,46 @@ func TestSwapInReviewOutputDirOwnsTheFreshDirectoryToTheAgentboxUser(t *testing.
 	workDir := t.TempDir()
 	writeFile(t, filepath.Join(workDir, agentboxResultDirRel, "result.json"), `{}`)
 
-	if _, err := swapInReviewOutputDir(workDir, 1); err != nil {
+	if _, err := swapInReviewOutputDir(workDir, 1, prepareAgentboxHostDirs); err != nil {
 		t.Fatalf("swapInReviewOutputDir: %s", err)
 	}
 	assertOwnedByAgentbox(t, filepath.Join(workDir, agentboxResultDirRel))
+}
+
+// Every spawn starts from a clean output directory. Without this a run that
+// crashed before flushing its own result.json left the PREVIOUS run's file in
+// place, and readAgentResult — which cannot tell one run's file from another's
+// — returned it: the Step then passed the verify gate on a verification that
+// never happened, counted the same usage twice, and carried on against a
+// half-edited tree.
+func TestClearAgentboxOutputArtifactsRemovesThePreviousRunsResult(t *testing.T) {
+	workDir := t.TempDir()
+	outputDir := filepath.Join(workDir, agentboxResultDirRel)
+	writeFile(t, filepath.Join(outputDir, agentboxResultFile), `{"status":"success"}`)
+	writeFile(t, filepath.Join(outputDir, agentboxProgressFile), `{"turns":7}`)
+	// Anything else in the directory is not ours to remove.
+	writeFile(t, filepath.Join(outputDir, "messages.jsonl"), "{}\n")
+
+	if err := clearAgentboxOutputArtifacts(workDir); err != nil {
+		t.Fatalf("clearAgentboxOutputArtifacts: %s", err)
+	}
+
+	for _, name := range []string{agentboxResultFile, agentboxProgressFile} {
+		if _, err := os.Stat(filepath.Join(outputDir, name)); !os.IsNotExist(err) {
+			t.Errorf("%s survived; the next run could read it as its own", name)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(outputDir, "messages.jsonl")); err != nil {
+		t.Errorf("the sweep removed a file that is not the run's own output: %s", err)
+	}
+	// And a directory with nothing to clear is not an error — the first run
+	// of a Step has nothing to clear.
+	if err := clearAgentboxOutputArtifacts(workDir); err != nil {
+		t.Errorf("clearing an already-clean directory failed: %s", err)
+	}
+	if err := clearAgentboxOutputArtifacts(t.TempDir()); err != nil {
+		t.Errorf("clearing a directory with no output dir at all failed: %s", err)
+	}
 }
 
 // --- the review container's environment ------------------------------------
@@ -225,6 +304,34 @@ func TestApplyMustFixEnvReplacesThePromptAndBoundsTheRun(t *testing.T) {
 	}
 	if _, ok := byKey["AGENT_MODE"]; ok {
 		t.Error("a fix run must be an ordinary batch run, with no AGENT_MODE override")
+	}
+}
+
+// A fix run is an implement run and gets the implement run's tool channel.
+// Without it, an agent asked to fix a finding in code that deploys a preview
+// loses the tools the original run used to do that work, and fails for a reason
+// that has nothing to do with the finding.
+func TestMustFixEnvKeepsTheAgentsToolSocket(t *testing.T) {
+	byKey := envMap(applyMustFixEnv([]string{
+		"STEP_PROMPT=the original",
+		agentMCPSocketEnvVar + "=" + agentboxMCPSocketInContainer,
+	}, "the fix prompt"))
+
+	if byKey[agentMCPSocketEnvVar] != agentboxMCPSocketInContainer {
+		t.Errorf("%s = %q, want the implement run's socket", agentMCPSocketEnvVar, byKey[agentMCPSocketEnvVar])
+	}
+}
+
+// The review container gets NO tool socket: review needs no runner tools, and
+// a channel the reviewer cannot use is a channel it cannot misuse.
+func TestReviewSpawnEnvDropsTheToolSocket(t *testing.T) {
+	byKey := envMap(applyReviewEnv([]string{
+		"ANTHROPIC_API_KEY=sk-ant-test",
+		agentMCPSocketEnvVar + "=" + agentboxMCPSocketInContainer,
+	}, reviewEnvInputs{passes: reviewPasses, baseCommits: `{"0-a/b":"abc"}`, round: 1}))
+
+	if _, ok := byKey[agentMCPSocketEnvVar]; ok {
+		t.Errorf("the review spawn env carries %s — a reviewer needs no runner tools", agentMCPSocketEnvVar)
 	}
 }
 
@@ -419,17 +526,51 @@ func TestRecordFailedRoundRecordsNotCheckedCoverageForEveryParameter(t *testing.
 // Off is the answer for every Job created before this stage existed, so a
 // missing parameter must read as Off rather than as On.
 func TestReadReviewParticipationDefaultsToOff(t *testing.T) {
-	if got := readReviewParticipation(map[string]interface{}{}); got != participationOff {
+	var logs strings.Builder
+	if got := readReviewParticipation(map[string]interface{}{}, &logs); got != participationOff {
 		t.Errorf("participation = %d, want Off for a Job with no review parameter", got)
+	}
+	// An ABSENT parameter is the ordinary pre-stage Job and says nothing.
+	if logs.Len() != 0 {
+		t.Errorf("a Job with no review parameter logged a warning: %s", logs.String())
 	}
 	parameters := map[string]interface{}{}
 	jobs.SetParameterValue[int64](parameters, parameters_enums.ReviewParticipation, int64(participationAdvisory))
-	if got := readReviewParticipation(parameters); got != participationAdvisory {
+	if got := readReviewParticipation(parameters, io.Discard); got != participationAdvisory {
 		t.Errorf("participation = %d, want Advisory", got)
 	}
 	jobs.SetParameterValue[int64](parameters, parameters_enums.ReviewParticipation, int64(99))
-	if got := readReviewParticipation(parameters); got != participationOff {
+	if got := readReviewParticipation(parameters, io.Discard); got != participationOff {
 		t.Errorf("participation = %d, want Off for a value outside the enum", got)
+	}
+}
+
+// A parameter that is PRESENT but not a usable int64 is a stamping bug, not an
+// opt-out. Read silently as Off it would turn the whole stage off across every
+// Task with nothing in any log to say it had ever been on.
+func TestReadReviewParticipationLogsAPresentButUnreadableValue(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		value interface{}
+	}{
+		{"a float64 off the wire", float64(1)},
+		{"a string", "on"},
+		{"an out-of-range number", int64(42)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			key, err := parameters_enums.ReviewParticipation.Key()
+			if err != nil {
+				t.Fatalf("ReviewParticipation has no persisted key: %s", err)
+			}
+			parameters := map[string]interface{}{key: tc.value}
+			var logs strings.Builder
+			if got := readReviewParticipation(parameters, &logs); got != participationOff {
+				t.Errorf("participation = %d, want Off", got)
+			}
+			if logs.Len() == 0 {
+				t.Errorf("a present-but-unreadable participation value (%v) was read as Off in silence", tc.value)
+			}
+		})
 	}
 }
 

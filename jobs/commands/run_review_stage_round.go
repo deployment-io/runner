@@ -36,7 +36,7 @@ func (s *reviewStage) runReviewRound(round int) (agentResult, error) {
 	if err != nil {
 		return agentResult{}, err
 	}
-	swap, err := swapInReviewOutputDir(workDirHost, round)
+	swap, err := swapInReviewOutputDir(workDirHost, round, prepareAgentboxHostDirs)
 	if err != nil {
 		return agentResult{}, fmt.Errorf("error preparing the review output directory: %s", err)
 	}
@@ -111,6 +111,11 @@ func applyReviewEnv(env []string, in reviewEnvInputs) []string {
 		switch key {
 		case "STEP_PROMPT", "PREVIOUS_STEPS_SUMMARY", "AGENT_MODE", "MAX_TURNS":
 			continue
+		case agentMCPSocketEnvVar:
+			// Review needs no runner tools, and the review spawn mounts no
+			// socket — so the var would name a path that is not there. Dropped
+			// here as well, so the two facts cannot drift apart.
+			continue
 		}
 		out = append(out, kv)
 	}
@@ -160,16 +165,72 @@ func implementerOutputStashPath(workDirHost string) string {
 	return strings.TrimRight(workDirHost, "/") + "-implement-output"
 }
 
-// reviewRoundOutputPath is where a finished round's own output is kept, also a
-// sibling of the work dir. Kept rather than deleted so the round's result.json
-// and progress.json survive for the job log.
+// reviewRoundOutputPath is where a round's own output is parked while it is
+// copied into the job log, also a sibling of the work dir.
+//
+// It is DELETED once the copy is made. The job log is the durable record —
+// leaving the directory behind put one host directory per round per Step on a
+// volume nothing ever swept, and a Step with three rounds left four.
 func reviewRoundOutputPath(workDirHost string, round int) string {
 	return fmt.Sprintf("%s-review-round-%d-output", strings.TrimRight(workDirHost, "/"), round)
 }
 
+// reviewRoundResultLogMaxBytes bounds how much of a round's result.json goes
+// into the job log. The findings and coverage are written separately and in
+// full by logFullReview; this copy is for the fields that never reach the
+// review block — the status, the error, the agent's own prose.
+const reviewRoundResultLogMaxBytes = 16000
+
+// logRoundOutput copies the round's result.json into the job log before the
+// round directory is removed, so nothing that only lived on disk is lost with
+// it. Best-effort throughout: a round that wrote no result is the case the
+// caller is already handling.
+func logRoundOutput(dir string, round int, logsWriter io.Writer) {
+	data, err := os.ReadFile(filepath.Join(dir, agentboxResultFile))
+	if err != nil || len(data) == 0 {
+		return
+	}
+	if len(data) > reviewRoundResultLogMaxBytes {
+		data = append(data[:reviewRoundResultLogMaxBytes], []byte("\n[… truncated]")...)
+	}
+	io.WriteString(logsWriter, fmt.Sprintf("Review round %d result.json:\n%s\n", round, data))
+}
+
+// cleanupReviewStageSiblings removes every host directory the stage parked
+// beside the work dir: the implementer's stash and any round directory a
+// failed restore left behind.
+//
+// Deferred at the top of the stage so it runs however the stage ends. restore
+// already removes each round directory on the ordinary path; this is the
+// backstop for the path where it could not, which is exactly the path that
+// would otherwise leak silently.
+func cleanupReviewStageSiblings(workDirHost string) {
+	_ = os.RemoveAll(implementerOutputStashPath(workDirHost))
+	matches, err := filepath.Glob(strings.TrimRight(workDirHost, "/") + "-review-round-*-output")
+	if err != nil {
+		return
+	}
+	for _, dir := range matches {
+		_ = os.RemoveAll(dir)
+	}
+}
+
+// prepareOutputDirFunc creates the round's fresh output directory and gives it
+// to the agentbox user.
+//
+// Injected rather than called directly so the rename half — which is the part
+// with the interesting failure modes — can be tested without root. The real
+// preparer chowns, and a chown to UID 1000 fails for an unprivileged test
+// process, which would have made every test of this logic a root-only test.
+// Ownership itself is still covered, by one euid-gated case.
+type prepareOutputDirFunc func(workDirHost string) error
+
 // swapInReviewOutputDir moves the implementer's output out of the work dir and
 // puts a fresh, correctly-owned directory in its place.
-func swapInReviewOutputDir(workDirHost string, round int) (*reviewOutputSwap, error) {
+func swapInReviewOutputDir(workDirHost string, round int, prepare prepareOutputDirFunc) (*reviewOutputSwap, error) {
+	if prepare == nil {
+		prepare = prepareAgentboxHostDirs
+	}
 	swap := &reviewOutputSwap{workDirHost: workDirHost, round: round}
 	implementerDir := filepath.Join(workDirHost, agentboxResultDirRel)
 	stash := implementerOutputStashPath(workDirHost)
@@ -188,7 +249,7 @@ func swapInReviewOutputDir(workDirHost string, round int) (*reviewOutputSwap, er
 	// Recreates .agentbox-output (empty) and chowns it, along with the tmp
 	// and corepack dirs, to the agentbox user — the container runs as UID
 	// 1000 and writes its result through the bind mount.
-	if err := prepareAgentboxHostDirs(workDirHost); err != nil {
+	if err := prepare(workDirHost); err != nil {
 		// Put the implementer's output back before giving up: the caller's
 		// deferred restore has not been registered yet.
 		swap.restore(io.Discard)
@@ -197,12 +258,14 @@ func swapInReviewOutputDir(workDirHost string, round int) (*reviewOutputSwap, er
 	return swap, nil
 }
 
-// restore moves the round's output to its own sibling of the work dir — where
-// it survives for the job log — and puts the implementer's directory back.
+// restore copies the round's output into the job log, removes it from the
+// host, and puts the implementer's directory back.
 //
 // Idempotent, and best-effort about the round's own output: losing a round's
 // log copy is a diagnostic cost, while failing to restore the implementer's
-// directory would leave the Step's own record displaced.
+// directory would leave the Step's own record displaced. The round directory
+// is REMOVED rather than kept — the job log is the durable record, and a
+// directory per round per Step on a volume nothing sweeps is a leak.
 func (s *reviewOutputSwap) restore(logsWriter io.Writer) {
 	if s == nil || s.restored {
 		return
@@ -212,11 +275,14 @@ func (s *reviewOutputSwap) restore(logsWriter io.Writer) {
 	roundDir := reviewRoundOutputPath(s.workDirHost, s.round)
 	_ = os.RemoveAll(roundDir)
 	if _, err := os.Stat(implementerDir); err == nil {
+		// Park the round's output under its own name first, so the copy into
+		// the log cannot race the implementer's directory coming back.
 		if err := os.Rename(implementerDir, roundDir); err != nil {
-			// Could not park the round's output; remove it so the
-			// implementer's directory can go back to its own name.
+			io.WriteString(logsWriter, fmt.Sprintf("warning: could not set aside review round %d's output: %s\n", s.round, err))
 			_ = os.RemoveAll(implementerDir)
-			io.WriteString(logsWriter, fmt.Sprintf("warning: could not keep review round %d's output: %s\n", s.round, err))
+		} else {
+			logRoundOutput(roundDir, s.round, logsWriter)
+			_ = os.RemoveAll(roundDir)
 		}
 	}
 	if !s.displaced {
@@ -248,6 +314,13 @@ func (s *reviewStage) runMustFixRound(mustFix []reviewFindingOutput) error {
 	}
 	stepPrompt, _ := jobs.GetParameterValue[string](s.parameters, parameters_enums.StepPrompt)
 	env = applyMustFixEnv(env, buildMustFixPrompt(stepPrompt, mustFix))
+	// A fix run is an implement run, so it gets the implement run's tool
+	// channel. Without it an agent asked to fix a finding in code that
+	// deploys a preview loses the tools the original run used to do that work
+	// — and fails, or silently does something else, for a reason that has
+	// nothing to do with the finding.
+	env = append(env, agentMCPSocketEnvVar+"="+agentboxMCPSocketInContainer)
+	previewDeps := buildStaticSitePreviewDeps(s.ctx, s.parameters, workDirHost, s.logsWriter)
 
 	// A fix run BUILDS, and it builds offline: the agent container has no
 	// credentials and the proxy allows only the agent's own hosts. RunAgentStep
@@ -265,11 +338,13 @@ func (s *reviewStage) runMustFixRound(mustFix []reviewFindingOutput) error {
 	io.WriteString(s.logsWriter, fmt.Sprintf("Routing %d must-fix finding(s) back to the implementer\n", len(mustFix)))
 	impl := &RunAgentStep{stopSignal: s.stopSignal, progressSink: s.progressSink}
 	result, err := impl.spawnAgentboxAndWait(agentboxSpawnSpec{
-		imageRef:    imageRef,
-		workDirHost: workDirHost,
-		cacheVolume: cacheVolumeName(s.ctx),
-		env:         env,
-		waitTimeout: mustFixRunTimeout,
+		imageRef:      imageRef,
+		workDirHost:   workDirHost,
+		cacheVolume:   cacheVolumeName(s.ctx),
+		env:           env,
+		mcpSocketHost: agentMCPSocketHostPath(workDirHost),
+		previewDeps:   previewDeps,
+		waitTimeout:   mustFixRunTimeout,
 	}, s.logsWriter)
 	// Attribute the fix run's work to the Step whether or not it succeeded,
 	// then decide what its outcome means.
@@ -309,15 +384,19 @@ func (s *reviewStage) ensureVendoredCache(imageRef, workDirHost string) error {
 	}
 	cacheVolume := cacheVolumeName(s.ctx)
 	if err := createCacheVolume(cacheVolume); err != nil {
-		return fmt.Errorf("error creating the cache volume for the fix run: %s", err)
+		return fmt.Errorf("error creating the cache volume for the fix run: %w", err)
 	}
 	spec, err := buildVendorSpec(imageRef, workDirHost, cacheVolume, s.ctx)
 	if err != nil {
 		return err
 	}
 	impl := &RunAgentStep{stopSignal: s.stopSignal}
+	// %w, not %s: the vendor phase honours the stop signal and returns
+	// types.ErrJobStoppedByUser. Flattened to a string it stopped matching
+	// errors.Is, so a user who stopped the Job during the fix run's vendor
+	// phase got a failed Step instead of a cancelled one.
 	if err := impl.spawnVendorAndWait(spec, s.logsWriter); err != nil {
-		return fmt.Errorf("error vendoring dependencies for the fix run: %s", err)
+		return fmt.Errorf("error vendoring dependencies for the fix run: %w", err)
 	}
 	s.vendored = true
 	return nil

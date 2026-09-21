@@ -456,6 +456,25 @@ func prepareAgentboxHostDirs(workDirHost string) error {
 	return nil
 }
 
+// clearAgentboxOutputArtifacts removes the result and progress files a
+// previous agentbox run left in the output directory.
+//
+// Only those two: the directory itself, its ownership, and anything else in it
+// are the caller's business. A file that is not there is not an error — the
+// first run of a Step has nothing to clear.
+func clearAgentboxOutputArtifacts(workDirHost string) error {
+	if strings.TrimSpace(workDirHost) == "" {
+		return nil
+	}
+	for _, name := range []string{agentboxResultFile, agentboxProgressFile} {
+		path := filepath.Join(workDirHost, agentboxResultDirRel, name)
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	return nil
+}
+
 // buildAgentSpawnEnvVars assembles the env vars passed to the agentbox
 // container. Combines the runtime-injected credentials (AgentEnvVars,
 // populated by deployment-server at Job pickup) with the per-Job spawn
@@ -771,6 +790,19 @@ func (rs *RunAgentStep) spawnAgentboxAndWait(spec agentboxSpawnSpec, logsWriter 
 		}()
 		go func() { _ = mcpSrv.ServeListener(mcpCtx, ln) }()
 	}
+	// Clear the previous run's output BEFORE the container starts, so the
+	// result this function reads can only be the one this container wrote.
+	//
+	// Without this a run that crashed before flushing its own result.json
+	// left the previous run's file in place — and readAgentResult, which has
+	// no way to tell one run's file from another's, returned it. The Step then
+	// passed the verify gate on a verification that never happened, counted
+	// the same token usage twice, and carried on against a half-edited tree.
+	// The invariant lives HERE rather than at each call site so every spawn
+	// has it, including the ones added later.
+	if err := clearAgentboxOutputArtifacts(spec.workDirHost); err != nil {
+		return agentResult{}, fmt.Errorf("error clearing the previous run's agentbox output: %w", err)
+	}
 	containerID, err := createAgentboxContainer(dockerCtx, cli, spec)
 	if err != nil {
 		return agentResult{}, err
@@ -812,16 +844,16 @@ func (rs *RunAgentStep) spawnAgentboxAndWait(spec agentboxSpawnSpec, logsWriter 
 	}
 	waitCtx, cancelWait := context.WithTimeout(dockerCtx, waitTimeout)
 	defer cancelWait()
-	_, waitErr := waitForContainerExit(waitCtx, cli, containerID, rs.stopSignal, logsWriter)
-	// On user-stop, return the partial result (caller merges into
-	// JobOutput) plus the stop sentinel error so the caller can route
-	// to the stop UX path. On other errors, propagate as-is.
-	if errors.Is(waitErr, types.ErrJobStoppedByUser) {
-		result, _ := readAgentResult(spec.workDirHost) // best-effort; may be empty if SIGTERM grace expired
-		return result, waitErr
-	}
+	_, waitErr := waitForContainerExit(waitCtx, cli, containerID, rs.stopSignal, waitTimeout, logsWriter)
 	if waitErr != nil {
-		return agentResult{}, waitErr
+		// Both the user-stop and the wall-clock paths SIGTERM the container
+		// with grace, and agentbox flushes a partial result.json on SIGTERM.
+		// Read it on EVERY error path: its token usage was really spent and
+		// has to be attributed, and on a review round its partial coverage is
+		// the only record of what the round managed to look at. Best-effort —
+		// the file is absent when the grace window expired first.
+		result, _ := readAgentResult(spec.workDirHost)
+		return result, waitErr
 	}
 	return readAgentResult(spec.workDirHost)
 }
@@ -1006,7 +1038,11 @@ func streamContainerLogs(ctx context.Context, cli *client.Client, containerID st
 //
 // stopSignal can be nil — a nil channel never fires in select, so the
 // stop branch is silently skipped. Pre-Phase-5.5 behavior matches.
-func waitForContainerExit(ctx context.Context, cli *client.Client, containerID string, stopSignal <-chan struct{}, logsWriter io.Writer) (int, error) {
+// waitTimeout is the EFFECTIVE cap for this wait, which is not always
+// defaultWallClockTimeout: a review round gets 20 minutes and a fix run 30, and
+// naming the default in the message sent a reader looking for a four-hour run
+// that never happened.
+func waitForContainerExit(ctx context.Context, cli *client.Client, containerID string, stopSignal <-chan struct{}, waitTimeout time.Duration, logsWriter io.Writer) (int, error) {
 	statusCh, errCh := cli.ContainerWait(ctx, containerID, container.WaitConditionNotRunning)
 	select {
 	case err := <-errCh:
@@ -1018,7 +1054,7 @@ func waitForContainerExit(ctx context.Context, cli *client.Client, containerID s
 			stopCtx := context.Background() // ContainerStop on a fresh context — the wait ctx is already done
 			grace := containerStopGraceSec
 			_ = cli.ContainerStop(stopCtx, containerID, container.StopOptions{Timeout: &grace})
-			return 0, fmt.Errorf("agentbox exceeded wall-clock cap of %s — SIGTERM sent", defaultWallClockTimeout)
+			return 0, fmt.Errorf("agentbox exceeded wall-clock cap of %s — SIGTERM sent", waitTimeout)
 		}
 		if err != nil {
 			return 0, fmt.Errorf("error waiting for container exit: %s", err)
@@ -1749,7 +1785,7 @@ func (rs *RunAgentStep) spawnVendorAndWait(spec agentboxSpawnSpec, logsWriter io
 	}()
 	waitCtx, cancelWait := context.WithTimeout(dockerCtx, defaultVendorTimeout)
 	defer cancelWait()
-	code, waitErr := waitForContainerExit(waitCtx, cli, containerID, rs.stopSignal, logsWriter)
+	code, waitErr := waitForContainerExit(waitCtx, cli, containerID, rs.stopSignal, defaultVendorTimeout, logsWriter)
 	if waitErr != nil {
 		return waitErr
 	}
