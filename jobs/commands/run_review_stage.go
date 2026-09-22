@@ -221,6 +221,7 @@ func (s *reviewStage) run() (map[string]interface{}, error) {
 		}
 		findings := s.classify(result)
 		s.recordRound(round, findings, result)
+		io.WriteString(s.logsWriter, fmt.Sprintf("Review round %d completed: %d finding(s) in %d turn(s) of %d\n", round, len(findings), result.Turns, reviewRunMaxTurns))
 		// Nothing to route back — including every advisory review, whose
 		// findings are annotations by definition (see classify).
 		mustFix := mustFixOnly(findings)
@@ -382,6 +383,7 @@ func (s *reviewStage) recordRound(round int, findings []reviewFindingOutput, res
 		Model:      s.jobModel(),
 		TokenUsage: result.TokenUsage,
 		CostUSD:    result.CostUSD,
+		Turns:      result.Turns,
 		Completed:  true,
 	})
 }
@@ -398,6 +400,7 @@ func (s *reviewStage) recordFailedRound(round int, reason string, result agentRe
 	s.rounds = append(s.rounds, reviewRoundOutput{
 		Round:      round,
 		Coverage:   notCheckedCoverage(reason),
+		Turns:      result.Turns,
 		AgentType:  s.jobAgentType(),
 		Model:      s.jobModel(),
 		TokenUsage: result.TokenUsage,
@@ -494,7 +497,7 @@ func (s *reviewStage) logFullReview(out *reviewOutput) {
 		if !round.Completed {
 			b.WriteString(fmt.Sprintf("Round %d: did not complete — %s\n", round.Round, round.Error))
 		} else {
-			b.WriteString(fmt.Sprintf("Round %d: %d finding(s)\n", round.Round, len(round.Findings)))
+			b.WriteString(fmt.Sprintf("Round %d: %d finding(s), %d turn(s)\n", round.Round, len(round.Findings), round.Turns))
 		}
 		for _, f := range round.Findings {
 			marker := "annotated"

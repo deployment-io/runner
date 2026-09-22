@@ -778,3 +778,15 @@ func TestBaseCommitDirIsThePathTheContainerSees(t *testing.T) {
 		t.Errorf("dir = %q, want the owner/repo path relative to /work", got)
 	}
 }
+
+// Every round records the turns it spent, completed or not. That number is
+// the evidence for the review turn cap: without it nobody can tell a stage
+// whose reviewer finished with room to spare from one that ran out of it.
+func TestRoundsRecordTheTurnsTheySpent(t *testing.T) {
+	stage := &reviewStage{participation: participationOn, thresholds: map[uint]uint{1: 4}}
+	stage.recordRound(1, nil, agentResult{Turns: 7})
+	stage.recordFailedRound(2, "no report", agentResult{Turns: 20})
+	if len(stage.rounds) != 2 || stage.rounds[0].Turns != 7 || stage.rounds[1].Turns != 20 {
+		t.Errorf("rounds = %+v, want turns 7 then 20 carried onto the record", stage.rounds)
+	}
+}
