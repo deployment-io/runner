@@ -4,7 +4,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/deployment-io/deployment-runner-kit/oauth"
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
 )
 
@@ -221,53 +220,25 @@ func TestReviewSectionOnARerunRendersTheCurrentAttempt(t *testing.T) {
 
 // --- the needs-fixes signal -------------------------------------------------
 
-// Four paths, one rule: the title says "needs fixes" exactly when the draft
-// could not say it.
-func TestNeedsFixesTitleForEachProviderPath(t *testing.T) {
-	const title = "Add OAuth login to auth-service"
-	for _, tc := range []struct {
-		name       string
-		needsFixes bool
-		dto        oauth.OpenPullRequestDtoV1
-		wantPrefix bool
-	}{
-		{
-			name:       "draft honoured on a new pull request: the draft state is the signal",
-			needsFixes: true,
-			dto:        oauth.OpenPullRequestDtoV1{URL: "u", Number: 7},
-			wantPrefix: false,
-		},
-		{
-			name:       "draft unsupported: the title is the only place left",
-			needsFixes: true,
-			dto:        oauth.OpenPullRequestDtoV1{URL: "u", Number: 7, DraftUnsupported: true},
-			wantPrefix: true,
-		},
-		{
-			name:       "already existed: draft state cannot be set after creation",
-			needsFixes: true,
-			dto:        oauth.OpenPullRequestDtoV1{URL: "u", Number: 7, AlreadyExisted: true},
-			wantPrefix: true,
-		},
-		{
-			name:       "no open must-fix finding: nothing to say",
-			needsFixes: false,
-			dto:        oauth.OpenPullRequestDtoV1{URL: "u", Number: 7, AlreadyExisted: true},
-			wantPrefix: false,
-		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			got, needed := needsFixesTitleFor(tc.needsFixes, tc.dto, title)
-			if needed != tc.wantPrefix {
-				t.Errorf("needed = %t, want %t", needed, tc.wantPrefix)
-			}
-			if tc.wantPrefix && !strings.HasPrefix(got, needsFixesTitlePrefix) {
-				t.Errorf("title = %q, want the needs-fixes prefix", got)
-			}
-			if !tc.wantPrefix && got != title {
-				t.Errorf("title = %q, want it untouched", got)
-			}
-		})
+// An unresolved must-fix finding prefixes the title on EVERY provider path,
+// draft or not. The draft is the guard, the title is the signal, and the two
+// are not the same thing: a list, a notification and an email show the title
+// and not the draft state, and "Ready for review" drops the draft state while
+// the findings stay open.
+func TestOpenerPrefixesTheTitleWheneverAMustFixFindingIsOpen(t *testing.T) {
+	review := completedReview(true,
+		reviewFindingOutput{Parameter: "security", Severity: "high", Location: "handler.go:41", What: "no session check", MustFix: true},
+	)
+	opener := reviewTestOpener(review)
+	if !opener.needsFixes() {
+		t.Fatal("an open must-fix finding did not ask for fixes")
+	}
+	title, _ := opener.buildPRTitleAndBody()
+	if strings.HasPrefix(title, needsFixesTitlePrefix) {
+		t.Fatalf("buildPRTitleAndBody applied the prefix itself (%q); openOne applies it once, after the subject is built", title)
+	}
+	if got := prefixNeedsFixes(title); !strings.HasPrefix(got, needsFixesTitlePrefix) || !strings.HasSuffix(got, strings.TrimSpace(title)) {
+		t.Errorf("prefixed title = %q, want the marker in front of %q", got, title)
 	}
 }
 

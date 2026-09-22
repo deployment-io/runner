@@ -27,9 +27,10 @@ const (
 )
 
 // needsFixesTitlePrefix marks a pull request whose review left a must-fix
-// finding open, on the providers where a draft could not be requested or where
-// the pull request already existed. The trailing space is part of it: the
-// prefix reads as a label in front of the title, not as a word glued to it.
+// finding open. It goes on every such pull request, draft or not: the draft
+// guards against a merge, the title is what a list, a notification or an
+// email shows. The trailing space is part of it: the prefix reads as a label
+// in front of the title, not as a word glued to it.
 const needsFixesTitlePrefix = "[Needs fixes] "
 
 // prefixNeedsFixes puts the marker in front of a title, once.
