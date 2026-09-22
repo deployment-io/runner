@@ -78,12 +78,14 @@ const (
 	// for a large diff over a slow model, short enough that a stuck round
 	// does not eat the stage budget.
 	reviewRunTimeout = 20 * time.Minute
-	// mustFixRunMaxTurns / mustFixRunTimeout bound one fix run. Larger than
-	// the review's because a fix edits code and re-verifies it, which is
-	// real work; far smaller than an implement run's, because a fix is
-	// scoped to a handful of named findings.
-	mustFixRunMaxTurns = 15
-	mustFixRunTimeout  = 30 * time.Minute
+	// mustFixRunTimeout is the wall clock for one fix run. A fix run's TURN
+	// cap is the implement run's own — the Task's MaxTurns, chosen by the
+	// user for this Task's size — inherited through the spawn environment
+	// rather than set here. A fix is an implement run scoped to a handful
+	// of findings, so it usually stops early; the cap is a ceiling, and a
+	// ceiling below the user's throws away a finished implementation when a
+	// bounded cleanup runs out of room.
+	mustFixRunTimeout = 30 * time.Minute
 	// reviewStageBudget caps the whole stage — every review round and every
 	// fix run together. The loop checks it BEFORE starting a round and exits
 	// through the escape hatch rather than starting one it cannot finish: a

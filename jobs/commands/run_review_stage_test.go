@@ -289,18 +289,25 @@ func TestMustFixPromptCarriesTheOriginalPromptAndOnlyTheMustFixFindings(t *testi
 	}
 }
 
-func TestApplyMustFixEnvReplacesThePromptAndBoundsTheRun(t *testing.T) {
+// A fix run keeps the implement run's turn cap — the Task's own MaxTurns —
+// rather than a smaller one of its own. A ceiling below the user's would fail
+// the Step, and discard a finished implementation, when a bounded cleanup ran
+// out of room.
+func TestApplyMustFixEnvReplacesThePromptAndKeepsTheTaskTurnCap(t *testing.T) {
 	byKey := envMap(applyMustFixEnv([]string{
 		"STEP_PROMPT=the original",
-		"MAX_TURNS=30",
+		"MAX_TURNS=80",
 		"ANTHROPIC_API_KEY=sk-ant-test",
 	}, "the fix prompt"))
 
 	if byKey["STEP_PROMPT"] != "the fix prompt" {
 		t.Errorf("STEP_PROMPT = %q, want the fix prompt", byKey["STEP_PROMPT"])
 	}
-	if byKey["MAX_TURNS"] != "15" {
-		t.Errorf("MAX_TURNS = %q, want the fix run's own cap", byKey["MAX_TURNS"])
+	if byKey["MAX_TURNS"] != "80" {
+		t.Errorf("MAX_TURNS = %q, want the implement run's own cap carried through", byKey["MAX_TURNS"])
+	}
+	if _, ok := envMap(applyMustFixEnv([]string{"STEP_PROMPT=x"}, "fix"))["MAX_TURNS"]; ok {
+		t.Error("a fix run invented a MAX_TURNS the implement run did not have")
 	}
 	if _, ok := byKey["AGENT_MODE"]; ok {
 		t.Error("a fix run must be an ordinary batch run, with no AGENT_MODE override")

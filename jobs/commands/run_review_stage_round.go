@@ -402,21 +402,20 @@ func (s *reviewStage) ensureVendoredCache(imageRef, workDirHost string) error {
 	return nil
 }
 
-// applyMustFixEnv replaces STEP_PROMPT with the fix prompt and bounds the run.
+// applyMustFixEnv replaces STEP_PROMPT with the fix prompt. Everything else,
+// MAX_TURNS included, is the implement run's: a fix run is that run again
+// with a narrower ask, and it keeps the turn cap the user chose for the Task.
 func applyMustFixEnv(env []string, prompt string) []string {
-	out := make([]string, 0, len(env)+2)
+	out := make([]string, 0, len(env)+1)
 	for _, kv := range env {
 		key, _, _ := strings.Cut(kv, "=")
 		switch key {
-		case "STEP_PROMPT", "MAX_TURNS", "AGENT_MODE":
+		case "STEP_PROMPT", "AGENT_MODE":
 			continue
 		}
 		out = append(out, kv)
 	}
-	return append(out,
-		"STEP_PROMPT="+prompt,
-		"MAX_TURNS="+strconv.Itoa(mustFixRunMaxTurns),
-	)
+	return append(out, "STEP_PROMPT="+prompt)
 }
 
 // buildMustFixPrompt folds the Step's original prompt together with the
