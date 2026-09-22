@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -56,16 +58,22 @@ func (rs *RunReviewStage) SetProgressSink(sink func(jobs.LiveProgressV1)) { rs.p
 // needs one defensible answer more than it needs a configuration surface, and
 // because a bound nobody has tuned yet is better argued from a comment than
 // from a database row nobody has written.
+// reviewDiffDirName mirrors agentbox's review.DirName: the directory beside
+// the repository checkouts where a review round's diff files live.
+const reviewDiffDirName = ".review"
+
 const (
 	// maxMustFixRounds caps how many times a must-fix finding may be routed
 	// back to the implementer, so at most three review runs happen in total.
 	// Two is the point where a loop that is converging has converged and one
 	// that is not has usually started arguing with itself.
 	maxMustFixRounds = 2
-	// reviewRunMaxTurns bounds one review run. A review reads a diff and
-	// writes a report; a run that wants more than a dozen turns for that has
-	// started doing something else.
-	reviewRunMaxTurns = 12
+	// reviewRunMaxTurns bounds one review run. A review reads the diff
+	// files agentbox wrote (one per repository, in pages when large), opens
+	// the callers of what changed, and writes a report; the reading is
+	// turns, so the cap leaves room for a multi-repository change. A run
+	// that wants more than this has started doing something else.
+	reviewRunMaxTurns = 20
 	// reviewRunTimeout is the wall clock for one review run. Generous enough
 	// for a large diff over a slow model, short enough that a stuck round
 	// does not eat the stage budget.
@@ -121,7 +129,13 @@ func (rs *RunReviewStage) Run(parameters map[string]interface{}, logsWriter io.W
 	// stash and one per round. Each round removes its own on the way out;
 	// this sweeps whatever a failed restore left, however the stage ends,
 	// so a Step cannot leak host directories nothing else ever collects.
-	defer cleanupReviewStageSiblings(commandUtils.GetTaskRepositoriesBaseDir(ctx.OrganizationID, ctx.TaskID))
+	workDirHost := commandUtils.GetTaskRepositoriesBaseDir(ctx.OrganizationID, ctx.TaskID)
+	defer cleanupReviewStageSiblings(workDirHost)
+	// agentbox writes the round's diff files under <work dir>/.review and
+	// removes them itself when the run ends; this is the safety net for a
+	// round killed before it could, so a fix run or the next Step never
+	// finds a stale diff beside the checkouts.
+	defer os.RemoveAll(filepath.Join(workDirHost, reviewDiffDirName))
 	stage := &reviewStage{
 		ctx:           ctx,
 		parameters:    parameters,

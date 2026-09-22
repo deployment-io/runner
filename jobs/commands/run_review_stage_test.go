@@ -257,7 +257,7 @@ func TestReviewSpawnEnvCarriesNeitherStepPromptNorPreviousStepsSummary(t *testin
 		"REVIEW_BASE_COMMITS": `{"0-acme-api":"abc123"}`,
 		"REVIEW_ROUND":        "1",
 		"REVIEW_SPEC":         `{"title":"Add login"}`,
-		"MAX_TURNS":           "12",
+		"MAX_TURNS":           "20",
 		// The credentials and agent selection are the implement run's: the
 		// Review stage runs on the Task's own agent and model.
 		"ANTHROPIC_API_KEY": "sk-ant-test",
