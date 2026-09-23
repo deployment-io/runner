@@ -74,6 +74,7 @@ func (opr *taskOpenPR) reviewSection() string {
 	var sb strings.Builder
 	sb.WriteString("\n---\n")
 	sb.WriteString("**Review**\n\n")
+	sb.WriteString(reviewedByLine(opr.review))
 
 	latest := latestCompletedRound(opr.review)
 	failed := failedFinalRound(opr.review)
@@ -106,6 +107,33 @@ func (opr *taskOpenPR) reviewSection() string {
 	}
 	sb.WriteString("\n" + coverageLine(latest.Coverage))
 	return boundSection(sb.String())
+}
+
+// reviewedByLine says WHO reviewed, because that is no longer implied by the
+// Task. A Task may run its review rounds on a model other than the one that
+// implemented the change, and a reader weighing a finding — or the absence of
+// one — is weighing the judgement of whichever model actually made it.
+//
+// The model is read from the rounds themselves rather than from the Job, so it
+// names the reviewer that ran. Scanned newest-first because a failed final
+// round still records who would have run; empty only for a review recorded by
+// a runner older than this line, where saying nothing beats guessing.
+//
+// The round count comes along when there was more than one, since "two rounds"
+// means the first round found something that had to be fixed — which is part
+// of reading what follows.
+func reviewedByLine(review *reviewOutput) string {
+	var model string
+	for i := len(review.Rounds) - 1; i >= 0 && model == ""; i-- {
+		model = strings.TrimSpace(review.Rounds[i].Model)
+	}
+	if model == "" {
+		return ""
+	}
+	if rounds := len(review.Rounds); rounds > 1 {
+		return fmt.Sprintf("Reviewed by %s, %d rounds.\n\n", model, rounds)
+	}
+	return fmt.Sprintf("Reviewed by %s.\n\n", model)
 }
 
 // mustFixHeading names what the must-fix findings actually are, which depends
