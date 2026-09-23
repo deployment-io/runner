@@ -127,6 +127,13 @@ func reviewerParameters(parameters map[string]interface{}) (map[string]interface
 	}
 	jobs.SetParameterValue[string](view, parameters_enums.AgentType, agentType)
 	jobs.SetParameterValue[string](view, parameters_enums.Model, model)
+	// The implementer's credential pair NEVER survives into the view, on
+	// either path. On the failure path the view still exists — it names the
+	// reviewer in the failed round's record — and a later caller that spawned
+	// from it without checking the failure would otherwise run the reviewer's
+	// agent on the implementer's secrets and provider.
+	delete(view, parameterKeyString(parameters_enums.AgentProvider))
+	jobs.SetParameterValue[map[string]string](view, parameters_enums.AgentEnvVars, map[string]string{})
 	provider, err := jobs.GetParameterValue[string](parameters, parameters_enums.ReviewAgentProvider)
 	if err != nil || provider == "" {
 		// The view is still returned so the failed round's record names the
@@ -134,12 +141,27 @@ func reviewerParameters(parameters map[string]interface{}) (map[string]interface
 		return view, fmt.Sprintf("no credentials for the reviewer model %s", model)
 	}
 	jobs.SetParameterValue[string](view, parameters_enums.AgentProvider, provider)
-	envVars, err := jobs.GetParameterValue[map[string]string](parameters, parameters_enums.ReviewAgentEnvVars)
-	if err != nil {
-		envVars = map[string]string{}
+	// An ABSENT bundle is legitimate (Bedrock, strict subscription) and stays
+	// the empty map set above. A PRESENT bundle of the wrong type is a
+	// producer bug, and spawning with no secrets because of it would surface
+	// as an unexplained auth failure inside the review round — so it fails the
+	// round by name instead.
+	if _, present := parameters[parameterKeyString(parameters_enums.ReviewAgentEnvVars)]; present {
+		envVars, err := jobs.GetParameterValue[map[string]string](parameters, parameters_enums.ReviewAgentEnvVars)
+		if err != nil {
+			return view, fmt.Sprintf("the credentials for the reviewer model %s could not be read: %s", model, err)
+		}
+		jobs.SetParameterValue[map[string]string](view, parameters_enums.AgentEnvVars, envVars)
 	}
-	jobs.SetParameterValue[map[string]string](view, parameters_enums.AgentEnvVars, envVars)
 	return view, ""
+}
+
+// parameterKeyString is the persisted map key for k. Every key in the enum has
+// one (runner-kit's keys_test pins it), so the error cannot occur for a
+// declared key and an undeclared one simply matches nothing.
+func parameterKeyString(k parameters_enums.Key) string {
+	key, _ := k.Key()
+	return key
 }
 
 // reviewPasses is the pass set this release runs, matching the two parameters

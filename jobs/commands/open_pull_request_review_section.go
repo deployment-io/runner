@@ -114,24 +114,34 @@ func (opr *taskOpenPR) reviewSection() string {
 // implemented the change, and a reader weighing a finding — or the absence of
 // one — is weighing the judgement of whichever model actually made it.
 //
-// The model is read from the rounds themselves rather than from the Job, so it
-// names the reviewer that ran. Scanned newest-first because a failed final
-// round still records who would have run; empty only for a review recorded by
-// a runner older than this line, where saying nothing beats guessing.
+// ONLY ROUNDS THAT COMPLETED COUNT. A round that failed before or during its
+// run reviewed nothing, so naming its model as the reviewer would claim a
+// review that did not happen — the failure sentence below already says what
+// went wrong. With no completed round the line is omitted. The model is read
+// from the rounds themselves rather than from the Job, so it names the
+// reviewer that ran; empty for a review recorded by a runner older than this
+// line, where saying nothing beats guessing.
 //
-// The round count comes along when there was more than one, since "two rounds"
-// means the first round found something that had to be fixed — which is part
-// of reading what follows.
+// The round count comes along when more than one round completed, since "two
+// rounds" means the first round found something that had to be fixed — which
+// is part of reading what follows.
 func reviewedByLine(review *reviewOutput) string {
 	var model string
-	for i := len(review.Rounds) - 1; i >= 0 && model == ""; i-- {
-		model = strings.TrimSpace(review.Rounds[i].Model)
+	completed := 0
+	for i := len(review.Rounds) - 1; i >= 0; i-- {
+		if !review.Rounds[i].Completed {
+			continue
+		}
+		completed++
+		if model == "" {
+			model = strings.TrimSpace(review.Rounds[i].Model)
+		}
 	}
 	if model == "" {
 		return ""
 	}
-	if rounds := len(review.Rounds); rounds > 1 {
-		return fmt.Sprintf("Reviewed by %s, %d rounds.\n\n", model, rounds)
+	if completed > 1 {
+		return fmt.Sprintf("Reviewed by %s, %d rounds.\n\n", model, completed)
 	}
 	return fmt.Sprintf("Reviewed by %s.\n\n", model)
 }

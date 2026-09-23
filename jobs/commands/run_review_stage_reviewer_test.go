@@ -329,3 +329,55 @@ func TestTheReviewSectionSaysWhoReviewed(t *testing.T) {
 		t.Errorf("a review with no recorded model claimed one anyway:\n%s", section)
 	}
 }
+
+// The implementer's credential pair never survives into the reviewer's view —
+// not even on the failure path, where the view still exists to name the
+// reviewer in the record. A caller that spawned from it without checking the
+// failure would otherwise run a Codex reviewer on the Anthropic key.
+func TestTheFailedReviewerViewCarriesNoImplementerCredentials(t *testing.T) {
+	parameters := withReviewer(t, implementerJobParameters(t), "codex", "gpt-5.5", nil, nil)
+	view, failure := reviewerParameters(parameters)
+	if failure == "" {
+		t.Fatal("a reviewer with no provider did not fail")
+	}
+	if creds, _ := jobs.GetParameterValue[map[string]string](view, parameters_enums.AgentEnvVars); len(creds) != 0 {
+		t.Errorf("the failed reviewer view still carries credentials %v", creds)
+	}
+	if _, present := view[parameterKeyString(parameters_enums.AgentProvider)]; present {
+		t.Error("the failed reviewer view still carries the implementer's provider")
+	}
+	// ...and the Job's own parameters are untouched.
+	if creds, _ := jobs.GetParameterValue[map[string]string](parameters, parameters_enums.AgentEnvVars); len(creds) == 0 {
+		t.Error("building the reviewer view stripped the implementer's own credentials from the Job")
+	}
+}
+
+// A PRESENT bundle of the wrong type is a producer bug, not an empty bundle:
+// the round fails by name instead of spawning the reviewer with no secrets.
+func TestAMalformedReviewerBundleFailsTheRound(t *testing.T) {
+	bedrock := llm_provider_enums.AWSBedrock
+	parameters := withReviewer(t, implementerJobParameters(t), "codex", "gpt-5.5", &bedrock, nil)
+	parameters[parameterKeyString(parameters_enums.ReviewAgentEnvVars)] = "not a map"
+	if _, failure := reviewerParameters(parameters); !strings.Contains(failure, "could not be read") {
+		t.Errorf("a malformed reviewer bundle produced failure %q, want a named read failure", failure)
+	}
+}
+
+// "Reviewed by" names only a review that ran. A round that failed reviewed
+// nothing; naming its model would claim a review that did not happen.
+func TestReviewedByCountsOnlyCompletedRounds(t *testing.T) {
+	failedOnly := &reviewOutput{Participation: "on", Rounds: []reviewRoundOutput{{
+		Round: 1, Completed: false, Model: "gpt-5.5", Error: "no credentials for the reviewer model gpt-5.5",
+		Coverage: []reviewCoverageOutput{{Parameter: "security", State: "not checked"}},
+	}}}
+	if line := reviewedByLine(failedOnly); line != "" {
+		t.Errorf("a review whose only round failed produced %q", line)
+	}
+	mixed := &reviewOutput{Participation: "on", Rounds: []reviewRoundOutput{
+		{Round: 1, Completed: true, Model: "gpt-5.5"},
+		{Round: 2, Completed: false, Model: "gpt-5.5", Error: "timed out"},
+	}}
+	if line := reviewedByLine(mixed); line != "Reviewed by gpt-5.5.\n\n" {
+		t.Errorf("one completed round of two produced %q, want no round count", line)
+	}
+}
