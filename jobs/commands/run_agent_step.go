@@ -30,6 +30,7 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/iam_policies"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner-kit/task_previews"
+	"github.com/deployment-io/deployment-runner-kit/tasks"
 	"github.com/deployment-io/deployment-runner-kit/types"
 	agentmcp "github.com/deployment-io/deployment-runner/agent_mcp"
 	"github.com/deployment-io/deployment-runner/agenttools"
@@ -271,6 +272,10 @@ func (rs *RunAgentStep) Run(parameters map[string]interface{}, logsWriter io.Wri
 	if err != nil {
 		return parameters, err
 	}
+	// The Step is now implementing. Reported here rather than left implicit
+	// so a Step that later moves to Review has a stage to move FROM — a card
+	// that only ever said "Review" would read as though the agent never ran.
+	reportTaskStepStage(parameters, ctx, tasks.StageImplement, logsWriter)
 	imageRef, err := jobs.GetParameterValue[string](parameters, parameters_enums.AgentboxImage)
 	if err != nil {
 		return parameters, fmt.Errorf("agentbox image missing: %s", err)
@@ -445,6 +450,25 @@ func prepareAgentboxHostDirs(workDirHost string) error {
 			return err
 		}
 		if err := os.Chown(dir, commandUtils.AgentboxUID, commandUtils.AgentboxGID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// clearAgentboxOutputArtifacts removes the result and progress files a
+// previous agentbox run left in the output directory.
+//
+// Only those two: the directory itself, its ownership, and anything else in it
+// are the caller's business. A file that is not there is not an error — the
+// first run of a Step has nothing to clear.
+func clearAgentboxOutputArtifacts(workDirHost string) error {
+	if strings.TrimSpace(workDirHost) == "" {
+		return nil
+	}
+	for _, name := range []string{agentboxResultFile, agentboxProgressFile} {
+		path := filepath.Join(workDirHost, agentboxResultDirRel, name)
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 			return err
 		}
 	}
@@ -766,6 +790,19 @@ func (rs *RunAgentStep) spawnAgentboxAndWait(spec agentboxSpawnSpec, logsWriter 
 		}()
 		go func() { _ = mcpSrv.ServeListener(mcpCtx, ln) }()
 	}
+	// Clear the previous run's output BEFORE the container starts, so the
+	// result this function reads can only be the one this container wrote.
+	//
+	// Without this a run that crashed before flushing its own result.json
+	// left the previous run's file in place — and readAgentResult, which has
+	// no way to tell one run's file from another's, returned it. The Step then
+	// passed the verify gate on a verification that never happened, counted
+	// the same token usage twice, and carried on against a half-edited tree.
+	// The invariant lives HERE rather than at each call site so every spawn
+	// has it, including the ones added later.
+	if err := clearAgentboxOutputArtifacts(spec.workDirHost); err != nil {
+		return agentResult{}, fmt.Errorf("error clearing the previous run's agentbox output: %w", err)
+	}
 	containerID, err := createAgentboxContainer(dockerCtx, cli, spec)
 	if err != nil {
 		return agentResult{}, err
@@ -801,18 +838,22 @@ func (rs *RunAgentStep) spawnAgentboxAndWait(spec agentboxSpawnSpec, logsWriter 
 	if rs.progressSink != nil {
 		go pollProgressFile(spec.workDirHost, rs.progressSink, stopProgressPoll)
 	}
-	waitCtx, cancelWait := context.WithTimeout(dockerCtx, defaultWallClockTimeout)
-	defer cancelWait()
-	_, waitErr := waitForContainerExit(waitCtx, cli, containerID, rs.stopSignal, logsWriter)
-	// On user-stop, return the partial result (caller merges into
-	// JobOutput) plus the stop sentinel error so the caller can route
-	// to the stop UX path. On other errors, propagate as-is.
-	if errors.Is(waitErr, types.ErrJobStoppedByUser) {
-		result, _ := readAgentResult(spec.workDirHost) // best-effort; may be empty if SIGTERM grace expired
-		return result, waitErr
+	waitTimeout := defaultWallClockTimeout
+	if spec.waitTimeout > 0 && spec.waitTimeout < waitTimeout {
+		waitTimeout = spec.waitTimeout
 	}
+	waitCtx, cancelWait := context.WithTimeout(dockerCtx, waitTimeout)
+	defer cancelWait()
+	_, waitErr := waitForContainerExit(waitCtx, cli, containerID, rs.stopSignal, waitTimeout, logsWriter)
 	if waitErr != nil {
-		return agentResult{}, waitErr
+		// Both the user-stop and the wall-clock paths SIGTERM the container
+		// with grace, and agentbox flushes a partial result.json on SIGTERM.
+		// Read it on EVERY error path: its token usage was really spent and
+		// has to be attributed, and on a review round its partial coverage is
+		// the only record of what the round managed to look at. Best-effort —
+		// the file is absent when the grace window expired first.
+		result, _ := readAgentResult(spec.workDirHost)
+		return result, waitErr
 	}
 	return readAgentResult(spec.workDirHost)
 }
@@ -997,7 +1038,11 @@ func streamContainerLogs(ctx context.Context, cli *client.Client, containerID st
 //
 // stopSignal can be nil — a nil channel never fires in select, so the
 // stop branch is silently skipped. Pre-Phase-5.5 behavior matches.
-func waitForContainerExit(ctx context.Context, cli *client.Client, containerID string, stopSignal <-chan struct{}, logsWriter io.Writer) (int, error) {
+// waitTimeout is the EFFECTIVE cap for this wait, which is not always
+// defaultWallClockTimeout: a review round gets 20 minutes and a fix run 30, and
+// naming the default in the message sent a reader looking for a four-hour run
+// that never happened.
+func waitForContainerExit(ctx context.Context, cli *client.Client, containerID string, stopSignal <-chan struct{}, waitTimeout time.Duration, logsWriter io.Writer) (int, error) {
 	statusCh, errCh := cli.ContainerWait(ctx, containerID, container.WaitConditionNotRunning)
 	select {
 	case err := <-errCh:
@@ -1009,7 +1054,7 @@ func waitForContainerExit(ctx context.Context, cli *client.Client, containerID s
 			stopCtx := context.Background() // ContainerStop on a fresh context — the wait ctx is already done
 			grace := containerStopGraceSec
 			_ = cli.ContainerStop(stopCtx, containerID, container.StopOptions{Timeout: &grace})
-			return 0, fmt.Errorf("agentbox exceeded wall-clock cap of %s — SIGTERM sent", defaultWallClockTimeout)
+			return 0, fmt.Errorf("agentbox exceeded wall-clock cap of %s — SIGTERM sent", waitTimeout)
 		}
 		if err != nil {
 			return 0, fmt.Errorf("error waiting for container exit: %s", err)
@@ -1087,6 +1132,44 @@ type agentResult struct {
 	// runner gates the Step's commit on it (ran && !passed → fail before
 	// CommitAndPush). Nil when the agent reported none.
 	VerifyResult *verifyResult `json:"verify_result,omitempty"`
+	// ReviewResult is what a review-mode run found. Nil for an implement
+	// run, and for an agentbox image that predates review mode — which is
+	// exactly how the older-image case is detected rather than crashed on.
+	//
+	// Note what it does NOT contain: must_fix_open. That decision is the
+	// runner's, computed from these findings and the thresholds stamped into
+	// the Job, because an agent that could assert it could wave its own
+	// findings through.
+	ReviewResult *reviewResult `json:"review_result,omitempty"`
+}
+
+// reviewResult mirrors agentbox's result.json review_result object — a
+// deliberate hand-mirror, like tokenUsage above, because the runner shares no
+// module with agentbox.
+//
+// Every field is a STRING, including parameter and severity. agentbox imports
+// no enum of ours; the runner maps the names through deployment-runner-kit's
+// wire mirror and annotates whatever it cannot read.
+type reviewResult struct {
+	Findings []reviewFinding  `json:"findings,omitempty"`
+	Coverage []reviewCoverage `json:"coverage,omitempty"`
+}
+
+type reviewFinding struct {
+	Key       string `json:"key,omitempty"`
+	Parameter string `json:"parameter,omitempty"`
+	Severity  string `json:"severity,omitempty"`
+	Location  string `json:"location,omitempty"`
+	What      string `json:"what,omitempty"`
+	Why       string `json:"why,omitempty"`
+	Stage     string `json:"stage,omitempty"`
+	Pass      string `json:"pass,omitempty"`
+}
+
+type reviewCoverage struct {
+	Parameter string `json:"parameter,omitempty"`
+	State     string `json:"state,omitempty"`
+	Reason    string `json:"reason,omitempty"`
 }
 
 // verifyResult mirrors the fields of agentbox's result.json verify_result
@@ -1379,14 +1462,38 @@ func resolveRunCost(parameters map[string]interface{}, result agentResult) *cost
 // envelope. CommitAndPush + OpenPullRequest later extend the same
 // envelope's repositories block; the merge-then-write pattern preserves
 // each command's contribution.
+//
+// IT ACCUMULATES rather than overwrites. A Step used to contain exactly one
+// agent run, so replacing the block was the same thing as writing it. The
+// Review stage can route a must-fix finding back to the implementer, and that
+// second run is the same Step's work: overwriting here would report the Step's
+// token usage as the FIX's usage alone, erase the implementer's pr_title the
+// moment a fix run emitted none, and under-report the Task's cost by however
+// much the first run spent.
+//
+// What replaces and what accumulates follows from what each field means:
+// counters add, lists union, the latest verification wins (it is the one that
+// describes the code being committed), and a title or summary is only ever
+// replaced by a non-empty one.
 func mergeAgentResultIntoJobOutput(parameters map[string]interface{}, result agentResult) error {
 	data := jobOutputData{}
 	if existing, err := jobs.GetParameterValue[string](parameters, parameters_enums.JobOutput); err == nil && len(existing) > 0 {
 		_ = json.Unmarshal([]byte(existing), &data)
 	}
 	data.SchemaVersion = jobOutputSchemaVersion
-	data.Cost = resolveRunCost(parameters, result)
-	data.Agent = &agentOutput{
+	data.Cost = accumulateCost(data.Cost, resolveRunCost(parameters, result))
+	data.Agent = accumulateAgentOutput(data.Agent, result)
+	merged, err := json.Marshal(data)
+	if err != nil {
+		return err
+	}
+	jobs.SetParameterValue[string](parameters, parameters_enums.JobOutput, string(merged))
+	return nil
+}
+
+// accumulateAgentOutput folds one implementer run into the Step's agent block.
+func accumulateAgentOutput(prev *agentOutput, result agentResult) *agentOutput {
+	next := &agentOutput{
 		ChangesSummary: result.ChangesSummary,
 		FilesChanged:   result.FilesChanged,
 		TokenUsage:     result.TokenUsage,
@@ -1397,12 +1504,140 @@ func mergeAgentResultIntoJobOutput(parameters map[string]interface{}, result age
 		PRTitle:        result.PRTitle,
 		VerifyResult:   result.VerifyResult,
 	}
+	if prev == nil {
+		return next
+	}
+	next.TokenUsage = addTokenUsage(prev.TokenUsage, result.TokenUsage)
+	next.Turns = prev.Turns + result.Turns
+	next.FilesChanged = unionStrings(prev.FilesChanged, result.FilesChanged)
+	next.DeniedHosts = unionStrings(prev.DeniedHosts, result.DeniedHosts)
+	next.CostUSD = addOptionalCost(prev.CostUSD, result.CostUSD)
+	// A fix run that produced no title must not erase the implementer's: the
+	// PR is still titled after the change as a whole.
+	if next.PRTitle == "" {
+		next.PRTitle = prev.PRTitle
+	}
+	// The narrative accumulates too, because the commit message is built from
+	// it and the fixes are part of what this Step did. A fix run that said
+	// nothing leaves the implementer's account standing.
+	next.ChangesSummary = appendChangesSummary(prev.ChangesSummary, result.ChangesSummary)
+	// The LATEST verification wins — it is the one that ran against the code
+	// actually being committed. A nil one does not erase the earlier verdict,
+	// because "this run reported no verify" is not "the build is unknown".
+	if next.VerifyResult == nil {
+		next.VerifyResult = prev.VerifyResult
+	}
+	return next
+}
+
+// accumulateReviewRunUsage folds a REVIEW run's usage and cost into the Step's
+// totals, and nothing else.
+//
+// A review writes no code, so its changes_summary is a description of someone
+// else's work and its files_changed is empty; folding those into the agent
+// block would put a reviewer's prose into the commit message. But it is an LLM
+// run that costs real money, and a Task whose cost omitted its reviews would
+// under-report by however much they spent — including for a round that failed
+// partway, which still burned the tokens it burned.
+func accumulateReviewRunUsage(parameters map[string]interface{}, result agentResult) error {
+	data := jobOutputData{}
+	if existing, err := jobs.GetParameterValue[string](parameters, parameters_enums.JobOutput); err == nil && len(existing) > 0 {
+		_ = json.Unmarshal([]byte(existing), &data)
+	}
+	data.SchemaVersion = jobOutputSchemaVersion
+	data.Cost = accumulateCost(data.Cost, resolveRunCost(parameters, result))
+	if data.Agent == nil {
+		data.Agent = &agentOutput{}
+	}
+	data.Agent.TokenUsage = addTokenUsage(data.Agent.TokenUsage, result.TokenUsage)
+	data.Agent.Turns += result.Turns
+	data.Agent.DeniedHosts = unionStrings(data.Agent.DeniedHosts, result.DeniedHosts)
 	merged, err := json.Marshal(data)
 	if err != nil {
 		return err
 	}
 	jobs.SetParameterValue[string](parameters, parameters_enums.JobOutput, string(merged))
 	return nil
+}
+
+func addTokenUsage(a, b tokenUsage) tokenUsage {
+	return tokenUsage{
+		InputTokens:         a.InputTokens + b.InputTokens,
+		OutputTokens:        a.OutputTokens + b.OutputTokens,
+		CacheReadTokens:     a.CacheReadTokens + b.CacheReadTokens,
+		CacheCreationTokens: a.CacheCreationTokens + b.CacheCreationTokens,
+	}
+}
+
+// addOptionalCost sums two agent-reported costs, preserving the distinction
+// between "no cost reported" (nil) and a real zero. A run that reported one
+// and a run that did not sum to the one that did — the alternative is dropping
+// a figure we were given.
+func addOptionalCost(a, b *float64) *float64 {
+	if a == nil {
+		return b
+	}
+	if b == nil {
+		return a
+	}
+	sum := *a + *b
+	return &sum
+}
+
+// accumulateCost sums the resolved cost across the runs of one Step.
+//
+// The PROVENANCE kept is the first one recorded. A Step whose implement run
+// was priced by the agent and whose review was estimated is mostly the former,
+// and inventing a third source value would break every reader that switches on
+// the two that exist. The model and provider are the same for every run in a
+// Step today — one credential bundle, one provider per Job — so there is no
+// ambiguity to record yet.
+func accumulateCost(prev, next *costOutput) *costOutput {
+	if prev == nil {
+		return next
+	}
+	if next == nil {
+		return prev
+	}
+	return &costOutput{
+		USD:      prev.USD + next.USD,
+		Source:   prev.Source,
+		Model:    prev.Model,
+		Provider: prev.Provider,
+	}
+}
+
+// unionStrings appends the entries of b that a does not already have,
+// preserving first-seen order.
+func unionStrings(a, b []string) []string {
+	seen := make(map[string]struct{}, len(a)+len(b))
+	out := make([]string, 0, len(a)+len(b))
+	for _, list := range [][]string{a, b} {
+		for _, v := range list {
+			if _, ok := seen[v]; ok {
+				continue
+			}
+			seen[v] = struct{}{}
+			out = append(out, v)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// appendChangesSummary joins the implementer's narrative with a later fix
+// run's, under a label so a reader can tell which is which.
+func appendChangesSummary(prev, next string) string {
+	prev, next = strings.TrimSpace(prev), strings.TrimSpace(next)
+	switch {
+	case next == "":
+		return prev
+	case prev == "":
+		return next
+	}
+	return prev + "\n\n[Review fixes]\n" + next
 }
 
 // agentboxSpawnSpec is the per-phase container configuration. An empty Cmd
@@ -1429,6 +1664,16 @@ type agentboxSpawnSpec struct {
 	// previewDeps, set for the agent phase only, is the task-scoped context the
 	// deploy_static_site_preview MCP tool closes over. Nil for the vendor phase.
 	previewDeps *agenttools.DeployStaticSitePreviewDeps
+	// waitTimeout overrides how long the container may run. Zero means
+	// defaultWallClockTimeout, which is what an implement run gets. The
+	// Review stage sets it per round, because a review and a bounded fix run
+	// are minutes of work and a four-hour cap on them would mean a stuck
+	// round eats the whole Step's budget before anyone notices.
+	//
+	// It can only ever SHORTEN the wait: nothing sets it above the default,
+	// so the Review stage cannot push a Step past the runner's existing
+	// per-container cap.
+	waitTimeout time.Duration
 }
 
 // agentMCPSocketHostPath returns the host path for a task's MCP tool socket: a
@@ -1540,7 +1785,7 @@ func (rs *RunAgentStep) spawnVendorAndWait(spec agentboxSpawnSpec, logsWriter io
 	}()
 	waitCtx, cancelWait := context.WithTimeout(dockerCtx, defaultVendorTimeout)
 	defer cancelWait()
-	code, waitErr := waitForContainerExit(waitCtx, cli, containerID, rs.stopSignal, logsWriter)
+	code, waitErr := waitForContainerExit(waitCtx, cli, containerID, rs.stopSignal, defaultVendorTimeout, logsWriter)
 	if waitErr != nil {
 		return waitErr
 	}

@@ -74,6 +74,8 @@ func Get(p commands_enums.Type) (jobs.Command, error) {
 		return &GetDeploymentLogsAws{}, nil
 	case commands_enums.RunAgentStep:
 		return &RunAgentStep{}, nil
+	case commands_enums.RunReviewStage:
+		return &RunReviewStage{}, nil
 	case commands_enums.RunAssistantSession:
 		return &RunAssistantSession{}, nil
 	case commands_enums.CommitAndPush:
