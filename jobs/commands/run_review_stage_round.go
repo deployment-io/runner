@@ -56,8 +56,12 @@ func (s *reviewStage) runReviewRound(round int) (agentResult, error) {
 	}, s.logsWriter)
 }
 
-// reviewSpawnEnv builds the review container's environment: the implement
-// run's credentials and agent selection, plus the four REVIEW_* inputs.
+// reviewSpawnEnv builds the review container's environment: the REVIEWER's
+// credentials and agent selection, plus the four REVIEW_* inputs.
+//
+// The reviewer view is what differs from the implement run — when the Job
+// names no reviewer it IS the Job's own parameters, and this is the
+// environment the stage has always built.
 //
 // It deliberately carries NEITHER STEP_PROMPT NOR PREVIOUS_STEPS_SUMMARY. The
 // review's work item is the diff, and handing it the implementer's instruction
@@ -65,7 +69,7 @@ func (s *reviewStage) runReviewRound(round int) (agentResult, error) {
 // do rather than against what the change actually does — and to keep going
 // where the implementer left off.
 func (s *reviewStage) reviewSpawnEnv(round int) ([]string, error) {
-	env, err := buildAgentSpawnEnvVars(s.parameters, s.logsWriter)
+	env, err := buildAgentSpawnEnvVars(s.reviewerView(), s.logsWriter)
 	if err != nil {
 		return nil, err
 	}
@@ -80,6 +84,84 @@ func (s *reviewStage) reviewSpawnEnv(round int) ([]string, error) {
 		baseCommits: string(baseCommits),
 		round:       round,
 	}), nil
+}
+
+// reviewerParameters is the Job's parameters AS THE REVIEWER SEES THEM: a
+// shallow copy with AgentType, Model, AgentEnvVars and AgentProvider replaced
+// by the reviewer's own ReviewAgentType, ReviewModel, ReviewAgentEnvVars and
+// ReviewAgentProvider.
+//
+// A COPY THROUGH THE EXISTING BUILDER, not a second env-building path. Bedrock
+// credential vending, per-provider model rendering, the Claude subscription
+// swap and the proxy allowlist all live in buildAgentSpawnEnvVars; handing it
+// a different view of the same four keys applies every one of them to the
+// reviewer, and none of them can drift out of sync with the implementer's.
+//
+// Returns (nil, "") when the Job names no reviewer, which is every Task that
+// never chose one and every Job created before reviewers existed. Callers read
+// that as "use the Job's own parameters" — the behaviour the stage has always
+// had.
+//
+// THE MISSING-CREDENTIALS TEST IS ReviewAgentProvider. deployment-server stamps
+// the reviewer's provider and bundle together, from one org read, and leaves
+// both unstamped when it cannot resolve them. So a reviewer with no provider
+// is a reviewer with no credentials, and the round fails NAMING IT rather than
+// falling back to the implementer's model: the stored record and the pull
+// request both say who reviewed, and a silent fallback would make them lie.
+//
+// An EMPTY or absent bundle with a provider present is valid and returns no
+// failure. The bundle is secrets only, and for Bedrock or a strict
+// subscription org it legitimately carries none — exactly as the implementer's
+// AgentEnvVars already can. It is replaced with an empty map rather than left
+// alone, because inheriting the implementer's secrets is the silent fallback
+// this function exists to prevent.
+func reviewerParameters(parameters map[string]interface{}) (map[string]interface{}, string) {
+	agentType, err := jobs.GetParameterValue[string](parameters, parameters_enums.ReviewAgentType)
+	if err != nil || agentType == "" {
+		return nil, ""
+	}
+	model, _ := jobs.GetParameterValue[string](parameters, parameters_enums.ReviewModel)
+	view := make(map[string]interface{}, len(parameters))
+	for k, v := range parameters {
+		view[k] = v
+	}
+	jobs.SetParameterValue[string](view, parameters_enums.AgentType, agentType)
+	jobs.SetParameterValue[string](view, parameters_enums.Model, model)
+	// The implementer's credential pair NEVER survives into the view, on
+	// either path. On the failure path the view still exists — it names the
+	// reviewer in the failed round's record — and a later caller that spawned
+	// from it without checking the failure would otherwise run the reviewer's
+	// agent on the implementer's secrets and provider.
+	delete(view, parameterKeyString(parameters_enums.AgentProvider))
+	jobs.SetParameterValue[map[string]string](view, parameters_enums.AgentEnvVars, map[string]string{})
+	provider, err := jobs.GetParameterValue[string](parameters, parameters_enums.ReviewAgentProvider)
+	if err != nil || provider == "" {
+		// The view is still returned so the failed round's record names the
+		// reviewer that was supposed to run.
+		return view, fmt.Sprintf("no credentials for the reviewer model %s", model)
+	}
+	jobs.SetParameterValue[string](view, parameters_enums.AgentProvider, provider)
+	// An ABSENT bundle is legitimate (Bedrock, strict subscription) and stays
+	// the empty map set above. A PRESENT bundle of the wrong type is a
+	// producer bug, and spawning with no secrets because of it would surface
+	// as an unexplained auth failure inside the review round — so it fails the
+	// round by name instead.
+	if _, present := parameters[parameterKeyString(parameters_enums.ReviewAgentEnvVars)]; present {
+		envVars, err := jobs.GetParameterValue[map[string]string](parameters, parameters_enums.ReviewAgentEnvVars)
+		if err != nil {
+			return view, fmt.Sprintf("the credentials for the reviewer model %s could not be read: %s", model, err)
+		}
+		jobs.SetParameterValue[map[string]string](view, parameters_enums.AgentEnvVars, envVars)
+	}
+	return view, ""
+}
+
+// parameterKeyString is the persisted map key for k. Every key in the enum has
+// one (runner-kit's keys_test pins it), so the error cannot occur for a
+// declared key and an undeclared one simply matches nothing.
+func parameterKeyString(k parameters_enums.Key) string {
+	key, _ := k.Key()
+	return key
 }
 
 // reviewPasses is the pass set this release runs, matching the two parameters

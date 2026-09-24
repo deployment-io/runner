@@ -632,7 +632,7 @@ func TestJobOutputAccumulatesAcrossTheStepsRuns(t *testing.T) {
 	}
 	// A review round: usage and cost only, never the prose.
 	reviewCost := 0.10
-	if err := accumulateReviewRunUsage(parameters, agentResult{
+	if err := accumulateReviewRunUsage(parameters, parameters, agentResult{
 		Status: "success", Turns: 4,
 		ChangesSummary: "I reviewed the change and found one thing.",
 		TokenUsage:     tokenUsage{InputTokens: 500, OutputTokens: 50},

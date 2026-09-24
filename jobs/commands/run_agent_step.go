@@ -1539,13 +1539,22 @@ func accumulateAgentOutput(prev *agentOutput, result agentResult) *agentOutput {
 // run that costs real money, and a Task whose cost omitted its reviews would
 // under-report by however much they spent — including for a round that failed
 // partway, which still burned the tokens it burned.
-func accumulateReviewRunUsage(parameters map[string]interface{}, result agentResult) error {
+//
+// TWO VIEWS, deliberately. pricingView is the parameter view the round
+// ACTUALLY RAN UNDER — the reviewer's model and provider when the Task named a
+// reviewer, the Job's own otherwise — and it is what the run is priced
+// against, because the same tokens cost different amounts on different models
+// and routes. parameters is the Job's real map, and it is where the
+// accumulated envelope is written back: the reviewer's view is a shallow copy,
+// so an envelope written into it would be discarded with the copy and the
+// Step's cost would silently lose every review it ran.
+func accumulateReviewRunUsage(parameters, pricingView map[string]interface{}, result agentResult) error {
 	data := jobOutputData{}
 	if existing, err := jobs.GetParameterValue[string](parameters, parameters_enums.JobOutput); err == nil && len(existing) > 0 {
 		_ = json.Unmarshal([]byte(existing), &data)
 	}
 	data.SchemaVersion = jobOutputSchemaVersion
-	data.Cost = accumulateCost(data.Cost, resolveRunCost(parameters, result))
+	data.Cost = accumulateCost(data.Cost, resolveRunCost(pricingView, result))
 	if data.Agent == nil {
 		data.Agent = &agentOutput{}
 	}

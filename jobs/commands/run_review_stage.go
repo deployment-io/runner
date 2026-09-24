@@ -138,16 +138,21 @@ func (rs *RunReviewStage) Run(parameters map[string]interface{}, logsWriter io.W
 	// round killed before it could, so a fix run or the next Step never
 	// finds a stale diff beside the checkouts.
 	defer os.RemoveAll(filepath.Join(workDirHost, reviewDiffDirName))
+	// Resolved ONCE, before the loop: every round of this stage runs on the
+	// same reviewer, and so does every round's record.
+	reviewerParams, reviewerFailure := reviewerParameters(parameters)
 	stage := &reviewStage{
-		ctx:           ctx,
-		parameters:    parameters,
-		logsWriter:    logsWriter,
-		participation: participation,
-		thresholds:    decodeMustFixThresholds(parameters, logsWriter),
-		baseCommits:   readBaseCommitsFromJobOutput(parameters),
-		deadline:      time.Now().Add(reviewStageBudget),
-		stopSignal:    rs.stopSignal,
-		progressSink:  rs.progressSink,
+		ctx:             ctx,
+		parameters:      parameters,
+		reviewerParams:  reviewerParams,
+		reviewerFailure: reviewerFailure,
+		logsWriter:      logsWriter,
+		participation:   participation,
+		thresholds:      decodeMustFixThresholds(parameters, logsWriter),
+		baseCommits:     readBaseCommitsFromJobOutput(parameters),
+		deadline:        time.Now().Add(reviewStageBudget),
+		stopSignal:      rs.stopSignal,
+		progressSink:    rs.progressSink,
 	}
 	return stage.run()
 }
@@ -156,15 +161,24 @@ func (rs *RunReviewStage) Run(parameters map[string]interface{}, logsWriter io.W
 // parameter list: the loop, each round and the reporting all read the same
 // half-dozen inputs.
 type reviewStage struct {
-	ctx           commandUtils.TaskJobContext
-	parameters    map[string]interface{}
-	logsWriter    io.Writer
-	participation int64
-	thresholds    map[uint]uint
-	baseCommits   map[string]string
-	deadline      time.Time
-	stopSignal    <-chan struct{}
-	progressSink  func(jobs.LiveProgressV1)
+	ctx        commandUtils.TaskJobContext
+	parameters map[string]interface{}
+	// reviewerParams is the parameter view REVIEW rounds run under — see
+	// reviewerParameters. Nil when the Job names no reviewer, which is what
+	// makes reviewerView fall back to parameters and the stage behave exactly
+	// as it did before reviewers existed. Fix rounds never read it: a fix is
+	// an implement run and keeps the Task's own model, agent and credentials.
+	reviewerParams map[string]interface{}
+	// reviewerFailure is why the named reviewer cannot run, or "". Set when a
+	// reviewer was named but its credentials were not resolved at pickup.
+	reviewerFailure string
+	logsWriter      io.Writer
+	participation   int64
+	thresholds      map[uint]uint
+	baseCommits     map[string]string
+	deadline        time.Time
+	stopSignal      <-chan struct{}
+	progressSink    func(jobs.LiveProgressV1)
 
 	rounds      []reviewRoundOutput
 	fixedInLoop []reviewFindingOutput
@@ -193,6 +207,15 @@ func (s *reviewStage) run() (map[string]interface{}, error) {
 		s.recordFailedRound(1, "no start-of-run commit was recorded for any repository", agentResult{})
 		return s.finish()
 	}
+	if s.reviewerFailure != "" {
+		// FAIL-OPEN, like every other review failure: recorded as coverage
+		// naming the reason, never a failed Step. What it must NOT do is run
+		// the review on the implementer's model instead — the record would
+		// then name a reviewer that did not review.
+		io.WriteString(s.logsWriter, fmt.Sprintf("Review stage: %s — continuing without a review\n", s.reviewerFailure))
+		s.recordFailedRound(1, s.reviewerFailure, agentResult{})
+		return s.finish()
+	}
 	if s.participation == participationAdvisory {
 		io.WriteString(s.logsWriter, "Review stage: participation is advisory — every finding will be annotated on the pull request, nothing is routed back to the agent, and nothing holds the pull request\n")
 	}
@@ -210,10 +233,10 @@ func (s *reviewStage) run() (map[string]interface{}, error) {
 		if errors.Is(err, types.ErrJobStoppedByUser) {
 			// A user stop is not a failed review. Attribute what the round
 			// spent and hand the stop to the outer loop's existing path.
-			_ = accumulateReviewRunUsage(s.parameters, result)
+			_ = accumulateReviewRunUsage(s.parameters, s.reviewerView(), result)
 			return s.parameters, err
 		}
-		_ = accumulateReviewRunUsage(s.parameters, result)
+		_ = accumulateReviewRunUsage(s.parameters, s.reviewerView(), result)
 		if reason := reviewRoundFailure(result, err); reason != "" {
 			io.WriteString(s.logsWriter, fmt.Sprintf("Review round %d did not complete: %s — continuing without it\n", round, reason))
 			s.recordFailedRound(round, reason, result)
@@ -414,13 +437,31 @@ func (s *reviewStage) recordFailedRound(round int, reason string, result agentRe
 	s.rememberOpenMustFix(nil)
 }
 
+// reviewerView is the parameter view a REVIEW round runs under: the reviewer's
+// when the Job names one, the Job's own otherwise.
+//
+// One accessor rather than a check at every call site, because every one of
+// them has to give the same answer — the env the round spawns with, the agent
+// and model its record names, and the model its cost is priced against. A
+// record that named a reviewer the spawn did not use would be worse than no
+// record at all.
+func (s *reviewStage) reviewerView() map[string]interface{} {
+	if s.reviewerParams != nil {
+		return s.reviewerParams
+	}
+	return s.parameters
+}
+
+// jobAgentType / jobModel answer "who reviewed", so they read the REVIEWER's
+// view. With no reviewer named that is the Job's own agent and model, which is
+// what these have always returned.
 func (s *reviewStage) jobAgentType() string {
-	v, _ := jobs.GetParameterValue[string](s.parameters, parameters_enums.AgentType)
+	v, _ := jobs.GetParameterValue[string](s.reviewerView(), parameters_enums.AgentType)
 	return v
 }
 
 func (s *reviewStage) jobModel() string {
-	v, _ := jobs.GetParameterValue[string](s.parameters, parameters_enums.Model)
+	v, _ := jobs.GetParameterValue[string](s.reviewerView(), parameters_enums.Model)
 	return v
 }
 
@@ -452,9 +493,9 @@ func reportTaskStepStage(parameters map[string]interface{}, ctx commandUtils.Tas
 }
 
 // reportReviewResult sends the FINAL round's result to deployment-server to be
-// stored on the Step, carrying the Job's own agent type and model as the
-// review run's provenance — the Review stage runs on the Task's agent, so that
-// is what produced these findings.
+// stored on the Step, carrying that round's own agent type and model as the
+// review run's provenance — the REVIEWER's when the Task named one, the Job's
+// own otherwise. Either way it names what actually produced these findings.
 func (s *reviewStage) reportReviewResult(out *reviewOutput) {
 	if len(out.Rounds) == 0 {
 		return
