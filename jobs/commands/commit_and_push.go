@@ -564,7 +564,7 @@ type reviewRoundOutput struct {
 	Model      string                 `json:"model,omitempty"`
 	TokenUsage tokenUsage             `json:"token_usage"`
 	CostUSD    *float64               `json:"cost_usd,omitempty"`
-	// Turns is how many the round spent against reviewRunMaxTurns. It is
+	// Turns is how many the round spent against its turn cap. It is
 	// the evidence for tuning that cap: a stage whose rounds sit near it is
 	// one whose reviewer runs out of room before it has read the change.
 	Turns     int    `json:"turns,omitempty"`

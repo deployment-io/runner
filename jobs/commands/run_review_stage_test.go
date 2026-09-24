@@ -257,7 +257,7 @@ func TestReviewSpawnEnvCarriesNeitherStepPromptNorPreviousStepsSummary(t *testin
 		"REVIEW_BASE_COMMITS": `{"0-acme-api":"abc123"}`,
 		"REVIEW_ROUND":        "1",
 		"REVIEW_SPEC":         `{"title":"Add login"}`,
-		"MAX_TURNS":           "20",
+		"MAX_TURNS":           "80",
 		// The credentials and agent selection are the implement run's: the
 		// Review stage runs on the Task's own agent and model.
 		"ANTHROPIC_API_KEY": "sk-ant-test",
@@ -788,5 +788,18 @@ func TestRoundsRecordTheTurnsTheySpent(t *testing.T) {
 	stage.recordFailedRound(2, "no report", agentResult{Turns: 20})
 	if len(stage.rounds) != 2 || stage.rounds[0].Turns != 7 || stage.rounds[1].Turns != 20 {
 		t.Errorf("rounds = %+v, want turns 7 then 20 carried onto the record", stage.rounds)
+	}
+}
+
+func TestEnvValueReadsTheLastOccurrence(t *testing.T) {
+	env := []string{"A=1", "MAX_TURNS=30", "B=x=y", "MAX_TURNS=80"}
+	if got := envValue(env, "MAX_TURNS"); got != "80" {
+		t.Errorf("envValue(MAX_TURNS) = %q, want the last occurrence 80", got)
+	}
+	if got := envValue(env, "B"); got != "x=y" {
+		t.Errorf("envValue(B) = %q, want the value with its own '=' intact", got)
+	}
+	if got := envValue(env, "MISSING"); got != "" {
+		t.Errorf("envValue(MISSING) = %q, want empty", got)
 	}
 }

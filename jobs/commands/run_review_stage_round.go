@@ -36,6 +36,15 @@ func (s *reviewStage) runReviewRound(round int) (agentResult, error) {
 	if err != nil {
 		return agentResult{}, err
 	}
+	// Log the turn cap this round is ACTUALLY spawned with, read back from the
+	// environment handed to the container. A round once ran past the constant
+	// without being stopped; logging what was passed, beside agentbox's own
+	// line saying what it received, is what locates a limit lost in transit.
+	s.lastTurnCap = envValue(env, "MAX_TURNS")
+	if s.lastTurnCap == "" {
+		s.lastTurnCap = "no cap"
+	}
+	io.WriteString(s.logsWriter, fmt.Sprintf("Review round %d: turn cap %s\n", round, s.lastTurnCap))
 	swap, err := swapInReviewOutputDir(workDirHost, round, prepareAgentboxHostDirs)
 	if err != nil {
 		return agentResult{}, fmt.Errorf("error preparing the review output directory: %s", err)
@@ -519,4 +528,17 @@ func buildMustFixPrompt(stepPrompt string, mustFix []reviewFindingOutput) string
 		}
 	}
 	return b.String()
+}
+
+// envValue returns the value of key in a KEY=VALUE environment slice, or ""
+// when absent. The last occurrence wins, matching how the container sees a
+// duplicated key.
+func envValue(env []string, key string) string {
+	value := ""
+	for _, kv := range env {
+		if k, v, ok := strings.Cut(kv, "="); ok && k == key {
+			value = v
+		}
+	}
+	return value
 }
