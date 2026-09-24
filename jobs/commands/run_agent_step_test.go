@@ -14,7 +14,38 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/enums/llm_provider_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
+	"github.com/deployment-io/deployment-runner-kit/types"
 )
+
+// A Task stopped by the user while its dependencies were being vendored must
+// still be reported as STOPPED, not failed. spawnVendorAndWait returns
+// waitForContainerExit's bare types.ErrJobStoppedByUser on the stop path, and
+// RunAgentStep hands that to vendorPhaseError — which has to keep the sentinel
+// reachable through errors.Is, the same test the Step's stop handling applies.
+// Wrapping with %s (what this used to do) flattens it and the Step is marked
+// failed instead.
+func TestVendorPhaseError_PreservesStopSentinel(t *testing.T) {
+	err := vendorPhaseError(types.ErrJobStoppedByUser)
+	if !errors.Is(err, types.ErrJobStoppedByUser) {
+		t.Errorf("stopped vendor phase lost the stop sentinel: %v", err)
+	}
+	if !strings.Contains(err.Error(), "error vendoring dependencies") {
+		t.Errorf("vendor error dropped its context: %q", err.Error())
+	}
+}
+
+// The other side of the same wrap: an ordinary dependency-fetch failure must
+// NOT look like a user stop, or a genuinely broken vendor phase would quietly
+// cancel the Step instead of failing it.
+func TestVendorPhaseError_OrdinaryFailureIsNotAStop(t *testing.T) {
+	err := vendorPhaseError(errors.New("vendor phase exited with code 1"))
+	if errors.Is(err, types.ErrJobStoppedByUser) {
+		t.Errorf("ordinary vendor failure reported as a user stop: %v", err)
+	}
+	if !strings.Contains(err.Error(), "vendor phase exited with code 1") {
+		t.Errorf("vendor error dropped the underlying cause: %q", err.Error())
+	}
+}
 
 // Without the subscription marker (the default — org is on AnthropicDirect),
 // the injected API key must survive untouched.

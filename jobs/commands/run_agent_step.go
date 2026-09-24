@@ -302,7 +302,7 @@ func (rs *RunAgentStep) Run(parameters map[string]interface{}, logsWriter io.Wri
 		return parameters, err
 	}
 	if err := rs.spawnVendorAndWait(vendorSpec, logsWriter); err != nil {
-		return parameters, fmt.Errorf("error vendoring dependencies: %s", err)
+		return parameters, vendorPhaseError(err)
 	}
 	envVars, err := buildAgentSpawnEnvVars(parameters, logsWriter)
 	if err != nil {
@@ -333,7 +333,13 @@ func (rs *RunAgentStep) Run(parameters map[string]interface{}, logsWriter io.Wri
 		return parameters, err
 	}
 	if err != nil {
-		return parameters, fmt.Errorf("error running agentbox: %s", err)
+		// %w, for the same reason as vendorPhaseError: this is the error from
+		// spawnAgentboxAndWait, which can carry the stop sentinel. The
+		// errors.Is branch above already routes the ordinary stop path, so
+		// this only matters for a sentinel that arrives some other way (e.g.
+		// wrapped further down) — but flattening it here would silently undo
+		// the stop UX again.
+		return parameters, fmt.Errorf("error running agentbox: %w", err)
 	}
 	if err := mergeAgentResultIntoJobOutput(parameters, result); err != nil {
 		return parameters, fmt.Errorf("error merging agent result: %s", err)
@@ -1802,6 +1808,20 @@ func (rs *RunAgentStep) spawnVendorAndWait(spec agentboxSpawnSpec, logsWriter io
 		return fmt.Errorf("vendor phase exited with code %d", code)
 	}
 	return nil
+}
+
+// vendorPhaseError renders a vendor-phase failure as the Step's error.
+//
+// %w, not %s: spawnVendorAndWait honours the stop signal and returns
+// types.ErrJobStoppedByUser. Flattened into a string it stops matching
+// errors.Is, so a user who stopped the Task while its dependencies were being
+// vendored saw a failed Step instead of a stopped one. The review stage's own
+// vendor path (ensureVendoredCache) wraps with %w for exactly this reason.
+//
+// Extracted from the call site only so the sentinel can be exercised without a
+// Docker daemon — see TestVendorPhaseError_PreservesStopSentinel.
+func vendorPhaseError(err error) error {
+	return fmt.Errorf("error vendoring dependencies: %w", err)
 }
 
 // buildVendorSpec assembles the vendor-phase container spec: the `vendor`
