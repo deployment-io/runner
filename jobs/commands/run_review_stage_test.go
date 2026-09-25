@@ -284,7 +284,10 @@ func TestTheReviewSpawnMountsEveryRepositoryReadOnly(t *testing.T) {
 	for _, dir := range []string{"0-acme/api", "1-acme/web"} {
 		writeFile(t, filepath.Join(workDir, dir, "main.go"), "package main\n")
 	}
-	dirs := readOnlyRepoDirs(workDir, map[string]string{"0-acme/api": "abc123", "1-acme/web": "def456"}, io.Discard)
+	dirs, complete := readOnlyRepoDirs(workDir, []string{"0-acme/api", "1-acme/web"}, io.Discard)
+	if !complete {
+		t.Fatal("two real repositories were reported as an incomplete read-only set")
+	}
 
 	mounts := agentboxMounts(agentboxSpawnSpec{
 		workDirHost: workDir, cacheVolume: "agentbox-cache-task-1-0", readOnlyRepoDirs: dirs,
@@ -350,13 +353,16 @@ func TestReadOnlyRepoDirsSkipsAnythingThatIsNotARepositoryDirectory(t *testing.T
 	writeFile(t, filepath.Join(workDir, "notes.md"), "not a repository\n")
 	var logs strings.Builder
 
-	got := readOnlyRepoDirs(workDir, map[string]string{
-		"0-acme/api":        "abc123",
-		"../elsewhere":      "def456", // outside the work dir
-		"/etc":              "ghi789", // absolute
-		"2-acme/never-came": "jkl012", // recorded but not checked out
-		"notes.md":          "mno345", // not a directory
+	got, complete := readOnlyRepoDirs(workDir, []string{
+		"0-acme/api",
+		"../elsewhere",      // outside the work dir
+		"/etc",              // absolute
+		"2-acme/never-came", // recorded but not checked out
+		"notes.md",          // not a directory
 	}, &logs)
+	if complete {
+		t.Error("a set with skipped directories was reported complete")
+	}
 
 	if len(got) != 1 || got[0] != "0-acme/api" {
 		t.Errorf("read-only dirs = %v, want only the repository that is really there", got)
@@ -1024,5 +1030,42 @@ func TestEnvValueReadsTheLastOccurrence(t *testing.T) {
 	}
 	if got := envValue(env, "MISSING"); got != "" {
 		t.Errorf("envValue(MISSING) = %q, want empty", got)
+	}
+}
+
+// A repository with no recorded start commit (a new, empty one) is still
+// committed and pushed, so it is mounted read-only like the rest.
+func TestTheReadOnlySetIncludesARepositoryWithNoStartCommit(t *testing.T) {
+	workDir := t.TempDir()
+	for _, dir := range []string{"0-acme/api", "1-acme/new"} {
+		writeFile(t, filepath.Join(workDir, dir, "README.md"), "x\n")
+	}
+	stage := &reviewStage{baseCommits: map[string]string{"0-acme/api": "abc"}, repoDirs: []string{"0-acme/api", "1-acme/new"}}
+	got, complete := readOnlyRepoDirs(workDir, stage.allRepositoryDirs(), io.Discard)
+	if !complete || len(got) != 2 || got[1] != "1-acme/new" {
+		t.Errorf("read-only dirs = %v (complete %v), want both, including the repository with no start commit", got, complete)
+	}
+}
+
+// A round that reported findings examined the change, whatever it called its
+// coverage; failing it would discard the findings.
+func TestARoundWithFindingsIsNotFailedForItsCoverageLabels(t *testing.T) {
+	result := agentResult{Status: "success", Turns: 6, ReviewResult: &reviewResult{
+		Findings: []reviewFinding{{Key: "sec-1", Parameter: "security", Severity: "high", What: "x"}},
+		Coverage: []reviewCoverage{{Parameter: "security", State: "complete"}},
+	}}
+	if reason := reviewRoundFailure(result, nil); reason != "" {
+		t.Errorf("a round with findings was failed: %q", reason)
+	}
+	result.ReviewResult.Findings = nil
+	if reason := reviewRoundFailure(result, nil); reason == "" {
+		t.Error("a round with no findings and nothing checked was not failed")
+	}
+}
+
+func TestWithoutEnvRemovesEveryOccurrence(t *testing.T) {
+	got := withoutEnv([]string{"A=1", "REVIEW_READONLY_MOUNTS=1", "B=2", "REVIEW_READONLY_MOUNTS=1"}, "REVIEW_READONLY_MOUNTS")
+	if len(got) != 2 || got[0] != "A=1" || got[1] != "B=2" {
+		t.Errorf("withoutEnv = %v", got)
 	}
 }

@@ -737,7 +737,12 @@ func reviewRoundFailure(result agentResult, err error) string {
 	// round agentbox's cost gate declined to spend an agent on — a
 	// documentation-only change, say — reports zero turns and no checked
 	// coverage, and is exactly as clean as it was before.
-	if result.Turns > 0 && !anyCoverageChecked(result.ReviewResult.Coverage) {
+	//
+	// Only when it also reported NO findings. The coverage state is free text
+	// from the agent; a round that found something but labelled its coverage
+	// differently did examine the change, and failing it would throw its
+	// findings away — must-fix ones included.
+	if result.Turns > 0 && len(result.ReviewResult.Findings) == 0 && !anyCoverageChecked(result.ReviewResult.Coverage) {
 		return "the reviewer ran but could not examine the change: " + firstSkippedCoverageReason(result.ReviewResult.Coverage)
 	}
 	return ""

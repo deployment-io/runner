@@ -38,6 +38,16 @@ func (s *reviewStage) runReviewRound(round int) (agentResult, error) {
 	if err != nil {
 		return agentResult{}, err
 	}
+	readOnly, allReadOnly := readOnlyRepoDirs(workDirHost, s.allRepositoryDirs(), s.logsWriter)
+	if !allReadOnly {
+		// A repository that could not be mounted read-only stays writable, so
+		// the agent must NOT be told the mounts make its own sandbox
+		// unnecessary. Without the flag, an agent that sandboxes itself keeps
+		// doing so — and one whose sandbox cannot start fails the round safely
+		// rather than reviewing with write access.
+		env = withoutEnv(env, "REVIEW_READONLY_MOUNTS")
+		io.WriteString(s.logsWriter, "Review round: not every repository could be mounted read-only, so the reviewer keeps its own sandbox\n")
+	}
 	// Log the turn cap this round is ACTUALLY spawned with, read back from the
 	// environment handed to the container. The cap counts model responses and
 	// the turns the agent reports afterwards count roughly one per tool call,
@@ -66,31 +76,56 @@ func (s *reviewStage) runReviewRound(round int) (agentResult, error) {
 		env:         env,
 		waitTimeout: reviewRunTimeout,
 		// The repositories are read-only FOR THE ROUND, at the mount level.
-		readOnlyRepoDirs: readOnlyRepoDirs(workDirHost, s.baseCommits, s.logsWriter),
+		readOnlyRepoDirs: readOnly,
 	}, s.logsWriter)
 }
 
 // readOnlyRepoDirs is the set of repository directories a review round mounts
-// read-only: the base commits' keys, each checked to be a real directory that
-// stays inside the work dir.
+// read-only, and whether that set covers every repository.
 //
-// The check is ensureRealRepositoryDir, the same one the fix run's undo applies
-// to the same keys — a path that is absolute, escapes with "..", or passes
-// through a symlink would name a host directory outside the Task, and handing
-// it to Docker as a bind source would mount it into the container.
+// The input is EVERY checked-out repository (allRepositoryDirs), not only
+// those with a recorded start commit: a new, empty repository has no commit
+// but is still committed and pushed afterwards, so leaving it writable would
+// let a reviewer's edits there ship unreviewed.
 //
-// A key that does not pass is SKIPPED WITH A LOG LINE rather than failing the
-// round: the Review stage is fail-open, and a review that still runs over the
-// repositories that could be mounted beats no review at all.
-func readOnlyRepoDirs(workDirHost string, baseCommits map[string]string, logsWriter io.Writer) []string {
-	dirs := sortedRepositoryDirs(baseCommits)
+// Each directory is checked with ensureRealRepositoryDir, the same check the
+// fix run's undo applies — a path that is absolute, escapes with "..", or
+// passes through a symlink would name a host directory outside the Task, and
+// handing it to Docker as a bind source would mount it into the container. A
+// directory that fails is SKIPPED WITH A LOG LINE (the stage is fail-open),
+// and the false return tells the caller the set is incomplete.
+func readOnlyRepoDirs(workDirHost string, dirs []string, logsWriter io.Writer) ([]string, bool) {
 	out := make([]string, 0, len(dirs))
+	complete := true
 	for _, dir := range dirs {
 		if err := ensureRealRepositoryDir(workDirHost, dir); err != nil {
 			io.WriteString(logsWriter, fmt.Sprintf("Review round: not mounting %q read-only: %s\n", dir, err))
+			complete = false
 			continue
 		}
 		out = append(out, dir)
+	}
+	return out, complete
+}
+
+// allRepositoryDirs is every checked-out repository directory the stage
+// knows: repoDirs, which includes one with no start commit, falling back to
+// the base commits' keys for a stage built without it.
+func (s *reviewStage) allRepositoryDirs() []string {
+	if len(s.repoDirs) > 0 {
+		return s.repoDirs
+	}
+	return sortedRepositoryDirs(s.baseCommits)
+}
+
+// withoutEnv returns env with every KEY=... entry for key removed.
+func withoutEnv(env []string, key string) []string {
+	out := make([]string, 0, len(env))
+	for _, kv := range env {
+		if k, _, _ := strings.Cut(kv, "="); k == key {
+			continue
+		}
+		out = append(out, kv)
 	}
 	return out
 }
