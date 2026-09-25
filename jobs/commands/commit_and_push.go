@@ -564,9 +564,12 @@ type reviewRoundOutput struct {
 	Model      string                 `json:"model,omitempty"`
 	TokenUsage tokenUsage             `json:"token_usage"`
 	CostUSD    *float64               `json:"cost_usd,omitempty"`
-	// Turns is how many the round spent against its turn cap. It is
-	// the evidence for tuning that cap: a stage whose rounds sit near it is
-	// one whose reviewer runs out of room before it has read the change.
+	// Turns is the agent's own reported turn count — roughly one per tool
+	// call, a different unit from the cap, which counts model responses. It
+	// measures how much reading a review did; it is NOT directly comparable
+	// with the cap, and a round that exceeds the cap's number here has not
+	// exceeded the cap. A round the cap did stop fails with the harness's
+	// max-turns error instead.
 	Turns     int    `json:"turns,omitempty"`
 	Completed bool   `json:"completed"`
 	Error     string `json:"error,omitempty"`

@@ -69,15 +69,18 @@ const (
 	// that is not has usually started arguing with itself.
 	maxMustFixRounds = 2
 	// reviewRunMaxTurns is a CEILING that catches a looping reviewer, not
-	// the budget a review is expected to use. A review reads the diff files
-	// agentbox wrote (one per repository, in pages when large), then the
-	// callers of what changed, and every read is a turn: a careful review of
-	// a one-file diff used 26, and a multi-repository change needs several
-	// times that. Time and cost are bounded by reviewRunTimeout and the stage
-	// budget; a cap tight enough to bind on a real review would end it with a
-	// max-turns error, the round would be recorded as failed, and the pull
-	// request would open unreviewed. agentbox states the budget in the review
-	// prompt so a reviewer nearing it reports what it has.
+	// the budget a review is expected to use. It is passed as MAX_TURNS and
+	// enforced by the agent's harness — for Claude Code, --max-turns, which
+	// counts MODEL RESPONSES. One response can carry many tool calls in
+	// parallel (a measured run made 13 calls in 3 responses), so this is not a
+	// cap on reads. The turns an agent REPORTS afterwards (num_turns, recorded
+	// on each round) are roughly one per tool call: a careful review of a
+	// one-file diff reported 26 while staying under a 20-response cap.
+	//
+	// Time and cost are bounded by reviewRunTimeout and the stage budget. A
+	// cap tight enough to bind on a real review would end it with a max-turns
+	// error and no report, the round would be recorded as failed, and the pull
+	// request would open unreviewed — so this errs high.
 	reviewRunMaxTurns = 80
 	// reviewRunTimeout is the wall clock for one review run. Generous enough
 	// for a large diff over a slow model, short enough that a stuck round
@@ -253,7 +256,7 @@ func (s *reviewStage) run() (map[string]interface{}, error) {
 		}
 		findings := s.classify(result)
 		s.recordRound(round, findings, result)
-		io.WriteString(s.logsWriter, fmt.Sprintf("Review round %d completed: %d finding(s) in %d turn(s) of %s\n", round, len(findings), result.Turns, s.lastTurnCap))
+		io.WriteString(s.logsWriter, fmt.Sprintf("Review round %d completed: %d finding(s), %d agent turn(s) reported (cap: %s model responses)\n", round, len(findings), result.Turns, s.lastTurnCap))
 		// Nothing to route back — including every advisory review, whose
 		// findings are annotations by definition (see classify).
 		mustFix := mustFixOnly(findings)
