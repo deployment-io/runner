@@ -92,7 +92,20 @@ func (s *reviewStage) takeFixRoundSnapshot(round int) (*fixRoundSnapshot, error)
 		return nil, err
 	}
 	started := time.Now()
-	for _, repoDir := range sortedRepositoryDirs(s.baseCommits) {
+	repoDirs := s.repoDirs
+	if len(repoDirs) == 0 {
+		repoDirs = sortedRepositoryDirs(s.baseCommits)
+	}
+	for _, repoDir := range repoDirs {
+		// The work dir is writable by the agent, and everything below runs as
+		// root: a repository path the agent swapped for a symlink would make
+		// the copy read, and the restore delete and replace, a directory
+		// outside the Task. No container is running here, so the check
+		// cannot be raced.
+		if err := ensureRealRepositoryDir(s.workDirHost, repoDir); err != nil {
+			snapshot.remove()
+			return nil, err
+		}
 		dst := filepath.Join(snapshot.root, repoDir)
 		if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 			snapshot.remove()
@@ -134,16 +147,16 @@ func (snap *fixRoundSnapshot) remove() {
 
 // restore puts every copied repository directory back exactly as it was.
 //
-// Remove-then-rename rather than a copy back: the fix run may have created
-// files that were not there before, and a copy over the top would leave them
-// in place. The rename is also atomic per repository, so a restore that fails
-// fails with the remaining directories still untouched rather than merged.
-//
 // An error here is the ONE fix-related failure that fails the Step: the tree is
 // then neither the implementation nor the fix, and nothing downstream can tell
-// which parts are which.
+// which parts are which. Each repository path is re-checked first — the fix
+// run had the work dir writable, and a path it replaced with a symlink must
+// not be followed by a root-owned delete and rename.
 func (snap *fixRoundSnapshot) restore() error {
 	for _, repoDir := range snap.repoDirs {
+		if err := ensureRealRepositoryDir(snap.workDirHost, repoDir); err != nil {
+			return err
+		}
 		if err := snap.restoreDir(filepath.Join(snap.root, repoDir), filepath.Join(snap.workDirHost, repoDir)); err != nil {
 			return fmt.Errorf("%s: %s", repoDir, err)
 		}
@@ -152,16 +165,56 @@ func (snap *fixRoundSnapshot) restore() error {
 	return nil
 }
 
-// restoreRepositoryDir is the real restore for one repository: drop what the
-// fix run left and move the copy back under its name.
+// restoreRepositoryDir is the real restore for one repository.
+//
+// MOVE ASIDE, MOVE IN, THEN DELETE. The fix run's tree is renamed out of the
+// way first and the copy renamed into its place; only then is the set-aside
+// tree deleted, best-effort. Deleting first would leave nothing in place if
+// the delete failed partway (a busy or immutable file), and the stage's
+// cleanup would then remove the only good copy with the snapshot. Renames on
+// one filesystem are atomic, so each repository is always either the fix
+// run's tree or the copy, never a mixture.
 func restoreRepositoryDir(snapshotDir, repoDir string) error {
-	if err := os.RemoveAll(repoDir); err != nil {
+	aside := snapshotDir + ".fix-run-tree"
+	if err := os.RemoveAll(aside); err != nil {
 		return err
 	}
-	if err := os.MkdirAll(filepath.Dir(repoDir), 0o755); err != nil {
+	if err := os.Rename(repoDir, aside); err != nil && !os.IsNotExist(err) {
 		return err
 	}
-	return os.Rename(snapshotDir, repoDir)
+	if err := os.Rename(snapshotDir, repoDir); err != nil {
+		// Put the fix run's tree back where it was, so the error describes a
+		// tree that is at least whole.
+		_ = os.Rename(aside, repoDir)
+		return err
+	}
+	_ = os.RemoveAll(aside)
+	return nil
+}
+
+// ensureRealRepositoryDir refuses a repository path that is not a plain
+// relative path to a real directory under the work dir: absolute, escaping
+// with "..", the work dir itself, or passing through a symlink at any
+// component.
+func ensureRealRepositoryDir(workDirHost, repoDir string) error {
+	if !filepath.IsLocal(repoDir) || filepath.Clean(repoDir) == "." {
+		return fmt.Errorf("repository directory %q is not a path inside the work dir", repoDir)
+	}
+	current := workDirHost
+	for _, part := range strings.Split(filepath.Clean(repoDir), string(filepath.Separator)) {
+		current = filepath.Join(current, part)
+		info, err := os.Lstat(current)
+		if err != nil {
+			return err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("repository directory %q passes through a symlink", repoDir)
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("repository directory %q is not a directory", repoDir)
+		}
+	}
+	return nil
 }
 
 // copyTreeToAgentbox is the real copy: modes and symlinks as they were, and
@@ -179,12 +232,14 @@ func lchownToAgentbox(path string) error {
 	return os.Lchown(path, commandUtils.AgentboxUID, commandUtils.AgentboxGID)
 }
 
-// copyTreePreserving copies src to dst recursively, preserving file modes and
-// copying symlinks AS SYMLINKS — a checkout's symlinks can point outside the
-// tree, and following them would copy the target into the repository.
+// copyTreePreserving copies src to dst recursively, preserving file modes
+// (including setuid, setgid and sticky bits) and copying symlinks AS SYMLINKS —
+// a checkout's symlinks can point outside the tree, and following them would
+// copy the target into the repository.
 //
 // chown is applied to every entry created, and may be nil for a caller that
-// cannot chown (an unprivileged test process).
+// cannot chown (an unprivileged test process). Modes are applied AFTER
+// ownership: a chown clears setuid and setgid.
 func copyTreePreserving(src, dst string, chown func(path string) error) error {
 	var dirs []string
 	err := filepath.WalkDir(src, func(path string, d fs.DirEntry, walkErr error) error {
@@ -199,39 +254,14 @@ func copyTreePreserving(src, dst string, chown func(path string) error) error {
 		if err != nil {
 			return err
 		}
-		target := filepath.Join(dst, rel)
-		switch {
-		case info.IsDir():
+		if info.IsDir() {
 			// Mode and ownership are applied AFTER the walk: a directory whose
 			// own mode forbids writing still has to have its contents copied
 			// into it first.
-			if err := os.MkdirAll(target, 0o700); err != nil {
-				return err
-			}
 			dirs = append(dirs, rel)
-			return nil
-		case info.Mode()&os.ModeSymlink != 0:
-			link, err := os.Readlink(path)
-			if err != nil {
-				return err
-			}
-			if err := os.Symlink(link, target); err != nil {
-				return err
-			}
-		case info.Mode().IsRegular():
-			if err := copyRegularFile(path, target, info.Mode().Perm()); err != nil {
-				return err
-			}
-		default:
-			// A socket, fifo or device node is not part of a checkout and
-			// cannot be reproduced by reading it. Skipped rather than failed:
-			// refusing the snapshot over one would mean refusing the fix run.
-			return nil
+			return os.MkdirAll(filepath.Join(dst, rel), 0o700)
 		}
-		if chown == nil {
-			return nil
-		}
-		return chown(target)
+		return copyTreeEntry(path, filepath.Join(dst, rel), info, chown)
 	})
 	if err != nil {
 		return err
@@ -243,17 +273,56 @@ func copyTreePreserving(src, dst string, chown func(path string) error) error {
 		if err != nil {
 			return err
 		}
-		target := filepath.Join(dst, dirs[i])
-		if err := os.Chmod(target, info.Mode().Perm()); err != nil {
+		if err := chownThenChmod(filepath.Join(dst, dirs[i]), fullMode(info), chown); err != nil {
 			return err
-		}
-		if chown != nil {
-			if err := chown(target); err != nil {
-				return err
-			}
 		}
 	}
 	return nil
+}
+
+// copyTreeEntry copies one non-directory entry: a symlink as a symlink, a
+// regular file with its contents and mode. A socket, fifo or device node is
+// not part of a checkout and cannot be reproduced by reading it, so it is
+// skipped rather than failing the whole copy (and with it the fix run).
+func copyTreeEntry(src, dst string, info fs.FileInfo, chown func(path string) error) error {
+	switch {
+	case info.Mode()&os.ModeSymlink != 0:
+		link, err := os.Readlink(src)
+		if err != nil {
+			return err
+		}
+		if err := os.Symlink(link, dst); err != nil {
+			return err
+		}
+		if chown == nil {
+			return nil
+		}
+		return chown(dst)
+	case info.Mode().IsRegular():
+		if err := copyRegularFile(src, dst, info.Mode().Perm()); err != nil {
+			return err
+		}
+		return chownThenChmod(dst, fullMode(info), chown)
+	default:
+		return nil
+	}
+}
+
+// fullMode is the part of a mode chmod can set: permissions plus the setuid,
+// setgid and sticky bits.
+func fullMode(info fs.FileInfo) fs.FileMode {
+	return info.Mode() & (fs.ModePerm | fs.ModeSetuid | fs.ModeSetgid | fs.ModeSticky)
+}
+
+// chownThenChmod applies ownership, then the mode — in that order, because a
+// chown clears setuid and setgid.
+func chownThenChmod(path string, mode fs.FileMode, chown func(path string) error) error {
+	if chown != nil {
+		if err := chown(path); err != nil {
+			return err
+		}
+	}
+	return os.Chmod(path, mode)
 }
 
 // copyRegularFile copies one file's contents and mode. The mode is set

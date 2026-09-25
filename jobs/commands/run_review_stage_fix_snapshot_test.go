@@ -1,8 +1,11 @@
 package commands
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
+	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"io"
 	"io/fs"
 	"os"
@@ -247,8 +250,13 @@ func TestASnapshotFailureSkipsTheFixRunAndHandsOff(t *testing.T) {
 	if review == nil || !review.MustFixOpen {
 		t.Fatalf("review = %+v, want the findings handed over still open", review)
 	}
-	if !strings.Contains(review.FixError, "no space left on device") {
-		t.Errorf("fix_error = %q, want it to name why no fix was attempted", review.FixError)
+	if !review.FixNotAttempted {
+		t.Error("fix_not_attempted = false, want the pull request told no fix was attempted")
+	}
+	// The detail (which can carry host paths) is for the job log, not the
+	// pull request.
+	if strings.Contains(review.FixError, "no space left on device") {
+		t.Errorf("fix_error = %q carries the internal error into the pull request", review.FixError)
 	}
 	if !strings.Contains(logs.String(), "no space left on device") {
 		t.Errorf("the job log does not say why the fix was skipped:\n%s", logs.String())
@@ -477,5 +485,153 @@ func assertSameTree(t *testing.T, want, got map[string]string) {
 		if want[path] != got[path] {
 			t.Errorf("%s: after the restore it is %q, was %q", path, got[path], want[path])
 		}
+	}
+}
+
+// A failed fix run's work is undone on disk, so its RESULT must not reach the
+// pull request or the commit: its title, summary, files and failing verify
+// would describe a fix that is not there. Its usage still counts.
+func TestAFailedFixRunsResultIsNotMergedButItsUsageIs(t *testing.T) {
+	parameters := map[string]interface{}{}
+	implement := agentResult{Status: "success", Turns: 10, PRTitle: "Add session handler",
+		ChangesSummary: "Add session handler", TokenUsage: tokenUsage{InputTokens: 100}}
+	if err := mergeAgentResultIntoJobOutput(parameters, implement); err != nil {
+		t.Fatal(err)
+	}
+	failed := agentResult{Status: "failure", Turns: 5, PRTitle: "fix: check caller session",
+		ChangesSummary: "Add session check to handler", TokenUsage: tokenUsage{InputTokens: 50}}
+	if err := recordFixRunResult(parameters, failed, nil, io.Discard); err == nil {
+		t.Fatal("a failed fix run was reported as kept")
+	}
+	data := jobOutputFor(t, parameters)
+	if data.Agent.PRTitle != "Add session handler" || strings.Contains(data.Agent.ChangesSummary, "session check") {
+		t.Errorf("the rolled-back fix reached the record: title %q, summary %q", data.Agent.PRTitle, data.Agent.ChangesSummary)
+	}
+	if data.Agent.Turns != 15 || data.Agent.TokenUsage.InputTokens != 150 {
+		t.Errorf("turns %d, input tokens %d; want the failed fix run's usage counted (15, 150)", data.Agent.Turns, data.Agent.TokenUsage.InputTokens)
+	}
+
+	kept := agentResult{Status: "success", Turns: 3, ChangesSummary: "Add session check to handler"}
+	if err := recordFixRunResult(parameters, kept, nil, io.Discard); err != nil {
+		t.Fatalf("a successful fix run was reported as failed: %s", err)
+	}
+	if data := jobOutputFor(t, parameters); !strings.Contains(data.Agent.ChangesSummary, "session check") {
+		t.Errorf("a kept fix run's summary was not merged: %q", data.Agent.ChangesSummary)
+	}
+}
+
+func jobOutputFor(t *testing.T, parameters map[string]interface{}) jobOutputData {
+	t.Helper()
+	raw, err := jobs.GetParameterValue[string](parameters, parameters_enums.JobOutput)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var data jobOutputData
+	if err := json.Unmarshal([]byte(raw), &data); err != nil {
+		t.Fatal(err)
+	}
+	if data.Agent == nil {
+		t.Fatal("job output has no agent block")
+	}
+	return data
+}
+
+// The work dir is agent-writable and the copy and restore run as root, so a
+// repository path swapped for a symlink — at any component — is refused
+// rather than followed.
+func TestSymlinkedRepositoryPathsAreRefused(t *testing.T) {
+	workDir := t.TempDir()
+	outside := t.TempDir()
+	writeFile(t, filepath.Join(outside, "api", "victim.go"), "not the Task's\n")
+	if err := os.Symlink(outside, filepath.Join(workDir, "0-acme")); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureRealRepositoryDir(workDir, "0-acme/api"); err == nil {
+		t.Error("a repository path through a symlinked component was accepted")
+	}
+	for _, bad := range []string{"../escape", "/abs", ".", ""} {
+		if err := ensureRealRepositoryDir(workDir, bad); err == nil {
+			t.Errorf("repository path %q was accepted", bad)
+		}
+	}
+	stage := fixLoopStage(workDir, nil)
+	if _, err := stage.takeFixRoundSnapshot(1); err == nil {
+		t.Error("a snapshot was taken through a symlinked repository path")
+	}
+	if _, err := os.Stat(filepath.Join(outside, "api", "victim.go")); err != nil {
+		t.Errorf("the directory outside the Task was touched: %s", err)
+	}
+}
+
+// The restore moves the fix run's tree aside before moving the copy in, so a
+// failure never leaves a repository missing.
+func TestRestoreMovesTheFixRunsTreeAsideFirst(t *testing.T) {
+	root := t.TempDir()
+	live := filepath.Join(root, "work", "0-acme", "api")
+	snap := filepath.Join(root, "snap", "0-acme", "api")
+	writeFile(t, filepath.Join(live, "handler.go"), "fix run's version\n")
+	writeFile(t, filepath.Join(snap, "handler.go"), "implementation\n")
+	if err := restoreRepositoryDir(snap, live); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(filepath.Join(live, "handler.go")); string(got) != "implementation\n" {
+		t.Errorf("restored content = %q", got)
+	}
+	if _, err := os.Stat(snap + ".fix-run-tree"); !os.IsNotExist(err) {
+		t.Error("the set-aside fix-run tree was left behind")
+	}
+
+	// A copy that cannot be moved in leaves the fix run's tree in place, whole.
+	writeFile(t, filepath.Join(live, "handler.go"), "fix run's version\n")
+	if err := restoreRepositoryDir(filepath.Join(root, "missing"), live); err == nil {
+		t.Fatal("a restore from a missing copy succeeded")
+	}
+	if got, _ := os.ReadFile(filepath.Join(live, "handler.go")); string(got) != "fix run's version\n" {
+		t.Errorf("after a failed restore the repository holds %q, want the fix run's tree back in place", got)
+	}
+}
+
+// Every checked-out repository is copied, including one with no recorded
+// start commit (a new, empty repository).
+func TestRepositoryDirsIncludeOnesWithNoStartCommit(t *testing.T) {
+	parameters := map[string]interface{}{}
+	raw, _ := json.Marshal(jobOutputData{BaseCommits: []baseCommitOutput{
+		{Index: 0, Dir: "0-acme/api", CommitSHA: "abc"},
+		{Index: 1, Dir: "1-acme/new"},
+	}})
+	jobs.SetParameterValue[string](parameters, parameters_enums.JobOutput, string(raw))
+	got := readRepositoryDirsFromJobOutput(parameters)
+	if len(got) != 2 || got[1] != "1-acme/new" {
+		t.Errorf("repository dirs = %v, want both, including the one with no start commit", got)
+	}
+	if bc := readBaseCommitsFromJobOutput(parameters); len(bc) != 1 {
+		t.Errorf("base commits = %v; the review baseline must still skip a repository with no commit", bc)
+	}
+}
+
+// The pull request states what actually happened: no "fix budget ran out"
+// when the loop ended on a failed or skipped fix, and a plain sentence when no
+// fix was attempted.
+func TestTheReviewSectionWordsTheFixOutcomeHonestly(t *testing.T) {
+	base := func() *reviewOutput {
+		return completedReview(true, reviewFindingOutput{Parameter: "security", Severity: "high",
+			Location: "handler.go:41", What: "no session check", MustFix: true})
+	}
+	failed := base()
+	failed.FixError = "agent step did not succeed"
+	body := reviewTestOpener(failed).reviewSection()
+	if strings.Contains(body, "fix budget ran out") || !strings.Contains(body, "A fix attempt did not complete") {
+		t.Errorf("a failed fix is worded wrongly:\n%s", body)
+	}
+	skipped := base()
+	skipped.FixError = "the change could not be copied first, so a failed fix could not have been undone"
+	skipped.FixNotAttempted = true
+	body = reviewTestOpener(skipped).reviewSection()
+	if !strings.Contains(body, "No fix was attempted") || strings.Contains(body, "A fix attempt did not complete") {
+		t.Errorf("a skipped fix is worded wrongly:\n%s", body)
+	}
+	exhausted := base()
+	if body := reviewTestOpener(exhausted).reviewSection(); !strings.Contains(body, "fix budget ran out") {
+		t.Errorf("an exhausted loop lost its wording:\n%s", body)
 	}
 }

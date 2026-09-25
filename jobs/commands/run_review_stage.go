@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -165,6 +166,7 @@ func (rs *RunReviewStage) Run(parameters map[string]interface{}, logsWriter io.W
 		participation:   participation,
 		thresholds:      decodeMustFixThresholds(parameters, logsWriter),
 		baseCommits:     readBaseCommitsFromJobOutput(parameters),
+		repoDirs:        readRepositoryDirsFromJobOutput(parameters),
 		deadline:        time.Now().Add(reviewStageBudget),
 		stopSignal:      rs.stopSignal,
 		progressSink:    rs.progressSink,
@@ -195,9 +197,14 @@ type reviewStage struct {
 	participation   int64
 	thresholds      map[uint]uint
 	baseCommits     map[string]string
-	deadline        time.Time
-	stopSignal      <-chan struct{}
-	progressSink    func(jobs.LiveProgressV1)
+	// repoDirs is EVERY checked-out repository directory, including one with
+	// no recorded start commit (a new, empty repository). The fix run's undo
+	// copies all of them: a repository missing from the copy would keep a
+	// failed fix's edits while the pull request says the change was put back.
+	repoDirs     []string
+	deadline     time.Time
+	stopSignal   <-chan struct{}
+	progressSink func(jobs.LiveProgressV1)
 
 	rounds      []reviewRoundOutput
 	fixedInLoop []reviewFindingOutput
@@ -221,6 +228,9 @@ type reviewStage struct {
 	// that put the tree back, so it also says what the change on the branch
 	// is: the one the implement run produced, not a half-applied fix.
 	fixError string
+	// fixNotAttempted is true when the undo copy could not be taken, so no
+	// fix run happened at all — worded differently on the pull request.
+	fixNotAttempted bool
 
 	// The two container runs and the two halves of the fix run's undo, all
 	// injectable so the loop's own decisions can be tested without a Docker
@@ -345,14 +355,27 @@ func (s *reviewStage) run() (map[string]interface{}, error) {
 //	             and belongs to the outer loop's stop path; or a restore that
 //	             did not work, which leaves a tree nobody can describe.
 func (s *reviewStage) attemptFix(round int, mustFix []reviewFindingOutput) (bool, error) {
+	// The copy can take a while on a large checkout and cannot be interrupted,
+	// so a stop is honoured on both sides of it rather than after a fix run
+	// that was never going to be wanted.
+	if s.stopRequested() {
+		return false, types.ErrJobStoppedByUser
+	}
 	snapshot, err := s.takeFixRoundSnapshot(round)
 	if err != nil {
 		// NEVER run a fix that cannot be undone. A fix run edits a tree that
 		// already passed its verify; without the copy, a fix that then failed
-		// would leave it half-edited with nothing to go back to.
-		s.fixError = fmt.Sprintf("the change could not be copied before the fix run, so no fix was attempted: %s", err)
-		io.WriteString(s.logsWriter, fmt.Sprintf("Review stage: %s — handing the evidence to a human on the pull request\n", s.fixError))
+		// would leave it half-edited with nothing to go back to. The detail
+		// (host paths included) goes to the job log only; the pull request
+		// gets the plain statement.
+		s.fixNotAttempted = true
+		s.fixError = "the change could not be copied first, so a failed fix could not have been undone"
+		io.WriteString(s.logsWriter, fmt.Sprintf("Review stage: no fix was attempted — the change could not be copied first: %s — handing the evidence to a human on the pull request\n", err))
 		return false, nil
+	}
+	if s.stopRequested() {
+		snapshot.remove()
+		return false, types.ErrJobStoppedByUser
 	}
 	fixErr := s.fixRound(mustFix)
 	if fixErr == nil {
@@ -389,11 +412,12 @@ func (s *reviewStage) canAfford(d time.Duration) bool {
 // plane, and returns. Always nil error — see run.
 func (s *reviewStage) finish() (map[string]interface{}, error) {
 	out := &reviewOutput{
-		Participation: participationName(s.participation),
-		Rounds:        s.rounds,
-		FixedInLoop:   s.fixedInLoop,
-		MustFixOpen:   len(s.openMustFix) > 0,
-		FixError:      s.fixError,
+		Participation:   participationName(s.participation),
+		Rounds:          s.rounds,
+		FixedInLoop:     s.fixedInLoop,
+		MustFixOpen:     len(s.openMustFix) > 0,
+		FixError:        s.fixError,
+		FixNotAttempted: s.fixNotAttempted,
 	}
 	s.logFullReview(out)
 	if err := mergeReviewIntoJobOutput(s.parameters, out); err != nil {
@@ -913,4 +937,46 @@ func readReviewFromJobOutput(parameters map[string]interface{}) *reviewOutput {
 		return nil
 	}
 	return data.Review
+}
+
+// stopRequested reports, without blocking, whether the user has stopped the
+// Job. The fix run's own spawn honours the stop signal while it waits; this
+// covers the host-side work around it (the undo copy).
+func (s *reviewStage) stopRequested() bool {
+	if s.stopSignal == nil {
+		return false
+	}
+	select {
+	case <-s.stopSignal:
+		return true
+	default:
+		return false
+	}
+}
+
+// readRepositoryDirsFromJobOutput returns every checked-out repository
+// directory recorded in the Job output, whether or not a start commit was
+// recorded for it. readBaseCommitsFromJobOutput keeps only the ones with a
+// commit — the review needs a baseline to diff against — but the fix run's
+// undo has to cover every directory a fix run could have edited.
+func readRepositoryDirsFromJobOutput(parameters map[string]interface{}) []string {
+	existing, err := jobs.GetParameterValue[string](parameters, parameters_enums.JobOutput)
+	if err != nil || len(existing) == 0 {
+		return nil
+	}
+	var data jobOutputData
+	if err := json.Unmarshal([]byte(existing), &data); err != nil {
+		return nil
+	}
+	seen := map[string]bool{}
+	var dirs []string
+	for _, bc := range data.BaseCommits {
+		if bc.Dir == "" || seen[bc.Dir] {
+			continue
+		}
+		seen[bc.Dir] = true
+		dirs = append(dirs, bc.Dir)
+	}
+	sort.Strings(dirs)
+	return dirs
 }

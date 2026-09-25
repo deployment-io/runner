@@ -101,7 +101,11 @@ func (opr *taskOpenPR) reviewSection() string {
 	// request is the implementer's own — not a half-applied cleanup. A reader
 	// comparing the findings against the change has to know that, or they will
 	// go looking for fix work that was deliberately rolled back.
-	if fixError := strings.TrimSpace(opr.review.FixError); fixError != "" {
+	fixError := strings.TrimSpace(opr.review.FixError)
+	switch {
+	case opr.review.FixNotAttempted:
+		sb.WriteString("\nNo fix was attempted: the change could not be copied first, so a failed fix could not have been undone.\n")
+	case fixError != "":
 		sb.WriteString(fmt.Sprintf("\nA fix attempt did not complete (%s); the change is shown as it was before that attempt.\n",
 			capRunes(fixError, reviewDetailMaxRunes)))
 	}
@@ -110,8 +114,12 @@ func (opr *taskOpenPR) reviewSection() string {
 	if omitted := len(stillOpen) + len(fixed) + len(annotated) - budget.rendered; omitted > 0 {
 		sb.WriteString(fmt.Sprintf("\n_%d further finding(s) are not shown here — the full review is in the Step's job log._\n", omitted))
 	}
-	if opr.review.MustFixOpen {
+	switch {
+	case opr.review.MustFixOpen && fixError == "":
 		sb.WriteString("\nThese findings were routed back to the agent and are still open after the review's fix budget ran out. They need a human.\n")
+	case opr.review.MustFixOpen:
+		// The loop ended on the fix attempt above, not on its budget.
+		sb.WriteString("\nThese findings are still open. They need a human.\n")
 	}
 	sb.WriteString("\n" + coverageLine(latest.Coverage))
 	return boundSection(sb.String())

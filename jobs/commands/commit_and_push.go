@@ -591,6 +591,9 @@ type reviewOutput struct {
 	// change on the branch is the one the implement run produced: the failed
 	// fix was undone, and the findings it was sent to fix are still open.
 	FixError string `json:"fix_error,omitempty"`
+	// FixNotAttempted is true when no fix run happened because its undo copy
+	// could not be taken; FixError then holds the plain reason.
+	FixNotAttempted bool `json:"fix_not_attempted,omitempty"`
 }
 
 type agentOutput struct {
