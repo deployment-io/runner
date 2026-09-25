@@ -725,7 +725,56 @@ func reviewRoundFailure(result agentResult, err error) string {
 	if result.ReviewResult == nil {
 		return "the review run produced no review_result"
 	}
+	// A REVIEW THAT EXAMINED NOTHING IS A FAILED ROUND, NOT A CLEAN ONE. An
+	// agent that ran and reported no checked parameter found no findings
+	// because it looked at nothing — and recorded as a completed round with an
+	// empty finding list, that is indistinguishable on the pull request from a
+	// change a reviewer read and passed. (It happened: a reviewer whose sandbox
+	// could not start failed every command it ran, skipped every pass, and the
+	// pull request said it had been reviewed.)
+	//
+	// Turns > 0 is what separates "ran and saw nothing" from "never ran": a
+	// round agentbox's cost gate declined to spend an agent on — a
+	// documentation-only change, say — reports zero turns and no checked
+	// coverage, and is exactly as clean as it was before.
+	if result.Turns > 0 && !anyCoverageChecked(result.ReviewResult.Coverage) {
+		return "the reviewer ran but could not examine the change: " + firstSkippedCoverageReason(result.ReviewResult.Coverage)
+	}
 	return ""
+}
+
+// anyCoverageChecked reports whether the round examined ANY parameter.
+func anyCoverageChecked(coverage []reviewCoverage) bool {
+	for _, c := range coverage {
+		if coverageChecked(c.State) {
+			return true
+		}
+	}
+	return false
+}
+
+// coverageChecked is the one reading of a coverage state, applied wherever the
+// question "was this parameter actually examined" is asked. Case-insensitive:
+// the state is a free string from an agent, and a round reported as "Checked"
+// examined the change exactly as much as one reported as "checked".
+func coverageChecked(state string) bool {
+	return strings.EqualFold(strings.TrimSpace(state), "checked")
+}
+
+// firstSkippedCoverageReason is the reviewer's own account of why it examined
+// nothing — the reason on the first parameter it did not check, which is what
+// names the cause (a sandbox that could not start, a diff it could not read)
+// instead of restating that nothing was checked.
+func firstSkippedCoverageReason(coverage []reviewCoverage) string {
+	for _, c := range coverage {
+		if coverageChecked(c.State) {
+			continue
+		}
+		if reason := strings.TrimSpace(c.Reason); reason != "" {
+			return reason
+		}
+	}
+	return "it reported no coverage and gave no reason"
 }
 
 // olderAgentboxReason is the coverage reason for the named special case: the

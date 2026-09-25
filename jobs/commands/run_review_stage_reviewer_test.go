@@ -374,10 +374,42 @@ func TestReviewedByCountsOnlyCompletedRounds(t *testing.T) {
 		t.Errorf("a review whose only round failed produced %q", line)
 	}
 	mixed := &reviewOutput{Participation: "on", Rounds: []reviewRoundOutput{
-		{Round: 1, Completed: true, Model: "gpt-5.5"},
+		{Round: 1, Completed: true, Model: "gpt-5.5",
+			Coverage: []reviewCoverageOutput{{Parameter: "security", State: "checked"}}},
 		{Round: 2, Completed: false, Model: "gpt-5.5", Error: "timed out"},
 	}}
 	if line := reviewedByLine(mixed); line != "Reviewed by gpt-5.5.\n\n" {
 		t.Errorf("one completed round of two produced %q, want no round count", line)
+	}
+}
+
+// Completing is not the same as reviewing. A round that checked no parameter
+// looked at nothing, and "Reviewed by gpt-5.5." directly above "No pass
+// examined this change" is what made a reviewer whose sandbox never started
+// read as a reviewer that approved the change.
+func TestReviewedByNamesNobodyWhenNoPassExaminedTheChange(t *testing.T) {
+	examinedNothing := &reviewOutput{Participation: "on", Rounds: []reviewRoundOutput{{
+		Round: 1, Completed: true, AgentType: "codex", Model: "gpt-5.5",
+		Coverage: []reviewCoverageOutput{
+			{Parameter: "security", State: "skipped", Reason: "every command failed"},
+			{Parameter: "correctness", State: "not checked", Reason: "the pass did not run"},
+		},
+	}}}
+	if line := reviewedByLine(examinedNothing); line != "" {
+		t.Errorf("a review that examined nothing produced %q", line)
+	}
+	// And the section it belongs to says so plainly instead.
+	section := (&taskOpenPR{review: examinedNothing}).reviewSection()
+	if strings.Contains(section, "Reviewed by") {
+		t.Errorf("the review section claims a reviewer that examined nothing:\n%s", section)
+	}
+	if !strings.Contains(section, "No pass examined this change") {
+		t.Errorf("the review section does not say nothing was examined:\n%s", section)
+	}
+
+	// One checked parameter in any completed round is a review, and it is named.
+	examinedNothing.Rounds[0].Coverage[0].State = "Checked"
+	if line := reviewedByLine(examinedNothing); line != "Reviewed by gpt-5.5.\n\n" {
+		t.Errorf("a round that checked a parameter produced %q, want the reviewer named", line)
 	}
 }

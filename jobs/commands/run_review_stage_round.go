@@ -18,9 +18,11 @@ import (
 //
 // One container per round, from the SAME agentbox image, the same /work bind
 // mount and the same per-Step cache volume as the implement run, spawned
-// through the same agentboxSpawnSpec and spawnAgentboxAndWait. No additional
-// mounts: the only thing that differs is the environment and the fact that the
-// implementer's output directory is not in the work dir while it runs.
+// through the same agentboxSpawnSpec and spawnAgentboxAndWait. What differs is
+// the environment, the fact that the implementer's output directory is not in
+// the work dir while it runs, and ONE MOUNT PER REPOSITORY: the checkouts are
+// bound read-only, so the round cannot edit the change it is reviewing no
+// matter what sandbox the reviewing agent can or cannot start for itself.
 //
 // RESULT_PATH is unchanged — still /work/.agentbox-output/result.json. It
 // resolves to the round's own fresh directory by virtue of the rename, which
@@ -63,7 +65,34 @@ func (s *reviewStage) runReviewRound(round int) (agentResult, error) {
 		cacheVolume: cacheVolumeName(s.ctx),
 		env:         env,
 		waitTimeout: reviewRunTimeout,
+		// The repositories are read-only FOR THE ROUND, at the mount level.
+		readOnlyRepoDirs: readOnlyRepoDirs(workDirHost, s.baseCommits, s.logsWriter),
 	}, s.logsWriter)
+}
+
+// readOnlyRepoDirs is the set of repository directories a review round mounts
+// read-only: the base commits' keys, each checked to be a real directory that
+// stays inside the work dir.
+//
+// The check is ensureRealRepositoryDir, the same one the fix run's undo applies
+// to the same keys — a path that is absolute, escapes with "..", or passes
+// through a symlink would name a host directory outside the Task, and handing
+// it to Docker as a bind source would mount it into the container.
+//
+// A key that does not pass is SKIPPED WITH A LOG LINE rather than failing the
+// round: the Review stage is fail-open, and a review that still runs over the
+// repositories that could be mounted beats no review at all.
+func readOnlyRepoDirs(workDirHost string, baseCommits map[string]string, logsWriter io.Writer) []string {
+	dirs := sortedRepositoryDirs(baseCommits)
+	out := make([]string, 0, len(dirs))
+	for _, dir := range dirs {
+		if err := ensureRealRepositoryDir(workDirHost, dir); err != nil {
+			io.WriteString(logsWriter, fmt.Sprintf("Review round: not mounting %q read-only: %s\n", dir, err))
+			continue
+		}
+		out = append(out, dir)
+	}
+	return out
 }
 
 // reviewSpawnEnv builds the review container's environment: the REVIEWER's
@@ -188,8 +217,8 @@ type reviewEnvInputs struct {
 }
 
 // applyReviewEnv turns an implement-run environment into a review-run one:
-// AGENT_MODE=review, the four REVIEW_* inputs, the review's own turn cap, and
-// the two implementer keys REMOVED.
+// AGENT_MODE=review, the REVIEW_* inputs, the review's own turn cap, and the
+// two implementer keys REMOVED.
 //
 // Removal rather than absence: the environment is built by the shared spawn
 // helper, which populates STEP_PROMPT and PREVIOUS_STEPS_SUMMARY from the
@@ -197,7 +226,7 @@ type reviewEnvInputs struct {
 // sees the implementer's prompt" a property of this function rather than of
 // remembering not to add them.
 func applyReviewEnv(env []string, in reviewEnvInputs) []string {
-	out := make([]string, 0, len(env)+6)
+	out := make([]string, 0, len(env)+7)
 	for _, kv := range env {
 		key, _, _ := strings.Cut(kv, "=")
 		switch key {
@@ -217,6 +246,14 @@ func applyReviewEnv(env []string, in reviewEnvInputs) []string {
 		"REVIEW_BASE_COMMITS="+in.baseCommits,
 		"REVIEW_ROUND="+strconv.Itoa(in.round),
 		"MAX_TURNS="+strconv.Itoa(reviewRunMaxTurns),
+		// The repositories are read-only at the MOUNT level (see
+		// agentboxMounts), so the agent needs no sandbox of its own to be
+		// unable to write them — and must not try to start one. Codex's
+		// --sandbox read-only is built on bwrap, which cannot create a
+		// namespace inside a CapDrop-ALL container: every command the reviewer
+		// ran failed with "No permissions to create new namespace" and the
+		// round examined nothing while still counting as a completed review.
+		"REVIEW_READONLY_MOUNTS=1",
 	)
 	if strings.TrimSpace(in.spec) != "" {
 		out = append(out, "REVIEW_SPEC="+in.spec)

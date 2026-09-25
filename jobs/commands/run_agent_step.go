@@ -896,27 +896,8 @@ func createAgentboxContainer(ctx context.Context, cli *client.Client, spec agent
 	if spec.memoryBytes > 0 {
 		memoryBytes = spec.memoryBytes
 	}
-	mounts := []mount.Mount{{
-		Type:   mount.TypeBind,
-		Source: spec.workDirHost,
-		Target: agentboxWorkDirInContainer,
-	}}
-	if spec.cacheVolume != "" {
-		mounts = append(mounts, mount.Mount{
-			Type:   mount.TypeVolume,
-			Source: spec.cacheVolume,
-			Target: agentboxCacheDirInContainer,
-		})
-	}
-	if spec.mcpSocketHost != "" {
-		mounts = append(mounts, mount.Mount{
-			Type:   mount.TypeBind,
-			Source: spec.mcpSocketHost,
-			Target: agentboxMCPSocketInContainer,
-		})
-	}
 	hostCfg := &container.HostConfig{
-		Mounts:         mounts,
+		Mounts:         agentboxMounts(spec),
 		CapDrop:        []string{"ALL"},
 		ReadonlyRootfs: true,
 		Tmpfs: map[string]string{
@@ -947,6 +928,54 @@ func createAgentboxContainer(ctx context.Context, cli *client.Client, spec agent
 		return "", fmt.Errorf("error creating container: %s", err)
 	}
 	return resp.ID, nil
+}
+
+// agentboxMounts is what the container sees: the work dir at /work, the shared
+// cache volume, the tool socket, and — for a run that must not write — one
+// read-only bind per repository directory on top of /work.
+//
+// THE READ-ONLY BINDS ARE LAYERED OVER A WRITABLE /work, NOT INSTEAD OF IT.
+// /work itself has to stay writable: a review round's diff files go to
+// /work/.review and agentbox writes its own output to /work/.agentbox-output.
+// Only the repository directories are made read-only, which is the whole of
+// what "the reviewer may not edit the change" means — and it is enforced by
+// the kernel, for every agent, rather than by whatever sandbox the agent
+// happens to carry. (A reviewer's own sandbox is not a substitute: Codex's
+// bwrap-based --sandbox read-only cannot create namespaces in these
+// containers — CapDrop ALL, read-only rootfs — so every command it ran failed
+// and the round examined nothing.)
+//
+// Docker orders binds by target depth, so a bind at /work/<dir> lands on top
+// of the /work bind rather than being hidden by it.
+func agentboxMounts(spec agentboxSpawnSpec) []mount.Mount {
+	mounts := []mount.Mount{{
+		Type:   mount.TypeBind,
+		Source: spec.workDirHost,
+		Target: agentboxWorkDirInContainer,
+	}}
+	if spec.cacheVolume != "" {
+		mounts = append(mounts, mount.Mount{
+			Type:   mount.TypeVolume,
+			Source: spec.cacheVolume,
+			Target: agentboxCacheDirInContainer,
+		})
+	}
+	if spec.mcpSocketHost != "" {
+		mounts = append(mounts, mount.Mount{
+			Type:   mount.TypeBind,
+			Source: spec.mcpSocketHost,
+			Target: agentboxMCPSocketInContainer,
+		})
+	}
+	for _, dir := range spec.readOnlyRepoDirs {
+		mounts = append(mounts, mount.Mount{
+			Type:     mount.TypeBind,
+			Source:   filepath.Join(spec.workDirHost, dir),
+			Target:   filepath.Join(agentboxWorkDirInContainer, dir),
+			ReadOnly: true,
+		})
+	}
+	return mounts
 }
 
 // pollProgressFile reads agentbox's progress.json from the bind-mounted
@@ -1683,6 +1712,16 @@ type agentboxSpawnSpec struct {
 	// so the Review stage cannot push a Step past the runner's existing
 	// per-container cap.
 	waitTimeout time.Duration
+	// readOnlyRepoDirs are repository directories, relative to the work dir,
+	// that this run may read but not write. Each gets its own read-only bind
+	// at /work/<dir> on top of the read-write /work bind — see agentboxMounts.
+	//
+	// Set by REVIEW ROUNDS ONLY. An implement run and a fix run exist to edit
+	// the checkouts, and a review round exists not to: making that the
+	// runner's business rather than the agent's is what stops a reviewer whose
+	// own sandbox cannot start from either editing the change or, as happened,
+	// failing every command it ran and reporting nothing.
+	readOnlyRepoDirs []string
 }
 
 // agentMCPSocketHostPath returns the host path for a task's MCP tool socket: a
