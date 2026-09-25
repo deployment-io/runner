@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -31,6 +32,12 @@ import (
 // cost of that choice is that a systematically broken review is invisible
 // except in the PR body and the job log, which is why every failure is
 // RECORDED as coverage naming the reason rather than passed over in silence.
+//
+// THAT RULE COVERS THE FIX RUN TOO. A fix run edits a tree that already passed
+// its own verify gate, so it only starts once it can be undone: the repository
+// directories are copied first, and a fix run that does not finish is rolled
+// back to exactly that copy and its findings handed to a human on the pull
+// request. See attemptFix and run_review_stage_fix_snapshot.go.
 //
 // It never routes anything back when participation is Advisory, and it returns
 // immediately when participation is Off — a Task that opted out runs the chain
@@ -152,12 +159,14 @@ func (rs *RunReviewStage) Run(parameters map[string]interface{}, logsWriter io.W
 	stage := &reviewStage{
 		ctx:             ctx,
 		parameters:      parameters,
+		workDirHost:     workDirHost,
 		reviewerParams:  reviewerParams,
 		reviewerFailure: reviewerFailure,
 		logsWriter:      logsWriter,
 		participation:   participation,
 		thresholds:      decodeMustFixThresholds(parameters, logsWriter),
 		baseCommits:     readBaseCommitsFromJobOutput(parameters),
+		repoDirs:        readRepositoryDirsFromJobOutput(parameters),
 		deadline:        time.Now().Add(reviewStageBudget),
 		stopSignal:      rs.stopSignal,
 		progressSink:    rs.progressSink,
@@ -171,6 +180,10 @@ func (rs *RunReviewStage) Run(parameters map[string]interface{}, logsWriter io.W
 type reviewStage struct {
 	ctx        commandUtils.TaskJobContext
 	parameters map[string]interface{}
+	// workDirHost is the host directory bind-mounted at /work — the one the
+	// repository checkouts live under, and the one the stage's sibling
+	// directories are named after.
+	workDirHost string
 	// reviewerParams is the parameter view REVIEW rounds run under — see
 	// reviewerParameters. Nil when the Job names no reviewer, which is what
 	// makes reviewerView fall back to parameters and the stage behave exactly
@@ -184,9 +197,14 @@ type reviewStage struct {
 	participation   int64
 	thresholds      map[uint]uint
 	baseCommits     map[string]string
-	deadline        time.Time
-	stopSignal      <-chan struct{}
-	progressSink    func(jobs.LiveProgressV1)
+	// repoDirs is EVERY checked-out repository directory, including one with
+	// no recorded start commit (a new, empty repository). The fix run's undo
+	// copies all of them: a repository missing from the copy would keep a
+	// failed fix's edits while the pull request says the change was put back.
+	repoDirs     []string
+	deadline     time.Time
+	stopSignal   <-chan struct{}
+	progressSink func(jobs.LiveProgressV1)
 
 	rounds      []reviewRoundOutput
 	fixedInLoop []reviewFindingOutput
@@ -206,11 +224,44 @@ type reviewStage struct {
 	// not. openMustFix answers "was this one routed back"; this answers "have
 	// we seen this at all", which is what makes a finding NEW.
 	seen map[string]bool
+	// fixError is why a fix run did not finish, or "". Set only on the path
+	// that put the tree back, so it also says what the change on the branch
+	// is: the one the implement run produced, not a half-applied fix.
+	fixError string
+	// fixNotAttempted is true when the undo copy could not be taken, so no
+	// fix run happened at all — worded differently on the pull request.
+	fixNotAttempted bool
+
+	// The two container runs and the two halves of the fix run's undo, all
+	// injectable so the loop's own decisions can be tested without a Docker
+	// daemon and without root. Nil means the real thing.
+	runReview  func(round int) (agentResult, error)
+	runFix     func(mustFix []reviewFindingOutput) error
+	copyTree   copyTreeFunc
+	restoreDir restoreDirFunc
 }
 
-// run is the loop. It always returns nil for the Step: a review failure is
-// recorded, never fatal. The ONE exception is a user stop, which is not a
-// review failure at all and must reach the outer loop's stop path.
+func (s *reviewStage) reviewRound(round int) (agentResult, error) {
+	if s.runReview != nil {
+		return s.runReview(round)
+	}
+	return s.runReviewRound(round)
+}
+
+func (s *reviewStage) fixRound(mustFix []reviewFindingOutput) error {
+	if s.runFix != nil {
+		return s.runFix(mustFix)
+	}
+	return s.runMustFixRound(mustFix)
+}
+
+// run is the loop. It returns nil for the Step in all but two cases: a review
+// failure is recorded, never fatal, and a fix run that did not finish is undone
+// and handed to a human rather than failing anything.
+//
+// The two exceptions are a user stop, which is not a review failure at all and
+// must reach the outer loop's stop path, and a restore that did not work — see
+// attemptFix.
 func (s *reviewStage) run() (map[string]interface{}, error) {
 	if len(s.baseCommits) == 0 {
 		// No baseline means no diff, and a review of no diff would report a
@@ -241,7 +292,7 @@ func (s *reviewStage) run() (map[string]interface{}, error) {
 		}
 		s.reportStage(tasks.StageReview)
 		io.WriteString(s.logsWriter, fmt.Sprintf("Review round %d: reviewing the change against the Task's spec\n", round))
-		result, err := s.runReviewRound(round)
+		result, err := s.reviewRound(round)
 		if errors.Is(err, types.ErrJobStoppedByUser) {
 			// A user stop is not a failed review. Attribute what the round
 			// spent and hand the stop to the outer loop's existing path.
@@ -274,20 +325,80 @@ func (s *reviewStage) run() (map[string]interface{}, error) {
 			break
 		}
 		s.reportStage(tasks.StageImplement)
-		if err := s.runMustFixRound(mustFix); err != nil {
-			if errors.Is(err, types.ErrJobStoppedByUser) {
-				return s.parameters, err
-			}
-			// A fix run that broke the build fails the Step BEFORE
-			// CommitAndPush, exactly as the implement run's verify gate
-			// does — the whole point of the gate is that broken code never
-			// reaches a commit, and a fix is code like any other.
+		ran, err := s.attemptFix(round, mustFix)
+		if err != nil {
+			// A user stop, or a restore that did not work. Nothing else here
+			// fails the Step.
 			return s.parameters, err
+		}
+		if !ran {
+			// The fix did not run, or ran and was undone. The findings this
+			// round opened are still open and go to a human.
+			break
 		}
 		mustFixRounds++
 		round++
 	}
 	return s.finish()
+}
+
+// attemptFix takes the undo copy, runs the fix, and decides what its outcome
+// means for the loop. It is the whole of "a bounded cleanup that did not finish
+// never costs the Step its implementation".
+//
+//	(true, nil)  the fix ran and the loop carries on to the next review round.
+//	(false, nil) no fix happened: either it could not be undone so it was never
+//	             started, or it failed and the tree has been put back. Either
+//	             way the round's must-fix findings are still open and the
+//	             existing handoff renders them on a draft pull request.
+//	(_, err)     the Step fails. A user stop, which is not a failed fix at all
+//	             and belongs to the outer loop's stop path; or a restore that
+//	             did not work, which leaves a tree nobody can describe.
+func (s *reviewStage) attemptFix(round int, mustFix []reviewFindingOutput) (bool, error) {
+	// The copy can take a while on a large checkout and cannot be interrupted,
+	// so a stop is honoured on both sides of it rather than after a fix run
+	// that was never going to be wanted.
+	if s.stopRequested() {
+		return false, types.ErrJobStoppedByUser
+	}
+	snapshot, err := s.takeFixRoundSnapshot(round)
+	if err != nil {
+		// NEVER run a fix that cannot be undone. A fix run edits a tree that
+		// already passed its verify; without the copy, a fix that then failed
+		// would leave it half-edited with nothing to go back to. The detail
+		// (host paths included) goes to the job log only; the pull request
+		// gets the plain statement.
+		s.fixNotAttempted = true
+		s.fixError = "the change could not be copied first, so a failed fix could not have been undone"
+		io.WriteString(s.logsWriter, fmt.Sprintf("Review stage: no fix was attempted — the change could not be copied first: %s — handing the evidence to a human on the pull request\n", err))
+		return false, nil
+	}
+	if s.stopRequested() {
+		snapshot.remove()
+		return false, types.ErrJobStoppedByUser
+	}
+	fixErr := s.fixRound(mustFix)
+	if fixErr == nil {
+		snapshot.remove()
+		return true, nil
+	}
+	if errors.Is(fixErr, types.ErrJobStoppedByUser) {
+		// Not a failed fix: the user stopped the Job and the container was
+		// SIGTERMed. Returned exactly as before, with the tree left as it is —
+		// the deferred sweep collects the copy.
+		return false, fixErr
+	}
+	io.WriteString(s.logsWriter, fmt.Sprintf("Fix round %d did not complete: %s — putting the change back to what it was before it ran\n", round, fixErr))
+	if err := snapshot.restore(); err != nil {
+		// THE ONE FIX-RELATED PATH THAT FAILS THE STEP. A tree that is neither
+		// the implementation nor the fix cannot be committed, and cannot be
+		// described on a pull request either.
+		io.WriteString(s.logsWriter, fmt.Sprintf("Review stage: the change could NOT be put back after the failed fix run: %s\n", err))
+		return false, fmt.Errorf("error restoring the change after fix round %d failed (%s): %s", round, fixErr, err)
+	}
+	s.fixError = fixErr.Error()
+	io.WriteString(s.logsWriter, fmt.Sprintf("Review stage: the change is back to exactly what it was before fix round %d — %d must-fix finding(s) go to a human on the pull request\n", round, len(mustFix)))
+	return false, nil
 }
 
 // canAfford reports whether the stage budget can accommodate a run of this
@@ -301,10 +412,12 @@ func (s *reviewStage) canAfford(d time.Duration) bool {
 // plane, and returns. Always nil error — see run.
 func (s *reviewStage) finish() (map[string]interface{}, error) {
 	out := &reviewOutput{
-		Participation: participationName(s.participation),
-		Rounds:        s.rounds,
-		FixedInLoop:   s.fixedInLoop,
-		MustFixOpen:   len(s.openMustFix) > 0,
+		Participation:   participationName(s.participation),
+		Rounds:          s.rounds,
+		FixedInLoop:     s.fixedInLoop,
+		MustFixOpen:     len(s.openMustFix) > 0,
+		FixError:        s.fixError,
+		FixNotAttempted: s.fixNotAttempted,
 	}
 	s.logFullReview(out)
 	if err := mergeReviewIntoJobOutput(s.parameters, out); err != nil {
@@ -578,6 +691,9 @@ func (s *reviewStage) logFullReview(out *reviewOutput) {
 	for _, f := range out.FixedInLoop {
 		b.WriteString(fmt.Sprintf("  [fixed in loop] %s/%s at %s — %s\n", f.Parameter, f.Severity, f.Location, f.What))
 	}
+	if out.FixError != "" {
+		b.WriteString(fmt.Sprintf("A fix attempt did not complete: %s — the change is exactly as it was before that attempt\n", out.FixError))
+	}
 	b.WriteString(fmt.Sprintf("Must-fix findings still open: %t\n", out.MustFixOpen))
 	io.WriteString(s.logsWriter, b.String())
 }
@@ -821,4 +937,46 @@ func readReviewFromJobOutput(parameters map[string]interface{}) *reviewOutput {
 		return nil
 	}
 	return data.Review
+}
+
+// stopRequested reports, without blocking, whether the user has stopped the
+// Job. The fix run's own spawn honours the stop signal while it waits; this
+// covers the host-side work around it (the undo copy).
+func (s *reviewStage) stopRequested() bool {
+	if s.stopSignal == nil {
+		return false
+	}
+	select {
+	case <-s.stopSignal:
+		return true
+	default:
+		return false
+	}
+}
+
+// readRepositoryDirsFromJobOutput returns every checked-out repository
+// directory recorded in the Job output, whether or not a start commit was
+// recorded for it. readBaseCommitsFromJobOutput keeps only the ones with a
+// commit — the review needs a baseline to diff against — but the fix run's
+// undo has to cover every directory a fix run could have edited.
+func readRepositoryDirsFromJobOutput(parameters map[string]interface{}) []string {
+	existing, err := jobs.GetParameterValue[string](parameters, parameters_enums.JobOutput)
+	if err != nil || len(existing) == 0 {
+		return nil
+	}
+	var data jobOutputData
+	if err := json.Unmarshal([]byte(existing), &data); err != nil {
+		return nil
+	}
+	seen := map[string]bool{}
+	var dirs []string
+	for _, bc := range data.BaseCommits {
+		if bc.Dir == "" || seen[bc.Dir] {
+			continue
+		}
+		seen[bc.Dir] = true
+		dirs = append(dirs, bc.Dir)
+	}
+	sort.Strings(dirs)
+	return dirs
 }

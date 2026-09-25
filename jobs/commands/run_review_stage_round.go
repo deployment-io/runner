@@ -289,21 +289,25 @@ func logRoundOutput(dir string, round int, logsWriter io.Writer) {
 }
 
 // cleanupReviewStageSiblings removes every host directory the stage parked
-// beside the work dir: the implementer's stash and any round directory a
-// failed restore left behind.
+// beside the work dir: the implementer's stash, any round directory a failed
+// restore left behind, and any fix round's undo copy.
 //
-// Deferred at the top of the stage so it runs however the stage ends. restore
-// already removes each round directory on the ordinary path; this is the
-// backstop for the path where it could not, which is exactly the path that
-// would otherwise leak silently.
+// Deferred at the top of the stage so it runs however the stage ends. Each
+// round removes its own directory and a fix run's snapshot is removed as soon
+// as it is no longer the undo; this is the backstop for the paths where that
+// did not happen — a user stop mid-fix leaves a whole checkout's worth of
+// copy, which is exactly the leak nothing else would collect.
 func cleanupReviewStageSiblings(workDirHost string) {
 	_ = os.RemoveAll(implementerOutputStashPath(workDirHost))
-	matches, err := filepath.Glob(strings.TrimRight(workDirHost, "/") + "-review-round-*-output")
-	if err != nil {
-		return
-	}
-	for _, dir := range matches {
-		_ = os.RemoveAll(dir)
+	base := strings.TrimRight(workDirHost, "/")
+	for _, pattern := range []string{base + "-review-round-*-output", base + "-fix-round-*-snapshot"} {
+		matches, err := filepath.Glob(pattern)
+		if err != nil {
+			continue
+		}
+		for _, dir := range matches {
+			_ = os.RemoveAll(dir)
+		}
 	}
 }
 
@@ -438,28 +442,54 @@ func (s *reviewStage) runMustFixRound(mustFix []reviewFindingOutput) error {
 		previewDeps:   previewDeps,
 		waitTimeout:   mustFixRunTimeout,
 	}, s.logsWriter)
-	// Attribute the fix run's work to the Step whether or not it succeeded,
-	// then decide what its outcome means.
-	mergeErr := mergeAgentResultIntoJobOutput(s.parameters, result)
-	if err != nil {
+	return recordFixRunResult(s.parameters, result, err, s.logsWriter)
+}
+
+// recordFixRunResult attributes a finished fix run to the Step and says what
+// its outcome means.
+//
+// Its USAGE AND COST always count — the tokens were spent. Its RESULT (title,
+// summary, files changed, verify result) is merged only when the run's work
+// is kept: a fix run that failed is undone on disk, and merging its result
+// anyway would title and describe the pull request, and the commit, after a
+// fix that is not in them, and replace a passing verify result with the
+// failing one of a tree that no longer exists.
+func recordFixRunResult(parameters map[string]interface{}, result agentResult, spawnErr error, logsWriter io.Writer) error {
+	if spawnErr != nil {
 		// Includes the user-stop sentinel, which the caller routes to the
 		// existing stop path.
-		return err
+		_ = accumulateReviewRunUsage(parameters, parameters, result)
+		return spawnErr
 	}
-	if mergeErr != nil {
-		io.WriteString(s.logsWriter, fmt.Sprintf("warning: could not merge the fix run's result: %s\n", mergeErr))
+	if outcome := fixRunOutcome(result, logsWriter); outcome != nil {
+		if err := accumulateReviewRunUsage(parameters, parameters, result); err != nil {
+			io.WriteString(logsWriter, fmt.Sprintf("warning: could not record the failed fix run's usage: %s\n", err))
+		}
+		return outcome
 	}
+	if err := mergeAgentResultIntoJobOutput(parameters, result); err != nil {
+		io.WriteString(logsWriter, fmt.Sprintf("warning: could not merge the fix run's result: %s\n", err))
+	}
+	return nil
+}
+
+// fixRunOutcome is what a FINISHED fix run means: nil when its work may stand,
+// an error naming why not.
+//
+// The same two tests the implement run applies, in the same order — the status,
+// then the verify gate, with a failure that predates the run still exempt —
+// because a fix run is an implement run with a narrower ask. What DIFFERS is
+// what the caller does with the error: the implement run's failure fails the
+// Step, while a fix run's is undone and handed to a human.
+func fixRunOutcome(result agentResult, logsWriter io.Writer) error {
 	if result.Status != "success" {
 		return formatAgentFailure(result)
 	}
-	// The SAME verify gate as the initial run. A fix that breaks the build
-	// fails the Step before CommitAndPush, and a failure that predates the
-	// run is still exempt.
 	switch decideVerifyGate(result.VerifyResult) {
 	case verifyGateFail:
 		return formatVerifyFailure(result.VerifyResult)
 	case verifyGateWarnPreExisting:
-		io.WriteString(s.logsWriter, formatPreExistingVerifyWarning(result.VerifyResult))
+		io.WriteString(logsWriter, formatPreExistingVerifyWarning(result.VerifyResult))
 	}
 	return nil
 }
