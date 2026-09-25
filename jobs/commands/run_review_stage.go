@@ -68,12 +68,17 @@ const (
 	// Two is the point where a loop that is converging has converged and one
 	// that is not has usually started arguing with itself.
 	maxMustFixRounds = 2
-	// reviewRunMaxTurns bounds one review run. A review reads the diff
-	// files agentbox wrote (one per repository, in pages when large), opens
-	// the callers of what changed, and writes a report; the reading is
-	// turns, so the cap leaves room for a multi-repository change. A run
-	// that wants more than this has started doing something else.
-	reviewRunMaxTurns = 20
+	// reviewRunMaxTurns is a CEILING that catches a looping reviewer, not
+	// the budget a review is expected to use. A review reads the diff files
+	// agentbox wrote (one per repository, in pages when large), then the
+	// callers of what changed, and every read is a turn: a careful review of
+	// a one-file diff used 26, and a multi-repository change needs several
+	// times that. Time and cost are bounded by reviewRunTimeout and the stage
+	// budget; a cap tight enough to bind on a real review would end it with a
+	// max-turns error, the round would be recorded as failed, and the pull
+	// request would open unreviewed. agentbox states the budget in the review
+	// prompt so a reviewer nearing it reports what it has.
+	reviewRunMaxTurns = 80
 	// reviewRunTimeout is the wall clock for one review run. Generous enough
 	// for a large diff over a slow model, short enough that a stuck round
 	// does not eat the stage budget.
@@ -182,6 +187,10 @@ type reviewStage struct {
 
 	rounds      []reviewRoundOutput
 	fixedInLoop []reviewFindingOutput
+	// lastTurnCap is the MAX_TURNS the most recent review round was actually
+	// spawned with, read back from its environment rather than assumed from
+	// the constant, so the log reports what the container received.
+	lastTurnCap string
 	// vendored records that the per-Step dependency cache has been refilled
 	// for a fix run — see ensureVendoredCache. Once per stage, not once per
 	// round.
@@ -244,7 +253,7 @@ func (s *reviewStage) run() (map[string]interface{}, error) {
 		}
 		findings := s.classify(result)
 		s.recordRound(round, findings, result)
-		io.WriteString(s.logsWriter, fmt.Sprintf("Review round %d completed: %d finding(s) in %d turn(s) of %d\n", round, len(findings), result.Turns, reviewRunMaxTurns))
+		io.WriteString(s.logsWriter, fmt.Sprintf("Review round %d completed: %d finding(s) in %d turn(s) of %s\n", round, len(findings), result.Turns, s.lastTurnCap))
 		// Nothing to route back — including every advisory review, whose
 		// findings are annotations by definition (see classify).
 		mustFix := mustFixOnly(findings)
