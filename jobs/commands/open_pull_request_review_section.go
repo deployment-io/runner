@@ -97,6 +97,14 @@ func (opr *taskOpenPR) reviewSection() string {
 	// dropped is never itself the thing that gets dropped.
 	budget := &renderBudget{items: reviewSectionMaxItems, runes: reviewSectionMaxRunes - utf8.RuneCountInString(sb.String()) - reviewSectionReserveRunes}
 	writeFindingGroup(&sb, mustFixHeading(failed != nil), stillOpen, budget)
+	// A fix run that did not finish was UNDONE, so the diff below this pull
+	// request is the implementer's own — not a half-applied cleanup. A reader
+	// comparing the findings against the change has to know that, or they will
+	// go looking for fix work that was deliberately rolled back.
+	if fixError := strings.TrimSpace(opr.review.FixError); fixError != "" {
+		sb.WriteString(fmt.Sprintf("\nA fix attempt did not complete (%s); the change is shown as it was before that attempt.\n",
+			capRunes(fixError, reviewDetailMaxRunes)))
+	}
 	writeFindingGroup(&sb, "Fixed during review", fixed, budget)
 	writeFindingGroup(&sb, "Noted", annotated, budget)
 	if omitted := len(stillOpen) + len(fixed) + len(annotated) - budget.rendered; omitted > 0 {

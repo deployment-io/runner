@@ -587,6 +587,10 @@ type reviewOutput struct {
 	Rounds        []reviewRoundOutput   `json:"rounds,omitempty"`
 	FixedInLoop   []reviewFindingOutput `json:"fixed_in_loop,omitempty"`
 	MustFixOpen   bool                  `json:"must_fix_open"`
+	// FixError is why a fix run did not finish, or empty. When it is set the
+	// change on the branch is the one the implement run produced: the failed
+	// fix was undone, and the findings it was sent to fix are still open.
+	FixError string `json:"fix_error,omitempty"`
 }
 
 type agentOutput struct {

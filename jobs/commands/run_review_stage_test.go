@@ -117,6 +117,9 @@ func TestCleanupReviewStageSiblingsRemovesEveryParkedDirectory(t *testing.T) {
 	writeFile(t, filepath.Join(implementerOutputStashPath(workDir), "result.json"), `{}`)
 	writeFile(t, filepath.Join(reviewRoundOutputPath(workDir, 1), "result.json"), `{}`)
 	writeFile(t, filepath.Join(reviewRoundOutputPath(workDir, 2), "result.json"), `{}`)
+	// A fix round's undo copy is a whole checkout — the one leak nothing else
+	// would ever collect.
+	writeFile(t, filepath.Join(fixRoundSnapshotPath(workDir, 1), "0-acme/api", "main.go"), "package main\n")
 
 	cleanupReviewStageSiblings(workDir)
 
@@ -124,6 +127,7 @@ func TestCleanupReviewStageSiblingsRemovesEveryParkedDirectory(t *testing.T) {
 		implementerOutputStashPath(workDir),
 		reviewRoundOutputPath(workDir, 1),
 		reviewRoundOutputPath(workDir, 2),
+		fixRoundSnapshotPath(workDir, 1),
 	} {
 		if _, err := os.Stat(dir); !os.IsNotExist(err) {
 			t.Errorf("%s survived the sweep: %v", dir, err)
