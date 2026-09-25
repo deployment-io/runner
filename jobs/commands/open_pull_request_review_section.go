@@ -130,11 +130,15 @@ func (opr *taskOpenPR) reviewSection() string {
 // implemented the change, and a reader weighing a finding — or the absence of
 // one — is weighing the judgement of whichever model actually made it.
 //
-// ONLY ROUNDS THAT COMPLETED COUNT. A round that failed before or during its
-// run reviewed nothing, so naming its model as the reviewer would claim a
-// review that did not happen — the failure sentence below already says what
-// went wrong. With no completed round the line is omitted. The model is read
-// from the rounds themselves rather than from the Job, so it names the
+// ONLY ROUNDS THAT COMPLETED AND EXAMINED SOMETHING COUNT. A round that failed
+// before or during its run reviewed nothing, so naming its model as the
+// reviewer would claim a review that did not happen — the failure sentence
+// below already says what went wrong. Nor is completing enough on its own: a
+// round that checked no parameter looked at nothing either, and "Reviewed by
+// gpt-5.5." sitting directly above "No pass examined this change" is the
+// sentence that made a reviewer whose sandbox never started read as a reviewer
+// that approved the change. With no such round the line is omitted. The model
+// is read from the rounds themselves rather than from the Job, so it names the
 // reviewer that ran; empty for a review recorded by a runner older than this
 // line, where saying nothing beats guessing.
 //
@@ -144,16 +148,24 @@ func (opr *taskOpenPR) reviewSection() string {
 func reviewedByLine(review *reviewOutput) string {
 	var model string
 	completed := 0
+	examined := false
 	for i := len(review.Rounds) - 1; i >= 0; i-- {
-		if !review.Rounds[i].Completed {
+		round := review.Rounds[i]
+		if !round.Completed {
 			continue
 		}
 		completed++
 		if model == "" {
-			model = strings.TrimSpace(review.Rounds[i].Model)
+			model = strings.TrimSpace(round.Model)
+		}
+		for _, c := range round.Coverage {
+			if coverageChecked(c.State) {
+				examined = true
+				break
+			}
 		}
 	}
-	if model == "" {
+	if model == "" || !examined {
 		return ""
 	}
 	if completed > 1 {
@@ -207,7 +219,7 @@ func failedFinalRound(review *reviewOutput) *reviewRoundOutput {
 func passesLine(coverage []reviewCoverageOutput) string {
 	var ran []string
 	for _, c := range coverage {
-		if strings.EqualFold(strings.TrimSpace(c.State), "checked") {
+		if coverageChecked(c.State) {
 			ran = append(ran, c.Parameter)
 		}
 	}

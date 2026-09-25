@@ -14,6 +14,7 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
+	"github.com/docker/docker/api/types/mount"
 )
 
 // --- the blind-to boundary -------------------------------------------------
@@ -273,6 +274,136 @@ func TestReviewSpawnEnvCarriesNeitherStepPromptNorPreviousStepsSummary(t *testin
 	}
 }
 
+// The repositories are read-only FOR THE REVIEWER, and the runner is what says
+// so: the round's own agent may have no working sandbox at all (Codex's
+// bwrap-based one cannot create a namespace inside a CapDrop-ALL container),
+// and a reviewer that cannot sandbox itself must still be unable to edit the
+// change it is reviewing.
+func TestTheReviewSpawnMountsEveryRepositoryReadOnly(t *testing.T) {
+	workDir := t.TempDir()
+	for _, dir := range []string{"0-acme/api", "1-acme/web"} {
+		writeFile(t, filepath.Join(workDir, dir, "main.go"), "package main\n")
+	}
+	dirs, complete := readOnlyRepoDirs(workDir, []string{"0-acme/api", "1-acme/web"}, io.Discard)
+	if !complete {
+		t.Fatal("two real repositories were reported as an incomplete read-only set")
+	}
+
+	mounts := agentboxMounts(agentboxSpawnSpec{
+		workDirHost: workDir, cacheVolume: "agentbox-cache-task-1-0", readOnlyRepoDirs: dirs,
+	})
+
+	// /work ITSELF STAYS WRITABLE. agentbox writes the round's diff files under
+	// /work/.review and its own result under /work/.agentbox-output; a
+	// read-only /work would leave the round with nowhere to report from.
+	work := findMount(t, mounts, agentboxWorkDirInContainer)
+	if work.ReadOnly {
+		t.Error("/work is mounted read-only — the round can write neither its diff files nor its result")
+	}
+	if work.Source != workDir {
+		t.Errorf("/work is bound from %q, want the Task's work dir %q", work.Source, workDir)
+	}
+	// ...and one read-only bind per repository on top of it.
+	readOnly := 0
+	for _, m := range mounts {
+		if m.ReadOnly {
+			readOnly++
+		}
+	}
+	if readOnly != 2 {
+		t.Errorf("%d read-only mount(s), want one per repository:\n%+v", readOnly, mounts)
+	}
+	for _, dir := range []string{"0-acme/api", "1-acme/web"} {
+		m := findMount(t, mounts, agentboxWorkDirInContainer+"/"+dir)
+		if !m.ReadOnly {
+			t.Errorf("%s is writable — the reviewer can edit the change it is reviewing", m.Target)
+		}
+		if m.Type != mount.TypeBind || m.Source != filepath.Join(workDir, dir) {
+			t.Errorf("mount %+v, want a bind from the repository's own host directory", m)
+		}
+	}
+}
+
+// An implement run and a fix run EXIST to edit the checkouts. Neither sets
+// readOnlyRepoDirs, and a spec without it mounts nothing read-only.
+func TestTheImplementAndFixSpawnsMountNothingReadOnly(t *testing.T) {
+	for _, spec := range []agentboxSpawnSpec{
+		// RunAgentStep's spawn.
+		{workDirHost: "/tasks/org-1/task-1", cacheVolume: "agentbox-cache-task-1-0", mcpSocketHost: "/tasks/org-1/task-1-agent-mcp.sock"},
+		// runMustFixRound's spawn, which is the same shape with a wait cap.
+		{workDirHost: "/tasks/org-1/task-1", cacheVolume: "agentbox-cache-task-1-0", mcpSocketHost: "/tasks/org-1/task-1-agent-mcp.sock", waitTimeout: mustFixRunTimeout},
+	} {
+		for _, m := range agentboxMounts(spec) {
+			if m.ReadOnly {
+				t.Errorf("a run that has to edit the checkouts got the read-only mount %+v", m)
+			}
+		}
+	}
+}
+
+// The base commits are keyed by whatever CheckoutRepository recorded, and the
+// work dir is writable by the agent. A key that escapes the work dir would name
+// a host directory outside the Task and Docker would mount it into the
+// container; one that is not a directory cannot be mounted at all. Both are
+// SKIPPED WITH A LOG LINE — the stage is fail-open, and a review over the
+// repositories that could be mounted beats no review.
+func TestReadOnlyRepoDirsSkipsAnythingThatIsNotARepositoryDirectory(t *testing.T) {
+	workDir := t.TempDir()
+	writeFile(t, filepath.Join(workDir, "0-acme/api", "main.go"), "package main\n")
+	writeFile(t, filepath.Join(workDir, "notes.md"), "not a repository\n")
+	var logs strings.Builder
+
+	got, complete := readOnlyRepoDirs(workDir, []string{
+		"0-acme/api",
+		"../elsewhere",      // outside the work dir
+		"/etc",              // absolute
+		"2-acme/never-came", // recorded but not checked out
+		"notes.md",          // not a directory
+	}, &logs)
+	if complete {
+		t.Error("a set with skipped directories was reported complete")
+	}
+
+	if len(got) != 1 || got[0] != "0-acme/api" {
+		t.Errorf("read-only dirs = %v, want only the repository that is really there", got)
+	}
+	for _, skipped := range []string{"../elsewhere", "/etc", "2-acme/never-came", "notes.md"} {
+		if !strings.Contains(logs.String(), skipped) {
+			t.Errorf("the job log does not say %q was skipped:\n%s", skipped, logs.String())
+		}
+	}
+}
+
+// The mount is the enforcement, so the agent is told about it: a reviewer that
+// starts its own sandbox on top of a read-only mount gains nothing, and Codex's
+// bwrap-based one gains less than nothing — it cannot create a namespace in
+// these containers, so every command it ran failed and the round examined
+// nothing while still counting as a completed review.
+func TestTheReviewEnvSaysTheRepositoriesAreReadOnlyAtTheMount(t *testing.T) {
+	byKey := envMap(applyReviewEnv([]string{"ANTHROPIC_API_KEY=sk-ant-test"},
+		reviewEnvInputs{passes: reviewPasses, baseCommits: `{"0-a/b":"abc"}`, round: 1}))
+	if byKey["REVIEW_READONLY_MOUNTS"] != "1" {
+		t.Errorf("REVIEW_READONLY_MOUNTS = %q, want 1 on a review run", byKey["REVIEW_READONLY_MOUNTS"])
+	}
+	// A fix run writes the checkouts, and nothing about it is read-only.
+	if _, ok := envMap(applyMustFixEnv([]string{"STEP_PROMPT=the original"}, "the fix prompt"))["REVIEW_READONLY_MOUNTS"]; ok {
+		t.Error("a fix run was told its repositories are read-only — it exists to edit them")
+	}
+}
+
+// findMount returns the mount for a container path, failing the test when there
+// is none.
+func findMount(t *testing.T, mounts []mount.Mount, target string) mount.Mount {
+	t.Helper()
+	for _, m := range mounts {
+		if m.Target == target {
+			return m
+		}
+	}
+	t.Fatalf("no mount at %s:\n%+v", target, mounts)
+	return mount.Mount{}
+}
+
 // A fix run is an ordinary batch run: the Step's original prompt plus the
 // must-fix findings, and nothing from the reviewer's transcript.
 func TestMustFixPromptCarriesTheOriginalPromptAndOnlyTheMustFixFindings(t *testing.T) {
@@ -506,6 +637,100 @@ func TestReviewRoundFailureNamesEachShape(t *testing.T) {
 	// And a round that DID complete reports no failure.
 	if got := reviewRoundFailure(agentResult{Status: "success", ReviewResult: &reviewResult{}}, nil); got != "" {
 		t.Errorf("reviewRoundFailure on a good round = %q, want empty", got)
+	}
+}
+
+// A REVIEW THAT EXAMINED NOTHING IS A FAILED ROUND, NOT A CLEAN ONE. An agent
+// that ran and checked no parameter found nothing because it looked at nothing,
+// and recorded as a completed round it is indistinguishable on the pull request
+// from a change a reviewer read and passed.
+func TestAReviewThatRanAndExaminedNothingIsAFailedRound(t *testing.T) {
+	ran := agentResult{Status: "success", Turns: 12, ReviewResult: &reviewResult{Coverage: []reviewCoverage{
+		{Parameter: "security", State: "skipped", Reason: "every command failed: bwrap: No permissions to create new namespace"},
+		{Parameter: "correctness", State: "not checked", Reason: "the pass did not run"},
+	}}}
+
+	got := reviewRoundFailure(ran, nil)
+	if !strings.Contains(got, "the reviewer ran but could not examine the change") {
+		t.Errorf("reason = %q, want a round that examined nothing recorded as failed", got)
+	}
+	// The reviewer's OWN account of why, so the record names the cause rather
+	// than restating that nothing was checked.
+	if !strings.Contains(got, "No permissions to create new namespace") {
+		t.Errorf("reason = %q, want the first skipped pass's reason carried into it", got)
+	}
+
+	// One checked parameter is a review. The state is a free string from an
+	// agent, so it is read case-insensitively.
+	for _, state := range []string{"checked", "Checked", " CHECKED "} {
+		partial := agentResult{Status: "success", Turns: 12, ReviewResult: &reviewResult{Coverage: []reviewCoverage{
+			{Parameter: "security", State: state},
+			{Parameter: "correctness", State: "skipped", Reason: "out of turns"},
+		}}}
+		if got := reviewRoundFailure(partial, nil); got != "" {
+			t.Errorf("a round that checked %q was recorded as failed: %q", state, got)
+		}
+	}
+
+	// TURNS 0 IS UNCHANGED: agentbox's cost gate ran no agent at all — a
+	// documentation-only change, say — and that round is exactly as clean as it
+	// was before.
+	noAgent := ran
+	noAgent.Turns = 0
+	if got := reviewRoundFailure(noAgent, nil); got != "" {
+		t.Errorf("a round where no agent ran was recorded as failed: %q", got)
+	}
+}
+
+// ...and the loop treats it as any other failed round: recorded with the reason,
+// no second round, and the Step still commits and opens its pull request.
+func TestTheLoopEndsOnAReviewThatExaminedNothing(t *testing.T) {
+	workDir := t.TempDir()
+	writeFile(t, filepath.Join(workDir, "0-acme/api", "handler.go"), "the implementation\n")
+	stage := fixLoopStage(workDir, io.Discard)
+	rounds := 0
+	stage.runReview = func(int) (agentResult, error) {
+		rounds++
+		return agentResult{Status: "success", Turns: 12, ReviewResult: &reviewResult{Coverage: []reviewCoverage{
+			{Parameter: "security", State: "skipped", Reason: "every command failed: bwrap: No permissions to create new namespace"},
+			{Parameter: "correctness", State: "not checked", Reason: "the pass did not run"},
+		}}}, nil
+	}
+
+	out, err := stage.run()
+	if err != nil {
+		t.Fatalf("a review that examined nothing failed the Step: %s", err)
+	}
+	if rounds != 1 {
+		t.Errorf("the loop ran %d round(s), want it to end on the failed one", rounds)
+	}
+	review := readReviewFromJobOutput(out)
+	if review == nil || len(review.Rounds) != 1 {
+		t.Fatalf("review = %+v, want the round recorded", review)
+	}
+	if review.Rounds[0].Completed {
+		t.Error("a round that examined nothing was recorded as completed — the pull request would read as reviewed")
+	}
+	if !strings.Contains(review.Rounds[0].Error, "the reviewer ran but could not examine the change") ||
+		!strings.Contains(review.Rounds[0].Error, "No permissions to create new namespace") {
+		t.Errorf("round error = %q, want the named reason", review.Rounds[0].Error)
+	}
+
+	// A round where no agent ran keeps the behaviour it had: completed, with
+	// whatever coverage it reported.
+	stage = fixLoopStage(workDir, io.Discard)
+	stage.runReview = func(int) (agentResult, error) {
+		return agentResult{Status: "success", ReviewResult: &reviewResult{Coverage: []reviewCoverage{
+			{Parameter: "security", State: "skipped", Reason: "the change is documentation only"},
+		}}}, nil
+	}
+	out, err = stage.run()
+	if err != nil {
+		t.Fatalf("run: %s", err)
+	}
+	review = readReviewFromJobOutput(out)
+	if review == nil || len(review.Rounds) != 1 || !review.Rounds[0].Completed {
+		t.Errorf("review = %+v, want a round where no agent ran left as it was", review)
 	}
 }
 
@@ -805,5 +1030,42 @@ func TestEnvValueReadsTheLastOccurrence(t *testing.T) {
 	}
 	if got := envValue(env, "MISSING"); got != "" {
 		t.Errorf("envValue(MISSING) = %q, want empty", got)
+	}
+}
+
+// A repository with no recorded start commit (a new, empty one) is still
+// committed and pushed, so it is mounted read-only like the rest.
+func TestTheReadOnlySetIncludesARepositoryWithNoStartCommit(t *testing.T) {
+	workDir := t.TempDir()
+	for _, dir := range []string{"0-acme/api", "1-acme/new"} {
+		writeFile(t, filepath.Join(workDir, dir, "README.md"), "x\n")
+	}
+	stage := &reviewStage{baseCommits: map[string]string{"0-acme/api": "abc"}, repoDirs: []string{"0-acme/api", "1-acme/new"}}
+	got, complete := readOnlyRepoDirs(workDir, stage.allRepositoryDirs(), io.Discard)
+	if !complete || len(got) != 2 || got[1] != "1-acme/new" {
+		t.Errorf("read-only dirs = %v (complete %v), want both, including the repository with no start commit", got, complete)
+	}
+}
+
+// A round that reported findings examined the change, whatever it called its
+// coverage; failing it would discard the findings.
+func TestARoundWithFindingsIsNotFailedForItsCoverageLabels(t *testing.T) {
+	result := agentResult{Status: "success", Turns: 6, ReviewResult: &reviewResult{
+		Findings: []reviewFinding{{Key: "sec-1", Parameter: "security", Severity: "high", What: "x"}},
+		Coverage: []reviewCoverage{{Parameter: "security", State: "complete"}},
+	}}
+	if reason := reviewRoundFailure(result, nil); reason != "" {
+		t.Errorf("a round with findings was failed: %q", reason)
+	}
+	result.ReviewResult.Findings = nil
+	if reason := reviewRoundFailure(result, nil); reason == "" {
+		t.Error("a round with no findings and nothing checked was not failed")
+	}
+}
+
+func TestWithoutEnvRemovesEveryOccurrence(t *testing.T) {
+	got := withoutEnv([]string{"A=1", "REVIEW_READONLY_MOUNTS=1", "B=2", "REVIEW_READONLY_MOUNTS=1"}, "REVIEW_READONLY_MOUNTS")
+	if len(got) != 2 || got[0] != "A=1" || got[1] != "B=2" {
+		t.Errorf("withoutEnv = %v", got)
 	}
 }
