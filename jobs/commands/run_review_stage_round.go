@@ -37,14 +37,15 @@ func (s *reviewStage) runReviewRound(round int) (agentResult, error) {
 		return agentResult{}, err
 	}
 	// Log the turn cap this round is ACTUALLY spawned with, read back from the
-	// environment handed to the container. A round once ran past the constant
-	// without being stopped; logging what was passed, beside agentbox's own
-	// line saying what it received, is what locates a limit lost in transit.
+	// environment handed to the container. The cap counts model responses and
+	// the turns the agent reports afterwards count roughly one per tool call,
+	// so both are logged with their units rather than as "N of M", which once
+	// made a cap that held look as if it had been ignored.
 	s.lastTurnCap = envValue(env, "MAX_TURNS")
 	if s.lastTurnCap == "" {
 		s.lastTurnCap = "no cap"
 	}
-	io.WriteString(s.logsWriter, fmt.Sprintf("Review round %d: turn cap %s\n", round, s.lastTurnCap))
+	io.WriteString(s.logsWriter, fmt.Sprintf("Review round %d: turn cap %s model responses\n", round, s.lastTurnCap))
 	swap, err := swapInReviewOutputDir(workDirHost, round, prepareAgentboxHostDirs)
 	if err != nil {
 		return agentResult{}, fmt.Errorf("error preparing the review output directory: %s", err)
