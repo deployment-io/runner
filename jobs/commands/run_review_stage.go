@@ -428,13 +428,33 @@ func (s *reviewStage) finish() (map[string]interface{}, error) {
 }
 
 // classify turns one round's raw findings into the Step's record: each finding
-// marked must-fix or not, and the previous round's must-fix findings that are
-// no longer present recorded as fixed.
+// marked must-fix or not, and the previous round's open must-fix findings
+// settled against the reviewer's own status for each of them.
 //
-// Pairing is by Finding.Key, with a synthesised key when the producer omitted
-// one — parameter, location and the first 80 runes of what, which is enough to
-// recognise the same finding after a fix attempt without being so specific
-// that a reworded report looks like a new problem.
+// WHAT DECIDES "FIXED" IS THE REVIEWER'S ANSWER, NOT A MISSING KEY. A round
+// that was sent the previous round's open must-fix findings (see
+// openMustFixEnvValue) answers with review_result.previous: one entry per key
+// it was given, resolved or still_present. A finding is fixed in loop only when
+// its entry says resolved AND this round did not report that key again.
+// Everything else is HELD — still must-fix, carried into the next round, and
+// rendered as still present.
+//
+// Key matching alone used to make that decision, and the key is the reviewer's
+// own free-text slug: a reworded key made an unfixed problem look fixed and its
+// re-report look new. A live run listed a Critical unauthenticated secret dump
+// under "Fixed during review" on a NON-DRAFT pull request while the code still
+// had it. So there is deliberately NO FALLBACK to key matching when previous is
+// absent — agentbox omits it both when the reviewer left the list out and when
+// every entry it returned was unusable, and a fallback would reproduce exactly
+// that bug. The cost of an image that never fills it in is that open findings
+// are held and the pull request opens as a draft, which is the safe direction.
+//
+// Rounds that were sent nothing — round 1, and any round following one that
+// left nothing open — have nothing to settle either way.
+//
+// Pairing is by findingKey: the producer's own key when it supplied one,
+// otherwise a synthesised one, capped either way at agentbox's key length so
+// the key the runner sends is the key it is answered about.
 func (s *reviewStage) classify(result agentResult) []reviewFindingOutput {
 	if result.ReviewResult == nil {
 		// Unreachable on the live path — reviewRoundFailure ends the loop for
@@ -443,7 +463,9 @@ func (s *reviewStage) classify(result agentResult) []reviewFindingOutput {
 		return nil
 	}
 	findings := make([]reviewFindingOutput, 0, len(result.ReviewResult.Findings))
-	present := map[string]bool{}
+	// indexByKey is where each key the round ITSELF reported sits in findings,
+	// so a held finding can mark that entry instead of being appended beside it.
+	indexByKey := map[string]int{}
 	if s.seen == nil {
 		s.seen = map[string]bool{}
 	}
@@ -470,17 +492,104 @@ func (s *reviewStage) classify(result agentResult) []reviewFindingOutput {
 		// means something once there is a round to be new since.
 		out.New = !firstRound && !s.seen[key]
 		findings = append(findings, out)
-		present[key] = true
-	}
-	for key := range present {
-		s.seen[key] = true
-	}
-	for key, previous := range s.openMustFix {
-		if !present[key] {
-			s.fixedInLoop = append(s.fixedInLoop, previous)
+		if _, reported := indexByKey[key]; !reported {
+			indexByKey[key] = len(findings) - 1
 		}
 	}
+	for key := range indexByKey {
+		s.seen[key] = true
+	}
+	// An empty openMustFix is exactly "this round was sent no open findings":
+	// round 1 starts with the map empty, and a round that left nothing open
+	// empties it again. Nothing to resolve, nothing to hold.
+	if len(s.openMustFix) == 0 {
+		return findings
+	}
+	return s.settleOpenMustFix(findings, indexByKey, result.ReviewResult.Previous)
+}
+
+// reviewStatusResolved is the one status that clears an open must-fix finding.
+// Every other value agentbox can return — still_present, an unrecognised
+// string, an absent entry — leaves it held.
+const reviewStatusResolved = "resolved"
+
+// settleOpenMustFix records each open must-fix finding as fixed in loop or
+// held, from the statuses the round returned. Held findings go into the round's
+// own finding list, which is what routes them back to the implementer and, at
+// the loop's bounds, onto a draft pull request.
+func (s *reviewStage) settleOpenMustFix(findings []reviewFindingOutput, indexByKey map[string]int, previous []reviewPreviousFinding) []reviewFindingOutput {
+	statuses := make(map[string]reviewPreviousFinding, len(previous))
+	for _, p := range previous {
+		if key := strings.TrimSpace(p.Key); key != "" {
+			statuses[key] = p
+		}
+	}
+	for _, key := range sortedFindingKeys(s.openMustFix) {
+		open := s.openMustFix[key]
+		status := statuses[key]
+		i, reReported := indexByKey[key]
+		// Re-reported under the same key is the reviewer contradicting its own
+		// status line, and the finding is the stronger evidence of the two.
+		if !reReported && strings.EqualFold(strings.TrimSpace(status.Status), reviewStatusResolved) {
+			// Held is cleared on the way in. A finding an EARLIER round held was
+			// stored back into openMustFix still marked held, and carrying that
+			// flag into FixedInLoop would render it under "Fixed during review"
+			// with "still present after a fix round" underneath it — the two
+			// statements this change exists to keep apart, in one entry.
+			open.Held = false
+			s.fixedInLoop = append(s.fixedInLoop, open)
+			continue
+		}
+		if reReported {
+			// Marked in place rather than copied: one problem the reader sees
+			// once and the implementer is sent once. Must-fix whatever severity
+			// it was re-reported at — the severity that gated it is the one the
+			// round that opened it assigned, and a reviewer downgrading its own
+			// report does not release it.
+			//
+			// A re-report under a DIFFERENT key is not this case and is left
+			// alone: it stands as its own finding beside the held one, because
+			// merging two reports that may or may not be one problem is a
+			// guess, and the loop already has one bug from guessing.
+			findings[i].MustFix = true
+			findings[i].Held = true
+			findings[i].Why = withStillPresentNote(findings[i].Why, status.Note)
+			continue
+		}
+		// Not mentioned at all: carried as the round that opened it reported
+		// it, and NOT new — it has been on the record since that round.
+		held := open
+		held.MustFix = true
+		held.Held = true
+		held.New = false
+		held.Why = withStillPresentNote(held.Why, status.Note)
+		findings = append(findings, held)
+	}
 	return findings
+}
+
+// withStillPresentNote folds the reviewer's account of what it still sees into
+// the finding's why, which is what the pull request and the fix prompt render.
+func withStillPresentNote(why, note string) string {
+	note = strings.TrimSpace(note)
+	if note == "" {
+		return why
+	}
+	if why = strings.TrimSpace(why); why == "" {
+		return "Still present: " + note
+	}
+	return why + " Still present: " + note
+}
+
+// sortedFindingKeys orders the open must-fix findings' keys, so a held finding
+// lands in the same place in the record on every run.
+func sortedFindingKeys(open map[string]reviewFindingOutput) []string {
+	keys := make([]string, 0, len(open))
+	for key := range open {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // isMustFix is the whole gate, and it is the RUNNER's decision: the severity
@@ -666,16 +775,7 @@ func (s *reviewStage) logFullReview(out *reviewOutput) {
 			b.WriteString(fmt.Sprintf("Round %d: %d finding(s), %d turn(s)\n", round.Round, len(round.Findings), round.Turns))
 		}
 		for _, f := range round.Findings {
-			marker := "annotated"
-			if f.MustFix {
-				marker = "MUST FIX"
-			}
-			if f.New {
-				marker += ", new since the last round"
-			} else if round.Round > 1 {
-				marker += ", still open"
-			}
-			b.WriteString(fmt.Sprintf("  [%s] %s/%s at %s — %s\n", marker, f.Parameter, f.Severity, f.Location, f.What))
+			b.WriteString(fmt.Sprintf("  [%s] %s/%s at %s — %s\n", findingLogMarker(f, round.Round), f.Parameter, f.Severity, f.Location, f.What))
 			if f.Why != "" {
 				b.WriteString(fmt.Sprintf("      why: %s\n", f.Why))
 			}
@@ -696,6 +796,29 @@ func (s *reviewStage) logFullReview(out *reviewOutput) {
 	}
 	b.WriteString(fmt.Sprintf("Must-fix findings still open: %t\n", out.MustFixOpen))
 	io.WriteString(s.logsWriter, b.String())
+}
+
+// findingLogMarker is how one finding reads in the job log.
+//
+// A HELD finding is marked still present and nothing else. That is the
+// reviewer's own verdict on a finding it was asked about, which is a different
+// and stronger statement than "still open" — that only ever meant the key
+// turned up again — and it must never read as new.
+func findingLogMarker(f reviewFindingOutput, round int) string {
+	if f.Held {
+		return "MUST FIX, still present"
+	}
+	marker := "annotated"
+	if f.MustFix {
+		marker = "MUST FIX"
+	}
+	switch {
+	case f.New:
+		return marker + ", new since the last round"
+	case round > 1:
+		return marker + ", still open"
+	}
+	return marker
 }
 
 // reviewRoundFailure names why a round produced no usable report, or "" when
@@ -850,20 +973,41 @@ func mustFixOnly(findings []reviewFindingOutput) []reviewFindingOutput {
 	return out
 }
 
-// findingKey is how the same finding is recognised across rounds. The
-// producer's own key when it supplied one; otherwise parameter, location and
-// the first 80 runes of what — specific enough to distinguish two problems in
-// one file, loose enough that a reworded report of the same problem still
-// pairs.
+// reviewFindingKeyMaxRunes is agentbox's cap on a finding key — the one it
+// applies to the keys it is given and to the keys it echoes back in
+// review_result.previous (agentbox's docs/CONTRACT.md).
+//
+// findingKey never exceeds it, so THE KEY THE RUNNER SENDS IS THE KEY IT IS
+// ANSWERED ABOUT. A longer key would come back cut, match nothing in
+// openMustFix, and the finding under it would be held for the rest of the loop
+// however thoroughly it was fixed.
+const reviewFindingKeyMaxRunes = 120
+
+// findingKey is how the same finding is recognised across rounds, and the key
+// the reviewer is asked about. The producer's own key when it supplied one;
+// otherwise parameter, location and the first 80 runes of what — specific
+// enough to distinguish two problems in one file, loose enough that a reworded
+// report of the same problem still pairs.
 func findingKey(f reviewFindingOutput) string {
 	if key := strings.TrimSpace(f.Key); key != "" {
-		return key
+		return capKeyRunes(key)
 	}
 	what := []rune(strings.TrimSpace(f.What))
 	if len(what) > 80 {
 		what = what[:80]
 	}
-	return strings.ToLower(strings.TrimSpace(f.Parameter) + "|" + strings.TrimSpace(f.Location) + "|" + string(what))
+	return capKeyRunes(strings.ToLower(strings.TrimSpace(f.Parameter) + "|" + strings.TrimSpace(f.Location) + "|" + string(what)))
+}
+
+// capKeyRunes truncates a key to the cap. Plain truncation with no ellipsis,
+// because the result has to be byte-identical to agentbox's own cut of the same
+// string — a marker character would make the two disagree.
+func capKeyRunes(key string) string {
+	runes := []rune(key)
+	if len(runes) <= reviewFindingKeyMaxRunes {
+		return key
+	}
+	return string(runes[:reviewFindingKeyMaxRunes])
 }
 
 func participationName(participation int64) string {

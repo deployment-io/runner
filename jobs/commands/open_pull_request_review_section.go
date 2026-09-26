@@ -306,6 +306,12 @@ func renderFinding(f reviewFindingOutput) string {
 	if why := strings.TrimSpace(f.Why); why != "" {
 		sb.WriteString("  _Why it matters:_ " + capRunes(why, reviewDetailMaxRunes) + "\n")
 	}
+	// A held finding was routed back to the agent and the reviewer has since
+	// said it is still there. Without the line it reads as a finding nobody has
+	// tried to fix yet, which understates it.
+	if f.Held {
+		sb.WriteString("  _Still present after a fix round._\n")
+	}
 	return sb.String()
 }
 

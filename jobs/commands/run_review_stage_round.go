@@ -151,13 +151,64 @@ func (s *reviewStage) reviewSpawnEnv(round int) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("error encoding the review base commits: %s", err)
 	}
+	openFindings, err := s.openMustFixEnvValue(round)
+	if err != nil {
+		return nil, err
+	}
 	spec, _ := jobs.GetParameterValue[string](s.parameters, parameters_enums.ReviewSpec)
 	return applyReviewEnv(env, reviewEnvInputs{
-		spec:        spec,
-		passes:      reviewPasses,
-		baseCommits: string(baseCommits),
-		round:       round,
+		spec:         spec,
+		passes:       reviewPasses,
+		baseCommits:  string(baseCommits),
+		round:        round,
+		openFindings: openFindings,
 	}), nil
+}
+
+// reviewOpenFinding is one open must-fix finding as REVIEW_OPEN_FINDINGS
+// carries it: what the reviewer needs to go and look at the same problem again,
+// and nothing else. No why, no must-fix marking — the runner is asking whether
+// the problem is still there, not re-arguing that it matters.
+type reviewOpenFinding struct {
+	// Key is THE MAP KEY from openMustFix — findingKey's answer, never the raw
+	// Key field, which is empty whenever the reviewer supplied no key of its
+	// own. agentbox drops an entry with no key, and a dropped entry comes back
+	// with no status, which would hold a finding the reviewer may well have
+	// fixed for the rest of the loop.
+	Key       string `json:"key"`
+	Parameter string `json:"parameter,omitempty"`
+	Severity  string `json:"severity,omitempty"`
+	Location  string `json:"location,omitempty"`
+	What      string `json:"what,omitempty"`
+}
+
+// openMustFixEnvValue is the REVIEW_OPEN_FINDINGS payload for this round: the
+// previous round's open must-fix findings, so the round can answer for each of
+// them by key instead of the runner inferring an answer from which keys it
+// happened to report.
+//
+// Empty for round 1, which has no previous round, and for any round after one
+// that left nothing open. Both send no variable at all.
+func (s *reviewStage) openMustFixEnvValue(round int) (string, error) {
+	if round < 2 || len(s.openMustFix) == 0 {
+		return "", nil
+	}
+	out := make([]reviewOpenFinding, 0, len(s.openMustFix))
+	for _, key := range sortedFindingKeys(s.openMustFix) {
+		f := s.openMustFix[key]
+		out = append(out, reviewOpenFinding{
+			Key:       key,
+			Parameter: f.Parameter,
+			Severity:  f.Severity,
+			Location:  f.Location,
+			What:      f.What,
+		})
+	}
+	encoded, err := json.Marshal(out)
+	if err != nil {
+		return "", fmt.Errorf("error encoding the review's open must-fix findings: %s", err)
+	}
+	return string(encoded), nil
 }
 
 // reviewerParameters is the Job's parameters AS THE REVIEWER SEES THEM: a
@@ -249,6 +300,9 @@ type reviewEnvInputs struct {
 	passes      string
 	baseCommits string
 	round       int
+	// openFindings is the JSON REVIEW_OPEN_FINDINGS payload, or "" for a round
+	// that is sent none — see openMustFixEnvValue.
+	openFindings string
 }
 
 // applyReviewEnv turns an implement-run environment into a review-run one:
@@ -265,7 +319,7 @@ func applyReviewEnv(env []string, in reviewEnvInputs) []string {
 	for _, kv := range env {
 		key, _, _ := strings.Cut(kv, "=")
 		switch key {
-		case "STEP_PROMPT", "PREVIOUS_STEPS_SUMMARY", "AGENT_MODE", "MAX_TURNS":
+		case "STEP_PROMPT", "PREVIOUS_STEPS_SUMMARY", "AGENT_MODE", "MAX_TURNS", "REVIEW_OPEN_FINDINGS":
 			continue
 		case agentMCPSocketEnvVar:
 			// Review needs no runner tools, and the review spawn mounts no
@@ -292,6 +346,13 @@ func applyReviewEnv(env []string, in reviewEnvInputs) []string {
 	)
 	if strings.TrimSpace(in.spec) != "" {
 		out = append(out, "REVIEW_SPEC="+in.spec)
+	}
+	// Absent rather than empty for a round with nothing open: an empty array
+	// would ask the reviewer to answer for no findings, and the answer — a
+	// previous list with no entries — is indistinguishable from the answer an
+	// image without the field gives.
+	if strings.TrimSpace(in.openFindings) != "" {
+		out = append(out, "REVIEW_OPEN_FINDINGS="+in.openFindings)
 	}
 	return out
 }
