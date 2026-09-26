@@ -513,6 +513,10 @@ func (s *reviewStage) classify(result agentResult) []reviewFindingOutput {
 // string, an absent entry — leaves it held.
 const reviewStatusResolved = "resolved"
 
+// reviewStatusStillPresent is the reviewer's explicit "not fixed". Only its
+// note is recorded: a note that came with "resolved" describes the fix.
+const reviewStatusStillPresent = "still_present"
+
 // settleOpenMustFix records each open must-fix finding as fixed in loop or
 // held, from the statuses the round returned. Held findings go into the round's
 // own finding list, which is what routes them back to the implementer and, at
@@ -537,6 +541,7 @@ func (s *reviewStage) settleOpenMustFix(findings []reviewFindingOutput, indexByK
 			// with "still present after a fix round" underneath it — the two
 			// statements this change exists to keep apart, in one entry.
 			open.Held = false
+			open.StillPresentNote = ""
 			s.fixedInLoop = append(s.fixedInLoop, open)
 			continue
 		}
@@ -553,7 +558,7 @@ func (s *reviewStage) settleOpenMustFix(findings []reviewFindingOutput, indexByK
 			// guess, and the loop already has one bug from guessing.
 			findings[i].MustFix = true
 			findings[i].Held = true
-			findings[i].Why = withStillPresentNote(findings[i].Why, status.Note)
+			findings[i].StillPresentNote = stillPresentNote(status)
 			continue
 		}
 		// Not mentioned at all: carried as the round that opened it reported
@@ -562,23 +567,22 @@ func (s *reviewStage) settleOpenMustFix(findings []reviewFindingOutput, indexByK
 		held.MustFix = true
 		held.Held = true
 		held.New = false
-		held.Why = withStillPresentNote(held.Why, status.Note)
+		held.StillPresentNote = stillPresentNote(status)
 		findings = append(findings, held)
 	}
 	return findings
 }
 
-// withStillPresentNote folds the reviewer's account of what it still sees into
-// the finding's why, which is what the pull request and the fix prompt render.
-func withStillPresentNote(why, note string) string {
-	note = strings.TrimSpace(note)
-	if note == "" {
-		return why
+// stillPresentNote is this round's note for a held finding: the reviewer's
+// own sentence when it said "still_present", and nothing otherwise. It
+// REPLACES the previous round's note rather than adding to it; a finding the
+// reviewer did not mention this round has no current note, and an older one
+// would describe code the last fix round may have changed.
+func stillPresentNote(status reviewPreviousFinding) string {
+	if !strings.EqualFold(strings.TrimSpace(status.Status), reviewStatusStillPresent) {
+		return ""
 	}
-	if why = strings.TrimSpace(why); why == "" {
-		return "Still present: " + note
-	}
-	return why + " Still present: " + note
+	return strings.TrimSpace(status.Note)
 }
 
 // sortedFindingKeys orders the open must-fix findings' keys, so a held finding
@@ -778,6 +782,9 @@ func (s *reviewStage) logFullReview(out *reviewOutput) {
 			b.WriteString(fmt.Sprintf("  [%s] %s/%s at %s — %s\n", findingLogMarker(f, round.Round), f.Parameter, f.Severity, f.Location, f.What))
 			if f.Why != "" {
 				b.WriteString(fmt.Sprintf("      why: %s\n", f.Why))
+			}
+			if f.StillPresentNote != "" {
+				b.WriteString(fmt.Sprintf("      still present: %s\n", f.StillPresentNote))
 			}
 		}
 		for _, c := range round.Coverage {

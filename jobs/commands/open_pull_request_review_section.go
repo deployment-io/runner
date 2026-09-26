@@ -311,6 +311,9 @@ func renderFinding(f reviewFindingOutput) string {
 	// tried to fix yet, which understates it.
 	if f.Held {
 		sb.WriteString("  _Still present after a fix round._\n")
+		if note := strings.TrimSpace(f.StillPresentNote); note != "" {
+			sb.WriteString("  _Reviewer's note:_ " + capRunes(note, reviewDetailMaxRunes) + "\n")
+		}
 	}
 	return sb.String()
 }

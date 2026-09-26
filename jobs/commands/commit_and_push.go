@@ -550,6 +550,13 @@ type reviewFindingOutput struct {
 	// appearing) once listed a Critical finding as fixed while the code still
 	// had it. See (s *reviewStage).classify.
 	Held bool `json:"held,omitempty"`
+	// StillPresentNote is the reviewer's one sentence on what it still sees,
+	// from the latest round that held the finding. It is kept apart from Why,
+	// which stays the round-that-opened-it's account: folded into Why it
+	// stacked round after round, survived into "Fixed during review", and
+	// relabelled a note written for a "resolved" status as evidence the
+	// problem persists. Set only with Held; cleared when the finding resolves.
+	StillPresentNote string `json:"still_present_note,omitempty"`
 }
 
 // reviewCoverageOutput mirrors agentbox's coverage entry: what happened to one

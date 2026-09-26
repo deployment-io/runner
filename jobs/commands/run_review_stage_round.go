@@ -690,6 +690,13 @@ func buildMustFixPrompt(stepPrompt string, mustFix []reviewFindingOutput) string
 		if why := strings.TrimSpace(f.Why); why != "" {
 			b.WriteString("   Why it matters: " + why + "\n")
 		}
+		if f.Held {
+			b.WriteString("   This finding was sent back before and the reviewer says it is still present.")
+			if note := strings.TrimSpace(f.StillPresentNote); note != "" {
+				b.WriteString(" Reviewer's note: " + note)
+			}
+			b.WriteString("\n")
+		}
 	}
 	return b.String()
 }

@@ -101,8 +101,8 @@ func TestTheRenamedFindingIsHeldAcrossEveryRoundAndOpensADraft(t *testing.T) {
 	if findingByKey(review.Rounds[1].Findings, "B") == nil {
 		t.Errorf("round 2's own finding B was lost: %+v", review.Rounds[1].Findings)
 	}
-	if note := findingByKey(review.Rounds[1].Findings, "A").Why; !strings.Contains(note, "Still present: the endpoint still has no auth check") {
-		t.Errorf("A's why = %q, want the reviewer's note on what it still sees", note)
+	if note := findingByKey(review.Rounds[1].Findings, "A").StillPresentNote; note != "the endpoint still has no auth check" {
+		t.Errorf("A's still-present note = %q, want the reviewer's note on what it still sees", note)
 	}
 }
 
@@ -235,8 +235,8 @@ func TestAReReportedHeldFindingIsMarkedInPlaceRatherThanDuplicated(t *testing.T)
 	if !findings[0].MustFix || !findings[0].Held {
 		t.Errorf("findings[0] = %+v, want the re-reported finding must-fix and held", findings[0])
 	}
-	if !strings.Contains(findings[0].Why, "Still present: still unauthenticated") {
-		t.Errorf("why = %q, want the reviewer's note", findings[0].Why)
+	if findings[0].StillPresentNote != "still unauthenticated" {
+		t.Errorf("still-present note = %q, want the reviewer's note", findings[0].StillPresentNote)
 	}
 	if len(stage.fixedInLoop) != 0 {
 		t.Errorf("fixed_in_loop = %+v, want nothing", stage.fixedInLoop)
@@ -280,6 +280,89 @@ func TestAFindingHeldByAnEarlierRoundIsNotStillPresentOnceItIsResolved(t *testin
 	}}).reviewSection()
 	if strings.Contains(section, "_Still present after a fix round._") {
 		t.Errorf("a fixed finding is rendered as still present:\n%s", section)
+	}
+}
+
+// The reviewer's note is kept apart from why, and replaced each round. Folded
+// into why it stacked on every round that held the finding.
+func TestAHeldFindingsNoteIsReplacedEachRoundNotStacked(t *testing.T) {
+	stage := classifyStageAfterRoundOne(reviewFindingOutput{
+		Key: "A", Parameter: "security", Severity: "critical",
+		What: "dumps every secret", Why: "anyone can read them", MustFix: true,
+	})
+
+	round2 := stage.classify(reviewRoundResult([]reviewPreviousFinding{{Key: "A", Status: "still_present", Note: "no auth check"}}))
+	stage.recordRound(2, round2, agentResult{Turns: 5})
+	stage.rememberOpenMustFix(mustFixOnly(round2))
+	round3 := stage.classify(reviewRoundResult([]reviewPreviousFinding{{Key: "A", Status: "still_present", Note: "still no auth check"}}))
+
+	held := findingByKey(round3, "A")
+	if held == nil {
+		t.Fatalf("round 3 lost A: %+v", round3)
+	}
+	if held.StillPresentNote != "still no auth check" {
+		t.Errorf("note = %q, want round 3's note alone", held.StillPresentNote)
+	}
+	if held.Why != "anyone can read them" {
+		t.Errorf("why = %q, want the round-1 account unchanged", held.Why)
+	}
+}
+
+// A note that came with "resolved" describes the fix. When the same round
+// reports the key again the finding is held, but that note is not evidence the
+// problem persists and must not be shown as if it were.
+func TestAResolvedNoteIsNotShownOnAFindingHeldBecauseItWasReportedAgain(t *testing.T) {
+	stage := classifyStageAfterRoundOne(reviewFindingOutput{
+		Key: "A", Parameter: "security", Severity: "critical", What: "dumps every secret", MustFix: true,
+	})
+
+	findings := stage.classify(reviewRoundResult(
+		[]reviewPreviousFinding{{Key: "A", Status: "resolved", Note: "the handler now checks the session"}},
+		reviewFinding{Key: "A", Parameter: "security", Severity: "critical", What: "dumps every secret", Why: "anyone can read them"}))
+
+	if len(findings) != 1 || !findings[0].Held {
+		t.Fatalf("findings = %+v, want A held", findings)
+	}
+	if findings[0].StillPresentNote != "" || strings.Contains(findings[0].Why, "checks the session") {
+		t.Errorf("the note for a resolved status was attached to the held finding: %+v", findings[0])
+	}
+}
+
+// A finding held with a note and then resolved leaves the note behind: under
+// "Fixed during review" it would say the problem is still there.
+func TestAResolvedFindingCarriesNoStillPresentNoteIntoFixedDuringReview(t *testing.T) {
+	stage := classifyStageAfterRoundOne(reviewFindingOutput{
+		Key: "A", Parameter: "security", Severity: "critical", What: "dumps every secret", Why: "anyone can read them", MustFix: true,
+	})
+	round2 := stage.classify(reviewRoundResult([]reviewPreviousFinding{{Key: "A", Status: "still_present", Note: "the endpoint still has no auth check"}}))
+	stage.recordRound(2, round2, agentResult{Turns: 5})
+	stage.rememberOpenMustFix(mustFixOnly(round2))
+	round3 := stage.classify(reviewRoundResult([]reviewPreviousFinding{{Key: "A", Status: "resolved"}}))
+	stage.recordRound(3, round3, agentResult{Turns: 5})
+
+	if len(stage.fixedInLoop) != 1 {
+		t.Fatalf("fixed_in_loop = %+v, want A", stage.fixedInLoop)
+	}
+	if fixed := stage.fixedInLoop[0]; fixed.StillPresentNote != "" || fixed.Why != "anyone can read them" {
+		t.Errorf("fixed finding = %+v, want no still-present note and the original why", fixed)
+	}
+	section := (&taskOpenPR{review: &reviewOutput{Participation: "on", Rounds: stage.rounds, FixedInLoop: stage.fixedInLoop}}).reviewSection()
+	if strings.Contains(section, "no auth check") {
+		t.Errorf("the fixed finding still carries the held round's note:\n%s", section)
+	}
+}
+
+// The implementer is told which findings already survived a fix round.
+func TestTheFixPromptSaysWhichFindingsSurvivedAFixRound(t *testing.T) {
+	prompt := buildMustFixPrompt("do the step", []reviewFindingOutput{
+		{Parameter: "security", Severity: "critical", What: "dumps every secret", MustFix: true, Held: true, StillPresentNote: "no auth check"},
+		{Parameter: "correctness", Severity: "high", What: "loop never ends", MustFix: true},
+	})
+	if strings.Count(prompt, "the reviewer says it is still present") != 1 {
+		t.Errorf("want exactly the held finding marked:\n%s", prompt)
+	}
+	if !strings.Contains(prompt, "Reviewer's note: no auth check") {
+		t.Errorf("the reviewer's note is missing:\n%s", prompt)
 	}
 }
 
@@ -392,8 +475,8 @@ func TestTheReviewSectionSaysAHeldFindingIsStillPresent(t *testing.T) {
 		reviewFindingOutput{
 			Parameter: "security", Severity: "critical", Location: "0-acme/api/debug.go:12",
 			What:    "GET /debug/env returns every secret without authentication",
-			Why:     "anyone on the internet can read them. Still present: the endpoint still has no auth check",
-			MustFix: true, Held: true,
+			Why:     "anyone on the internet can read them",
+			MustFix: true, Held: true, StillPresentNote: "the endpoint still has no auth check",
 		},
 		reviewFindingOutput{
 			Parameter: "correctness", Severity: "high", Location: "0-acme/api/store.go:8",
@@ -408,7 +491,7 @@ func TestTheReviewSectionSaysAHeldFindingIsStillPresent(t *testing.T) {
 	if strings.Count(section, "_Still present after a fix round._") != 1 {
 		t.Errorf("the still-present line was written for a finding that is not held:\n%s", section)
 	}
-	if !strings.Contains(section, "Still present: the endpoint still has no auth check") {
+	if !strings.Contains(section, "_Reviewer's note:_ the endpoint still has no auth check") {
 		t.Errorf("the reviewer's note on what it still sees is missing:\n%s", section)
 	}
 	// And under the must-fix heading, above what is merely noted.
