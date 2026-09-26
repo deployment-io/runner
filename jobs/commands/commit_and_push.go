@@ -543,6 +543,20 @@ type reviewFindingOutput struct {
 	// introduced something else" — two very different things for a reader to
 	// see, and indistinguishable from the finding alone.
 	New bool `json:"new,omitempty"`
+	// Held marks a must-fix finding an earlier round opened that the reviewer
+	// has since said is STILL PRESENT — or has not said is resolved, which the
+	// runner reads the same way. It is the opposite of fixed-in-loop, and it is
+	// recorded rather than inferred because the inference (the key stopped
+	// appearing) once listed a Critical finding as fixed while the code still
+	// had it. See (s *reviewStage).classify.
+	Held bool `json:"held,omitempty"`
+	// StillPresentNote is the reviewer's one sentence on what it still sees,
+	// from the latest round that held the finding. It is kept apart from Why,
+	// which stays the round-that-opened-it's account: folded into Why it
+	// stacked round after round, survived into "Fixed during review", and
+	// relabelled a note written for a "resolved" status as evidence the
+	// problem persists. Set only with Held; cleared when the finding resolves.
+	StillPresentNote string `json:"still_present_note,omitempty"`
 }
 
 // reviewCoverageOutput mirrors agentbox's coverage entry: what happened to one
