@@ -286,19 +286,25 @@ func TestARestoreFailureFailsTheStep(t *testing.T) {
 	}
 }
 
-// A fix run that DID finish leaves nothing behind: the undo is dropped as soon
-// as it stops being one, and the loop carries on to the next review round.
+// A fix run that DID finish and DID change something leaves nothing behind: the
+// undo is dropped as soon as it stops being one, and the loop carries on to the
+// next review round exactly as it always has.
 func TestASuccessfulFixRunRemovesItsSnapshotAndContinues(t *testing.T) {
 	workDir := t.TempDir()
-	writeFile(t, filepath.Join(workDir, "0-acme/api", "handler.go"), "the implementation\n")
+	repoDir := filepath.Join(workDir, "0-acme/api")
+	writeFile(t, filepath.Join(repoDir, "handler.go"), "the implementation\n")
 	stage := fixLoopStage(workDir, nil)
 	fixRuns := 0
 	stage.runFix = func([]reviewFindingOutput) error {
 		fixRuns++
+		// ONE FILE IS ENOUGH: a fix run that changed anything is reviewed again,
+		// even if it declined some of the findings it was sent.
+		writeFile(t, filepath.Join(repoDir, "handler.go"), fmt.Sprintf("fix round %d\n", fixRuns))
 		return fixRunOutcome(agentResult{Status: "success"}, io.Discard)
 	}
 
-	if _, err := stage.run(); err != nil {
+	out, err := stage.run()
+	if err != nil {
 		t.Fatalf("run: %s", err)
 	}
 	// The stand-in reviewer reports the same finding every round, so the loop
@@ -310,6 +316,222 @@ func TestASuccessfulFixRunRemovesItsSnapshotAndContinues(t *testing.T) {
 		if _, err := os.Stat(fixRoundSnapshotPath(workDir, round)); !os.IsNotExist(err) {
 			t.Errorf("fix round %d's snapshot was kept after the fix succeeded: %v", round, err)
 		}
+	}
+	if review := readReviewFromJobOutput(out); review == nil || review.StoppedNoChange {
+		t.Errorf("review = %+v, want the loop recorded as running its course rather than stopping on a no-change fix", review)
+	}
+}
+
+// --- a fix run that changed nothing ------------------------------------------
+//
+// A fix run may decline a finding it judges wrong or contrary to the Step and
+// explain why in its summary. When it changes NO FILE, another review round can
+// only report the same findings again — the reviewer never sees that summary, by
+// design — at the cost of up to two more rounds and another fix run.
+
+func TestAFixRunThatChangedNothingEndsTheLoopAndHandsOff(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		fix  func(t *testing.T, repoDir string)
+	}{
+		{
+			name: "it declined the findings and left the code alone",
+			fix:  func(*testing.T, string) {},
+		},
+		{
+			// .git is skipped by the comparison on purpose: the next review
+			// round would be handed the same working tree.
+			name: "it only committed what was already there",
+			fix: func(t *testing.T, repoDir string) {
+				before := headCommit(t, repoDir)
+				if after := commitEverything(t, repoDir, "the fix run's commit"); after == before {
+					t.Fatal("the commit did not move HEAD, so this case is not exercising what it names")
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			workDir := t.TempDir()
+			repoDir := filepath.Join(workDir, "0-acme/api")
+			head := initSnapshotTestRepository(t, repoDir)
+			var logs strings.Builder
+			stage := fixLoopStage(workDir, &logs)
+			stage.baseCommits = map[string]string{"0-acme/api": head}
+			reviewer := stage.runReview
+			reviewRounds := 0
+			stage.runReview = func(round int) (agentResult, error) {
+				reviewRounds++
+				return reviewer(round)
+			}
+			fixRuns := 0
+			stage.runFix = func([]reviewFindingOutput) error {
+				fixRuns++
+				tc.fix(t, repoDir)
+				return fixRunOutcome(agentResult{Status: "success"}, io.Discard)
+			}
+
+			out, err := stage.run()
+			if err != nil {
+				t.Fatalf("a fix run that changed nothing failed the Step: %s", err)
+			}
+			if fixRuns != 1 {
+				t.Errorf("the loop ran %d fix round(s), want the one", fixRuns)
+			}
+			if reviewRounds != 1 {
+				t.Errorf("the loop ran %d review round(s), want it to stop rather than ask the same question again", reviewRounds)
+			}
+			review := readReviewFromJobOutput(out)
+			if review == nil {
+				t.Fatal("no review was recorded")
+			}
+			if !review.StoppedNoChange {
+				t.Error("stopped_no_change = false — nothing records why the loop ended")
+			}
+			if !review.MustFixOpen {
+				t.Error("must_fix_open = false — the findings the fix run declined were closed by nobody")
+			}
+			// Not a failed fix: the run succeeded and said why it left the code
+			// alone, so nothing may read as a fix that did not complete.
+			if review.FixError != "" || review.FixNotAttempted {
+				t.Errorf("review = %+v, want no fix failure recorded", review)
+			}
+			held := findingByKey(review.Rounds[0].Findings, "sec-1")
+			if held == nil || !held.MustFix {
+				t.Errorf("round 1's findings = %+v, want the finding still open and must-fix", review.Rounds[0].Findings)
+			}
+			if !strings.Contains(logs.String(), "Fix round 1 changed no file") {
+				t.Errorf("the job log does not say the fix round changed nothing:\n%s", logs.String())
+			}
+			// The existing handoff: a draft pull request with the marker in its
+			// title, and one line saying where the explanation is.
+			pr := &taskOpenPR{review: review}
+			if !pr.needsFixes() {
+				t.Error("the pull request was not requested as a draft")
+			}
+			section := pr.reviewSection()
+			if !strings.Contains(section, "_The last fix round changed nothing; the description says why._") {
+				t.Errorf("the review section does not carry the no-change line:\n%s", section)
+			}
+			if strings.Contains(section, "A fix attempt did not complete") {
+				t.Errorf("the review section reports a failed fix attempt that did not happen:\n%s", section)
+			}
+			// The loop stopped on the no-change round, not on its budget, so
+			// the closing line must not say the budget ran out.
+			if strings.Contains(section, "fix budget ran out") {
+				t.Errorf("the review section says the fix budget ran out when the loop stopped on a no-change round:\n%s", section)
+			}
+			if !strings.Contains(section, "These findings are still open. They need a human.") {
+				t.Errorf("the review section lost the hand-to-a-human line:\n%s", section)
+			}
+			if _, err := os.Stat(fixRoundSnapshotPath(workDir, 1)); !os.IsNotExist(err) {
+				t.Errorf("the undo copy was kept after the fix run succeeded: %v", err)
+			}
+		})
+	}
+}
+
+// What counts as a change, edit by edit. The comparison decides whether another
+// review round happens at all, so an edit it cannot see is a finding the loop
+// stops working on — and a difference it invents is two wasted rounds.
+func TestTheNoChangeComparisonSeesEveryKindOfEdit(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		edit func(t *testing.T, repoDir string)
+		want bool
+	}{
+		{"nothing at all", func(*testing.T, string) {}, false},
+		{"a rewrite of the same length", func(t *testing.T, repoDir string) {
+			// Same byte count, so nothing but the contents themselves says so.
+			writeFile(t, filepath.Join(repoDir, "main.go"), "package MAIN\n")
+		}, true},
+		{"a new file", func(t *testing.T, repoDir string) {
+			writeFile(t, filepath.Join(repoDir, "session.go"), "package api\n")
+		}, true},
+		{"a deleted file", func(t *testing.T, repoDir string) {
+			if err := os.Remove(filepath.Join(repoDir, "doomed.txt")); err != nil {
+				t.Fatal(err)
+			}
+		}, true},
+		{"a mode change", func(t *testing.T, repoDir string) {
+			if err := os.Chmod(filepath.Join(repoDir, "scripts", "build.sh"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}, true},
+		{"a retargeted symlink", func(t *testing.T, repoDir string) {
+			link := filepath.Join(repoDir, "entry.go")
+			if err := os.Remove(link); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink("doomed.txt", link); err != nil {
+				t.Fatal(err)
+			}
+		}, true},
+		{"a commit and nothing else", func(t *testing.T, repoDir string) {
+			commitEverything(t, repoDir, "the fix run's commit")
+		}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			workDir := t.TempDir()
+			repoDir := filepath.Join(workDir, "0-acme/api")
+			head := initSnapshotTestRepository(t, repoDir)
+			stage := &reviewStage{
+				workDirHost: workDir,
+				logsWriter:  io.Discard,
+				baseCommits: map[string]string{"0-acme/api": head},
+				copyTree:    testCopyTree,
+			}
+			snapshot, err := stage.takeFixRoundSnapshot(1)
+			if err != nil {
+				t.Fatalf("takeFixRoundSnapshot: %s", err)
+			}
+			tc.edit(t, repoDir)
+
+			changed, err := snapshot.treeChanged()
+			if err != nil {
+				t.Fatalf("treeChanged: %s", err)
+			}
+			if changed != tc.want {
+				t.Errorf("treeChanged = %t, want %t", changed, tc.want)
+			}
+		})
+	}
+}
+
+// THE NO-CHANGE CHECK IS FOR A FIX RUN THAT SUCCEEDED. One that failed without
+// managing to change anything is still a fix run that did not finish: it is
+// rolled back and recorded as a failure, and its findings go to a human under
+// that heading rather than as findings somebody chose to leave.
+func TestAFailedFixRunThatChangedNothingIsStillRecordedAsAFailure(t *testing.T) {
+	workDir := t.TempDir()
+	writeFile(t, filepath.Join(workDir, "0-acme/api", "handler.go"), "the implementation\n")
+	var logs strings.Builder
+	stage := fixLoopStage(workDir, &logs)
+	stage.runFix = func([]reviewFindingOutput) error {
+		return fixRunOutcome(agentResult{Status: "failure", Error: "claude exited: max turns reached"}, io.Discard)
+	}
+
+	out, err := stage.run()
+	if err != nil {
+		t.Fatalf("a failed fix run failed the Step: %s", err)
+	}
+	review := readReviewFromJobOutput(out)
+	if review == nil {
+		t.Fatal("no review was recorded")
+	}
+	if review.StoppedNoChange {
+		t.Error("stopped_no_change = true for a fix run that did not finish — the pull request would say it chose to leave the findings")
+	}
+	if !strings.Contains(review.FixError, "max turns reached") {
+		t.Errorf("fix_error = %q, want it to name why the fix run did not finish", review.FixError)
+	}
+	if !review.MustFixOpen {
+		t.Error("must_fix_open = false after a fix run that did not finish")
+	}
+	if !strings.Contains(logs.String(), "back to exactly what it was") {
+		t.Errorf("the job log does not say the change was put back:\n%s", logs.String())
+	}
+	if section := (&taskOpenPR{review: review}).reviewSection(); strings.Contains(section, "changed nothing") {
+		t.Errorf("the review section reads as a declined finding rather than a failed fix:\n%s", section)
 	}
 }
 

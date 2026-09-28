@@ -162,7 +162,69 @@ func (s *reviewStage) reviewSpawnEnv(round int) ([]string, error) {
 		baseCommits:  string(baseCommits),
 		round:        round,
 		openFindings: openFindings,
+		verifyResult: s.verifyResultEnvValue(),
 	}), nil
+}
+
+// verifyResultEnvValue is the REVIEW_VERIFY_RESULT payload: the Step's CURRENT
+// verify result — the implement run's, or the latest kept fix run's — as compact
+// JSON, or "" when no run reported one.
+//
+// The reviewer otherwise has to guess whether the change builds, and a reviewer
+// that guesses either re-runs the build itself (minutes of a round's budget, on
+// a cache it may not have) or reports a build concern nobody can act on.
+// agentbox 1.9.22 reads this and shows it under [Build and tests].
+//
+// THE OUTPUT TAILS ARE LEFT OUT. What the reviewer needs is whether verification
+// ran, what it concluded and for which repository; a build log is the one input
+// most likely to fill the round's context with text it cannot act on. A FAILING
+// result is still sent — a Step commits over a pre-existing failure, and a
+// reviewer told nothing about it reviews as though the build were green.
+func (s *reviewStage) verifyResultEnvValue() string {
+	vr := readVerifyResultFromJobOutput(s.parameters)
+	if vr == nil {
+		return ""
+	}
+	out := reviewVerifyResult{
+		Ran:           vr.Ran,
+		Passed:        vr.Passed,
+		Command:       vr.Command,
+		SkippedReason: vr.SkippedReason,
+		PreExisting:   vr.PreExisting,
+	}
+	for _, step := range vr.Steps {
+		out.Steps = append(out.Steps, reviewVerifyStep{Repo: step.Repo, Command: step.Command, Passed: step.Passed})
+	}
+	encoded, err := json.Marshal(out)
+	if err != nil {
+		// Nothing rather than a broken payload: the reviewer's own contract is
+		// that an absent variable means "no verify result was recorded", which
+		// is the truthful reading of a result that could not be encoded.
+		io.WriteString(s.logsWriter, fmt.Sprintf("warning: could not encode the Step's verify result for the reviewer: %s\n", err))
+		return ""
+	}
+	return string(encoded)
+}
+
+// reviewVerifyResult is the Step's verify result AS THE REVIEWER SEES IT: what
+// ran, what it concluded, and nothing that would fill a review round's context.
+// A hand-written mirror of the fields agentbox's REVIEW_VERIFY_RESULT contract
+// names, rather than verifyResult itself, because verifyResult carries the
+// output tails and marshalling it would send them.
+type reviewVerifyResult struct {
+	Ran           bool               `json:"ran"`
+	Passed        bool               `json:"passed"`
+	Command       string             `json:"command,omitempty"`
+	SkippedReason string             `json:"skipped_reason,omitempty"`
+	PreExisting   bool               `json:"pre_existing,omitempty"`
+	Steps         []reviewVerifyStep `json:"steps,omitempty"`
+}
+
+// reviewVerifyStep is one repository's verification, tails omitted.
+type reviewVerifyStep struct {
+	Repo    string `json:"repo,omitempty"`
+	Command string `json:"command,omitempty"`
+	Passed  bool   `json:"passed"`
 }
 
 // reviewOpenFinding is one open must-fix finding as REVIEW_OPEN_FINDINGS
@@ -303,6 +365,9 @@ type reviewEnvInputs struct {
 	// openFindings is the JSON REVIEW_OPEN_FINDINGS payload, or "" for a round
 	// that is sent none — see openMustFixEnvValue.
 	openFindings string
+	// verifyResult is the JSON REVIEW_VERIFY_RESULT payload, or "" when the
+	// Step has no verify result to send — see verifyResultEnvValue.
+	verifyResult string
 }
 
 // applyReviewEnv turns an implement-run environment into a review-run one:
@@ -319,7 +384,7 @@ func applyReviewEnv(env []string, in reviewEnvInputs) []string {
 	for _, kv := range env {
 		key, _, _ := strings.Cut(kv, "=")
 		switch key {
-		case "STEP_PROMPT", "PREVIOUS_STEPS_SUMMARY", "AGENT_MODE", "MAX_TURNS", "REVIEW_OPEN_FINDINGS":
+		case "STEP_PROMPT", "PREVIOUS_STEPS_SUMMARY", "AGENT_MODE", "MAX_TURNS", "REVIEW_OPEN_FINDINGS", "REVIEW_VERIFY_RESULT":
 			continue
 		case agentMCPSocketEnvVar:
 			// Review needs no runner tools, and the review spawn mounts no
@@ -353,6 +418,14 @@ func applyReviewEnv(env []string, in reviewEnvInputs) []string {
 	// image without the field gives.
 	if strings.TrimSpace(in.openFindings) != "" {
 		out = append(out, "REVIEW_OPEN_FINDINGS="+in.openFindings)
+	}
+	// Absent rather than empty when the Step recorded no verification: an empty
+	// object says "it ran and passed nothing", which is a claim about a build
+	// nobody made. Stripped from the inherited environment above for the same
+	// reason — a value carried in through the reviewer's own AgentEnvVars would
+	// describe some other run's build.
+	if strings.TrimSpace(in.verifyResult) != "" {
+		out = append(out, "REVIEW_VERIFY_RESULT="+in.verifyResult)
 	}
 	return out
 }
@@ -555,14 +628,12 @@ func (s *reviewStage) runMustFixRound(mustFix []reviewFindingOutput) error {
 	previewDeps := buildStaticSitePreviewDeps(s.ctx, s.parameters, workDirHost, s.logsWriter)
 
 	// A fix run BUILDS, and it builds offline: the agent container has no
-	// credentials and the proxy allows only the agent's own hosts. RunAgentStep
-	// vendored the Step's dependencies into a per-Step volume and then removed
-	// it on the way out, so the cache this run mounts is empty until it is
-	// filled again. Without this the fix would fail its own verify on missing
-	// dependencies and take the Step down with it — a Step failed by the
-	// machinery rather than by the code.
-	//
-	// Once per stage: the second fix round reuses what the first vendored.
+	// credentials and the proxy allows only the agent's own hosts. Ordinarily
+	// the implement run's own cache volume is still mounted here — vendored
+	// dependencies and build cache both — and this does nothing. It only
+	// vendors when that volume is gone, where without it the fix would fail its
+	// own verify on missing dependencies and take the Step down with it: a Step
+	// failed by the machinery rather than by the code.
 	if err := s.ensureVendoredCache(imageRef, workDirHost); err != nil {
 		return err
 	}
@@ -630,16 +701,22 @@ func fixRunOutcome(result agentResult, logsWriter io.Writer) error {
 	return nil
 }
 
-// ensureVendoredCache re-populates the per-Step dependency cache before the
-// first fix run, using the same vendor phase RunAgentStep runs.
+// ensureVendoredCache makes sure the per-Step dependency cache holds this
+// Step's dependencies before a fix run builds against it, using the same vendor
+// phase RunAgentStep runs.
 //
-// The volume carries the Step's own name, so it is the same shelf the
-// implement run built against — and it is created here rather than assumed,
-// because RunAgentStep removes it when it returns.
+// IT USUALLY DOES NOTHING. RunAgentStep now leaves its cache volume in place for
+// the stage (keepCacheVolumeForReview), and the stage starts with vendored set
+// from whether that volume was still there — so the fix run mounts the shelf the
+// implement run built, compiler cache included, and builds incrementally. It is
+// the FALLBACK that vendors: a volume that was gone when the stage started, an
+// implement run from an older runner. At most once per stage either way, so a
+// second fix round reuses what the first left.
 func (s *reviewStage) ensureVendoredCache(imageRef, workDirHost string) error {
 	if s.vendored {
 		return nil
 	}
+	io.WriteString(s.logsWriter, "Review stage: the Step's dependency cache is empty — vendoring again before the fix run\n")
 	cacheVolume := cacheVolumeName(s.ctx)
 	if err := createCacheVolume(cacheVolume); err != nil {
 		return fmt.Errorf("error creating the cache volume for the fix run: %w", err)

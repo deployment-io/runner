@@ -1,6 +1,8 @@
 package commands
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -143,6 +145,168 @@ func (snap *fixRoundSnapshot) remove() {
 		return
 	}
 	_ = os.RemoveAll(snap.root)
+}
+
+// treeChanged reports whether the working tree differs from this copy — which
+// is to say whether the fix run that has just finished changed anything at all.
+//
+// The copy was taken to undo a fix run that failed; a fix run that SUCCEEDED
+// can use it for a second purpose. A fix run may decline a finding it judges
+// wrong or contrary to the Step and say why in its summary; when it changes no
+// file, the next review round is handed the same tree and can only report the
+// same findings again, because the reviewer never sees that summary. So the loop
+// asks here instead of spending two more rounds finding out.
+//
+// .GIT IS SKIPPED, whole. A fix run that only committed changed .git and nothing
+// else — the next round would review the same working tree — so a commit with no
+// file change is still no change.
+//
+// EVERYTHING ELSE IS COMPARED BYTE FOR BYTE: the file set, each file's contents,
+// modes (permissions plus setuid, setgid and sticky) and each symlink's target.
+// Cheap relative to the copy that already happened, and the only comparison that
+// cannot miss an edit a timestamp or a size would hide.
+//
+// Anything copyTreePreserving does not reproduce — a socket, fifo or device node
+// in a checkout — is present in the tree and absent from the copy, so it reads
+// as CHANGED. That is the safe direction: one more review round, not a loop cut
+// short on an edit nobody looked for.
+func (snap *fixRoundSnapshot) treeChanged() (bool, error) {
+	for _, repoDir := range snap.repoDirs {
+		if err := ensureRealRepositoryDir(snap.workDirHost, repoDir); err != nil {
+			return false, err
+		}
+		same, err := sameTree(filepath.Join(snap.root, repoDir), filepath.Join(snap.workDirHost, repoDir))
+		if err != nil {
+			return false, err
+		}
+		if !same {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// treeEntry is one entry of a tree as the comparison sees it: what kind of thing
+// it is and the mode bits a checkout can carry, plus a symlink's target and a
+// regular file's size. Size is a cheap first test, never the last one — equal
+// sizes still have their contents compared.
+type treeEntry struct {
+	mode fs.FileMode
+	size int64
+	link string
+}
+
+// sameTree reports whether two trees are identical, .git excluded.
+func sameTree(a, b string) (bool, error) {
+	entriesA, err := walkTreeExcludingGit(a)
+	if err != nil {
+		return false, err
+	}
+	entriesB, err := walkTreeExcludingGit(b)
+	if err != nil {
+		return false, err
+	}
+	if len(entriesA) != len(entriesB) {
+		return false, nil
+	}
+	for rel, entryA := range entriesA {
+		entryB, present := entriesB[rel]
+		if !present || entryA != entryB {
+			return false, nil
+		}
+		if !entryA.mode.IsRegular() {
+			continue
+		}
+		same, err := sameFileContents(filepath.Join(a, rel), filepath.Join(b, rel))
+		if err != nil {
+			return false, err
+		}
+		if !same {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// walkTreeExcludingGit indexes a tree by each entry's path relative to its root.
+func walkTreeExcludingGit(root string) (map[string]treeEntry, error) {
+	entries := map[string]treeEntry{}
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if d.Name() == ".git" {
+			if d.IsDir() {
+				return fs.SkipDir
+			}
+			return nil
+		}
+		rel, err := filepath.Rel(root, path)
+		if err != nil {
+			return err
+		}
+		if rel == "." {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		entry := treeEntry{mode: info.Mode().Type() | fullMode(info)}
+		switch {
+		case info.Mode()&os.ModeSymlink != 0:
+			link, err := os.Readlink(path)
+			if err != nil {
+				return err
+			}
+			entry.link = link
+		case info.Mode().IsRegular():
+			entry.size = info.Size()
+		}
+		entries[rel] = entry
+		return nil
+	})
+	return entries, err
+}
+
+// treeCompareBufferSize is the block each file is compared in. 64 KiB is the
+// usual sweet spot for sequential reads and keeps the pair of buffers off the
+// heap's large-object path.
+const treeCompareBufferSize = 64 * 1024
+
+// sameFileContents compares two files block by block, stopping at the first
+// difference.
+func sameFileContents(a, b string) (bool, error) {
+	fileA, err := os.Open(a)
+	if err != nil {
+		return false, err
+	}
+	defer fileA.Close()
+	fileB, err := os.Open(b)
+	if err != nil {
+		return false, err
+	}
+	defer fileB.Close()
+	bufA := make([]byte, treeCompareBufferSize)
+	bufB := make([]byte, treeCompareBufferSize)
+	for {
+		readA, errA := io.ReadFull(fileA, bufA)
+		readB, errB := io.ReadFull(fileB, bufB)
+		if readA != readB || !bytes.Equal(bufA[:readA], bufB[:readB]) {
+			return false, nil
+		}
+		// Both files ended together, which with equal blocks all the way down
+		// is what "identical" means.
+		if errors.Is(errA, io.EOF) || errors.Is(errA, io.ErrUnexpectedEOF) {
+			return errors.Is(errB, io.EOF) || errors.Is(errB, io.ErrUnexpectedEOF), nil
+		}
+		if errA != nil {
+			return false, errA
+		}
+		if errB != nil {
+			return false, errB
+		}
+	}
 }
 
 // restore puts every copied repository directory back exactly as it was.

@@ -608,6 +608,11 @@ type reviewOutput struct {
 	// FixNotAttempted is true when no fix run happened because its undo copy
 	// could not be taken; FixError then holds the plain reason.
 	FixNotAttempted bool `json:"fix_not_attempted,omitempty"`
+	// StoppedNoChange is true when the loop ended because the last fix run
+	// finished and changed no file — it declined the findings it was sent and
+	// said why in the description. A further review round would only report the
+	// same findings again, so the loop handed them to a human instead.
+	StoppedNoChange bool `json:"stopped_no_change,omitempty"`
 }
 
 type agentOutput struct {

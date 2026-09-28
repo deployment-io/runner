@@ -2,6 +2,7 @@ package commands
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"path/filepath"
 	"strings"
@@ -535,7 +536,9 @@ func heldLoopStage(t *testing.T) *reviewStage {
 	workDir := t.TempDir()
 	// A checkout for the fix round's undo copy to take: without one the
 	// snapshot fails, no fix runs, and the loop ends after its first round.
-	writeFile(t, filepath.Join(workDir, "0-acme/api", "debug.go"), "package api\n")
+	repoDir := filepath.Join(workDir, "0-acme/api")
+	writeFile(t, filepath.Join(repoDir, "debug.go"), "package api\n")
+	fixRuns := 0
 	return &reviewStage{
 		parameters:    map[string]interface{}{},
 		workDirHost:   workDir,
@@ -545,7 +548,14 @@ func heldLoopStage(t *testing.T) *reviewStage {
 		baseCommits:   map[string]string{"0-acme/api": "abc123"},
 		deadline:      time.Now().Add(reviewStageBudget),
 		copyTree:      testCopyTree,
-		runFix:        func([]reviewFindingOutput) error { return nil },
+		// The stand-in fix run EDITS the checkout, as a real one does. A fix run
+		// that changes no file now ends the loop on purpose (see attemptFix),
+		// and these tests are about what the reviewer says across rounds.
+		runFix: func([]reviewFindingOutput) error {
+			fixRuns++
+			writeFile(t, filepath.Join(repoDir, "debug.go"), fmt.Sprintf("package api // fix round %d\n", fixRuns))
+			return nil
+		},
 	}
 }
 

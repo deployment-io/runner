@@ -290,13 +290,25 @@ func (rs *RunAgentStep) Run(parameters map[string]interface{}, logsWriter io.Wri
 	// Two-phase model: a vendor container pre-fetches dependencies into a
 	// shared cache volume using the git token, then the credential-less
 	// agent container builds / verifies offline against it. The volume is
-	// per-Step and ephemeral — removed on the way out. See
-	// PLAN_tasks_verification.md.
+	// per-Step and ephemeral. See PLAN_tasks_verification.md.
 	cacheVolume := cacheVolumeName(ctx)
 	if err := createCacheVolume(cacheVolume); err != nil {
 		return parameters, fmt.Errorf("error creating cache volume: %s", err)
 	}
-	defer removeCacheVolume(cacheVolume)
+	// IT OUTLIVES THIS RUN WHEN A REVIEW STAGE FOLLOWS IT — see
+	// keepCacheVolumeForReview. The volume holds the vendored dependencies AND
+	// the compiler's own cache (agentbox points GOCACHE at it), so removing it
+	// here made every fix run compile the project from scratch and left the
+	// first review round with nothing vendored at all: a reviewer that ran a
+	// build on a repository with private modules failed on blocked github.com
+	// fetches. The Review stage then owns the removal, on every path out of it.
+	defer func() {
+		if keepCacheVolumeForReview(err, parameters) {
+			io.WriteString(logsWriter, "Leaving the Step's dependency cache in place for the Review stage\n")
+			return
+		}
+		removeCacheVolume(cacheVolume)
+	}()
 	vendorSpec, err := buildVendorSpec(imageRef, workDirHost, cacheVolume, ctx)
 	if err != nil {
 		return parameters, err
@@ -1931,7 +1943,8 @@ func vendorGitToken(ctx commandUtils.TaskJobContext) (string, error) {
 
 // cacheVolumeName is the per-Step-Job Docker volume holding the shared
 // module cache. Scoped to (taskID, stepIndex) so concurrent Steps don't
-// collide and cleanup is unambiguous.
+// collide and cleanup is unambiguous — and so every run of ONE Step, the
+// implement run and each review and fix run after it, names the same shelf.
 func cacheVolumeName(ctx commandUtils.TaskJobContext) string {
 	return fmt.Sprintf("agentbox-cache-%s-%d", ctx.TaskID, ctx.StepIndex)
 }
@@ -1944,6 +1957,46 @@ func createCacheVolume(name string) error {
 	defer cli.Close()
 	_, err = cli.VolumeCreate(context.Background(), volume.CreateOptions{Name: name})
 	return err
+}
+
+// cacheVolumeExists reports whether the per-Step cache volume is still on the
+// host — which is how the Review stage tells "the implement run handed me its
+// vendored dependencies and build cache" from "there is nothing here yet".
+//
+// An unreachable daemon reads as MISSING, so the stage vendors again rather
+// than mounting a shelf it only assumed was full: a fix run that builds against
+// an empty cache fails on dependencies it cannot fetch, which is worse than one
+// vendor phase nobody needed.
+func cacheVolumeExists(name string) bool {
+	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		return false
+	}
+	defer cli.Close()
+	_, err = cli.VolumeInspect(context.Background(), name)
+	return err == nil
+}
+
+// keepCacheVolumeForReview reports whether the per-Step cache volume must
+// survive the implement run: only when that run SUCCEEDED and a Review stage
+// follows it in this same Step Job.
+//
+// Both halves matter. A run that failed or was stopped is the end of the Step,
+// so nothing later needs the cache and leaving it would leak a volume nothing
+// collects. A Task whose review is Off runs no stage that could remove one —
+// and neither does a Job created before the stage existed, which carries no
+// participation parameter at all and reads as Off. The resolved participation
+// and the Job's command list are stamped together at Job creation, so an On here
+// means the stage really is next in the chain.
+//
+// Participation is read with the log discarded: RunReviewStage reads the same
+// parameter a moment later and logs whatever is wrong with it, and a warning
+// printed twice reads as two problems.
+func keepCacheVolumeForReview(runErr error, parameters map[string]interface{}) bool {
+	if runErr != nil {
+		return false
+	}
+	return readReviewParticipation(parameters, io.Discard) != participationOff
 }
 
 // removeCacheVolume best-effort deletes the per-Step cache volume. Called
