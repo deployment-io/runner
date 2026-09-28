@@ -121,10 +121,11 @@ func (opr *taskOpenPR) reviewSection() string {
 		sb.WriteString(fmt.Sprintf("\n_%d further finding(s) are not shown here — the full review is in the Step's job log._\n", omitted))
 	}
 	switch {
-	case opr.review.MustFixOpen && fixError == "":
+	case opr.review.MustFixOpen && fixError == "" && !opr.review.StoppedNoChange:
 		sb.WriteString("\nThese findings were routed back to the agent and are still open after the review's fix budget ran out. They need a human.\n")
 	case opr.review.MustFixOpen:
-		// The loop ended on the fix attempt above, not on its budget.
+		// The loop ended on the fix attempt above, or on a fix round that
+		// changed nothing, not on its budget.
 		sb.WriteString("\nThese findings are still open. They need a human.\n")
 	}
 	sb.WriteString("\n" + coverageLine(latest.Coverage))

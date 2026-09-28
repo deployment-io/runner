@@ -415,6 +415,14 @@ func TestAFixRunThatChangedNothingEndsTheLoopAndHandsOff(t *testing.T) {
 			if strings.Contains(section, "A fix attempt did not complete") {
 				t.Errorf("the review section reports a failed fix attempt that did not happen:\n%s", section)
 			}
+			// The loop stopped on the no-change round, not on its budget, so
+			// the closing line must not say the budget ran out.
+			if strings.Contains(section, "fix budget ran out") {
+				t.Errorf("the review section says the fix budget ran out when the loop stopped on a no-change round:\n%s", section)
+			}
+			if !strings.Contains(section, "These findings are still open. They need a human.") {
+				t.Errorf("the review section lost the hand-to-a-human line:\n%s", section)
+			}
 			if _, err := os.Stat(fixRoundSnapshotPath(workDir, 1)); !os.IsNotExist(err) {
 				t.Errorf("the undo copy was kept after the fix run succeeded: %v", err)
 			}
