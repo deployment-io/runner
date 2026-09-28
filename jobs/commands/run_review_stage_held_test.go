@@ -354,7 +354,7 @@ func TestAResolvedFindingCarriesNoStillPresentNoteIntoFixedDuringReview(t *testi
 
 // The implementer is told which findings already survived a fix round.
 func TestTheFixPromptSaysWhichFindingsSurvivedAFixRound(t *testing.T) {
-	prompt := buildMustFixPrompt("do the step", []reviewFindingOutput{
+	prompt := buildMustFixPrompt("do the step", "", []reviewFindingOutput{
 		{Parameter: "security", Severity: "critical", What: "dumps every secret", MustFix: true, Held: true, StillPresentNote: "no auth check"},
 		{Parameter: "correctness", Severity: "high", What: "loop never ends", MustFix: true},
 	})
