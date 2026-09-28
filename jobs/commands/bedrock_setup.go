@@ -131,7 +131,10 @@ func resolveBedrockModelID(ctx context.Context, cfg aws.Config, model llm_provid
 		}
 		for _, p := range out.InferenceProfileSummaries {
 			id := aws.ToString(p.InferenceProfileId)
-			if strings.HasPrefix(id, prefix) && strings.Contains(id, profilePrefix) {
+			// MatchesBedrockProfile, not Contains(id, profilePrefix): Contains
+			// let an Opus 5 task match us.anthropic.claude-opus-5-5, and the
+			// newest-first sort below then picked it — a silent model swap.
+			if strings.HasPrefix(id, prefix) && model.MatchesBedrockProfile(id) {
 				matches = append(matches, id)
 			}
 		}
@@ -140,7 +143,7 @@ func resolveBedrockModelID(ctx context.Context, cfg aws.Config, model llm_provid
 		io.WriteString(logsWriter, fmt.Sprintf("Bedrock: no %s inference profile for %s in %s — check model access for this account/region. Leaving it unchanged.\n", prefix, model, region))
 		return ""
 	}
-	// Descending so the newest revision wins. Because the prefix pins the model
+	// Descending so the newest revision wins. Because the match pins the model
 	// version, this only ever chooses between DATES/revisions of the same
 	// model — a safe auto-upgrade, not a silent model swap. Logged because a
 	// silent pick between several revisions is hard to reconstruct later.
