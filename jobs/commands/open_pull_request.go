@@ -188,39 +188,148 @@ func (opr *taskOpenPR) needsFixes() bool {
 	return opr.review != nil && opr.review.MustFixOpen && opr.review.Participation == "on"
 }
 
+// Bounds on the pull-request body as a whole.
+//
+// GitHub rejects a body over 65,536 characters, and a rejected body is a pull
+// request that never opens — the Step's work would be pushed with nothing
+// pointing at it. 60,000 leaves margin for a provider that counts differently
+// than we do.
+const (
+	prBodyMaxRunes = 60000
+	// prBodyDeniedHostsMaxItems bounds the blocked-host list. A run that was
+	// denied hundreds of hosts was denied the same handful over and over in
+	// practice; the count in the overflow line is what the reader needs past
+	// the first fifty names.
+	prBodyDeniedHostsMaxItems = 50
+	// prBodyVerifyOverflowReserveRunes is held back from whatever budget the
+	// verification section is given for the line saying how many steps were
+	// left out, so the note about what was dropped is never itself the thing
+	// that gets dropped.
+	prBodyVerifyOverflowReserveRunes = 200
+	// prSummaryTruncatedNote goes where the summary was cut. The Task-URL
+	// line above it is what "the Task page" refers to, so the note needs no
+	// link of its own.
+	prSummaryTruncatedNote = "\n\n_The summary was truncated. The full text is on the Task page._"
+	// prBodyTruncatedNote goes at the end of a body that had to be cut below
+	// the summary — the last guard's note, for the case where dropping the
+	// summary entirely still left the body over the cap.
+	prBodyTruncatedNote = "\n\n_This description was truncated to fit the provider's limit on pull-request bodies. The full text is on the Task page._"
+)
+
 // buildPRTitleAndBody assembles the PR subject + body. Subject source
 // is decided by subjectAndLeadIn (agent pr_title > changes_summary
 // first line > generic fallback; see that function for the policy).
 //
 // Body composition: lead-in first (when present) so reviewers see the
 // agent's narrative before metadata, then the trailer block, then the
-// optional denied-hosts section. When the Step had allowlist denies,
-// the section lists the blocked hostnames so the PR reviewer can see
-// what the agent tried to reach — helps diagnose "agent gave up
-// because it couldn't fetch X" without digging through container logs.
+// optional denied-hosts, verification and Review sections.
+//
+// EVERYTHING BELOW THE SUMMARY IS BUILT FIRST and the summary is given what
+// is left of prBodyMaxRunes. Each of those sections is bounded — the Review
+// section by reviewSectionMaxRunes, the blocked hosts by
+// prBodyDeniedHostsMaxItems, a verify step's output by boundVerifyTail — and
+// the agent's summary is the one part that is not, so it is the part that
+// yields when the body has to fit.
+//
+// The body as a whole is bounded LAST and unconditionally. Giving the summary
+// what is left over is what keeps an ordinary pull request readable; it is not
+// what makes the cap hold. Those sections' own bounds are several, and several
+// bounded parts still add up — plus the trailer carries a Task title of any
+// length. The last cut is the one that guarantees the pull request opens.
 func (opr *taskOpenPR) buildPRTitleAndBody() (string, string) {
 	subject, leadIn := opr.subjectAndLeadIn()
+	below := opr.bodyBelowSummary()
+	// Less two runes for the blank line between the summary and what follows.
+	leadIn = boundPRSummary(leadIn, prBodyMaxRunes-utf8.RuneCountInString(below)-2)
 	var sb strings.Builder
 	if len(leadIn) > 0 {
 		sb.WriteString(leadIn)
 		sb.WriteString("\n\n")
 	}
+	sb.WriteString(below)
+	return subject, cutToRuneBudget(sb.String(), prBodyMaxRunes, prBodyTruncatedNote)
+}
+
+// bodyBelowSummary is everything after the agent's narrative: the trailer
+// block, then the optional denied-hosts, verification and Review sections.
+//
+// The verification section is the one part here with no bound of its own — a
+// step's output is bounded by boundVerifyTail, but the number of failing steps
+// follows the Task's repositories — so it is given what the rest of this block
+// leaves of the body. That budget is the whole body's, not a smaller one of its
+// own: as long as the body fits, every pre-existing failure is named, which is
+// what this section exists to do.
+func (opr *taskOpenPR) bodyBelowSummary() string {
+	var sb strings.Builder
 	sb.WriteString("Generated-By: deployment.io Tasks\n")
 	sb.WriteString(fmt.Sprintf("Task: %s\n", opr.ctx.TaskTitle))
 	if len(opr.ctx.DashboardURL) > 0 {
 		sb.WriteString(fmt.Sprintf("Task-URL: %s/tasks/%s\n", strings.TrimRight(opr.ctx.DashboardURL, "/"), opr.ctx.TaskID))
 	}
-	if len(opr.deniedHosts) > 0 {
-		sb.WriteString("\n---\n")
-		sb.WriteString("**Network: blocked hosts during this Step**\n\n")
-		sb.WriteString("The agent attempted to reach the following hostnames but they weren't on the allowlist. Add them to your org's Tasks → Allowed Hosts settings if expected:\n\n")
-		for _, h := range opr.deniedHosts {
-			sb.WriteString(fmt.Sprintf("- `%s`\n", h))
-		}
+	sb.WriteString(opr.blockedHostsSection())
+	review := opr.reviewSection()
+	sb.WriteString(opr.verificationSection(prBodyMaxRunes - utf8.RuneCountInString(sb.String()) - utf8.RuneCountInString(review)))
+	sb.WriteString(review)
+	return sb.String()
+}
+
+// blockedHostsSection lists the hostnames the agentbox proxy denied during
+// this Step, so the PR reviewer can see what the agent tried to reach — helps
+// diagnose "agent gave up because it couldn't fetch X" without digging
+// through container logs. Empty when nothing was denied.
+func (opr *taskOpenPR) blockedHostsSection() string {
+	if len(opr.deniedHosts) == 0 {
+		return ""
 	}
-	sb.WriteString(opr.verificationSection())
-	sb.WriteString(opr.reviewSection())
-	return subject, sb.String()
+	var sb strings.Builder
+	sb.WriteString("\n---\n")
+	sb.WriteString("**Network: blocked hosts during this Step**\n\n")
+	sb.WriteString("The agent attempted to reach the following hostnames but they weren't on the allowlist. Add them to your org's Tasks → Allowed Hosts settings if expected:\n\n")
+	shown := opr.deniedHosts
+	if len(shown) > prBodyDeniedHostsMaxItems {
+		shown = shown[:prBodyDeniedHostsMaxItems]
+	}
+	for _, h := range shown {
+		sb.WriteString(fmt.Sprintf("- `%s`\n", h))
+	}
+	if omitted := len(opr.deniedHosts) - len(shown); omitted > 0 {
+		sb.WriteString(fmt.Sprintf("- and %d more\n", omitted))
+	}
+	return sb.String()
+}
+
+// boundPRSummary fits the agent's narrative into the runes the rest of the
+// body left for it.
+func boundPRSummary(summary string, budget int) string {
+	return cutToRuneBudget(summary, budget, prSummaryTruncatedNote)
+}
+
+// cutToRuneBudget cuts text to a rune budget, note included, and appends the
+// note in place of what it removed.
+//
+// Cut at the LAST LINE BREAK that fits, so what is kept ends on a whole line
+// rather than mid-sentence, and say that it was cut — an unmarked truncation
+// reads as text that simply stopped having anything to say. Counted in runes
+// and sliced on runes, so a multi-byte character is never split.
+//
+// A budget too small for even the note returns nothing: the cap is what keeps
+// the pull request openable, and overrunning it to explain itself would
+// defeat the point.
+func cutToRuneBudget(text string, budget int, note string) string {
+	if utf8.RuneCountInString(text) <= budget {
+		return text
+	}
+	allowance := budget - utf8.RuneCountInString(note)
+	if allowance <= 0 {
+		return ""
+	}
+	kept := string([]rune(text)[:allowance])
+	// The index is a byte offset into a valid UTF-8 string at a '\n', which is
+	// always a character boundary.
+	if idx := strings.LastIndexByte(kept, '\n'); idx > 0 {
+		kept = kept[:idx]
+	}
+	return strings.TrimRight(kept, "\n ") + note
 }
 
 // verificationSection reports a verification that failed but was allowed
@@ -231,7 +340,11 @@ func (opr *taskOpenPR) buildPRTitleAndBody() (string, string) {
 // buried in a job log they'd have to know to open. Empty string when nothing
 // was pre-existing, which is every ordinary PR: a green verify has nothing to
 // say and a genuinely new failure never reaches PR-open at all.
-func (opr *taskOpenPR) verificationSection() string {
+// budget is the runes the rest of the body below the summary left for it; a
+// Task failing across enough repositories to exhaust the whole body reports
+// what it can and says how many steps it left out, rather than pushing the
+// Review section below it past the provider's limit.
+func (opr *taskOpenPR) verificationSection(budget int) string {
 	steps := preExistingVerifySteps(opr.verifyResult)
 	if len(steps) == 0 {
 		return ""
@@ -240,12 +353,36 @@ func (opr *taskOpenPR) verificationSection() string {
 	sb.WriteString("\n---\n")
 	sb.WriteString("**Verification: failing before this Step**\n\n")
 	sb.WriteString("The agent's build/test check failed, but the same command fails on the base commit too — so this Step didn't introduce it, and the work was committed rather than discarded:\n\n")
+	// Spend the budget over the steps in the order agentbox reported them, and
+	// name what was left out.
+	budget -= utf8.RuneCountInString(sb.String()) + prBodyVerifyOverflowReserveRunes
+	shown := 0
 	for _, s := range steps {
-		sb.WriteString(fmt.Sprintf("- `%s` in `%s` — fails on the base commit as well\n",
-			verifyCommandLabel(s.Command), verifyStepRepoLabel(s.Repo)))
-		if tail := boundVerifyTail(verifyStepTail(s)); tail != "" {
-			sb.WriteString("\n```\n" + tail + "\n```\n")
+		entry := verifyStepEntry(s)
+		cost := utf8.RuneCountInString(entry)
+		// The first step is always rendered: its own output is bounded, and a
+		// section that reports failures without naming one reports nothing.
+		if shown > 0 && cost > budget {
+			break
 		}
+		sb.WriteString(entry)
+		budget -= cost
+		shown++
+	}
+	if omitted := len(steps) - shown; omitted > 0 {
+		sb.WriteString(fmt.Sprintf("- and %d more failing step(s) — the full output is in the Step's job log\n", omitted))
+	}
+	return sb.String()
+}
+
+// verifyStepEntry renders one pre-existing failure: the command, the repo it
+// ran in, and the tail of what it printed.
+func verifyStepEntry(s verifyStep) string {
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("- `%s` in `%s` — fails on the base commit as well\n",
+		verifyCommandLabel(s.Command), verifyStepRepoLabel(s.Repo)))
+	if tail := boundVerifyTail(verifyStepTail(s)); tail != "" {
+		sb.WriteString("\n```\n" + tail + "\n```\n")
 	}
 	return sb.String()
 }

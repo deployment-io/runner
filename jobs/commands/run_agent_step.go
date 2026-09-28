@@ -1522,9 +1522,33 @@ func resolveRunCost(parameters map[string]interface{}, result agentResult) *cost
 //
 // What replaces and what accumulates follows from what each field means:
 // counters add, lists union, the latest verification wins (it is the one that
-// describes the code being committed), and a title or summary is only ever
-// replaced by a non-empty one.
+// describes the code being committed), the FIRST title stands and the LAST
+// summary does.
 func mergeAgentResultIntoJobOutput(parameters map[string]interface{}, result agentResult) error {
+	return mergeRunResultIntoJobOutput(parameters, result)
+}
+
+// mergeFixResultIntoJobOutput folds a KEPT fix run into the Step's record.
+//
+// A SEPARATE ENTRY POINT from the implement run's, so the caller says which
+// run it is holding rather than the fold inferring it from whether a record
+// already exists. recordFixRunResult calls this one, and only for a run whose
+// work is kept: a rolled-back fix run's result never reaches the record at
+// all (see recordFixRunResult).
+//
+// What that distinction buys the reader is the title and the summary. The
+// implement run's title names the change and stands for the whole pull
+// request; this run's names its own errand and only fills in a title nobody
+// recorded. Its summary, by contrast, REPLACES the implement run's, because
+// it is asked for a description of the change as it now stands — see
+// buildMustFixPrompt.
+func mergeFixResultIntoJobOutput(parameters map[string]interface{}, result agentResult) error {
+	return mergeRunResultIntoJobOutput(parameters, result)
+}
+
+// mergeRunResultIntoJobOutput is the merge both entry points share: read the
+// envelope, fold this run's cost and agent output into it, write it back.
+func mergeRunResultIntoJobOutput(parameters map[string]interface{}, result agentResult) error {
 	data := jobOutputData{}
 	if existing, err := jobs.GetParameterValue[string](parameters, parameters_enums.JobOutput); err == nil && len(existing) > 0 {
 		_ = json.Unmarshal([]byte(existing), &data)
@@ -1561,15 +1585,25 @@ func accumulateAgentOutput(prev *agentOutput, result agentResult) *agentOutput {
 	next.FilesChanged = unionStrings(prev.FilesChanged, result.FilesChanged)
 	next.DeniedHosts = unionStrings(prev.DeniedHosts, result.DeniedHosts)
 	next.CostUSD = addOptionalCost(prev.CostUSD, result.CostUSD)
-	// A fix run that produced no title must not erase the implementer's: the
-	// PR is still titled after the change as a whole.
-	if next.PRTitle == "" {
+	// The FIRST non-empty title stands. The pull request is titled after the
+	// change as a whole, which is the implement run's errand; a fix run's
+	// title names the narrow thing it was sent back to do. A Step that added
+	// a /debug/env route came out titled "Gate /debug/env behind a token and
+	// redact secret env values" — the fix, not the change. A later run only
+	// fills a title no run recorded.
+	if prev.PRTitle != "" {
 		next.PRTitle = prev.PRTitle
 	}
-	// The narrative accumulates too, because the commit message is built from
-	// it and the fixes are part of what this Step did. A fix run that said
-	// nothing leaves the implementer's account standing.
-	next.ChangesSummary = appendChangesSummary(prev.ChangesSummary, result.ChangesSummary)
+	// The LAST non-empty summary stands, WHOLE. It is the pull request's
+	// description and the commit message's body, and both describe the change
+	// as it finally stands — a fix run is asked for exactly that (see
+	// buildMustFixPrompt), so its account supersedes the earlier one rather
+	// than being appended under a label. Appending left the description
+	// opening on an account of code that the fixes had since removed. A run
+	// that said nothing leaves the earlier account standing.
+	if strings.TrimSpace(result.ChangesSummary) == "" {
+		next.ChangesSummary = prev.ChangesSummary
+	}
 	// The LATEST verification wins — it is the one that ran against the code
 	// actually being committed. A nil one does not erase the earlier verdict,
 	// because "this run reported no verify" is not "the build is unknown".
@@ -1683,19 +1717,6 @@ func unionStrings(a, b []string) []string {
 		return nil
 	}
 	return out
-}
-
-// appendChangesSummary joins the implementer's narrative with a later fix
-// run's, under a label so a reader can tell which is which.
-func appendChangesSummary(prev, next string) string {
-	prev, next = strings.TrimSpace(prev), strings.TrimSpace(next)
-	switch {
-	case next == "":
-		return prev
-	case prev == "":
-		return next
-	}
-	return prev + "\n\n[Review fixes]\n" + next
 }
 
 // agentboxSpawnSpec is the per-phase container configuration. An empty Cmd

@@ -879,7 +879,7 @@ func TestJobOutputAccumulatesAcrossTheStepsRuns(t *testing.T) {
 	}
 	// A fix run that emitted no pr_title.
 	fixCost := 0.20
-	if err := mergeAgentResultIntoJobOutput(parameters, agentResult{
+	if err := mergeFixResultIntoJobOutput(parameters, agentResult{
 		Status: "success", Turns: 6,
 		ChangesSummary: "Added the missing session check.",
 		FilesChanged:   []string{"0-acme/api/handler.go", "0-acme/api/auth.go"},
@@ -902,9 +902,10 @@ func TestJobOutputAccumulatesAcrossTheStepsRuns(t *testing.T) {
 	if len(data.Agent.FilesChanged) != 2 {
 		t.Errorf("files changed = %v, want the union", data.Agent.FilesChanged)
 	}
-	if !strings.Contains(data.Agent.ChangesSummary, "Added the login endpoint.") ||
-		!strings.Contains(data.Agent.ChangesSummary, "Added the missing session check.") {
-		t.Errorf("changes summary = %q, want both runs' accounts", data.Agent.ChangesSummary)
+	// The fix run's account of the change REPLACES the implement run's — it
+	// describes the change as it finally stands. See mergeFixResultIntoJobOutput.
+	if data.Agent.ChangesSummary != "Added the missing session check." {
+		t.Errorf("changes summary = %q, want the fix run's alone", data.Agent.ChangesSummary)
 	}
 	if strings.Contains(data.Agent.ChangesSummary, "I reviewed the change") {
 		t.Errorf("the reviewer's prose reached the commit message: %q", data.Agent.ChangesSummary)
