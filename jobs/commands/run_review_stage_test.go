@@ -407,7 +407,7 @@ func findMount(t *testing.T, mounts []mount.Mount, target string) mount.Mount {
 // A fix run is an ordinary batch run: the Step's original prompt plus the
 // must-fix findings, and nothing from the reviewer's transcript.
 func TestMustFixPromptCarriesTheOriginalPromptAndOnlyTheMustFixFindings(t *testing.T) {
-	prompt := buildMustFixPrompt("Implement the export endpoint.", []reviewFindingOutput{{
+	prompt := buildMustFixPrompt("Implement the export endpoint.", "", []reviewFindingOutput{{
 		Parameter: "security", Severity: "high", Location: "0-acme/api/handler.go:41",
 		What:    "the new /export handler does not check the caller's session",
 		Why:     "any unauthenticated caller can read another org's data",
