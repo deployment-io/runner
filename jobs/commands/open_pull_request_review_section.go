@@ -108,6 +108,12 @@ func (opr *taskOpenPR) reviewSection() string {
 	case fixError != "":
 		sb.WriteString(fmt.Sprintf("\nA fix attempt did not complete (%s); the change is shown as it was before that attempt.\n",
 			capRunes(fixError, reviewDetailMaxRunes)))
+	case opr.review.StoppedNoChange:
+		// The last fix run SUCCEEDED and left the code alone: it judged these
+		// findings wrong, or fixing them contrary to the Step, and said so in its
+		// summary — which is this pull request's description. Without the line
+		// the findings read as ones nobody has answered.
+		sb.WriteString("\n_The last fix round changed nothing; the description says why._\n")
 	}
 	writeFindingGroup(&sb, "Fixed during review", fixed, budget)
 	writeFindingGroup(&sb, "Noted", annotated, budget)

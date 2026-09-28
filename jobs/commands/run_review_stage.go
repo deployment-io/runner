@@ -128,20 +128,16 @@ func (rs *RunReviewStage) Run(parameters map[string]interface{}, logsWriter io.W
 	if participation == participationOff {
 		return parameters, nil
 	}
+	// Nothing between here and stage.run() returns early, which is what makes the
+	// stage's own defer the single owner of the cache volume below. This parse is
+	// the exception, and it reads the very parameters RunAgentStep parsed a
+	// moment ago from the same map — a Step that fails here never had an
+	// implement run to leave a volume behind.
 	ctx, err := commandUtils.ParseTaskJobContext(parameters)
 	if err != nil {
 		return parameters, err
 	}
-	// The per-Step cache volume is created here and removed on the way out:
-	// RunAgentStep removed its own when it returned, and a fix run needs the
-	// shelf back. Same name, so it is the Step's own cache rather than a
-	// second one — and the removal keeps a Step from leaking a volume whether
-	// or not a fix round happened.
-	cacheVolume := cacheVolumeName(ctx)
-	if err := createCacheVolume(cacheVolume); err != nil {
-		io.WriteString(logsWriter, fmt.Sprintf("warning: could not create the review stage's cache volume: %s\n", err))
-	}
-	defer removeCacheVolume(cacheVolume)
+	cacheVolume, cacheKept := adoptCacheVolume(ctx, cacheVolumeExists, createCacheVolume, logsWriter)
 	// The stage parks directories beside the work dir — the implementer's
 	// stash and one per round. Each round removes its own on the way out;
 	// this sweeps whatever a failed restore left, however the stage ends,
@@ -160,6 +156,8 @@ func (rs *RunReviewStage) Run(parameters map[string]interface{}, logsWriter io.W
 		ctx:             ctx,
 		parameters:      parameters,
 		workDirHost:     workDirHost,
+		cacheVolume:     cacheVolume,
+		vendored:        cacheKept,
 		reviewerParams:  reviewerParams,
 		reviewerFailure: reviewerFailure,
 		logsWriter:      logsWriter,
@@ -174,6 +172,35 @@ func (rs *RunReviewStage) Run(parameters map[string]interface{}, logsWriter io.W
 	return stage.run()
 }
 
+// adoptCacheVolume takes over the Step's dependency cache for the stage, and
+// says whether the implement run's own is still on it.
+//
+// THE VOLUME NOW SPANS THE WHOLE STEP. RunAgentStep leaves it in place when a
+// review follows it (keepCacheVolumeForReview), so what this stage mounts still
+// holds the implement run's vendored dependencies AND its build cache — which is
+// what keeps the first review round from running a build with nothing vendored
+// (a reviewer on a repository with private modules failed on blocked github.com
+// fetches) and every fix run from compiling the project from scratch (one cold
+// build outlived the fix agent's tool timeout and cost it four minutes). From
+// here the stage owns the volume and removes it on every path out of run().
+//
+// A MISSING volume is the fallback: an implement run from an older runner, or one
+// whose volume something else collected. It is created empty and the first fix
+// run vendors into it, exactly as before. The two collaborators are injected so
+// that handover can be exercised without a Docker daemon.
+func adoptCacheVolume(ctx commandUtils.TaskJobContext, exists func(name string) bool, create func(name string) error, logsWriter io.Writer) (string, bool) {
+	name := cacheVolumeName(ctx)
+	if exists(name) {
+		io.WriteString(logsWriter, "Review stage: reusing the dependency cache the implement run left in place\n")
+		return name, true
+	}
+	io.WriteString(logsWriter, "Review stage: the implement run's dependency cache is gone — a fix run will vendor again\n")
+	if err := create(name); err != nil {
+		io.WriteString(logsWriter, fmt.Sprintf("warning: could not create the review stage's cache volume: %s\n", err))
+	}
+	return name, false
+}
+
 // reviewStage holds one Step's Review stage. A struct rather than a long
 // parameter list: the loop, each round and the reporting all read the same
 // half-dozen inputs.
@@ -184,6 +211,10 @@ type reviewStage struct {
 	// repository checkouts live under, and the one the stage's sibling
 	// directories are named after.
 	workDirHost string
+	// cacheVolume is the per-Step dependency cache the implement run left in
+	// place, and the stage's to remove: releaseCacheVolume drops it once, on
+	// every path out of run(). Empty in a test that never mounts one.
+	cacheVolume string
 	// reviewerParams is the parameter view REVIEW rounds run under — see
 	// reviewerParameters. Nil when the Job names no reviewer, which is what
 	// makes reviewerView fall back to parameters and the stage behave exactly
@@ -212,10 +243,15 @@ type reviewStage struct {
 	// spawned with, read back from its environment rather than assumed from
 	// the constant, so the log reports what the container received.
 	lastTurnCap string
-	// vendored records that the per-Step dependency cache has been refilled
-	// for a fix run — see ensureVendoredCache. Once per stage, not once per
-	// round.
+	// vendored records that the per-Step dependency cache holds this Step's
+	// dependencies — either because the implement run left its volume in
+	// place, which is the ordinary case, or because a fix round refilled it.
+	// See ensureVendoredCache: at most one vendor phase per stage, and none at
+	// all when the implement run's cache survived.
 	vendored bool
+	// cacheReleased guards releaseCacheVolume, so the volume is removed once
+	// however many times the stage's paths out overlap.
+	cacheReleased bool
 	// openMustFix carries the previous round's must-fix findings, keyed by
 	// finding key, so the next round can be classified as fixed / still open
 	// / new rather than as an undifferentiated list.
@@ -231,14 +267,38 @@ type reviewStage struct {
 	// fixNotAttempted is true when the undo copy could not be taken, so no
 	// fix run happened at all — worded differently on the pull request.
 	fixNotAttempted bool
+	// stoppedNoChange is true when the loop ended because a fix run finished
+	// and changed no file. Not a failure of anything: the fix run succeeded and
+	// its summary says why it left the findings alone. Recorded so the pull
+	// request can say that rather than leaving the findings looking untouched.
+	stoppedNoChange bool
 
-	// The two container runs and the two halves of the fix run's undo, all
-	// injectable so the loop's own decisions can be tested without a Docker
-	// daemon and without root. Nil means the real thing.
-	runReview  func(round int) (agentResult, error)
-	runFix     func(mustFix []reviewFindingOutput) error
-	copyTree   copyTreeFunc
-	restoreDir restoreDirFunc
+	// The two container runs, the two halves of the fix run's undo and the
+	// cache volume's removal, all injectable so the loop's own decisions can be
+	// tested without a Docker daemon and without root. Nil means the real
+	// thing.
+	runReview   func(round int) (agentResult, error)
+	runFix      func(mustFix []reviewFindingOutput) error
+	copyTree    copyTreeFunc
+	restoreDir  restoreDirFunc
+	removeCache func(name string)
+}
+
+// releaseCacheVolume removes the Step's dependency cache. Deferred at the top
+// of run(), so it happens EXACTLY ONCE on every path out of the stage — a
+// finished loop, a failed or skipped review, a user stop, and a fix round that
+// was rolled back — and never while a later run in the same Step still needs
+// what is on it.
+func (s *reviewStage) releaseCacheVolume() {
+	if s.cacheVolume == "" || s.cacheReleased {
+		return
+	}
+	s.cacheReleased = true
+	remove := s.removeCache
+	if remove == nil {
+		remove = removeCacheVolume
+	}
+	remove(s.cacheVolume)
 }
 
 func (s *reviewStage) reviewRound(round int) (agentResult, error) {
@@ -263,6 +323,9 @@ func (s *reviewStage) fixRound(mustFix []reviewFindingOutput) error {
 // must reach the outer loop's stop path, and a restore that did not work — see
 // attemptFix.
 func (s *reviewStage) run() (map[string]interface{}, error) {
+	// The Step's dependency cache is the stage's to remove, however the stage
+	// ends — see releaseCacheVolume.
+	defer s.releaseCacheVolume()
 	if len(s.baseCommits) == 0 {
 		// No baseline means no diff, and a review of no diff would report a
 		// clean bill of health for work it never saw. Record that and let the
@@ -296,10 +359,10 @@ func (s *reviewStage) run() (map[string]interface{}, error) {
 		if errors.Is(err, types.ErrJobStoppedByUser) {
 			// A user stop is not a failed review. Attribute what the round
 			// spent and hand the stop to the outer loop's existing path.
-			_ = accumulateReviewRunUsage(s.parameters, s.reviewerView(), result)
+			s.accumulateReviewRun(round, result)
 			return s.parameters, err
 		}
-		_ = accumulateReviewRunUsage(s.parameters, s.reviewerView(), result)
+		s.accumulateReviewRun(round, result)
 		if reason := reviewRoundFailure(result, err); reason != "" {
 			io.WriteString(s.logsWriter, fmt.Sprintf("Review round %d did not complete: %s — continuing without it\n", round, reason))
 			s.recordFailedRound(round, reason, result)
@@ -342,15 +405,40 @@ func (s *reviewStage) run() (map[string]interface{}, error) {
 	return s.finish()
 }
 
+// accumulateReviewRun folds a review round's usage and cost into the Step's
+// totals, and keeps the round's BLOCKED HOSTS out of them.
+//
+// A fix run's blocked hosts are the Step's: the implementer tried to reach
+// something the Task's allowlist does not cover, and the pull request's
+// "Network: blocked hosts during this Step" section exists to tell the user to
+// add it. A REVIEW run's are not. The reviewer is a different agent, spawned by
+// this stage for its own purposes, and its startup calls are its own — a Codex
+// reviewer's github.com, api.github.com and chatgpt.com turned up on a pull
+// request as advice to widen the implementer's allowlist for hosts the
+// implementer never asked for.
+//
+// So they go to the job log instead, where whoever is debugging the reviewer can
+// find them, and nowhere near the Step's record.
+func (s *reviewStage) accumulateReviewRun(round int, result agentResult) {
+	if len(result.DeniedHosts) > 0 {
+		io.WriteString(s.logsWriter, fmt.Sprintf("Review round %d: the reviewer's requests to these hosts were blocked: %s\n",
+			round, strings.Join(result.DeniedHosts, ", ")))
+	}
+	result.DeniedHosts = nil
+	_ = accumulateReviewRunUsage(s.parameters, s.reviewerView(), result)
+}
+
 // attemptFix takes the undo copy, runs the fix, and decides what its outcome
 // means for the loop. It is the whole of "a bounded cleanup that did not finish
 // never costs the Step its implementation".
 //
-//	(true, nil)  the fix ran and the loop carries on to the next review round.
-//	(false, nil) no fix happened: either it could not be undone so it was never
-//	             started, or it failed and the tree has been put back. Either
-//	             way the round's must-fix findings are still open and the
-//	             existing handoff renders them on a draft pull request.
+//	(true, nil)  the fix ran, changed something, and the loop carries on to the
+//	             next review round.
+//	(false, nil) nothing more is worth reviewing: the fix could not be undone so
+//	             it was never started, or it failed and the tree has been put
+//	             back, or it finished and changed no file. In all three the
+//	             round's must-fix findings are still open and the existing
+//	             handoff renders them on a draft pull request.
 //	(_, err)     the Step fails. A user stop, which is not a failed fix at all
 //	             and belongs to the outer loop's stop path; or a restore that
 //	             did not work, which leaves a tree nobody can describe.
@@ -379,7 +467,28 @@ func (s *reviewStage) attemptFix(round int, mustFix []reviewFindingOutput) (bool
 	}
 	fixErr := s.fixRound(mustFix)
 	if fixErr == nil {
+		// THE UNDO COPY IS ALSO THE ANSWER TO "DID THIS RUN CHANGE ANYTHING",
+		// so the comparison happens before the copy is dropped.
+		changed, err := snapshot.treeChanged()
 		snapshot.remove()
+		if err != nil {
+			// Fail-open, like the rest of the stage: a comparison nobody could
+			// make must not end the loop on a guess. Reviewed again as before.
+			io.WriteString(s.logsWriter, fmt.Sprintf("warning: could not tell whether fix round %d changed anything (%s) — reviewing it as usual\n", round, err))
+			return true, nil
+		}
+		if !changed {
+			// A fix run may decline a finding it judges wrong or contrary to the
+			// Step, and say why in its summary. When it changes NO file, another
+			// review round can only report the same findings again — the reviewer
+			// never sees that explanation, by design — at the cost of up to two
+			// more rounds and another fix run. So the loop stops here and the
+			// findings go to a human with the explanation the fix run wrote,
+			// which recordFixRunResult has already merged into the description.
+			s.stoppedNoChange = true
+			io.WriteString(s.logsWriter, fmt.Sprintf("Fix round %d changed no file — the findings it was sent stay open; handing them to a human on the pull request\n", round))
+			return false, nil
+		}
 		return true, nil
 	}
 	if errors.Is(fixErr, types.ErrJobStoppedByUser) {
@@ -418,6 +527,7 @@ func (s *reviewStage) finish() (map[string]interface{}, error) {
 		MustFixOpen:     len(s.openMustFix) > 0,
 		FixError:        s.fixError,
 		FixNotAttempted: s.fixNotAttempted,
+		StoppedNoChange: s.stoppedNoChange,
 	}
 	s.logFullReview(out)
 	if err := mergeReviewIntoJobOutput(s.parameters, out); err != nil {
