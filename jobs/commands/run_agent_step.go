@@ -1182,6 +1182,26 @@ type agentResult struct {
 type reviewResult struct {
 	Findings []reviewFinding  `json:"findings,omitempty"`
 	Coverage []reviewCoverage `json:"coverage,omitempty"`
+	// Previous is the reviewer's VERDICT ON EACH OPEN MUST-FIX FINDING the
+	// round was sent in REVIEW_OPEN_FINDINGS — one entry per key it was given,
+	// each either resolved or still_present. It is what decides "fixed in
+	// loop"; see (s *reviewStage).classify for why the absence of a key in
+	// this round's findings is not.
+	//
+	// Absent — nil — in three cases agentbox does not distinguish: an image
+	// that predates the field, a reviewer that left the list out, and a
+	// reviewer whose entries were all unusable. The runner treats all three
+	// the same way, by holding every open finding.
+	Previous []reviewPreviousFinding `json:"previous,omitempty"`
+}
+
+// reviewPreviousFinding is one entry of review_result.previous: the key the
+// runner sent (echoed back, cut to agentbox's 120-rune cap), the reviewer's
+// status for it, and its own account of what it saw.
+type reviewPreviousFinding struct {
+	Key    string `json:"key,omitempty"`
+	Status string `json:"status,omitempty"`
+	Note   string `json:"note,omitempty"`
 }
 
 type reviewFinding struct {

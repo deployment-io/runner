@@ -553,8 +553,10 @@ func TestDecodeMustFixThresholds(t *testing.T) {
 }
 
 // Findings pair across rounds on Key, with a synthesised key when the producer
-// omitted one — so "fixed" and "still open" are real distinctions rather than
-// list arithmetic.
+// omitted one. What each pairing MEANS is the reviewer's own answer for that
+// key: sec-1 is still present because it was reported again, sec-2 is fixed
+// because the reviewer said so. A key that merely stopped appearing settles
+// nothing — see run_review_stage_held_test.go.
 func TestClassifyMarksFixedStillOpenAndNew(t *testing.T) {
 	stage := &reviewStage{participation: participationOn, thresholds: map[uint]uint{1: 4}}
 	stage.rememberOpenMustFix([]reviewFindingOutput{
@@ -562,10 +564,16 @@ func TestClassifyMarksFixedStillOpenAndNew(t *testing.T) {
 		{Key: "sec-2", Parameter: "security", Severity: "high", What: "also open", MustFix: true},
 	})
 
-	findings := stage.classify(agentResult{ReviewResult: &reviewResult{Findings: []reviewFinding{
-		{Key: "sec-1", Parameter: "security", Severity: "high", What: "was open"},  // still open
-		{Key: "sec-3", Parameter: "security", Severity: "low", What: "new, minor"}, // new, annotated
-	}}})
+	findings := stage.classify(agentResult{ReviewResult: &reviewResult{
+		Findings: []reviewFinding{
+			{Key: "sec-1", Parameter: "security", Severity: "high", What: "was open"},  // still open
+			{Key: "sec-3", Parameter: "security", Severity: "low", What: "new, minor"}, // new, annotated
+		},
+		Previous: []reviewPreviousFinding{
+			{Key: "sec-1", Status: "still_present"},
+			{Key: "sec-2", Status: "resolved"},
+		},
+	}})
 
 	if len(findings) != 2 {
 		t.Fatalf("findings = %+v, want 2", findings)
@@ -574,7 +582,7 @@ func TestClassifyMarksFixedStillOpenAndNew(t *testing.T) {
 		t.Errorf("must-fix marking is wrong: %+v", findings)
 	}
 	if len(stage.fixedInLoop) != 1 || stage.fixedInLoop[0].Key != "sec-2" {
-		t.Errorf("fixedInLoop = %+v, want the finding that disappeared", stage.fixedInLoop)
+		t.Errorf("fixedInLoop = %+v, want the finding the reviewer said it resolved", stage.fixedInLoop)
 	}
 }
 
