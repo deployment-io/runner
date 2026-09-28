@@ -600,7 +600,7 @@ func recordFixRunResult(parameters map[string]interface{}, result agentResult, s
 		}
 		return outcome
 	}
-	if err := mergeAgentResultIntoJobOutput(parameters, result); err != nil {
+	if err := mergeFixResultIntoJobOutput(parameters, result); err != nil {
 		io.WriteString(logsWriter, fmt.Sprintf("warning: could not merge the fix run's result: %s\n", err))
 	}
 	return nil
@@ -679,6 +679,12 @@ func applyMustFixEnv(env []string, prompt string) []string {
 // The original prompt comes FIRST and in full: the implementer needs to know
 // what it was building before it is told what is wrong with it, or it will fix
 // the finding in a way the Step's actual goal does not want.
+//
+// The SUMMARY INSTRUCTION comes last, after the findings, because it is about
+// what to write once they are fixed. A kept fix run's summary replaces the
+// implement run's as the pull request's description (see
+// mergeFixResultIntoJobOutput), so this run has to be asked for a description
+// of the whole change rather than a note on its own errand.
 func buildMustFixPrompt(stepPrompt string, mustFix []reviewFindingOutput) string {
 	var b strings.Builder
 	b.WriteString(stepPrompt)
@@ -698,6 +704,7 @@ func buildMustFixPrompt(stepPrompt string, mustFix []reviewFindingOutput) string
 			b.WriteString("\n")
 		}
 	}
+	b.WriteString("\nYour final summary becomes the pull request description, replacing the earlier one. Describe the whole change as it now stands — what the Step changed and why, including these fixes — not only what you changed in this run. Write it for a reviewer reading the pull request: do not address the user, ask questions, or offer further work.\n")
 	return b.String()
 }
 
