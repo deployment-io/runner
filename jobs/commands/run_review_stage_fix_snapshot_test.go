@@ -831,9 +831,8 @@ func TestRepositoryDirsIncludeOnesWithNoStartCommit(t *testing.T) {
 	}
 }
 
-// The pull request states what actually happened: no "fix budget ran out"
-// when the loop ended on a failed or skipped fix, and a plain sentence when no
-// fix was attempted.
+// The pull request states what actually happened: how a failed or skipped fix
+// ended, and a closing line that is true however the loop ended.
 func TestTheReviewSectionWordsTheFixOutcomeHonestly(t *testing.T) {
 	base := func() *reviewOutput {
 		return completedReview(true, reviewFindingOutput{Parameter: "security", Severity: "high",
@@ -852,8 +851,13 @@ func TestTheReviewSectionWordsTheFixOutcomeHonestly(t *testing.T) {
 	if !strings.Contains(body, "No fix was attempted") || strings.Contains(body, "A fix attempt did not complete") {
 		t.Errorf("a skipped fix is worded wrongly:\n%s", body)
 	}
+	// A loop that ran out of fix rounds closes with the same line as every
+	// other: its findings may include ones first reported in the last round,
+	// which were never routed back, so "after the fix budget ran out" is not
+	// true of all of them.
 	exhausted := base()
-	if body := reviewTestOpener(exhausted).reviewSection(); !strings.Contains(body, "fix budget ran out") {
-		t.Errorf("an exhausted loop lost its wording:\n%s", body)
+	if body := reviewTestOpener(exhausted).reviewSection(); strings.Contains(body, "fix budget ran out") ||
+		!strings.Contains(body, "These findings are still open. They need a human.") {
+		t.Errorf("an exhausted loop is worded wrongly:\n%s", body)
 	}
 }

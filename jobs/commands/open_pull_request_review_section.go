@@ -59,7 +59,8 @@ func stripNeedsFixesPrefix(title string) string {
 // reviewSection renders the Review stage's record into the pull-request body.
 //
 // Order is deliberate and is the reader's priority order: what is still wrong
-// and must be fixed, then what the loop already fixed (which explains why the
+// and must be fixed, then what was sent back for a fix, survived it, and does
+// not hold the pull request, then what the loop already fixed (which explains why the
 // change looks different from what the implementer first wrote), then what was
 // merely noted. Coverage comes last, because it answers "what did you look
 // at" — a question that only arises once the findings have been read.
@@ -89,47 +90,76 @@ func (opr *taskOpenPR) reviewSection() string {
 	}
 
 	sb.WriteString(passesLine(latest.Coverage))
-	stillOpen, annotated := splitFindings(latest.Findings)
+	stillOpen, notedAfterFix, annotated := splitFindings(latest.Findings)
 	fixed := opr.review.FixedInLoop
 
 	// Both budgets are spent in reader-priority order, and the overflow line
 	// is written from what is LEFT OVER — so the note that says how much was
 	// dropped is never itself the thing that gets dropped.
 	budget := &renderBudget{items: reviewSectionMaxItems, runes: reviewSectionMaxRunes - utf8.RuneCountInString(sb.String()) - reviewSectionReserveRunes}
-	writeFindingGroup(&sb, mustFixHeading(failed != nil), stillOpen, budget)
-	// A fix run that did not finish was UNDONE, so the diff below this pull
-	// request is the implementer's own — not a half-applied cleanup. A reader
-	// comparing the findings against the change has to know that, or they will
-	// go looking for fix work that was deliberately rolled back.
 	fixError := strings.TrimSpace(opr.review.FixError)
-	switch {
-	case opr.review.FixNotAttempted:
-		sb.WriteString("\nNo fix was attempted: the change could not be copied first, so a failed fix could not have been undone.\n")
-	case fixError != "":
-		sb.WriteString(fmt.Sprintf("\nA fix attempt did not complete (%s); the change is shown as it was before that attempt.\n",
-			capRunes(fixError, reviewDetailMaxRunes)))
-	case opr.review.StoppedNoChange:
-		// The last fix run SUCCEEDED and left the code alone: it judged these
-		// findings wrong, or fixing them contrary to the Step, and said so in its
-		// summary — which is this pull request's description. Without the line
-		// the findings read as ones nobody has answered.
-		sb.WriteString("\n_The last fix round changed nothing; the description says why._\n")
+	// The line about how the last fix attempt ended goes under the group that
+	// holds the findings that attempt was sent: the must-fix heading when any
+	// of them holds the pull request, stillOpenBelowHoldHeading otherwise.
+	outcome := fixOutcomeLine(opr.review, fixError)
+	writeFindingGroup(&sb, mustFixHeading(failed != nil), stillOpen, budget)
+	if len(stillOpen) > 0 {
+		sb.WriteString(outcome)
+	}
+	writeFindingGroup(&sb, stillOpenBelowHoldHeading, notedAfterFix, budget)
+	if len(stillOpen) == 0 {
+		sb.WriteString(outcome)
 	}
 	writeFindingGroup(&sb, "Fixed during review", fixed, budget)
 	writeFindingGroup(&sb, "Noted", annotated, budget)
-	if omitted := len(stillOpen) + len(fixed) + len(annotated) - budget.rendered; omitted > 0 {
+	if omitted := len(stillOpen) + len(notedAfterFix) + len(fixed) + len(annotated) - budget.rendered; omitted > 0 {
 		sb.WriteString(fmt.Sprintf("\n_%d further finding(s) are not shown here — the full review is in the Step's job log._\n", omitted))
 	}
-	switch {
-	case opr.review.MustFixOpen && fixError == "" && !opr.review.StoppedNoChange:
-		sb.WriteString("\nThese findings were routed back to the agent and are still open after the review's fix budget ran out. They need a human.\n")
-	case opr.review.MustFixOpen:
-		// The loop ended on the fix attempt above, or on a fix round that
-		// changed nothing, not on its budget.
+	// One closing line for every way the loop can end with a must-fix finding
+	// open. "Routed back to the agent … after the fix budget ran out" was
+	// false for a must-fix finding first reported in the last round (never
+	// routed back), and for a loop that ended on a failed or no-change fix
+	// round. Findings that did go through a fix round say so themselves
+	// ("Still present after a fix round"), and the outcome line above says how
+	// the last fix attempt ended.
+	if opr.review.MustFixOpen {
 		sb.WriteString("\nThese findings are still open. They need a human.\n")
 	}
 	sb.WriteString("\n" + coverageLine(latest.Coverage))
 	return boundSection(sb.String())
+}
+
+// stillOpenBelowHoldHeading heads the findings that qualified to be sent back
+// but sit below the hold threshold and are still open. It says only what is
+// true of every one of them. Some went through a fix round and survived it
+// (those carry "Still present after a fix round" themselves); others were
+// first reported in the last round, after the fix rounds or the stage budget
+// ran out, and never had a fix attempt. "Noted after a fix attempt" was false
+// for the second kind.
+const stillOpenBelowHoldHeading = "Still open (does not hold this pull request)"
+
+// fixOutcomeLine says how the last fix attempt ended, when that is not simply
+// "it ran and the review looked again", or "".
+//
+// A fix run that did not finish was UNDONE, so the diff below this pull
+// request is the implementer's own — not a half-applied cleanup. A reader
+// comparing the findings against the change has to know that, or they will go
+// looking for fix work that was deliberately rolled back.
+func fixOutcomeLine(review *reviewOutput, fixError string) string {
+	switch {
+	case review.FixNotAttempted:
+		return "\nNo fix was attempted: the change could not be copied first, so a failed fix could not have been undone.\n"
+	case fixError != "":
+		return fmt.Sprintf("\nA fix attempt did not complete (%s); the change is shown as it was before that attempt.\n",
+			capRunes(fixError, reviewDetailMaxRunes))
+	case review.StoppedNoChange:
+		// The last fix run SUCCEEDED and left the code alone: it judged these
+		// findings wrong, or fixing them contrary to the Step, and said so in its
+		// summary — which is this pull request's description. Without the line
+		// the findings read as ones nobody has answered.
+		return "\n_The last fix round changed nothing; the description says why._\n"
+	}
+	return ""
 }
 
 // reviewedByLine says WHO reviewed, because that is no longer implied by the
@@ -256,16 +286,20 @@ func coverageLine(coverage []reviewCoverageOutput) string {
 }
 
 // splitFindings separates a round's findings into the ones that must be fixed
-// and the ones that are merely reported.
-func splitFindings(findings []reviewFindingOutput) (mustFix, annotated []reviewFindingOutput) {
+// (they hold the pull request), the ones sent back for a fix below the hold
+// threshold that are still open, and the ones that are merely reported.
+func splitFindings(findings []reviewFindingOutput) (mustFix, notedAfterFix, annotated []reviewFindingOutput) {
 	for _, f := range findings {
-		if f.MustFix {
+		switch {
+		case f.MustFix:
 			mustFix = append(mustFix, f)
-			continue
+		case f.SentBack:
+			notedAfterFix = append(notedAfterFix, f)
+		default:
+			annotated = append(annotated, f)
 		}
-		annotated = append(annotated, f)
 	}
-	return mustFix, annotated
+	return mustFix, notedAfterFix, annotated
 }
 
 // renderBudget is what is left to spend on findings: a count and a rune
