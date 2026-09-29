@@ -115,12 +115,14 @@ func (opr *taskOpenPR) reviewSection() string {
 	if omitted := len(stillOpen) + len(notedAfterFix) + len(fixed) + len(annotated) - budget.rendered; omitted > 0 {
 		sb.WriteString(fmt.Sprintf("\n_%d further finding(s) are not shown here — the full review is in the Step's job log._\n", omitted))
 	}
-	switch {
-	case opr.review.MustFixOpen && fixError == "" && !opr.review.StoppedNoChange:
-		sb.WriteString("\nThese findings were routed back to the agent and are still open after the review's fix budget ran out. They need a human.\n")
-	case opr.review.MustFixOpen:
-		// The loop ended on the fix attempt above, or on a fix round that
-		// changed nothing, not on its budget.
+	// One closing line for every way the loop can end with a must-fix finding
+	// open. "Routed back to the agent … after the fix budget ran out" was
+	// false for a must-fix finding first reported in the last round (never
+	// routed back), and for a loop that ended on a failed or no-change fix
+	// round. Findings that did go through a fix round say so themselves
+	// ("Still present after a fix round"), and the outcome line above says how
+	// the last fix attempt ended.
+	if opr.review.MustFixOpen {
 		sb.WriteString("\nThese findings are still open. They need a human.\n")
 	}
 	sb.WriteString("\n" + coverageLine(latest.Coverage))
