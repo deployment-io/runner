@@ -258,7 +258,7 @@ func TestReviewSpawnEnvCarriesNeitherStepPromptNorPreviousStepsSummary(t *testin
 	}
 	for key, want := range map[string]string{
 		"AGENT_MODE":          "review",
-		"REVIEW_PASSES":       "security,correctness",
+		"REVIEW_PASSES":       "security,correctness,spec",
 		"REVIEW_BASE_COMMITS": `{"0-acme-api":"abc123"}`,
 		"REVIEW_ROUND":        "1",
 		"REVIEW_SPEC":         `{"title":"Add login"}`,
