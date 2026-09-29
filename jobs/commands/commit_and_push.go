@@ -538,12 +538,19 @@ type reviewFindingOutput struct {
 	Stage     string `json:"stage,omitempty"`
 	Pass      string `json:"pass,omitempty"`
 	MustFix   bool   `json:"must_fix,omitempty"`
+	// SentBack marks a finding at or above its parameter's FIX threshold: it
+	// was routed back to the implementer for a fix round. MustFix is the HOLD
+	// half: a must-fix finding still open at the end holds the pull request,
+	// a sent-back one below the hold threshold is only noted. Every must-fix
+	// finding is sent back; records written before the split carry MustFix
+	// alone.
+	SentBack bool `json:"sent_back,omitempty"`
 	// New marks a finding no earlier round reported. On a second or third
 	// round it is the difference between "the fix did not work" and "the fix
 	// introduced something else" — two very different things for a reader to
 	// see, and indistinguishable from the finding alone.
 	New bool `json:"new,omitempty"`
-	// Held marks a must-fix finding an earlier round opened that the reviewer
+	// Held marks a sent-back finding an earlier round opened that the reviewer
 	// has since said is STILL PRESENT — or has not said is resolved, which the
 	// runner reads the same way. It is the opposite of fixed-in-loop, and it is
 	// recorded rather than inferred because the inference (the key stopped

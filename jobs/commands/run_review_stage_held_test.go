@@ -193,7 +193,7 @@ func TestANilPreviousHoldsEveryOpenFinding(t *testing.T) {
 	if len(stage.fixedInLoop) != 0 {
 		t.Errorf("fixed_in_loop = %+v, want nothing: a round that reported no statuses resolved nothing", stage.fixedInLoop)
 	}
-	if len(mustFixOnly(findings)) != 2 {
+	if len(sentBackOnly(findings)) != 2 {
 		t.Errorf("findings = %+v, want both open findings held and routed back", findings)
 	}
 	for _, key := range []string{"A", "B"} {
@@ -245,7 +245,7 @@ func TestAReReportedHeldFindingIsMarkedInPlaceRatherThanDuplicated(t *testing.T)
 }
 
 // A finding held by one round and resolved by the next is FIXED, and reads that
-// way. It went back into openMustFix marked held, so the flag has to come off on
+// way. It went back into openSentBack marked held, so the flag has to come off on
 // the way into fixedInLoop: "Fixed during review" with "still present after a
 // fix round" underneath it is the two statements this change exists to keep
 // apart, in one entry, on exactly the sequence it was built for.
@@ -261,12 +261,12 @@ func TestAFindingHeldByAnEarlierRoundIsNotStillPresentOnceItIsResolved(t *testin
 		t.Fatalf("round 2 did not hold A: %+v", round2)
 	}
 	stage.recordRound(2, round2, agentResult{Turns: 5})
-	stage.rememberOpenMustFix(mustFixOnly(round2))
+	stage.rememberOpenSentBack(sentBackOnly(round2))
 
 	// Round 3 says it is gone and does not report it again.
 	round3 := stage.classify(reviewRoundResult([]reviewPreviousFinding{{Key: "A", Status: "resolved"}}))
 	stage.recordRound(3, round3, agentResult{Turns: 5})
-	stage.rememberOpenMustFix(mustFixOnly(round3))
+	stage.rememberOpenSentBack(sentBackOnly(round3))
 
 	if len(stage.fixedInLoop) != 1 || stage.fixedInLoop[0].Key != "A" {
 		t.Fatalf("fixed_in_loop = %+v, want the finding the reviewer said it resolved", stage.fixedInLoop)
@@ -294,7 +294,7 @@ func TestAHeldFindingsNoteIsReplacedEachRoundNotStacked(t *testing.T) {
 
 	round2 := stage.classify(reviewRoundResult([]reviewPreviousFinding{{Key: "A", Status: "still_present", Note: "no auth check"}}))
 	stage.recordRound(2, round2, agentResult{Turns: 5})
-	stage.rememberOpenMustFix(mustFixOnly(round2))
+	stage.rememberOpenSentBack(sentBackOnly(round2))
 	round3 := stage.classify(reviewRoundResult([]reviewPreviousFinding{{Key: "A", Status: "still_present", Note: "still no auth check"}}))
 
 	held := findingByKey(round3, "A")
@@ -337,7 +337,7 @@ func TestAResolvedFindingCarriesNoStillPresentNoteIntoFixedDuringReview(t *testi
 	})
 	round2 := stage.classify(reviewRoundResult([]reviewPreviousFinding{{Key: "A", Status: "still_present", Note: "the endpoint still has no auth check"}}))
 	stage.recordRound(2, round2, agentResult{Turns: 5})
-	stage.rememberOpenMustFix(mustFixOnly(round2))
+	stage.rememberOpenSentBack(sentBackOnly(round2))
 	round3 := stage.classify(reviewRoundResult([]reviewPreviousFinding{{Key: "A", Status: "resolved"}}))
 	stage.recordRound(3, round3, agentResult{Turns: 5})
 
@@ -375,7 +375,7 @@ func TestTheFixPromptSaysWhichFindingsSurvivedAFixRound(t *testing.T) {
 // would drop, holding a finding that may well have been fixed.
 func TestReviewOpenFindingsIsAbsentInRoundOneAndCarriesTheOpenFindingsAfter(t *testing.T) {
 	stage := reviewStageFor(t, implementerJobParameters(t))
-	stage.rememberOpenMustFix([]reviewFindingOutput{
+	stage.rememberOpenSentBack([]reviewFindingOutput{
 		{Key: "sec-1", Parameter: "security", Severity: "critical", Location: "0-acme/api/debug.go:12", What: "dumps every secret", Why: "anyone can read them", MustFix: true},
 		// No key of its own: findingKey synthesises one, and that is what has
 		// to cross the wire.
@@ -412,7 +412,7 @@ func TestReviewOpenFindingsIsAbsentInRoundOneAndCarriesTheOpenFindingsAfter(t *t
 		}
 		byKey[f.Key] = f
 	}
-	for key := range stage.openMustFix {
+	for key := range stage.openSentBack {
 		if _, ok := byKey[key]; !ok {
 			t.Errorf("the open finding keyed %q was not sent: %s", key, payload)
 		}
@@ -422,7 +422,7 @@ func TestReviewOpenFindingsIsAbsentInRoundOneAndCarriesTheOpenFindingsAfter(t *t
 		t.Errorf("the open finding was sent as %+v, want its parameter, severity, location and what", got)
 	}
 	// A round after one that left nothing open is sent nothing again.
-	stage.rememberOpenMustFix(nil)
+	stage.rememberOpenSentBack(nil)
 	third, err := stage.reviewSpawnEnv(3)
 	if err != nil {
 		t.Fatalf("reviewSpawnEnv(3): %s", err)
@@ -434,7 +434,7 @@ func TestReviewOpenFindingsIsAbsentInRoundOneAndCarriesTheOpenFindingsAfter(t *t
 
 // The key the runner SENDS has to be the key agentbox echoes back, and agentbox
 // cuts both to 120 runes. A longer key would come back matching nothing in
-// openMustFix and its finding would be held for the rest of the loop however
+// openSentBack and its finding would be held for the rest of the loop however
 // well it was fixed.
 func TestFindingKeyNeverExceedsAgentboxsKeyCap(t *testing.T) {
 	for _, tc := range []struct {
@@ -565,7 +565,7 @@ func heldLoopStage(t *testing.T) *reviewStage {
 func classifyStageAfterRoundOne(open ...reviewFindingOutput) *reviewStage {
 	stage := &reviewStage{participation: participationOn, thresholds: map[uint]uint{1: 4, 2: 4}}
 	stage.recordRound(1, open, agentResult{Turns: 4})
-	stage.rememberOpenMustFix(open)
+	stage.rememberOpenSentBack(open)
 	return stage
 }
 

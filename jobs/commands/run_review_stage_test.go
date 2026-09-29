@@ -559,7 +559,7 @@ func TestDecodeMustFixThresholds(t *testing.T) {
 // nothing — see run_review_stage_held_test.go.
 func TestClassifyMarksFixedStillOpenAndNew(t *testing.T) {
 	stage := &reviewStage{participation: participationOn, thresholds: map[uint]uint{1: 4}}
-	stage.rememberOpenMustFix([]reviewFindingOutput{
+	stage.rememberOpenSentBack([]reviewFindingOutput{
 		{Key: "sec-1", Parameter: "security", Severity: "high", What: "was open", MustFix: true},
 		{Key: "sec-2", Parameter: "security", Severity: "high", What: "also open", MustFix: true},
 	})
@@ -760,8 +760,8 @@ func TestRecordFailedRoundRecordsNotCheckedCoverageForEveryParameter(t *testing.
 			t.Errorf("coverage entry %+v, want not checked with the failure reason", c)
 		}
 	}
-	if len(stage.openMustFix) != 0 {
-		t.Errorf("a failed round opened %d must-fix finding(s)", len(stage.openMustFix))
+	if len(stage.openSentBack) != 0 {
+		t.Errorf("a failed round opened %d must-fix finding(s)", len(stage.openSentBack))
 	}
 }
 
@@ -990,7 +990,7 @@ func TestClassifyMarksFindingsNewOnlyAfterTheFirstRound(t *testing.T) {
 		t.Error("a first-round finding was marked new — everything is new in the first round, so the flag means nothing there")
 	}
 	stage.recordRound(1, first, agentResult{})
-	stage.rememberOpenMustFix(mustFixOnly(first))
+	stage.rememberOpenSentBack(sentBackOnly(first))
 
 	second := stage.classify(agentResult{ReviewResult: &reviewResult{Findings: []reviewFinding{
 		{Key: "sec-1", Parameter: "security", Severity: "high", What: "no session check"},

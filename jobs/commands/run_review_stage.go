@@ -22,8 +22,10 @@ import (
 
 // RunReviewStage sits between RunAgentStep and CommitAndPush. It reviews the
 // diff the implementer just produced against the Task's spec, routes findings
-// at or above the org's must-fix threshold back to the implementer inside this
-// same Job, and records what it found.
+// at or above the org's FIX threshold back to the implementer inside this same
+// Job, and records what it found. Findings at or above the HOLD (must-fix)
+// threshold that are still open when the loop ends hold the pull request; a
+// sent-back finding below it that survives is noted and holds nothing.
 //
 // THE STAGE IS FAIL-OPEN. A review that cannot complete — a round that failed,
 // an agentbox image that predates review mode, a baseline that was never
@@ -163,6 +165,7 @@ func (rs *RunReviewStage) Run(parameters map[string]interface{}, logsWriter io.W
 		logsWriter:      logsWriter,
 		participation:   participation,
 		thresholds:      decodeMustFixThresholds(parameters, logsWriter),
+		fixThresholds:   decodeFixThresholds(parameters, logsWriter),
 		baseCommits:     readBaseCommitsFromJobOutput(parameters),
 		repoDirs:        readRepositoryDirsFromJobOutput(parameters),
 		deadline:        time.Now().Add(reviewStageBudget),
@@ -226,8 +229,16 @@ type reviewStage struct {
 	reviewerFailure string
 	logsWriter      io.Writer
 	participation   int64
-	thresholds      map[uint]uint
-	baseCommits     map[string]string
+	// thresholds are the HOLD thresholds (ReviewMustFixThresholds): a finding
+	// at or above one is must-fix, and one still open at the end holds the
+	// pull request.
+	thresholds map[uint]uint
+	// fixThresholds are the FIX thresholds (ReviewFixThresholds): a finding at
+	// or above one is sent back to the implementer. NIL means the parameter
+	// was absent — a Job from an older control plane — and the fix thresholds
+	// are the hold thresholds, exactly today's behaviour. See fixThresholdsOrHold.
+	fixThresholds map[uint]uint
+	baseCommits   map[string]string
 	// repoDirs is EVERY checked-out repository directory, including one with
 	// no recorded start commit (a new, empty repository). The fix run's undo
 	// copies all of them: a repository missing from the copy would keep a
@@ -252,12 +263,14 @@ type reviewStage struct {
 	// cacheReleased guards releaseCacheVolume, so the volume is removed once
 	// however many times the stage's paths out overlap.
 	cacheReleased bool
-	// openMustFix carries the previous round's must-fix findings, keyed by
-	// finding key, so the next round can be classified as fixed / still open
-	// / new rather than as an undifferentiated list.
-	openMustFix map[string]reviewFindingOutput
-	// seen carries EVERY finding key any earlier round reported, must-fix or
-	// not. openMustFix answers "was this one routed back"; this answers "have
+	// openSentBack carries the previous round's SENT-BACK findings — must-fix
+	// or not — keyed by finding key, so the next round can be classified as
+	// fixed / still open / new rather than as an undifferentiated list. Each
+	// entry keeps the class the round that opened it gave it: MustFix is what
+	// decides whether it holds the pull request.
+	openSentBack map[string]reviewFindingOutput
+	// seen carries EVERY finding key any earlier round reported, sent back or
+	// not. openSentBack answers "was this one routed back"; this answers "have
 	// we seen this at all", which is what makes a finding NEW.
 	seen map[string]bool
 	// fixError is why a fix run did not finish, or "". Set only on the path
@@ -345,7 +358,7 @@ func (s *reviewStage) run() (map[string]interface{}, error) {
 	if s.participation == participationAdvisory {
 		io.WriteString(s.logsWriter, "Review stage: participation is advisory — every finding will be annotated on the pull request, nothing is routed back to the agent, and nothing holds the pull request\n")
 	}
-	s.openMustFix = map[string]reviewFindingOutput{}
+	s.openSentBack = map[string]reviewFindingOutput{}
 	round := 1
 	mustFixRounds := 0
 	for {
@@ -373,14 +386,14 @@ func (s *reviewStage) run() (map[string]interface{}, error) {
 		io.WriteString(s.logsWriter, fmt.Sprintf("Review round %d completed: %d finding(s), %d agent turn(s) reported (cap: %s model responses)\n", round, len(findings), result.Turns, s.lastTurnCap))
 		// Nothing to route back — including every advisory review, whose
 		// findings are annotations by definition (see classify).
-		mustFix := mustFixOnly(findings)
-		if len(mustFix) == 0 {
-			s.rememberOpenMustFix(nil)
+		sentBack := sentBackOnly(findings)
+		if len(sentBack) == 0 {
+			s.rememberOpenSentBack(nil)
 			break
 		}
-		s.rememberOpenMustFix(mustFix)
+		s.rememberOpenSentBack(sentBack)
 		if mustFixRounds >= maxMustFixRounds {
-			io.WriteString(s.logsWriter, fmt.Sprintf("Review stage: %d must-fix finding(s) still open after %d fix round(s) — handing the evidence to a human on the pull request\n", len(mustFix), mustFixRounds))
+			io.WriteString(s.logsWriter, fmt.Sprintf("Review stage: %d sent-back finding(s) still open after %d fix round(s) — handing the evidence to a human on the pull request\n", len(sentBack), mustFixRounds))
 			break
 		}
 		if !s.canAfford(mustFixRunTimeout + reviewRunTimeout) {
@@ -388,7 +401,7 @@ func (s *reviewStage) run() (map[string]interface{}, error) {
 			break
 		}
 		s.reportStage(tasks.StageImplement)
-		ran, err := s.attemptFix(round, mustFix)
+		ran, err := s.attemptFix(round, sentBack)
 		if err != nil {
 			// A user stop, or a restore that did not work. Nothing else here
 			// fails the Step.
@@ -506,7 +519,7 @@ func (s *reviewStage) attemptFix(round int, mustFix []reviewFindingOutput) (bool
 		return false, fmt.Errorf("error restoring the change after fix round %d failed (%s): %s", round, fixErr, err)
 	}
 	s.fixError = fixErr.Error()
-	io.WriteString(s.logsWriter, fmt.Sprintf("Review stage: the change is back to exactly what it was before fix round %d — %d must-fix finding(s) go to a human on the pull request\n", round, len(mustFix)))
+	io.WriteString(s.logsWriter, fmt.Sprintf("Review stage: the change is back to exactly what it was before fix round %d — %d sent-back finding(s) go to a human on the pull request\n", round, len(mustFix)))
 	return false, nil
 }
 
@@ -524,7 +537,7 @@ func (s *reviewStage) finish() (map[string]interface{}, error) {
 		Participation:   participationName(s.participation),
 		Rounds:          s.rounds,
 		FixedInLoop:     s.fixedInLoop,
-		MustFixOpen:     len(s.openMustFix) > 0,
+		MustFixOpen:     s.mustFixOpen(),
 		FixError:        s.fixError,
 		FixNotAttempted: s.fixNotAttempted,
 		StoppedNoChange: s.stoppedNoChange,
@@ -538,16 +551,23 @@ func (s *reviewStage) finish() (map[string]interface{}, error) {
 }
 
 // classify turns one round's raw findings into the Step's record: each finding
-// marked must-fix or not, and the previous round's open must-fix findings
-// settled against the reviewer's own status for each of them.
+// marked sent back or not and must-fix or not, and the previous round's open
+// sent-back findings settled against the reviewer's own status for each of
+// them.
+//
+// TWO THRESHOLDS, TWO QUESTIONS. SentBack — at or above the parameter's FIX
+// threshold — routes the finding back to the implementer for a fix round.
+// MustFix — at or above the HOLD threshold (isMustFix) — makes it hold the
+// pull request if it is still open when the loop ends. A must-fix finding is
+// always sent back too.
 //
 // WHAT DECIDES "FIXED" IS THE REVIEWER'S ANSWER, NOT A MISSING KEY. A round
 // that was sent the previous round's open must-fix findings (see
-// openMustFixEnvValue) answers with review_result.previous: one entry per key
+// openSentBackEnvValue) answers with review_result.previous: one entry per key
 // it was given, resolved or still_present. A finding is fixed in loop only when
 // its entry says resolved AND this round did not report that key again.
-// Everything else is HELD — still must-fix, carried into the next round, and
-// rendered as still present.
+// Everything else is HELD — still sent back, carried into the next round, and
+// rendered as still present, in the class the round that opened it gave it.
 //
 // Key matching alone used to make that decision, and the key is the reviewer's
 // own free-text slug: a reworded key made an unfixed problem look fixed and its
@@ -597,6 +617,9 @@ func (s *reviewStage) classify(result agentResult) []reviewFindingOutput {
 			// blocked when nothing is blocking it.
 			MustFix: s.participation == participationOn && s.isMustFix(f),
 		}
+		// Must-fix implies sent back: nothing may hold the pull request that
+		// was never given a fix round.
+		out.SentBack = out.MustFix || (s.participation == participationOn && s.isSentBack(f))
 		key := findingKey(out)
 		// Nothing is "new" in the first round — everything is. The flag only
 		// means something once there is a round to be new since.
@@ -609,13 +632,13 @@ func (s *reviewStage) classify(result agentResult) []reviewFindingOutput {
 	for key := range indexByKey {
 		s.seen[key] = true
 	}
-	// An empty openMustFix is exactly "this round was sent no open findings":
+	// An empty openSentBack is exactly "this round was sent no open findings":
 	// round 1 starts with the map empty, and a round that left nothing open
 	// empties it again. Nothing to resolve, nothing to hold.
-	if len(s.openMustFix) == 0 {
+	if len(s.openSentBack) == 0 {
 		return findings
 	}
-	return s.settleOpenMustFix(findings, indexByKey, result.ReviewResult.Previous)
+	return s.settleOpenSentBack(findings, indexByKey, result.ReviewResult.Previous)
 }
 
 // reviewStatusResolved is the one status that clears an open must-fix finding.
@@ -627,26 +650,26 @@ const reviewStatusResolved = "resolved"
 // note is recorded: a note that came with "resolved" describes the fix.
 const reviewStatusStillPresent = "still_present"
 
-// settleOpenMustFix records each open must-fix finding as fixed in loop or
+// settleOpenSentBack records each open sent-back finding as fixed in loop or
 // held, from the statuses the round returned. Held findings go into the round's
 // own finding list, which is what routes them back to the implementer and, at
 // the loop's bounds, onto a draft pull request.
-func (s *reviewStage) settleOpenMustFix(findings []reviewFindingOutput, indexByKey map[string]int, previous []reviewPreviousFinding) []reviewFindingOutput {
+func (s *reviewStage) settleOpenSentBack(findings []reviewFindingOutput, indexByKey map[string]int, previous []reviewPreviousFinding) []reviewFindingOutput {
 	statuses := make(map[string]reviewPreviousFinding, len(previous))
 	for _, p := range previous {
 		if key := strings.TrimSpace(p.Key); key != "" {
 			statuses[key] = p
 		}
 	}
-	for _, key := range sortedFindingKeys(s.openMustFix) {
-		open := s.openMustFix[key]
+	for _, key := range sortedFindingKeys(s.openSentBack) {
+		open := s.openSentBack[key]
 		status := statuses[key]
 		i, reReported := indexByKey[key]
 		// Re-reported under the same key is the reviewer contradicting its own
 		// status line, and the finding is the stronger evidence of the two.
 		if !reReported && strings.EqualFold(strings.TrimSpace(status.Status), reviewStatusResolved) {
 			// Held is cleared on the way in. A finding an EARLIER round held was
-			// stored back into openMustFix still marked held, and carrying that
+			// stored back into openSentBack still marked held, and carrying that
 			// flag into FixedInLoop would render it under "Fixed during review"
 			// with "still present after a fix round" underneath it — the two
 			// statements this change exists to keep apart, in one entry.
@@ -657,16 +680,18 @@ func (s *reviewStage) settleOpenMustFix(findings []reviewFindingOutput, indexByK
 		}
 		if reReported {
 			// Marked in place rather than copied: one problem the reader sees
-			// once and the implementer is sent once. Must-fix whatever severity
-			// it was re-reported at — the severity that gated it is the one the
-			// round that opened it assigned, and a reviewer downgrading its own
-			// report does not release it.
+			// once and the implementer is sent once. It keeps the CLASS the
+			// round that opened it assigned, whatever severity it was
+			// re-reported at: a reviewer downgrading a must-fix Medium to Low
+			// does not release it, and a sent-back Low re-reported higher never
+			// starts holding the pull request.
 			//
 			// A re-report under a DIFFERENT key is not this case and is left
 			// alone: it stands as its own finding beside the held one, because
 			// merging two reports that may or may not be one problem is a
 			// guess, and the loop already has one bug from guessing.
-			findings[i].MustFix = true
+			findings[i].SentBack = true
+			findings[i].MustFix = open.MustFix
 			findings[i].Held = true
 			findings[i].StillPresentNote = stillPresentNote(status)
 			continue
@@ -674,7 +699,7 @@ func (s *reviewStage) settleOpenMustFix(findings []reviewFindingOutput, indexByK
 		// Not mentioned at all: carried as the round that opened it reported
 		// it, and NOT new — it has been on the record since that round.
 		held := open
-		held.MustFix = true
+		held.SentBack = true
 		held.Held = true
 		held.New = false
 		held.StillPresentNote = stillPresentNote(status)
@@ -695,7 +720,7 @@ func stillPresentNote(status reviewPreviousFinding) string {
 	return strings.TrimSpace(status.Note)
 }
 
-// sortedFindingKeys orders the open must-fix findings' keys, so a held finding
+// sortedFindingKeys orders the open sent-back findings' keys, so a held finding
 // lands in the same place in the record on every run.
 func sortedFindingKeys(open map[string]reviewFindingOutput) []string {
 	keys := make([]string, 0, len(open))
@@ -719,6 +744,29 @@ func sortedFindingKeys(open map[string]reviewFindingOutput) []string {
 // Critical. That is the annotate-only case, and it is deliberately not the
 // same as "Info and above".
 func (s *reviewStage) isMustFix(f reviewFinding) bool {
+	return meetsThreshold(f, s.thresholds)
+}
+
+// isSentBack is the FIX gate: the same comparison as isMustFix, against the
+// fix thresholds.
+func (s *reviewStage) isSentBack(f reviewFinding) bool {
+	return meetsThreshold(f, s.fixThresholdsOrHold())
+}
+
+// fixThresholdsOrHold is the fix thresholds, or the hold thresholds when the
+// Job carries none — which makes a Job from an older control plane send back
+// exactly what it holds, as before the split.
+func (s *reviewStage) fixThresholdsOrHold() map[uint]uint {
+	if s.fixThresholds == nil {
+		return s.thresholds
+	}
+	return s.fixThresholds
+}
+
+// meetsThreshold maps a finding's parameter and severity through
+// deployment-runner-kit's wire mirror and compares them with one set of
+// thresholds. Unparseable findings and absent or zero thresholds never meet it.
+func meetsThreshold(f reviewFinding, thresholds map[uint]uint) bool {
 	parameter, ok := tasks.ReviewParameterValue(f.Parameter)
 	if !ok {
 		return false
@@ -727,18 +775,30 @@ func (s *reviewStage) isMustFix(f reviewFinding) bool {
 	if !ok {
 		return false
 	}
-	threshold, ok := s.thresholds[parameter]
+	threshold, ok := thresholds[parameter]
 	if !ok || threshold == 0 {
 		return false
 	}
 	return severity >= threshold
 }
 
-func (s *reviewStage) rememberOpenMustFix(findings []reviewFindingOutput) {
-	s.openMustFix = map[string]reviewFindingOutput{}
+func (s *reviewStage) rememberOpenSentBack(findings []reviewFindingOutput) {
+	s.openSentBack = map[string]reviewFindingOutput{}
 	for _, f := range findings {
-		s.openMustFix[findingKey(f)] = f
+		s.openSentBack[findingKey(f)] = f
 	}
+}
+
+// mustFixOpen is MustFixOpen: whether any finding still open at the end is
+// at or above the HOLD threshold. A sent-back finding below it that survived
+// the loop is noted on the pull request and holds nothing.
+func (s *reviewStage) mustFixOpen() bool {
+	for _, f := range s.openSentBack {
+		if f.MustFix {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *reviewStage) recordRound(round int, findings []reviewFindingOutput, result agentResult) {
@@ -781,8 +841,8 @@ func (s *reviewStage) recordFailedRound(round int, reason string, result agentRe
 	})
 	// A round that did not complete asserts nothing. Anything a previous
 	// round left open stays open only if a previous round said so; a failed
-	// round never opens a must-fix finding of its own.
-	s.rememberOpenMustFix(nil)
+	// round never opens a sent-back finding of its own.
+	s.rememberOpenSentBack(nil)
 }
 
 // reviewerView is the parameter view a REVIEW round runs under: the reviewer's
@@ -921,13 +981,24 @@ func (s *reviewStage) logFullReview(out *reviewOutput) {
 // reviewer's own verdict on a finding it was asked about, which is a different
 // and stronger statement than "still open" — that only ever meant the key
 // turned up again — and it must never read as new.
+//
+// A finding sent back for a fix round that does not hold the pull request is
+// marked SENT BACK rather than MUST FIX, so the log says which findings can
+// make the pull request a draft.
 func findingLogMarker(f reviewFindingOutput, round int) string {
-	if f.Held {
-		return "MUST FIX, still present"
-	}
 	marker := "annotated"
-	if f.MustFix {
+	switch {
+	case f.MustFix:
 		marker = "MUST FIX"
+	case f.SentBack:
+		marker = "SENT BACK"
+	}
+	if f.Held {
+		if !f.SentBack {
+			// A record from before the split: held always meant must-fix.
+			marker = "MUST FIX"
+		}
+		return marker + ", still present"
 	}
 	switch {
 	case f.New:
@@ -1080,10 +1151,12 @@ func reviewCoverageDtos(in []reviewCoverageOutput) []tasks.ReviewCoverageDtoV1 {
 	return out
 }
 
-func mustFixOnly(findings []reviewFindingOutput) []reviewFindingOutput {
+// sentBackOnly is the findings routed back to the implementer: every finding
+// at or above its fix threshold, must-fix or not.
+func sentBackOnly(findings []reviewFindingOutput) []reviewFindingOutput {
 	var out []reviewFindingOutput
 	for _, f := range findings {
-		if f.MustFix {
+		if f.SentBack || f.MustFix {
 			out = append(out, f)
 		}
 	}
@@ -1096,7 +1169,7 @@ func mustFixOnly(findings []reviewFindingOutput) []reviewFindingOutput {
 //
 // findingKey never exceeds it, so THE KEY THE RUNNER SENDS IS THE KEY IT IS
 // ANSWERED ABOUT. A longer key would come back cut, match nothing in
-// openMustFix, and the finding under it would be held for the rest of the loop
+// openSentBack, and the finding under it would be held for the rest of the loop
 // however thoroughly it was fixed.
 const reviewFindingKeyMaxRunes = 120
 
@@ -1190,6 +1263,35 @@ func decodeMustFixThresholds(parameters map[string]interface{}, logsWriter io.Wr
 		io.WriteString(logsWriter, fmt.Sprintf("warning: could not read the review must-fix thresholds (%s) — every finding will be annotated\n", err))
 		return out
 	}
+	for key, severity := range decoded {
+		parameter, err := strconv.Atoi(key)
+		if err != nil || parameter <= 0 {
+			continue
+		}
+		out[uint(parameter)] = severity
+	}
+	return out
+}
+
+// decodeFixThresholds reads the resolved FIX policy, in the same shape as
+// decodeMustFixThresholds, e.g. {"1":2,"2":2}.
+//
+// NIL means "no fix thresholds on this Job": the parameter is absent (a Job
+// created by an older control plane) or unreadable. The stage then sends back
+// exactly what it holds (see fixThresholdsOrHold), which is today's behaviour
+// — never more than the org asked to hold on, never less. A present, readable
+// empty object is NOT nil: it sends nothing back beyond what must be fixed.
+func decodeFixThresholds(parameters map[string]interface{}, logsWriter io.Writer) map[uint]uint {
+	raw, err := jobs.GetParameterValue[string](parameters, parameters_enums.ReviewFixThresholds)
+	if err != nil || strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	decoded := map[string]uint{}
+	if err := json.Unmarshal([]byte(raw), &decoded); err != nil {
+		io.WriteString(logsWriter, fmt.Sprintf("warning: could not read the review fix thresholds (%s) — findings are sent back at the must-fix thresholds\n", err))
+		return nil
+	}
+	out := map[uint]uint{}
 	for key, severity := range decoded {
 		parameter, err := strconv.Atoi(key)
 		if err != nil || parameter <= 0 {

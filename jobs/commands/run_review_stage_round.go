@@ -151,7 +151,7 @@ func (s *reviewStage) reviewSpawnEnv(round int) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("error encoding the review base commits: %s", err)
 	}
-	openFindings, err := s.openMustFixEnvValue(round)
+	openFindings, err := s.openSentBackEnvValue(round)
 	if err != nil {
 		return nil, err
 	}
@@ -227,12 +227,12 @@ type reviewVerifyStep struct {
 	Passed  bool   `json:"passed"`
 }
 
-// reviewOpenFinding is one open must-fix finding as REVIEW_OPEN_FINDINGS
+// reviewOpenFinding is one open sent-back finding as REVIEW_OPEN_FINDINGS
 // carries it: what the reviewer needs to go and look at the same problem again,
 // and nothing else. No why, no must-fix marking — the runner is asking whether
 // the problem is still there, not re-arguing that it matters.
 type reviewOpenFinding struct {
-	// Key is THE MAP KEY from openMustFix — findingKey's answer, never the raw
+	// Key is THE MAP KEY from openSentBack — findingKey's answer, never the raw
 	// Key field, which is empty whenever the reviewer supplied no key of its
 	// own. agentbox drops an entry with no key, and a dropped entry comes back
 	// with no status, which would hold a finding the reviewer may well have
@@ -244,20 +244,20 @@ type reviewOpenFinding struct {
 	What      string `json:"what,omitempty"`
 }
 
-// openMustFixEnvValue is the REVIEW_OPEN_FINDINGS payload for this round: the
-// previous round's open must-fix findings, so the round can answer for each of
+// openSentBackEnvValue is the REVIEW_OPEN_FINDINGS payload for this round: the
+// previous round's open sent-back findings (must-fix or not), so the round can answer for each of
 // them by key instead of the runner inferring an answer from which keys it
 // happened to report.
 //
 // Empty for round 1, which has no previous round, and for any round after one
 // that left nothing open. Both send no variable at all.
-func (s *reviewStage) openMustFixEnvValue(round int) (string, error) {
-	if round < 2 || len(s.openMustFix) == 0 {
+func (s *reviewStage) openSentBackEnvValue(round int) (string, error) {
+	if round < 2 || len(s.openSentBack) == 0 {
 		return "", nil
 	}
-	out := make([]reviewOpenFinding, 0, len(s.openMustFix))
-	for _, key := range sortedFindingKeys(s.openMustFix) {
-		f := s.openMustFix[key]
+	out := make([]reviewOpenFinding, 0, len(s.openSentBack))
+	for _, key := range sortedFindingKeys(s.openSentBack) {
+		f := s.openSentBack[key]
 		out = append(out, reviewOpenFinding{
 			Key:       key,
 			Parameter: f.Parameter,
@@ -268,7 +268,7 @@ func (s *reviewStage) openMustFixEnvValue(round int) (string, error) {
 	}
 	encoded, err := json.Marshal(out)
 	if err != nil {
-		return "", fmt.Errorf("error encoding the review's open must-fix findings: %s", err)
+		return "", fmt.Errorf("error encoding the review's open sent-back findings: %s", err)
 	}
 	return string(encoded), nil
 }
@@ -363,7 +363,7 @@ type reviewEnvInputs struct {
 	baseCommits string
 	round       int
 	// openFindings is the JSON REVIEW_OPEN_FINDINGS payload, or "" for a round
-	// that is sent none — see openMustFixEnvValue.
+	// that is sent none — see openSentBackEnvValue.
 	openFindings string
 	// verifyResult is the JSON REVIEW_VERIFY_RESULT payload, or "" when the
 	// Step has no verify result to send — see verifyResultEnvValue.
@@ -595,13 +595,14 @@ func (s *reviewOutputSwap) restore(logsWriter io.Writer) {
 	}
 }
 
-// runMustFixRound routes the open must-fix findings back to the implementer as
-// an ORDINARY batch agentbox run — same image, same mode, same verify gate as
-// any other implement run.
+// runMustFixRound routes the open sent-back findings back to the implementer
+// as an ORDINARY batch agentbox run — same image, same mode, same verify gate
+// as any other implement run.
 //
 // Its prompt is the Step's original prompt plus a labelled block listing only
-// the must-fix findings. Never the reviewer's transcript, and never a
-// below-threshold finding: the implementer is being asked to fix named
+// the sent-back findings — those at or above the fix threshold, whether or not
+// they would hold the pull request. Never the reviewer's transcript, and never
+// a finding below the fix threshold: the implementer is being asked to fix named
 // problems, and padding that with everything the reviewer noticed turns a
 // bounded fix into a second open-ended Step.
 func (s *reviewStage) runMustFixRound(mustFix []reviewFindingOutput) error {
@@ -754,7 +755,8 @@ func applyMustFixEnv(env []string, prompt string) []string {
 }
 
 // buildMustFixPrompt folds the Step's original prompt together with the
-// findings that must be fixed and the pull request description so far.
+// sent-back findings — every one at or above its fix threshold, whatever its
+// severity — and the pull request description so far.
 //
 // The original prompt comes FIRST and in full: the implementer needs to know
 // what it was building before it is told what is wrong with it, or it will fix
