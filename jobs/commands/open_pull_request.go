@@ -104,6 +104,23 @@ type taskOpenPR struct {
 	// created before the stage existed — in which case the PR body carries no
 	// Review section and looks exactly as it did before.
 	review *reviewOutput
+	// pullRequests is the deployment-server RPC surface this command uses.
+	// Nil means the runner client; tests substitute a stub.
+	pullRequests pullRequestRPC
+}
+
+// pullRequestRPC is the part of the runner client that opens pull requests and
+// posts review comments on them.
+type pullRequestRPC interface {
+	OpenPullRequest(organizationID string, args oauth.OpenPullRequestArgsV1) (oauth.OpenPullRequestDtoV1, error)
+	PostPullRequestReview(organizationID string, args oauth.PostPullRequestReviewArgsV1) (oauth.PostPullRequestReviewDtoV1, error)
+}
+
+func (opr *taskOpenPR) rpc() pullRequestRPC {
+	if opr.pullRequests != nil {
+		return opr.pullRequests
+	}
+	return client.Get()
 }
 
 // openAll iterates the Job's repositories. Skips repos where
@@ -155,7 +172,7 @@ func (opr *taskOpenPR) openOne(idx int, entry tasks.RepositoryEntry) (repoOutput
 	if needsFixes {
 		title = prefixNeedsFixes(title)
 	}
-	dto, err := client.Get().OpenPullRequest(opr.ctx.OrganizationID, oauth.OpenPullRequestArgsV1{
+	dto, err := opr.rpc().OpenPullRequest(opr.ctx.OrganizationID, oauth.OpenPullRequestArgsV1{
 		InstallationID: entry.InstallationID,
 		RepoName:       entry.Name,
 		BaseBranch:     entry.BaseBranch,
@@ -168,6 +185,9 @@ func (opr *taskOpenPR) openOne(idx int, entry tasks.RepositoryEntry) (repoOutput
 		return repoOutput{}, err
 	}
 	io.WriteString(opr.logsWriter, fmt.Sprintf("Opened PR #%d for repo %s: %s\n", dto.Number, entry.Name, dto.URL))
+	// Never fails the Step: the pull request exists and its description
+	// carries every finding; the inline comments are a view onto it.
+	opr.postReviewComments(idx, entry, dto.Number)
 	return repoOutput{
 		Index:      idx,
 		Name:       entry.Name,

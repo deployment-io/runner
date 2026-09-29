@@ -89,3 +89,24 @@ func (r *RunnerClient) OpenPullRequest(organizationID string, args oauth.OpenPul
 	}
 	return dto, nil
 }
+
+// PostPullRequestReview asks the deployment-server to post the Review stage's
+// open findings as ONE non-blocking review with inline comments on a pull
+// request. The server drops comments that are not on the diff and reports
+// Unsupported for a provider that cannot post inline reviews.
+//
+// The caller treats any error — including an older deployment-server without
+// the method — as "not posted" and carries on: the findings are in the pull
+// request's description regardless.
+func (r *RunnerClient) PostPullRequestReview(organizationID string, args oauth.PostPullRequestReviewArgsV1) (oauth.PostPullRequestReviewDtoV1, error) {
+	var dto oauth.PostPullRequestReviewDtoV1
+	if !r.isConnected {
+		return dto, ErrConnection
+	}
+	args.OrganizationID = r.GetComputedOrganizationID(organizationID)
+	args.Token = r.token
+	if err := r.c.Call("Oauth.PostPullRequestReviewV1", args, &dto); err != nil {
+		return dto, err
+	}
+	return dto, nil
+}
