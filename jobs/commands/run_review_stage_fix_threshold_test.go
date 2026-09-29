@@ -188,8 +188,8 @@ func TestALowStillOpenAfterTheBoundsIsNotedAndHoldsNothing(t *testing.T) {
 		t.Error("a surviving Low made the pull request a draft")
 	}
 	section := opener.reviewSection()
-	if !strings.Contains(section, "_Noted after a fix attempt_") {
-		t.Errorf("the surviving Low is not under Noted after a fix attempt:\n%s", section)
+	if !strings.Contains(section, "_"+stillOpenBelowHoldHeading+"_") {
+		t.Errorf("the surviving Low is not under the still-open-below-hold group:\n%s", section)
 	}
 	if strings.Contains(section, mustFixHeading(false)) || strings.Contains(section, "They need a human") {
 		t.Errorf("the section says the Low must be fixed:\n%s", section)
@@ -210,9 +210,9 @@ func TestAMediumStillOpenHoldsThePullRequest(t *testing.T) {
 	}
 	section := (&taskOpenPR{review: review}).reviewSection()
 	mustFixAt := strings.Index(section, mustFixHeading(false))
-	notedAt := strings.Index(section, "_Noted after a fix attempt_")
+	notedAt := strings.Index(section, "_"+stillOpenBelowHoldHeading+"_")
 	if mustFixAt < 0 || notedAt < 0 || mustFixAt > notedAt {
-		t.Errorf("want the Medium under the must-fix heading and the Low under Noted after a fix attempt:\n%s", section)
+		t.Errorf("want the Medium under the must-fix heading and the Low under the still-open-below-hold group:\n%s", section)
 	}
 }
 
@@ -267,10 +267,10 @@ func TestANoChangeStopWithOnlyLowsOpenIsNotADraft(t *testing.T) {
 		t.Error("a no-change stop with only a Low open made the pull request a draft")
 	}
 	section := (&taskOpenPR{review: review}).reviewSection()
-	notedAt := strings.Index(section, "_Noted after a fix attempt_")
+	notedAt := strings.Index(section, "_"+stillOpenBelowHoldHeading+"_")
 	lineAt := strings.Index(section, "_The last fix round changed nothing; the description says why._")
 	if notedAt < 0 || lineAt < notedAt {
-		t.Errorf("the no-change line is not under Noted after a fix attempt:\n%s", section)
+		t.Errorf("the no-change line is not under the still-open-below-hold group:\n%s", section)
 	}
 	if strings.Contains(section, "They need a human") {
 		t.Errorf("the closing must-fix line was written with nothing holding:\n%s", section)
@@ -289,7 +289,7 @@ func TestANoChangeStopWithAMediumOpenKeepsItsLineUnderMustFix(t *testing.T) {
 	}
 	section := (&taskOpenPR{review: review}).reviewSection()
 	lineAt := strings.Index(section, "_The last fix round changed nothing")
-	notedAt := strings.Index(section, "_Noted after a fix attempt_")
+	notedAt := strings.Index(section, "_"+stillOpenBelowHoldHeading+"_")
 	if lineAt < 0 || notedAt < 0 || lineAt > notedAt {
 		t.Errorf("the no-change line is not under the must-fix heading:\n%s", section)
 	}

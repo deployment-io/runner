@@ -100,13 +100,13 @@ func (opr *taskOpenPR) reviewSection() string {
 	fixError := strings.TrimSpace(opr.review.FixError)
 	// The line about how the last fix attempt ended goes under the group that
 	// holds the findings that attempt was sent: the must-fix heading when any
-	// of them holds the pull request, "Noted after a fix attempt" otherwise.
+	// of them holds the pull request, stillOpenBelowHoldHeading otherwise.
 	outcome := fixOutcomeLine(opr.review, fixError)
 	writeFindingGroup(&sb, mustFixHeading(failed != nil), stillOpen, budget)
 	if len(stillOpen) > 0 {
 		sb.WriteString(outcome)
 	}
-	writeFindingGroup(&sb, "Noted after a fix attempt", notedAfterFix, budget)
+	writeFindingGroup(&sb, stillOpenBelowHoldHeading, notedAfterFix, budget)
 	if len(stillOpen) == 0 {
 		sb.WriteString(outcome)
 	}
@@ -126,6 +126,15 @@ func (opr *taskOpenPR) reviewSection() string {
 	sb.WriteString("\n" + coverageLine(latest.Coverage))
 	return boundSection(sb.String())
 }
+
+// stillOpenBelowHoldHeading heads the findings that qualified to be sent back
+// but sit below the hold threshold and are still open. It says only what is
+// true of every one of them. Some went through a fix round and survived it
+// (those carry "Still present after a fix round" themselves); others were
+// first reported in the last round, after the fix rounds or the stage budget
+// ran out, and never had a fix attempt. "Noted after a fix attempt" was false
+// for the second kind.
+const stillOpenBelowHoldHeading = "Still open (does not hold this pull request)"
 
 // fixOutcomeLine says how the last fix attempt ended, when that is not simply
 // "it ran and the review looked again", or "".
