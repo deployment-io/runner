@@ -620,6 +620,11 @@ type reviewOutput struct {
 	// said why in the description. A further review round would only report the
 	// same findings again, so the loop handed them to a human instead.
 	StoppedNoChange bool `json:"stopped_no_change,omitempty"`
+	// FinalTreeReviewed is true when the latest completed review round
+	// reviewed the tree being committed: no fix run's work was kept after it.
+	// Only then do its findings' locations describe the code on the branch,
+	// so only then are they posted as inline comments on the pull request.
+	FinalTreeReviewed bool `json:"final_tree_reviewed,omitempty"`
 }
 
 type agentOutput struct {

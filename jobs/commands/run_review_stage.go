@@ -285,6 +285,12 @@ type reviewStage struct {
 	// its summary says why it left the findings alone. Recorded so the pull
 	// request can say that rather than leaving the findings looking untouched.
 	stoppedNoChange bool
+	// finalTreeReviewed tracks whether the latest completed review round
+	// reviewed the tree as it now stands. ONE RULE, not a list of exits: set
+	// when a review round completes, cleared when a fix run's work is kept; a
+	// rolled-back fix or a no-change stop leaves it alone. Whatever it holds
+	// when the loop ends is the answer — see reviewOutput.FinalTreeReviewed.
+	finalTreeReviewed bool
 
 	// The two container runs, the two halves of the fix run's undo and the
 	// cache volume's removal, all injectable so the loop's own decisions can be
@@ -383,6 +389,7 @@ func (s *reviewStage) run() (map[string]interface{}, error) {
 		}
 		findings := s.classify(result)
 		s.recordRound(round, findings, result)
+		s.finalTreeReviewed = true
 		io.WriteString(s.logsWriter, fmt.Sprintf("Review round %d completed: %d finding(s), %d agent turn(s) reported (cap: %s model responses)\n", round, len(findings), result.Turns, s.lastTurnCap))
 		// Nothing to route back — including every advisory review, whose
 		// findings are annotations by definition (see classify).
@@ -412,6 +419,9 @@ func (s *reviewStage) run() (map[string]interface{}, error) {
 			// round opened are still open and go to a human.
 			break
 		}
+		// The fix's work is kept: the tree is no longer the one the last
+		// completed round reviewed, until another round completes.
+		s.finalTreeReviewed = false
 		mustFixRounds++
 		round++
 	}
@@ -534,13 +544,14 @@ func (s *reviewStage) canAfford(d time.Duration) bool {
 // plane, and returns. Always nil error — see run.
 func (s *reviewStage) finish() (map[string]interface{}, error) {
 	out := &reviewOutput{
-		Participation:   participationName(s.participation),
-		Rounds:          s.rounds,
-		FixedInLoop:     s.fixedInLoop,
-		MustFixOpen:     s.mustFixOpen(),
-		FixError:        s.fixError,
-		FixNotAttempted: s.fixNotAttempted,
-		StoppedNoChange: s.stoppedNoChange,
+		Participation:     participationName(s.participation),
+		Rounds:            s.rounds,
+		FixedInLoop:       s.fixedInLoop,
+		MustFixOpen:       s.mustFixOpen(),
+		FixError:          s.fixError,
+		FixNotAttempted:   s.fixNotAttempted,
+		StoppedNoChange:   s.stoppedNoChange,
+		FinalTreeReviewed: s.finalTreeReviewed,
 	}
 	s.logFullReview(out)
 	if err := mergeReviewIntoJobOutput(s.parameters, out); err != nil {
