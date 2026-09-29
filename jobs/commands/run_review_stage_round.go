@@ -644,7 +644,15 @@ func (s *reviewStage) runMustFixRound(mustFix []reviewFindingOutput) error {
 		return err
 	}
 
-	io.WriteString(s.logsWriter, fmt.Sprintf("Routing %d must-fix finding(s) back to the implementer\n", len(mustFix)))
+	// Every finding here was sent back; only the MustFix ones hold the pull
+	// request if they survive the loop, so the count says which is which.
+	holding := 0
+	for _, f := range mustFix {
+		if f.MustFix {
+			holding++
+		}
+	}
+	io.WriteString(s.logsWriter, fmt.Sprintf("Routing %d finding(s) back to the implementer (%d must-fix)\n", len(mustFix), holding))
 	impl := &RunAgentStep{stopSignal: s.stopSignal, progressSink: s.progressSink}
 	result, err := impl.spawnAgentboxAndWait(agentboxSpawnSpec{
 		imageRef:      imageRef,
