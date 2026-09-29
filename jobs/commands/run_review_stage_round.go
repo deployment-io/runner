@@ -351,11 +351,16 @@ func parameterKeyString(k parameters_enums.Key) string {
 	return key
 }
 
-// reviewPasses is the pass set this release runs, matching the two parameters
-// the platform default policy gates on. A pass with no gate would be a report
-// nobody acts on; a gate with no pass would be a threshold on evidence nothing
-// generates.
-const reviewPasses = "security,correctness"
+// reviewPasses is the pass set this release asks agentbox to run.
+//
+// security and correctness are the two parameters the platform default policy
+// sends back and holds on. spec ("spec conformance": does the change do what
+// the Task's spec asks) has no default threshold, so its findings are notes on
+// the pull request until an org sets one: a person reads them, nothing is sent
+// back. agentbox runs it on documentation- and lockfile-only changes too, and
+// skips it when the Task has no spec. An agentbox image older than 1.9.25 does
+// not know the pass and ignores the name, so the order of release is safe.
+const reviewPasses = "security,correctness,spec"
 
 type reviewEnvInputs struct {
 	spec        string
