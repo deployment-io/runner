@@ -13,6 +13,8 @@ import (
 	"time"
 
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
+	"github.com/go-git/go-billy/v5/osfs"
+	"github.com/go-git/go-git/v5/plumbing/format/gitignore"
 )
 
 // THE FIX RUN'S UNDO.
@@ -161,6 +163,17 @@ func (snap *fixRoundSnapshot) remove() {
 // else — the next round would review the same working tree — so a commit with no
 // file change is still no change.
 //
+// SO IS EVERYTHING GIT IGNORES, with git's own semantics (gitSemanticsPatterns,
+// the same set commit-and-push stages by). A fix run that builds and tests
+// rewrites caches inside the repository — vitest's results under
+// node_modules/.vite, a tsbuildinfo, a target/ directory — and none of that can
+// reach the pull request. Counting it made a fix run that changed no code look
+// like one that did: in a live Task the no-change stop never fired and the loop
+// spent two more fix runs and review rounds on findings the fixer had declined.
+// "Changed" here means "changed something that would be committed". Each tree
+// is judged by its own ignore files, and an edit to a .gitignore is itself a
+// change.
+//
 // EVERYTHING ELSE IS COMPARED BYTE FOR BYTE: the file set, each file's contents,
 // modes (permissions plus setuid, setgid and sticky) and each symlink's target.
 // Cheap relative to the copy that already happened, and the only comparison that
@@ -196,13 +209,14 @@ type treeEntry struct {
 	link string
 }
 
-// sameTree reports whether two trees are identical, .git excluded.
+// sameTree reports whether two trees are identical in everything git would
+// commit: .git and ignored paths excluded.
 func sameTree(a, b string) (bool, error) {
-	entriesA, err := walkTreeExcludingGit(a)
+	entriesA, err := walkCommittableTree(a)
 	if err != nil {
 		return false, err
 	}
-	entriesB, err := walkTreeExcludingGit(b)
+	entriesB, err := walkCommittableTree(b)
 	if err != nil {
 		return false, err
 	}
@@ -228,8 +242,11 @@ func sameTree(a, b string) (bool, error) {
 	return true, nil
 }
 
-// walkTreeExcludingGit indexes a tree by each entry's path relative to its root.
-func walkTreeExcludingGit(root string) (map[string]treeEntry, error) {
+// walkCommittableTree indexes a tree by each entry's path relative to its root,
+// skipping .git and every path the tree's own ignore files exclude (an
+// excluded directory is not entered at all, as git does not).
+func walkCommittableTree(root string) (map[string]treeEntry, error) {
+	ignored := gitignore.NewMatcher(gitSemanticsPatterns(osfs.New(root)))
 	entries := map[string]treeEntry{}
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
@@ -246,6 +263,12 @@ func walkTreeExcludingGit(root string) (map[string]treeEntry, error) {
 			return err
 		}
 		if rel == "." {
+			return nil
+		}
+		if ignored.Match(strings.Split(filepath.ToSlash(rel), "/"), d.IsDir()) {
+			if d.IsDir() {
+				return fs.SkipDir
+			}
 			return nil
 		}
 		info, err := d.Info()
