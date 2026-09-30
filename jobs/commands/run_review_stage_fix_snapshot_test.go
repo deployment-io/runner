@@ -861,3 +861,73 @@ func TestTheReviewSectionWordsTheFixOutcomeHonestly(t *testing.T) {
 		t.Errorf("an exhausted loop is worded wrongly:\n%s", body)
 	}
 }
+
+// A fix run that builds and tests rewrites caches inside the repository —
+// vitest's results under node_modules/.vite, logs — that can never reach the
+// pull request. The no-change stop judges only what git would commit, with
+// git's own semantics: an excluded directory is not entered, so a negating
+// .gitignore inside it (tailwind ships one) re-includes nothing.
+func TestTheNoChangeComparisonIgnoresWhatGitIgnores(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		edit func(t *testing.T, repoDir string)
+		want bool
+	}{
+		{"a test cache under an ignored directory is rewritten", func(t *testing.T, repoDir string) {
+			writeFile(t, filepath.Join(repoDir, "node_modules", ".vite", "vitest", "results.json"), `{"version":"4","results":{"a":1}}`)
+		}, false},
+		{"a new file under an ignored directory", func(t *testing.T, repoDir string) {
+			writeFile(t, filepath.Join(repoDir, "node_modules", "left-pad", "index.js"), "module.exports = 1\n")
+		}, false},
+		{"a new ignored file", func(t *testing.T, repoDir string) {
+			writeFile(t, filepath.Join(repoDir, "test-run.log"), "ok\n")
+		}, false},
+		{"an ignored file is deleted", func(t *testing.T, repoDir string) {
+			if err := os.Remove(filepath.Join(repoDir, "build.log")); err != nil {
+				t.Fatal(err)
+			}
+		}, false},
+		{"a negation inside an ignored directory re-includes nothing", func(t *testing.T, repoDir string) {
+			writeFile(t, filepath.Join(repoDir, "node_modules", "tailwindcss", "stubs", ".gitignore"), "!*\n")
+			writeFile(t, filepath.Join(repoDir, "node_modules", "tailwindcss", "stubs", "config.js"), "module.exports = {}\n")
+		}, false},
+		{"a source file changes beside the caches", func(t *testing.T, repoDir string) {
+			writeFile(t, filepath.Join(repoDir, "node_modules", ".vite", "vitest", "results.json"), `{"version":"4","results":{"b":2}}`)
+			writeFile(t, filepath.Join(repoDir, "main.go"), "package main\n\nfunc main() {}\n")
+		}, true},
+		{"the .gitignore itself changes", func(t *testing.T, repoDir string) {
+			writeFile(t, filepath.Join(repoDir, ".gitignore"), "node_modules/\n")
+		}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			workDir := t.TempDir()
+			repoDir := filepath.Join(workDir, "0-acme/web")
+			initSnapshotTestRepository(t, repoDir)
+			writeFile(t, filepath.Join(repoDir, ".gitignore"), "node_modules/\n*.log\n")
+			head := commitEverything(t, repoDir, "ignore dependencies and logs")
+			// What an implement run leaves behind: ignored, never committed.
+			writeFile(t, filepath.Join(repoDir, "node_modules", ".vite", "vitest", "results.json"), `{"version":"4","results":{}}`)
+			writeFile(t, filepath.Join(repoDir, "build.log"), "built\n")
+
+			stage := &reviewStage{
+				workDirHost: workDir,
+				logsWriter:  io.Discard,
+				baseCommits: map[string]string{"0-acme/web": head},
+				copyTree:    testCopyTree,
+			}
+			snapshot, err := stage.takeFixRoundSnapshot(1)
+			if err != nil {
+				t.Fatalf("takeFixRoundSnapshot: %s", err)
+			}
+			tc.edit(t, repoDir)
+
+			changed, err := snapshot.treeChanged()
+			if err != nil {
+				t.Fatalf("treeChanged: %s", err)
+			}
+			if changed != tc.want {
+				t.Errorf("treeChanged = %t, want %t", changed, tc.want)
+			}
+		})
+	}
+}
