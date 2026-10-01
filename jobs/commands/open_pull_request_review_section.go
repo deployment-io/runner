@@ -470,7 +470,10 @@ func boundSection(section string) string {
 		return section
 	}
 	runes := []rune(section)
-	return string(runes[:reviewSectionMaxRunes]) + "\n\n_The Review section was truncated — the full review is in the Step's job log._\n"
+	// The cut lands near the end, which is where the collapsed blocks are; one
+	// left open would swallow everything after it on GitHub — the blocked
+	// hosts, the trailer, and this very note.
+	return closeOpenDetails(string(runes[:reviewSectionMaxRunes])) + "\n\n_The Review section was truncated — the full review is in the Step's job log._\n"
 }
 
 // capRunes truncates to n runes with an ellipsis, counting runes rather than

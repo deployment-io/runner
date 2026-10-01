@@ -9,6 +9,7 @@ import (
 
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
+	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
 )
 
 // taskSpecJSON is kit's TaskSpec as it reaches the ReviewSpec parameter:
@@ -420,5 +421,53 @@ func TestBlockedHostsAreCollapsedWithTheirCount(t *testing.T) {
 	}
 	if got := (&taskOpenPR{}).blockedHostsSection(); got != "" {
 		t.Errorf("a Step with no denied hosts got %q", got)
+	}
+}
+
+// A cut never leaves a collapsed block open. The Review section is cut near
+// its end, which is where its collapsed blocks are, and on GitHub an unclosed
+// <details> swallows everything after it — the blocked hosts and the trailer.
+func TestACutNeverLeavesACollapsedBlockOpen(t *testing.T) {
+	long := strings.Repeat("x", 290)
+	var findings, fixed []reviewFindingOutput
+	for i := 0; i < 8; i++ {
+		findings = append(findings, reviewFindingOutput{Key: fmt.Sprint("o", i), Parameter: "correctness", Severity: "low",
+			Location: strings.Repeat("p", 190), What: long, Why: long})
+	}
+	for i := 0; i < 6; i++ {
+		fixed = append(fixed, reviewFindingOutput{Key: fmt.Sprint("f", i), Parameter: "security", Severity: "medium",
+			Location: strings.Repeat("q", 190), What: long, Why: long})
+	}
+	var coverage []reviewCoverageOutput
+	for _, p := range []string{"security", "correctness", "spec conformance", "testing", "deploy readiness", "performance", "maintainability", "reliability"} {
+		coverage = append(coverage, reviewCoverageOutput{Parameter: p, State: "not checked", Reason: "no pass for this parameter in this release"})
+	}
+	coverage[0].State, coverage[1].State = "checked", "checked"
+	opr := &taskOpenPR{
+		ctx:         commandUtils.TaskJobContext{TaskTitle: "T"},
+		deniedHosts: []string{"a.example"},
+		review: &reviewOutput{Participation: "on", FinalTreeReviewed: true, FixedInLoop: fixed,
+			Rounds: []reviewRoundOutput{{Round: 1, Completed: true, Findings: findings, Coverage: coverage}}},
+	}
+	section := opr.reviewSection()
+	if !strings.Contains(section, "The Review section was truncated") {
+		t.Fatalf("the fixture no longer forces a cut; make the findings longer:\n%s", section)
+	}
+	_, body := opr.buildPRTitleAndBody()
+	if open, closed := strings.Count(body, "<details>"), strings.Count(body, "</details>"); open != closed {
+		t.Errorf("%d <details> but %d </details>; the rest of the body would be swallowed:\n%s", open, closed, body)
+	}
+	if !strings.HasSuffix(strings.TrimSpace(body), "Task: T") {
+		t.Errorf("the trailer is no longer last:\n%s", body)
+	}
+
+	// The whole-body cut closes what it cuts into, and stays within budget.
+	text := "intro\n\n<details><summary>Output</summary>\n\n" + strings.Repeat("line\n", 100) + "\n</details>\n\ntail\n"
+	cut := cutToRuneBudget(text, 120, "\n\n_cut_")
+	if strings.Count(cut, "<details>") != strings.Count(cut, "</details>") {
+		t.Errorf("cutToRuneBudget left a block open:\n%s", cut)
+	}
+	if n := utf8.RuneCountInString(cut); n > 120 {
+		t.Errorf("cutToRuneBudget returned %d runes, over its budget of 120", n)
 	}
 }

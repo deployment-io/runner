@@ -358,6 +358,11 @@ func cutToRuneBudget(text string, budget int, note string) string {
 		return text
 	}
 	allowance := budget - utf8.RuneCountInString(note)
+	// Room for closing a collapsed block the cut lands in. The body's blocks
+	// are never nested, so a cut can leave at most one open.
+	if strings.Contains(text, detailsOpenTag) {
+		allowance -= utf8.RuneCountInString(detailsCloseTag)
+	}
 	if allowance <= 0 {
 		return ""
 	}
@@ -367,7 +372,24 @@ func cutToRuneBudget(text string, budget int, note string) string {
 	if idx := strings.LastIndexByte(kept, '\n'); idx > 0 {
 		kept = kept[:idx]
 	}
-	return strings.TrimRight(kept, "\n ") + note
+	return closeOpenDetails(strings.TrimRight(kept, "\n ")) + note
+}
+
+const (
+	detailsOpenTag = "<details>"
+	// detailsCloseTag closes a collapsed block a cut left open, after a blank
+	// line so the markdown inside it still renders.
+	detailsCloseTag = "\n\n</details>"
+)
+
+// closeOpenDetails closes every <details> block the text opens and does not
+// close. On GitHub an unclosed block swallows everything after it, so a cut
+// that lands inside one would hide the rest of the body.
+func closeOpenDetails(text string) string {
+	if open := strings.Count(text, detailsOpenTag) - strings.Count(text, "</details>"); open > 0 {
+		return text + strings.Repeat(detailsCloseTag, open)
+	}
+	return text
 }
 
 // Bounds on "What the Task asks for".
