@@ -4,37 +4,38 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"strings"
 
+	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
+	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner-kit/types"
 )
 
 // THE SHADOW REVIEW IS A TEMPORARY MEASUREMENT KNOB. It answers one question —
 // does reviewing at a higher reasoning effort find more real problems, and what
 // does it cost — before a per-Task "review depth" setting is built. Remove it,
-// REVIEW_SHADOW_EFFORT and everything in this file when per-Task review depth
-// replaces it.
+// the ReviewShadowEffort parameter and everything in this file when per-Task
+// review depth replaces it.
 //
-// When the runner process's own environment sets REVIEW_SHADOW_EFFORT to one
-// of reviewEffortLevels, the stage runs ONE extra review right after round 1
+// When the Job carries a ReviewShadowEffort parameter set to one of
+// reviewEffortLevels, the stage runs ONE extra review right after round 1
 // completes: the same tree, spec, passes, reviewer and review environment as
 // round 1, plus REVIEW_EFFORT. It is LOG-ONLY. Its findings are never
 // classified, sent back, counted in MustFixOpen, rendered on the pull request
 // or the dashboard, and it is never a round in reviewOutput.Rounds; the only
 // trace outside the job log is its spend, which is real and goes on the Job's
-// cost. Nothing in the control plane stamps the variable — it is read here, at
-// review time.
-const shadowEffortEnv = "REVIEW_SHADOW_EFFORT"
+// cost. The level comes from the Job: the control plane stamps it at Job
+// creation, for the orgs being measured only. The runner's own environment
+// plays no part — it is wiped when a runner auto-upgrades.
 
 // reviewEffortLevels are the REVIEW_EFFORT values agentbox accepts.
 var reviewEffortLevels = []string{"low", "medium", "high", "xhigh", "max"}
 
-// readShadowEffort reads REVIEW_SHADOW_EFFORT from the runner's environment,
-// trimmed and lowercased. Anything that is not one of reviewEffortLevels is
-// logged and treated as unset.
-func readShadowEffort(logsWriter io.Writer) string {
-	raw := os.Getenv(shadowEffortEnv)
+// readShadowEffort reads the Job's ReviewShadowEffort parameter, trimmed and
+// lowercased. An absent or empty parameter is "": no shadow review. Anything
+// that is not one of reviewEffortLevels is logged and treated as absent.
+func readShadowEffort(parameters map[string]interface{}, logsWriter io.Writer) string {
+	raw, _ := jobs.GetParameterValue[string](parameters, parameters_enums.ReviewShadowEffort)
 	v := strings.ToLower(strings.TrimSpace(raw))
 	if v == "" {
 		return ""
@@ -44,7 +45,7 @@ func readShadowEffort(logsWriter io.Writer) string {
 			return v
 		}
 	}
-	io.WriteString(logsWriter, fmt.Sprintf("Review stage: ignoring %s=%s\n", shadowEffortEnv, raw))
+	io.WriteString(logsWriter, fmt.Sprintf("Review stage: ignoring ReviewShadowEffort=%s\n", raw))
 	return ""
 }
 
