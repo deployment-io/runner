@@ -204,6 +204,12 @@ func (s *reviewStage) reviewSpawnEnvWithEffort(round int, effort string) ([]stri
 		return nil, err
 	}
 	spec, _ := jobs.GetParameterValue[string](s.parameters, parameters_enums.ReviewSpec)
+	// Only a loop round after a kept fix has fix diffs; the shadow review runs
+	// as round 1 and never does.
+	fixDiffs := ""
+	if round > 1 {
+		fixDiffs = s.roundFixDiffs
+	}
 	return applyReviewEnv(env, reviewEnvInputs{
 		spec:         spec,
 		passes:       reviewPasses,
@@ -212,6 +218,7 @@ func (s *reviewStage) reviewSpawnEnvWithEffort(round int, effort string) ([]stri
 		openFindings: openFindings,
 		verifyResult: s.verifyResultEnvValue(),
 		effort:       effort,
+		fixDiffs:     fixDiffs,
 	}), nil
 }
 
@@ -425,6 +432,9 @@ type reviewEnvInputs struct {
 	// effort is the REVIEW_EFFORT value, or "" for the model's default — see
 	// reviewSpawnEnvWithEffort.
 	effort string
+	// fixDiffs is the JSON REVIEW_FIX_DIFFS payload, or "" for a round that
+	// does not directly follow a kept fix — see stageFixDiffs.
+	fixDiffs string
 }
 
 // applyReviewEnv turns an implement-run environment into a review-run one:
@@ -441,7 +451,7 @@ func applyReviewEnv(env []string, in reviewEnvInputs) []string {
 	for _, kv := range env {
 		key, _, _ := strings.Cut(kv, "=")
 		switch key {
-		case "STEP_PROMPT", "PREVIOUS_STEPS_SUMMARY", "AGENT_MODE", "MAX_TURNS", "REVIEW_OPEN_FINDINGS", "REVIEW_VERIFY_RESULT", "REVIEW_EFFORT":
+		case "STEP_PROMPT", "PREVIOUS_STEPS_SUMMARY", "AGENT_MODE", "MAX_TURNS", "REVIEW_OPEN_FINDINGS", "REVIEW_VERIFY_RESULT", "REVIEW_EFFORT", "REVIEW_FIX_DIFFS":
 			continue
 		case agentMCPSocketEnvVar:
 			// Review needs no runner tools, and the review spawn mounts no
@@ -489,6 +499,11 @@ func applyReviewEnv(env []string, in reviewEnvInputs) []string {
 	// inherited can set it either.
 	if in.effort != "" {
 		out = append(out, "REVIEW_EFFORT="+in.effort)
+	}
+	// Absent unless the last fix left diffs; stripped above so an inherited
+	// value can never point a round at some other run's files.
+	if in.fixDiffs != "" {
+		out = append(out, "REVIEW_FIX_DIFFS="+in.fixDiffs)
 	}
 	return out
 }
