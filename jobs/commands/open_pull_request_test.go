@@ -158,9 +158,7 @@ func TestSplitFirstLine(t *testing.T) {
 }
 
 // TestTaskOpenPR_BuildPRTitleAndBody_TrailerAndLeadIn pins the
-// PR-body composition order: lead-in first (when present), then the
-// trailer block, then the optional denied-hosts section. The lead-in
-// goes BEFORE the trailer so reviewers see what the agent did before
+// lead-in before the trailer: reviewers see what the agent did before
 // the metadata.
 func TestTaskOpenPR_BuildPRTitleAndBody_TrailerAndLeadIn(t *testing.T) {
 	ctx := commandUtils.TaskJobContext{
@@ -201,9 +199,10 @@ func TestTaskOpenPR_BuildPRTitleAndBody_TrailerAndLeadIn(t *testing.T) {
 }
 
 // TestTaskOpenPR_BuildPRTitleAndBody_WithDeniedHosts pins the
-// denied-hosts section appears AFTER the trailer (separated by a "---"
-// horizontal rule) and lists each host as a code-formatted bullet.
-// Surfaced to reviewers so they can suggest allowlist additions.
+// denied-hosts section as a collapsed block, with the count in its summary,
+// BEFORE the trailer (which is always last), listing each host as a
+// code-formatted bullet. Surfaced to reviewers so they can suggest allowlist
+// additions.
 func TestTaskOpenPR_BuildPRTitleAndBody_WithDeniedHosts(t *testing.T) {
 	opr := &taskOpenPR{
 		ctx: commandUtils.TaskJobContext{
@@ -216,8 +215,8 @@ func TestTaskOpenPR_BuildPRTitleAndBody_WithDeniedHosts(t *testing.T) {
 	}
 	_, body := opr.buildPRTitleAndBody()
 
-	if !strings.Contains(body, "**Network: blocked hosts during this Step**") {
-		t.Errorf("body missing denied-hosts header:\n%s", body)
+	if !strings.Contains(body, "<details><summary>Hosts the agent was blocked from reaching (2)</summary>\n\n") {
+		t.Errorf("body missing the collapsed denied-hosts block:\n%s", body)
 	}
 	if !strings.Contains(body, "`pypi.example.com`") {
 		t.Errorf("body missing pypi.example.com bullet:\n%s", body)
@@ -225,17 +224,19 @@ func TestTaskOpenPR_BuildPRTitleAndBody_WithDeniedHosts(t *testing.T) {
 	if !strings.Contains(body, "`registry.internal`") {
 		t.Errorf("body missing registry.internal bullet:\n%s", body)
 	}
-	// Denied-hosts must appear after the trailer — they're optional
-	// detail, not primary metadata.
+	// The hosts and their closing tag are inside the block, and the trailer
+	// comes after it.
+	deniedIdx := strings.Index(body, "<details><summary>Hosts the agent")
+	hostIdx := strings.Index(body, "`registry.internal`")
+	closeIdx := strings.Index(body, "</details>")
 	trailerIdx := strings.Index(body, "Generated-By:")
-	deniedIdx := strings.Index(body, "**Network: blocked hosts")
-	if trailerIdx == -1 || deniedIdx == -1 || deniedIdx <= trailerIdx {
-		t.Errorf("denied-hosts must follow trailer:\n%s", body)
+	if deniedIdx == -1 || !(deniedIdx < hostIdx && hostIdx < closeIdx && closeIdx < trailerIdx) {
+		t.Errorf("denied hosts must sit inside their <details> block, before the trailer:\n%s", body)
 	}
 }
 
-// An ordinary body — a Step with no fix round and a summary that fits — is
-// exactly the body it was before the cap existed, byte for byte. The cap is a
+// An ordinary body — a Step with no review, no verify result and a summary
+// that fits — is the summary and the trailer, byte for byte. The cap is a
 // guard on the one case that would fail the PR open, not a reformatting of
 // every pull request.
 func TestTaskOpenPR_OrdinaryBodyIsUnchanged(t *testing.T) {
@@ -251,6 +252,7 @@ func TestTaskOpenPR_OrdinaryBodyIsUnchanged(t *testing.T) {
 
 	const wantSubject = "Add OAuth login to auth-service"
 	const wantBody = "Added the login endpoint.\n\nIt checks the caller's session.\n\n" +
+		"---\n" +
 		"Generated-By: deployment.io Tasks\n" +
 		"Task: My Task\n" +
 		"Task-URL: https://app.example.com/tasks/task-1\n"

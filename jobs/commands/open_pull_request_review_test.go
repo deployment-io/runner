@@ -22,6 +22,8 @@ func completedReview(mustFixOpen bool, findings ...reviewFindingOutput) *reviewO
 	return &reviewOutput{
 		Participation: "on",
 		MustFixOpen:   mustFixOpen,
+		// No fix run was kept after the round, so it reviewed the committed tree.
+		FinalTreeReviewed: true,
 		Rounds: []reviewRoundOutput{{
 			Round:     1,
 			Completed: true,
@@ -60,8 +62,8 @@ func TestReviewSectionRendersFindingsInReaderPriorityOrder(t *testing.T) {
 	if stillOpen < 0 || fixed < 0 || annotated < 0 {
 		t.Fatalf("a finding group is missing from the body:\n%s", body)
 	}
-	if !(stillOpen < fixed && fixed < annotated) {
-		t.Errorf("findings are out of order — still-open must-fix, then fixed, then annotated:\n%s", body)
+	if !(stillOpen < annotated && annotated < fixed) {
+		t.Errorf("findings are out of order — still-open must-fix, then annotated, then the collapsed fixed ones:\n%s", body)
 	}
 	if !strings.Contains(body, "Passes run: security, correctness.") {
 		t.Errorf("the body does not say which passes ran:\n%s", body)

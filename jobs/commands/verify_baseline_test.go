@@ -223,7 +223,7 @@ func jobOutputParams(payload string) map[string]interface{} {
 
 // The PR is where the reviewer is. A Step that landed only because its
 // verification failure predates it has to say so there, not only in a job log
-// the reviewer would have to know to open.
+// the reviewer would have to know to open — with the failure's output, folded.
 func TestPRBodyCarriesVerificationSectionWhenPreExisting(t *testing.T) {
 	opr := &taskOpenPR{
 		ctx: commandUtils.TaskJobContext{
@@ -242,31 +242,27 @@ func TestPRBodyCarriesVerificationSectionWhenPreExisting(t *testing.T) {
 	_, body := opr.buildPRTitleAndBody()
 
 	for _, want := range []string{
-		"**Verification: failing before this Step**",
-		"`go test ./...`",
-		"`0-acme/api`",
-		"fails on the base commit as well",
-		"user_test.go:31: want 200, got 500",
+		"**How it was checked**",
+		"- `go test ./...` failed in `0-acme/api` — it fails on the base commit too, so this change did not cause it\n",
+		"<details><summary>Output</summary>\n\n```\nuser_test.go:31: want 200, got 500\n```\n\n</details>",
+		"- `npm test` passed in `1-acme/web`\n",
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("PR body is missing %q:\n%s", want, body)
 		}
 	}
-	if strings.Contains(body, "1-acme/web") {
-		t.Errorf("a passing repo was reported as failing:\n%s", body)
-	}
-	// Optional detail, like denied-hosts: after the trailer, never before
-	// the agent's own narrative.
+	// After the agent's own narrative, before the trailer.
+	summaryIdx := strings.Index(body, "Add OAuth login")
+	sectionIdx := strings.Index(body, "**How it was checked**")
 	trailerIdx := strings.Index(body, "Generated-By:")
-	sectionIdx := strings.Index(body, "**Verification:")
-	if trailerIdx == -1 || sectionIdx <= trailerIdx {
-		t.Errorf("the Verification section must follow the trailer:\n%s", body)
+	if !(summaryIdx < sectionIdx && sectionIdx < trailerIdx) {
+		t.Errorf("How it was checked must sit between the summary and the trailer:\n%s", body)
 	}
 }
 
-// Every ordinary PR: nothing pre-existing, so nothing to explain. A section
-// that showed up on green PRs would train reviewers to skip it.
-func TestPRBodyHasNoVerificationSectionWhenNothingIsPreExisting(t *testing.T) {
+// Only a failure the base commit shares is called pre-existing: claiming it
+// for any other failure would excuse a break this change may have caused.
+func TestPRBodyClaimsAPreExistingFailureOnlyWhenTheBaseCommitFailsToo(t *testing.T) {
 	cases := map[string]*verifyResult{
 		"no verify at all":                     nil,
 		"passed":                               {Ran: true, Passed: true, Command: "go test ./..."},
@@ -286,8 +282,8 @@ func TestPRBodyHasNoVerificationSectionWhenNothingIsPreExisting(t *testing.T) {
 				agentSummary: "Add OAuth login",
 				verifyResult: vr,
 			}
-			if _, body := opr.buildPRTitleAndBody(); strings.Contains(body, "**Verification:") {
-				t.Errorf("unexpected Verification section:\n%s", body)
+			if _, body := opr.buildPRTitleAndBody(); strings.Contains(body, "fails on the base commit too") {
+				t.Errorf("a failure that is not on the base commit was reported as pre-existing:\n%s", body)
 			}
 		})
 	}

@@ -60,14 +60,14 @@ func stripNeedsFixesPrefix(title string) string {
 //
 // Order is deliberate and is the reader's priority order: what is still wrong
 // and must be fixed, then what was sent back for a fix, survived it, and does
-// not hold the pull request, then what the loop already fixed (which explains why the
-// change looks different from what the implementer first wrote), then what was
-// merely noted. Coverage comes last, because it answers "what did you look
-// at" — a question that only arises once the findings have been read.
+// not hold the pull request, then what was merely noted. What the loop already
+// fixed (which explains why the change looks different from what the
+// implementer first wrote) and the coverage line (which answers "what did you
+// look at" — a question that only arises once the findings have been read)
+// come last, collapsed: they are reference, not verdict.
 //
 // Empty when the Review stage did not run at all, so a Task with review
-// participation Off produces exactly the body it produced before this stage
-// existed.
+// participation Off has no Review section.
 func (opr *taskOpenPR) reviewSection() string {
 	if opr.review == nil || len(opr.review.Rounds) == 0 {
 		return ""
@@ -85,33 +85,40 @@ func (opr *taskOpenPR) reviewSection() string {
 		sb.WriteString(fmt.Sprintf("The review did not complete: %s. The change was committed and this pull request opened anyway; nothing here has been gated on a review verdict.\n\n", failed.Error))
 	}
 	if latest == nil {
-		sb.WriteString(coverageLine(opr.review.Rounds[len(opr.review.Rounds)-1].Coverage))
+		sb.WriteString(coverageBlock(opr.review.Rounds[len(opr.review.Rounds)-1].Coverage))
 		return boundSection(sb.String())
 	}
 
 	sb.WriteString(passesLine(latest.Coverage))
 	stillOpen, notedAfterFix, annotated := splitFindings(latest.Findings)
 	fixed := opr.review.FixedInLoop
+	// The findings are UNVERIFIED when a fix ran after the round that reported
+	// them and nothing re-checked it: the last round failed, or a kept fix run
+	// was never reviewed. Calling them "still open" would assert something
+	// nobody checked.
+	unverified := failed != nil || !opr.review.FinalTreeReviewed
 
-	// Both budgets are spent in reader-priority order, and the overflow line
-	// is written from what is LEFT OVER — so the note that says how much was
+	// Both budgets are spent in reader-priority order — the visible groups
+	// first, then the collapsed fixed findings — and the overflow line is
+	// written from what is LEFT OVER, so the note that says how much was
 	// dropped is never itself the thing that gets dropped.
 	budget := &renderBudget{items: reviewSectionMaxItems, runes: reviewSectionMaxRunes - utf8.RuneCountInString(sb.String()) - reviewSectionReserveRunes}
 	fixError := strings.TrimSpace(opr.review.FixError)
 	// The line about how the last fix attempt ended goes under the group that
 	// holds the findings that attempt was sent: the must-fix heading when any
-	// of them holds the pull request, stillOpenBelowHoldHeading otherwise.
+	// of them holds the pull request, the below-hold heading otherwise.
 	outcome := fixOutcomeLine(opr.review, fixError)
-	writeFindingGroup(&sb, mustFixHeading(failed != nil), stillOpen, budget)
+	writeFindingGroup(&sb, mustFixHeading(unverified), stillOpen, budget)
 	if len(stillOpen) > 0 {
 		sb.WriteString(outcome)
 	}
-	writeFindingGroup(&sb, stillOpenBelowHoldHeading, notedAfterFix, budget)
+	writeFindingGroup(&sb, belowHoldHeading(unverified), notedAfterFix, budget)
 	if len(stillOpen) == 0 {
 		sb.WriteString(outcome)
 	}
-	writeFindingGroup(&sb, "Fixed during review", fixed, budget)
 	writeFindingGroup(&sb, "Noted", annotated, budget)
+	// Built before the overflow line so the overflow count includes it.
+	fixedBlock := fixedDuringReviewBlock(fixed, budget)
 	if omitted := len(stillOpen) + len(notedAfterFix) + len(fixed) + len(annotated) - budget.rendered; omitted > 0 {
 		sb.WriteString(fmt.Sprintf("\n_%d further finding(s) are not shown here — the full review is in the Step's job log._\n", omitted))
 	}
@@ -123,10 +130,92 @@ func (opr *taskOpenPR) reviewSection() string {
 	// ("Still present after a fix round"), and the outcome line above says how
 	// the last fix attempt ended.
 	if opr.review.MustFixOpen {
-		sb.WriteString("\nThese findings are still open. They need a human.\n")
+		if unverified {
+			sb.WriteString("\nThese findings were open at the last completed review. They need a human.\n")
+		} else {
+			sb.WriteString("\nThese findings are still open. They need a human.\n")
+		}
 	}
-	sb.WriteString("\n" + coverageLine(latest.Coverage))
+	sb.WriteString(fixedBlock)
+	sb.WriteString(coverageBlock(latest.Coverage))
 	return boundSection(sb.String())
+}
+
+// fixedDuringReviewBlock renders what the loop already fixed in a collapsed
+// block, spending what the visible groups left of the budget. Empty when
+// there is nothing to show or no budget left to show any of it — the
+// overflow line counts what was not rendered.
+func fixedDuringReviewBlock(fixed []reviewFindingOutput, budget *renderBudget) string {
+	if len(fixed) == 0 || budget.exhausted() {
+		return ""
+	}
+	header := fmt.Sprintf("\n<details><summary>Fixed during review (%d)</summary>\n\n", len(fixed))
+	budget.runes -= utf8.RuneCountInString(header)
+	var findings strings.Builder
+	writeFindings(&findings, fixed, budget)
+	if findings.Len() == 0 {
+		return ""
+	}
+	return header + findings.String() + "\n</details>\n"
+}
+
+// coverageBlock puts the coverage line in a collapsed block, or "" when there
+// is no coverage to show.
+func coverageBlock(coverage []reviewCoverageOutput) string {
+	line := coverageLine(coverage)
+	if line == "" {
+		return ""
+	}
+	return "\n<details><summary>Coverage</summary>\n\n" + line + "\n</details>\n"
+}
+
+// reviewTally is the one line at the top of the body that says what the review
+// did, computed from the same record — and counting exactly the findings — the
+// Review section lists. Empty when the Review stage did not run.
+func reviewTally(review *reviewOutput) string {
+	if review == nil || len(review.Rounds) == 0 {
+		return ""
+	}
+	if failedFinalRound(review) != nil {
+		return "**Review:** did not complete — details below."
+	}
+	latest := latestCompletedRound(review)
+	examined := false
+	for _, c := range latest.Coverage {
+		if coverageChecked(c.State) {
+			examined = true
+			break
+		}
+	}
+	if !examined {
+		return "**Review:** nothing was examined — details below."
+	}
+	if !review.FinalTreeReviewed {
+		return "**Review:** the last fix was not re-checked — details below."
+	}
+	fixed, mustFix, noted := len(review.FixedInLoop), 0, 0
+	for _, f := range latest.Findings {
+		if f.MustFix {
+			mustFix++
+		} else {
+			noted++
+		}
+	}
+	total := fixed + mustFix + noted
+	if total == 0 {
+		return "**Review:** no findings."
+	}
+	line := fmt.Sprintf("**Review:** %d found", total)
+	if fixed > 0 {
+		line += fmt.Sprintf(" · %d fixed before this PR", fixed)
+	}
+	if mustFix > 0 {
+		line += fmt.Sprintf(" · %d must be fixed before merge", mustFix)
+	}
+	if noted > 0 {
+		line += fmt.Sprintf(" · %d noted", noted)
+	}
+	return line
 }
 
 // stillOpenBelowHoldHeading heads the findings that qualified to be sent back
@@ -137,6 +226,16 @@ func (opr *taskOpenPR) reviewSection() string {
 // ran out, and never had a fix attempt. "Noted after a fix attempt" was false
 // for the second kind.
 const stillOpenBelowHoldHeading = "Still open (does not hold this pull request)"
+
+// belowHoldHeading is stillOpenBelowHoldHeading, or — when the findings are
+// unverified, see mustFixHeading — the heading that does not claim they are
+// still open.
+func belowHoldHeading(unverified bool) string {
+	if unverified {
+		return "Reported by the last completed review, fix not verified (does not hold this pull request)"
+	}
+	return stillOpenBelowHoldHeading
+}
 
 // fixOutcomeLine says how the last fix attempt ended, when that is not simply
 // "it ran and the review looked again", or "".
@@ -212,16 +311,16 @@ func reviewedByLine(review *reviewOutput) string {
 }
 
 // mustFixHeading names what the must-fix findings actually are, which depends
-// on whether the LAST round completed.
+// on whether the last completed round reviewed the tree being committed.
 //
 // When it did, these findings are the last review's verdict on the current
-// tree: still open, and they must be fixed. When it did not, they are an
-// EARLIER round's verdict, and a fix run may well have addressed them since —
-// the round that would have confirmed that is the one that failed. Saying
-// "still open" there asserts something nobody checked, and sends a reader
-// looking for a problem that may no longer exist.
-func mustFixHeading(finalRoundFailed bool) string {
-	if finalRoundFailed {
+// tree: still open, and they must be fixed. When it did not — the last round
+// failed, or a kept fix run was never reviewed — a fix may well have addressed
+// them since, and nothing confirmed it. Saying "still open" there asserts
+// something nobody checked, and sends a reader looking for a problem that may
+// no longer exist.
+func mustFixHeading(unverified bool) string {
+	if unverified {
 		return "Reported by the last completed review, fix not verified"
 	}
 	return "Still open and must be fixed"
@@ -322,6 +421,11 @@ func writeFindingGroup(sb *strings.Builder, heading string, findings []reviewFin
 	header := fmt.Sprintf("\n_%s_\n\n", heading)
 	sb.WriteString(header)
 	budget.runes -= utf8.RuneCountInString(header)
+	writeFindings(sb, findings, budget)
+}
+
+// writeFindings renders findings until either budget runs out.
+func writeFindings(sb *strings.Builder, findings []reviewFindingOutput, budget *renderBudget) {
 	for _, f := range findings {
 		if budget.exhausted() {
 			return
@@ -366,7 +470,10 @@ func boundSection(section string) string {
 		return section
 	}
 	runes := []rune(section)
-	return string(runes[:reviewSectionMaxRunes]) + "\n\n_The Review section was truncated — the full review is in the Step's job log._\n"
+	// The cut lands near the end, which is where the collapsed blocks are; one
+	// left open would swallow everything after it on GitHub — the blocked
+	// hosts, the trailer, and this very note.
+	return closeOpenDetails(string(runes[:reviewSectionMaxRunes])) + "\n\n_The Review section was truncated — the full review is in the Step's job log._\n"
 }
 
 // capRunes truncates to n runes with an ellipsis, counting runes rather than
