@@ -162,6 +162,11 @@ func MarkDeploymentDone(parameters map[string]interface{}, err error) <-chan str
 			return
 		}
 
+		if restartOnly, _ := jobs.GetParameterValue[bool](parameters, parameters_enums.RestartOnly); restartOnly {
+			//a restart records nothing on the deployment or the build; the Job reports its own result
+			return
+		}
+
 		deploymentID, e := jobs.GetParameterValue[string](parameters, parameters_enums.DeploymentID)
 		if e != nil {
 			//job is not a deployment type
