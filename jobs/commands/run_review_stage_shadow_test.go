@@ -105,14 +105,14 @@ func reviewJSON(t *testing.T, parameters map[string]interface{}) string {
 	return string(b)
 }
 
-// With REVIEW_SHADOW_EFFORT unset there is no shadow run, and the loop is the
+// With no ReviewShadowEffort on the Job there is no shadow run, and the loop is the
 // loop it always was.
 func TestNoShadowReviewWhenTheEffortIsUnset(t *testing.T) {
 	var logs strings.Builder
 	var events []string
 	stage := shadowTestStage(t, &logs, &events)
 	stage.runShadow = func([]string) (agentResult, error) {
-		t.Fatal("a shadow review ran with REVIEW_SHADOW_EFFORT unset")
+		t.Fatal("a shadow review ran with no ReviewShadowEffort on the Job")
 		return agentResult{}, nil
 	}
 	if _, err := stage.run(); err != nil {
@@ -353,26 +353,48 @@ func TestNoShadowReviewAfterAFailedRoundOne(t *testing.T) {
 }
 
 func TestReadShadowEffort(t *testing.T) {
-	for _, tc := range []struct{ raw, want, log string }{
-		{"", "", ""},
-		{"high", "high", ""},
-		{"  XHigh\n", "xhigh", ""},
-		{"Low", "low", ""},
-		{"medium", "medium", ""},
-		{"MAX", "max", ""},
-		{"bogus", "", "Review stage: ignoring REVIEW_SHADOW_EFFORT=bogus\n"},
-		{"ultra", "", "Review stage: ignoring REVIEW_SHADOW_EFFORT=ultra\n"},
+	for _, tc := range []struct {
+		name    string
+		present bool
+		raw     string
+		want    string
+		log     string
+	}{
+		{"absent", false, "", "", ""},
+		{"empty", true, "", "", ""},
+		{"padded mixed case", true, " High ", "high", ""},
+		{"xhigh", true, "  XHigh\n", "xhigh", ""},
+		{"low", true, "Low", "low", ""},
+		{"medium", true, "medium", "medium", ""},
+		{"max", true, "MAX", "max", ""},
+		{"bogus", true, "bogus", "", "Review stage: ignoring ReviewShadowEffort=bogus\n"},
+		{"ultra", true, "ultra", "", "Review stage: ignoring ReviewShadowEffort=ultra\n"},
 	} {
-		t.Run(tc.raw, func(t *testing.T) {
-			t.Setenv(shadowEffortEnv, tc.raw)
+		t.Run(tc.name, func(t *testing.T) {
+			parameters := map[string]interface{}{}
+			if tc.present {
+				jobs.SetParameterValue[string](parameters, parameters_enums.ReviewShadowEffort, tc.raw)
+			}
 			var logs strings.Builder
-			if got := readShadowEffort(&logs); got != tc.want {
+			if got := readShadowEffort(parameters, &logs); got != tc.want {
 				t.Errorf("readShadowEffort(%q) = %q, want %q", tc.raw, got, tc.want)
 			}
 			if logs.String() != tc.log {
 				t.Errorf("logged %q, want %q", logs.String(), tc.log)
 			}
 		})
+	}
+}
+
+// The runner's own environment plays no part: only the Job decides.
+func TestReadShadowEffortIgnoresTheRunnerEnvironment(t *testing.T) {
+	t.Setenv("REVIEW_SHADOW_EFFORT", "high")
+	var logs strings.Builder
+	if got := readShadowEffort(map[string]interface{}{}, &logs); got != "" {
+		t.Errorf("readShadowEffort with no Job parameter = %q, want \"\"", got)
+	}
+	if logs.String() != "" {
+		t.Errorf("logged %q, want nothing", logs.String())
 	}
 }
 

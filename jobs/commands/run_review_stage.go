@@ -171,9 +171,10 @@ func (rs *RunReviewStage) Run(parameters map[string]interface{}, logsWriter io.W
 		deadline:        time.Now().Add(reviewStageBudget),
 		stopSignal:      rs.stopSignal,
 		progressSink:    rs.progressSink,
-		// Read here, at review time, from the runner's own environment: a
-		// temporary measurement knob (see run_review_stage_shadow.go).
-		shadowEffort: readShadowEffort(logsWriter),
+		// Stamped on the Job by the control plane, for the orgs being
+		// measured only: a temporary measurement knob (see
+		// run_review_stage_shadow.go).
+		shadowEffort: readShadowEffort(parameters, logsWriter),
 	}
 	return stage.run()
 }
@@ -250,8 +251,9 @@ type reviewStage struct {
 	deadline     time.Time
 	stopSignal   <-chan struct{}
 	progressSink func(jobs.LiveProgressV1)
-	// shadowEffort is REVIEW_SHADOW_EFFORT, validated, or "" — a TEMPORARY
-	// measurement knob; see run_review_stage_shadow.go.
+	// shadowEffort is the Job's ReviewShadowEffort parameter, validated, or
+	// "" — a TEMPORARY measurement knob the control plane stamps for the orgs
+	// being measured; see run_review_stage_shadow.go.
 	shadowEffort string
 
 	rounds      []reviewRoundOutput
