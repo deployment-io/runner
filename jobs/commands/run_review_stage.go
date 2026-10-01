@@ -151,6 +151,9 @@ func (rs *RunReviewStage) Run(parameters map[string]interface{}, logsWriter io.W
 	// round killed before it could, so a fix run or the next Step never
 	// finds a stale diff beside the checkouts.
 	defer os.RemoveAll(filepath.Join(workDirHost, reviewDiffDirName))
+	// The fix diffs written for a round are removed when that round ends; this
+	// is the net for a round that crashed before it could.
+	defer os.RemoveAll(filepath.Join(workDirHost, reviewFixDiffDirName))
 	// Resolved ONCE, before the loop: every round of this stage runs on the
 	// same reviewer, and so does every round's record.
 	reviewerParams, reviewerFailure := reviewerParameters(parameters)
@@ -300,6 +303,19 @@ type reviewStage struct {
 	// when the loop ends is the answer — see reviewOutput.FinalTreeReviewed.
 	finalTreeReviewed bool
 
+	// pendingFixDiffs are the last KEPT fix run's own diffs, per repository
+	// directory, waiting for the round that directly follows it. Taken (and
+	// cleared) by stageFixDiffs before that round, so they are never reused.
+	pendingFixDiffs map[string]string
+	// roundFixDiffs is the REVIEW_FIX_DIFFS payload for the round being run,
+	// or "" — set by stageFixDiffs, cleared by clearFixDiffs.
+	roundFixDiffs string
+	// fixTreesTmpRoot and fixTreesGit override where the fix-tree snapshots
+	// keep their temporary directory and which git they run; "" means the
+	// system default. Tests only.
+	fixTreesTmpRoot string
+	fixTreesGit     string
+
 	// The two container runs, the two halves of the fix run's undo and the
 	// cache volume's removal, all injectable so the loop's own decisions can be
 	// tested without a Docker daemon and without root. Nil means the real
@@ -384,7 +400,9 @@ func (s *reviewStage) run() (map[string]interface{}, error) {
 		}
 		s.reportStage(tasks.StageReview)
 		io.WriteString(s.logsWriter, fmt.Sprintf("Review round %d: reviewing the change against the Task's spec\n", round))
+		s.stageFixDiffs(round)
 		result, err := s.reviewRound(round)
+		s.clearFixDiffs()
 		if errors.Is(err, types.ErrJobStoppedByUser) {
 			// A user stop is not a failed review. Attribute what the round
 			// spent and hand the stop to the outer loop's existing path.
@@ -483,6 +501,9 @@ func (s *reviewStage) accumulateReviewRun(round int, result agentResult) {
 //	             and belongs to the outer loop's stop path; or a restore that
 //	             did not work, which leaves a tree nobody can describe.
 func (s *reviewStage) attemptFix(round int, mustFix []reviewFindingOutput) (bool, error) {
+	// Only a kept fix leaves diffs for the next round; nothing from an
+	// earlier one may survive into it.
+	s.pendingFixDiffs = nil
 	// The copy can take a while on a large checkout and cannot be interrupted,
 	// so a stop is honoured on both sides of it rather than after a fix run
 	// that was never going to be wanted.
@@ -505,6 +526,10 @@ func (s *reviewStage) attemptFix(round int, mustFix []reviewFindingOutput) (bool
 		snapshot.remove()
 		return false, types.ErrJobStoppedByUser
 	}
+	// The fix run's own diff, for the round after it: trees before and after,
+	// held in a temporary directory that goes on every path out of here.
+	trees := s.takeFixTrees()
+	defer trees.remove()
 	fixErr := s.fixRound(mustFix)
 	if fixErr == nil {
 		// THE UNDO COPY IS ALSO THE ANSWER TO "DID THIS RUN CHANGE ANYTHING",
@@ -515,6 +540,7 @@ func (s *reviewStage) attemptFix(round int, mustFix []reviewFindingOutput) (bool
 			// Fail-open, like the rest of the stage: a comparison nobody could
 			// make must not end the loop on a guess. Reviewed again as before.
 			io.WriteString(s.logsWriter, fmt.Sprintf("warning: could not tell whether fix round %d changed anything (%s) — reviewing it as usual\n", round, err))
+			s.pendingFixDiffs = trees.fixDiffs()
 			return true, nil
 		}
 		if !changed {
@@ -529,6 +555,7 @@ func (s *reviewStage) attemptFix(round int, mustFix []reviewFindingOutput) (bool
 			io.WriteString(s.logsWriter, fmt.Sprintf("Fix round %d changed no file — the findings it was sent stay open; handing them to a human on the pull request\n", round))
 			return false, nil
 		}
+		s.pendingFixDiffs = trees.fixDiffs()
 		return true, nil
 	}
 	if errors.Is(fixErr, types.ErrJobStoppedByUser) {
