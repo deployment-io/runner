@@ -63,6 +63,7 @@ func (opr *OpenPullRequest) Run(parameters map[string]interface{}, logsWriter io
 		agentPRTitle: readAgentPRTitleFromJobOutput(parameters),
 		verifyResult: readVerifyResultFromJobOutput(parameters),
 		review:       readReviewFromJobOutput(parameters),
+		acceptance:   readAcceptanceCriteria(parameters),
 	}
 	prOutputs, err := opener.openAll(hasChangesByIndex)
 	if err != nil {
@@ -94,16 +95,19 @@ type taskOpenPR struct {
 	// image predates the field — subjectAndLeadIn falls through to the
 	// truncated-first-line-of-changes_summary path.
 	agentPRTitle string
-	// verifyResult is agentbox's verify_result for this Step run, read back
-	// off the same envelope. Non-nil with pre-existing steps only when the
-	// commit gate let a failing verification through — the case the PR body
-	// has to explain. Nil otherwise (including for older agentbox images).
+	// verifyResult is agentbox's verify_result for this Step run (after review
+	// fixes, the last kept fix run's), read back off the same envelope. It is
+	// what "How it was checked" reports. Nil for older agentbox images.
 	verifyResult *verifyResult
 	// review is the Review stage's record for this Step run. Nil when the
 	// stage did not run — a Task with review participation Off, or a Job
 	// created before the stage existed — in which case the PR body carries no
 	// Review section and looks exactly as it did before.
 	review *reviewOutput
+	// acceptance is the Task's acceptance criteria, read off the ReviewSpec
+	// parameter (see readAcceptanceCriteria). Nil for a Task without a
+	// structured spec, in which case the body has no "What the Task asks for".
+	acceptance []string
 	// pullRequests is the deployment-server RPC surface this command uses.
 	// Nil means the runner client; tests substitute a stub.
 	pullRequests pullRequestRPC
@@ -222,7 +226,7 @@ const (
 	// the first fifty names.
 	prBodyDeniedHostsMaxItems = 50
 	// prBodyVerifyOverflowReserveRunes is held back from whatever budget the
-	// verification section is given for the line saying how many steps were
+	// "How it was checked" section is given for the line saying how many steps were
 	// left out, so the note about what was dropped is never itself the thing
 	// that gets dropped.
 	prBodyVerifyOverflowReserveRunes = 200
@@ -240,70 +244,83 @@ const (
 // is decided by subjectAndLeadIn (agent pr_title > changes_summary
 // first line > generic fallback; see that function for the policy).
 //
-// Body composition: lead-in first (when present) so reviewers see the
-// agent's narrative before metadata, then the trailer block, then the
-// optional denied-hosts, verification and Review sections.
+// The body has a fixed layout, every part left out when it has nothing to
+// show: the one-line review tally, the agent's summary, what the Task asks
+// for, how the change was checked, the Review section, the blocked hosts, and
+// the trailer last. What a reviewer reads first is what the review did and
+// what the change is; the reference material sits below it, collapsed.
 //
-// EVERYTHING BELOW THE SUMMARY IS BUILT FIRST and the summary is given what
-// is left of prBodyMaxRunes. Each of those sections is bounded — the Review
-// section by reviewSectionMaxRunes, the blocked hosts by
-// prBodyDeniedHostsMaxItems, a verify step's output by boundVerifyTail — and
-// the agent's summary is the one part that is not, so it is the part that
-// yields when the body has to fit.
+// EVERYTHING EXCEPT THE SUMMARY IS BUILT FIRST and the summary is given what
+// is left of prBodyMaxRunes. Each of those parts is bounded — the Review
+// section by reviewSectionMaxRunes, the criteria and blocked hosts by their
+// item caps, a verify step's output by boundVerifyTail — and the agent's
+// summary is the one part that is not, so it is the part that yields when the
+// body has to fit.
 //
 // The body as a whole is bounded LAST and unconditionally. Giving the summary
 // what is left over is what keeps an ordinary pull request readable; it is not
-// what makes the cap hold. Those sections' own bounds are several, and several
+// what makes the cap hold. Those parts' own bounds are several, and several
 // bounded parts still add up — plus the trailer carries a Task title of any
 // length. The last cut is the one that guarantees the pull request opens.
 func (opr *taskOpenPR) buildPRTitleAndBody() (string, string) {
 	subject, leadIn := opr.subjectAndLeadIn()
-	below := opr.bodyBelowSummary()
-	// Less two runes for the blank line between the summary and what follows.
-	leadIn = boundPRSummary(leadIn, prBodyMaxRunes-utf8.RuneCountInString(below)-2)
-	var sb strings.Builder
-	if len(leadIn) > 0 {
-		sb.WriteString(leadIn)
-		sb.WriteString("\n\n")
-	}
-	sb.WriteString(below)
-	return subject, cutToRuneBudget(sb.String(), prBodyMaxRunes, prBodyTruncatedNote)
+	tally := reviewTally(opr.review)
+	asks := acceptanceSection(opr.acceptance)
+	review := strings.Trim(opr.reviewSection(), "\n")
+	hosts := opr.blockedHostsSection()
+	trailer := opr.trailer()
+	// "How it was checked" is the one part here with no bound of its own — a
+	// step's output is bounded by boundVerifyTail, but the number of failing
+	// steps follows the Task's repositories — so it is given what the rest of
+	// the body leaves, less the separator in front of it.
+	others := joinBodyParts(tally, asks, review, hosts, trailer) + "\n"
+	checked := opr.howCheckedSection(prBodyMaxRunes - utf8.RuneCountInString(others) - len(bodyPartSeparator))
+	rest := joinBodyParts(tally, asks, checked, review, hosts, trailer) + "\n"
+	leadIn = boundPRSummary(leadIn, prBodyMaxRunes-utf8.RuneCountInString(rest)-len(bodyPartSeparator))
+	body := joinBodyParts(tally, leadIn, asks, checked, review, hosts, trailer) + "\n"
+	return subject, cutToRuneBudget(body, prBodyMaxRunes, prBodyTruncatedNote)
 }
 
-// bodyBelowSummary is everything after the agent's narrative: the trailer
-// block, then the optional denied-hosts, verification and Review sections.
-//
-// The verification section is the one part here with no bound of its own — a
-// step's output is bounded by boundVerifyTail, but the number of failing steps
-// follows the Task's repositories — so it is given what the rest of this block
-// leaves of the body. That budget is the whole body's, not a smaller one of its
-// own: as long as the body fits, every pre-existing failure is named, which is
-// what this section exists to do.
-func (opr *taskOpenPR) bodyBelowSummary() string {
+// bodyPartSeparator is the blank line between two parts of the body.
+const bodyPartSeparator = "\n\n"
+
+// joinBodyParts joins the non-empty parts with a blank line between each, so
+// a part with nothing to show leaves no gap behind.
+func joinBodyParts(parts ...string) string {
+	kept := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.Trim(p, "\n"); p != "" {
+			kept = append(kept, p)
+		}
+	}
+	return strings.Join(kept, bodyPartSeparator)
+}
+
+// trailer is the metadata block that closes every body. Never collapsed: the
+// lines are what tooling and a reader looking for the Task page key on.
+func (opr *taskOpenPR) trailer() string {
 	var sb strings.Builder
+	sb.WriteString("---\n")
 	sb.WriteString("Generated-By: deployment.io Tasks\n")
 	sb.WriteString(fmt.Sprintf("Task: %s\n", opr.ctx.TaskTitle))
 	if len(opr.ctx.DashboardURL) > 0 {
 		sb.WriteString(fmt.Sprintf("Task-URL: %s/tasks/%s\n", strings.TrimRight(opr.ctx.DashboardURL, "/"), opr.ctx.TaskID))
 	}
-	sb.WriteString(opr.blockedHostsSection())
-	review := opr.reviewSection()
-	sb.WriteString(opr.verificationSection(prBodyMaxRunes - utf8.RuneCountInString(sb.String()) - utf8.RuneCountInString(review)))
-	sb.WriteString(review)
 	return sb.String()
 }
 
 // blockedHostsSection lists the hostnames the agentbox proxy denied during
 // this Step, so the PR reviewer can see what the agent tried to reach — helps
 // diagnose "agent gave up because it couldn't fetch X" without digging
-// through container logs. Empty when nothing was denied.
+// through container logs. Collapsed, with the count in its summary: it is
+// reference material, not what a reviewer reads first. Empty when nothing was
+// denied.
 func (opr *taskOpenPR) blockedHostsSection() string {
 	if len(opr.deniedHosts) == 0 {
 		return ""
 	}
 	var sb strings.Builder
-	sb.WriteString("\n---\n")
-	sb.WriteString("**Network: blocked hosts during this Step**\n\n")
+	sb.WriteString(fmt.Sprintf("<details><summary>Hosts the agent was blocked from reaching (%d)</summary>\n\n", len(opr.deniedHosts)))
 	sb.WriteString("The agent attempted to reach the following hostnames but they weren't on the allowlist. Add them to your org's Tasks → Allowed Hosts settings if expected:\n\n")
 	shown := opr.deniedHosts
 	if len(shown) > prBodyDeniedHostsMaxItems {
@@ -315,6 +332,7 @@ func (opr *taskOpenPR) blockedHostsSection() string {
 	if omitted := len(opr.deniedHosts) - len(shown); omitted > 0 {
 		sb.WriteString(fmt.Sprintf("- and %d more\n", omitted))
 	}
+	sb.WriteString("\n</details>\n")
 	return sb.String()
 }
 
@@ -352,57 +370,169 @@ func cutToRuneBudget(text string, budget int, note string) string {
 	return strings.TrimRight(kept, "\n ") + note
 }
 
-// verificationSection reports a verification that failed but was allowed
-// through because the same failure is present on the base commit.
+// Bounds on "What the Task asks for".
+const (
+	prBodyAcceptanceMaxItems = 20
+	prBodyAcceptanceMaxRunes = 300
+)
+
+// readAcceptanceCriteria reads the Task's acceptance criteria off the Job's
+// ReviewSpec parameter, which kit stamps on every Step Job.
 //
-// This PR exists only because of that exemption — without it the Step would
-// have been discarded — so the exemption belongs where the reviewer is, not
-// buried in a job log they'd have to know to open. Empty string when nothing
-// was pre-existing, which is every ordinary PR: a green verify has nothing to
-// say and a genuinely new failure never reaches PR-open at all.
-// budget is the runes the rest of the body below the summary left for it; a
-// Task failing across enough repositories to exhaust the whole body reports
-// what it can and says how many steps it left out, rather than pushing the
-// Review section below it past the provider's limit.
-func (opr *taskOpenPR) verificationSection(budget int) string {
-	steps := preExistingVerifySteps(opr.verifyResult)
-	if len(steps) == 0 {
+// For a Task with a structured spec the parameter is kit's TaskSpec
+// marshalled with no json tags, so the criteria sit under "Acceptance"; for a
+// Task without one it is the prose Description, which carries no criteria.
+// Only a value that is a JSON object is decoded, and only that one key is
+// read: nothing else from the spec belongs in the body. Nil when there are no
+// non-blank criteria — the section is then left out.
+//
+// The criteria are the Task's, not the Step's, so a multi-Step Task shows all
+// of them on every Step's pull request.
+func readAcceptanceCriteria(parameters map[string]interface{}) []string {
+	spec, err := jobs.GetParameterValue[string](parameters, parameters_enums.ReviewSpec)
+	if err != nil {
+		return nil
+	}
+	return parseAcceptanceCriteria(spec)
+}
+
+func parseAcceptanceCriteria(spec string) []string {
+	trimmed := strings.TrimSpace(spec)
+	if !strings.HasPrefix(trimmed, "{") {
+		return nil
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(trimmed), &fields); err != nil {
+		return nil
+	}
+	raw, ok := fields["Acceptance"]
+	if !ok {
+		return nil
+	}
+	var criteria []string
+	if err := json.Unmarshal(raw, &criteria); err != nil {
+		return nil
+	}
+	lineBreaks := strings.NewReplacer("\r\n", " ", "\r", " ", "\n", " ")
+	var out []string
+	for _, c := range criteria {
+		// A criterion must stay one bullet.
+		c = strings.TrimSpace(lineBreaks.Replace(c))
+		if c == "" {
+			continue
+		}
+		out = append(out, capRunes(c, prBodyAcceptanceMaxRunes))
+	}
+	return out
+}
+
+// acceptanceSection renders "What the Task asks for": the Task's acceptance
+// criteria, one bullet each, so a reviewer reads the change against what was
+// asked. Empty when there are none.
+func acceptanceSection(criteria []string) string {
+	if len(criteria) == 0 {
 		return ""
 	}
 	var sb strings.Builder
-	sb.WriteString("\n---\n")
-	sb.WriteString("**Verification: failing before this Step**\n\n")
-	sb.WriteString("The agent's build/test check failed, but the same command fails on the base commit too — so this Step didn't introduce it, and the work was committed rather than discarded:\n\n")
-	// Spend the budget over the steps in the order agentbox reported them, and
-	// name what was left out.
+	sb.WriteString("**What the Task asks for**\n\n")
+	shown := criteria
+	if len(shown) > prBodyAcceptanceMaxItems {
+		shown = shown[:prBodyAcceptanceMaxItems]
+	}
+	for _, c := range shown {
+		sb.WriteString("- " + c + "\n")
+	}
+	if omitted := len(criteria) - len(shown); omitted > 0 {
+		sb.WriteString(fmt.Sprintf("- and %d more on the Task page\n", omitted))
+	}
+	return sb.String()
+}
+
+// howCheckedSection renders "How it was checked": deployment.io's own verify
+// result for the code in this pull request. After review fixes it is the last
+// kept fix run's — a fix run that failed its verify is rolled back and never
+// merged — so it always describes the code under review. It reports only the
+// platform's check: the agent may have run builds and tests of its own.
+//
+// Empty for an agentbox older than verify_result.
+//
+// budget is the runes the rest of the body left for it. Passing steps' one-line
+// bullets are always shown, as is the first failing step with its output; past
+// the budget, further failing steps are left out and counted, rather than
+// pushing the parts below past the provider's limit.
+func (opr *taskOpenPR) howCheckedSection(budget int) string {
+	vr := opr.verifyResult
+	if vr == nil {
+		return ""
+	}
+	var sb strings.Builder
+	sb.WriteString("**How it was checked**\n\n")
+	if !vr.Ran {
+		if reason := strings.TrimSpace(vr.SkippedReason); reason != "" {
+			sb.WriteString(fmt.Sprintf("deployment.io did not run a build or test check: %s.\n", strings.TrimRight(reason, ".")))
+		} else {
+			sb.WriteString("deployment.io did not run a build or test check.\n")
+		}
+		return sb.String()
+	}
+	if len(vr.Steps) == 0 {
+		sb.WriteString(fmt.Sprintf("- `%s` %s\n", verifyCommandLabel(vr.Command), passedOrFailed(vr.Passed)))
+		return sb.String()
+	}
+	// Passing steps are always shown, so their cost comes off the top; the
+	// failing steps share what is left, in the order agentbox reported them.
 	budget -= utf8.RuneCountInString(sb.String()) + prBodyVerifyOverflowReserveRunes
-	shown := 0
-	for _, s := range steps {
+	for _, s := range vr.Steps {
+		if s.Passed {
+			budget -= utf8.RuneCountInString(verifyStepEntry(s))
+		}
+	}
+	shownFailing, omitted := 0, 0
+	for _, s := range vr.Steps {
 		entry := verifyStepEntry(s)
-		cost := utf8.RuneCountInString(entry)
-		// The first step is always rendered: its own output is bounded, and a
-		// section that reports failures without naming one reports nothing.
-		if shown > 0 && cost > budget {
-			break
+		if !s.Passed {
+			cost := utf8.RuneCountInString(entry)
+			// The first failing step is always rendered: its own output is
+			// bounded, and a section that reports failures without naming one
+			// reports nothing.
+			if shownFailing > 0 && cost > budget {
+				omitted++
+				continue
+			}
+			budget -= cost
+			shownFailing++
 		}
 		sb.WriteString(entry)
-		budget -= cost
-		shown++
 	}
-	if omitted := len(steps) - shown; omitted > 0 {
+	if omitted > 0 {
 		sb.WriteString(fmt.Sprintf("- and %d more failing step(s) — the full output is in the Step's job log\n", omitted))
 	}
 	return sb.String()
 }
 
-// verifyStepEntry renders one pre-existing failure: the command, the repo it
-// ran in, and the tail of what it printed.
+func passedOrFailed(passed bool) string {
+	if passed {
+		return "passed"
+	}
+	return "failed"
+}
+
+// verifyStepEntry renders one step: the command, the repo it ran in, and for a
+// failure, whether the base commit fails the same way and the tail of what it
+// printed, collapsed.
 func verifyStepEntry(s verifyStep) string {
+	command, repo := verifyCommandLabel(s.Command), verifyStepRepoLabel(s.Repo)
+	if s.Passed {
+		return fmt.Sprintf("- `%s` passed in `%s`\n", command, repo)
+	}
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("- `%s` in `%s` — fails on the base commit as well\n",
-		verifyCommandLabel(s.Command), verifyStepRepoLabel(s.Repo)))
+	if s.BaselineRan && !s.BaselinePassed {
+		sb.WriteString(fmt.Sprintf("- `%s` failed in `%s` — it fails on the base commit too, so this change did not cause it\n", command, repo))
+	} else {
+		sb.WriteString(fmt.Sprintf("- `%s` failed in `%s`\n", command, repo))
+	}
 	if tail := boundVerifyTail(verifyStepTail(s)); tail != "" {
-		sb.WriteString("\n```\n" + tail + "\n```\n")
+		sb.WriteString("\n<details><summary>Output</summary>\n\n```\n" + tail + "\n```\n\n</details>\n\n")
 	}
 	return sb.String()
 }
@@ -534,7 +664,7 @@ func readAgentPRTitleFromJobOutput(parameters map[string]interface{}) string {
 // readVerifyResultFromJobOutput pulls agentbox's verify_result that
 // RunAgentStep wrote to the accumulated JobOutput. Nil on a missing or
 // malformed payload — the PR is the user-facing artifact and must still land;
-// the worst case is a PR body without the Verification section, and the job
+// the worst case is a PR body without the "How it was checked" section, and the job
 // log still carries the warning. Mirrors readDeniedHostsFromJobOutput; both
 // read different fields off the same envelope.
 func readVerifyResultFromJobOutput(parameters map[string]interface{}) *verifyResult {

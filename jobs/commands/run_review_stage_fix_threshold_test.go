@@ -158,7 +158,7 @@ func TestALowIsSentBackAndFixedInLoop(t *testing.T) {
 		t.Error("must_fix_open = true after every finding was resolved")
 	}
 	section := (&taskOpenPR{review: review}).reviewSection()
-	if !strings.Contains(section, "_Fixed during review_") || !strings.Contains(section, "echoes the request path") {
+	if !strings.Contains(section, "<summary>Fixed during review (2)</summary>") || !strings.Contains(section, "echoes the request path") {
 		t.Errorf("the fixed Low is not under Fixed during review:\n%s", section)
 	}
 }
