@@ -171,6 +171,9 @@ func (rs *RunReviewStage) Run(parameters map[string]interface{}, logsWriter io.W
 		deadline:        time.Now().Add(reviewStageBudget),
 		stopSignal:      rs.stopSignal,
 		progressSink:    rs.progressSink,
+		// Read here, at review time, from the runner's own environment: a
+		// temporary measurement knob (see run_review_stage_shadow.go).
+		shadowEffort: readShadowEffort(logsWriter),
 	}
 	return stage.run()
 }
@@ -247,6 +250,9 @@ type reviewStage struct {
 	deadline     time.Time
 	stopSignal   <-chan struct{}
 	progressSink func(jobs.LiveProgressV1)
+	// shadowEffort is REVIEW_SHADOW_EFFORT, validated, or "" — a TEMPORARY
+	// measurement knob; see run_review_stage_shadow.go.
+	shadowEffort string
 
 	rounds      []reviewRoundOutput
 	fixedInLoop []reviewFindingOutput
@@ -295,9 +301,11 @@ type reviewStage struct {
 	// The two container runs, the two halves of the fix run's undo and the
 	// cache volume's removal, all injectable so the loop's own decisions can be
 	// tested without a Docker daemon and without root. Nil means the real
-	// thing.
+	// thing. runShadow is the shadow review's run, handed the environment it
+	// would be spawned with.
 	runReview   func(round int) (agentResult, error)
 	runFix      func(mustFix []reviewFindingOutput) error
+	runShadow   func(env []string) (agentResult, error)
 	copyTree    copyTreeFunc
 	restoreDir  restoreDirFunc
 	removeCache func(name string)
@@ -391,6 +399,13 @@ func (s *reviewStage) run() (map[string]interface{}, error) {
 		s.recordRound(round, findings, result)
 		s.finalTreeReviewed = true
 		io.WriteString(s.logsWriter, fmt.Sprintf("Review round %d completed: %d finding(s), %d agent turn(s) reported (cap: %s model responses)\n", round, len(findings), result.Turns, s.lastTurnCap))
+		if round == 1 {
+			// Before anything moves the tree or the loop's state, so the shadow
+			// review sees exactly what round 1 saw.
+			if err := s.shadowReview(result); err != nil {
+				return s.parameters, err
+			}
+		}
 		// Nothing to route back — including every advisory review, whose
 		// findings are annotations by definition (see classify).
 		sentBack := sentBackOnly(findings)

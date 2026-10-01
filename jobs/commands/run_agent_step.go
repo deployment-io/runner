@@ -1163,7 +1163,12 @@ type agentResult struct {
 	// Outcome.CostUSD, emitted as "cost_usd"). Present for Claude Code; nil
 	// for Codex (token usage only). Carried through to agentOutput by
 	// mergeAgentResultIntoJobOutput so app-server's projection can show it.
-	CostUSD     *float64 `json:"cost_usd,omitempty"`
+	CostUSD *float64 `json:"cost_usd,omitempty"`
+	// StartedAt / EndedAt are the unix seconds agentbox recorded around the
+	// agent subprocess. Zero when an image did not write them. Read for the
+	// review-effort comparison's durations (run_review_stage_shadow.go).
+	StartedAt   int64    `json:"started_at,omitempty"`
+	EndedAt     int64    `json:"ended_at,omitempty"`
 	Error       string   `json:"error,omitempty"`
 	DeniedHosts []string `json:"denied_hosts,omitempty"`
 	// PRTitle is the agent-produced short title for the resulting

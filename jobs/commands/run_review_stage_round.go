@@ -29,15 +29,41 @@ import (
 // is what lets the live-progress poller keep reading its existing path and the
 // dashboard's counters keep moving through the Review stage.
 func (s *reviewStage) runReviewRound(round int) (agentResult, error) {
+	env, err := s.reviewSpawnEnv(round)
+	if err != nil {
+		return agentResult{}, err
+	}
+	workDirHost := commandUtils.GetTaskRepositoriesBaseDir(s.ctx.OrganizationID, s.ctx.TaskID)
+	return s.spawnReviewRun(reviewRunSpec{
+		label:     fmt.Sprintf("Review round %d", round),
+		round:     round,
+		outputDir: reviewRoundOutputPath(workDirHost, round),
+	}, env)
+}
+
+// reviewRunSpec names one review container run: a loop round, or the shadow
+// review (see run_review_stage_shadow.go).
+type reviewRunSpec struct {
+	// label is how the job log names the run — "Review round 2", "Shadow
+	// review".
+	label string
+	round int
+	// outputDir is where the run's output is parked while it is copied into
+	// the job log. Each run has its own, so the shadow review cannot land on
+	// round 1's.
+	outputDir string
+}
+
+// spawnReviewRun runs one review container with env and returns what it
+// reported. The environment is built by the caller; everything else — the
+// read-only mounts, the output swap, the spawn — is the same for every review
+// run.
+func (s *reviewStage) spawnReviewRun(spec reviewRunSpec, env []string) (agentResult, error) {
 	imageRef, err := jobs.GetParameterValue[string](s.parameters, parameters_enums.AgentboxImage)
 	if err != nil {
 		return agentResult{}, fmt.Errorf("agentbox image missing: %s", err)
 	}
 	workDirHost := commandUtils.GetTaskRepositoriesBaseDir(s.ctx.OrganizationID, s.ctx.TaskID)
-	env, err := s.reviewSpawnEnv(round)
-	if err != nil {
-		return agentResult{}, err
-	}
 	readOnly, allReadOnly := readOnlyRepoDirs(workDirHost, s.allRepositoryDirs(), s.logsWriter)
 	if !allReadOnly {
 		// A repository that could not be mounted read-only stays writable, so
@@ -48,20 +74,13 @@ func (s *reviewStage) runReviewRound(round int) (agentResult, error) {
 		env = withoutEnv(env, "REVIEW_READONLY_MOUNTS")
 		io.WriteString(s.logsWriter, "Review round: not every repository could be mounted read-only, so the reviewer keeps its own sandbox\n")
 	}
-	// Log the turn cap this round is ACTUALLY spawned with, read back from the
-	// environment handed to the container. The cap counts model responses and
-	// the turns the agent reports afterwards count roughly one per tool call,
-	// so both are logged with their units rather than as "N of M", which once
-	// made a cap that held look as if it had been ignored.
-	s.lastTurnCap = envValue(env, "MAX_TURNS")
-	if s.lastTurnCap == "" {
-		s.lastTurnCap = "no cap"
-	}
-	io.WriteString(s.logsWriter, fmt.Sprintf("Review round %d: turn cap %s model responses\n", round, s.lastTurnCap))
-	swap, err := swapInReviewOutputDir(workDirHost, round, prepareAgentboxHostDirs)
+	s.logReviewRunLimits(spec.label, env)
+	swap, err := swapInReviewOutputDir(workDirHost, spec.round, prepareAgentboxHostDirs)
 	if err != nil {
 		return agentResult{}, fmt.Errorf("error preparing the review output directory: %s", err)
 	}
+	swap.outputDir = spec.outputDir
+	swap.label = spec.label
 	// DEFERRED so a failed, timed-out or cancelled round cannot leave the
 	// implementer's output displaced. Everything after this point — the spawn,
 	// the wait, the result read — happens with the implementer's directory
@@ -78,6 +97,28 @@ func (s *reviewStage) runReviewRound(round int) (agentResult, error) {
 		// The repositories are read-only FOR THE ROUND, at the mount level.
 		readOnlyRepoDirs: readOnly,
 	}, s.logsWriter)
+}
+
+// logReviewRunLimits logs the turn cap and the effort a review run is ACTUALLY
+// spawned with, read back from the environment handed to the container. The
+// cap counts model responses and the turns the agent reports afterwards count
+// roughly one per tool call, so both are logged with their units rather than
+// as "N of M", which once made a cap that held look as if it had been ignored.
+func (s *reviewStage) logReviewRunLimits(label string, env []string) {
+	s.lastTurnCap = envValue(env, "MAX_TURNS")
+	if s.lastTurnCap == "" {
+		s.lastTurnCap = "no cap"
+	}
+	io.WriteString(s.logsWriter, fmt.Sprintf("%s: turn cap %s model responses\n", label, s.lastTurnCap))
+	io.WriteString(s.logsWriter, fmt.Sprintf("%s: effort %s\n", label, effortName(envValue(env, "REVIEW_EFFORT"))))
+}
+
+// effortName is how the job log names a REVIEW_EFFORT value.
+func effortName(effort string) string {
+	if effort == "" {
+		return "model default"
+	}
+	return effort
 }
 
 // readOnlyRepoDirs is the set of repository directories a review round mounts
@@ -143,6 +184,13 @@ func withoutEnv(env []string, key string) []string {
 // do rather than against what the change actually does — and to keep going
 // where the implementer left off.
 func (s *reviewStage) reviewSpawnEnv(round int) ([]string, error) {
+	return s.reviewSpawnEnvWithEffort(round, "")
+}
+
+// reviewSpawnEnvWithEffort is reviewSpawnEnv plus REVIEW_EFFORT. Only the
+// shadow review sets an effort; the loop's rounds always run at the model's
+// default.
+func (s *reviewStage) reviewSpawnEnvWithEffort(round int, effort string) ([]string, error) {
 	env, err := buildAgentSpawnEnvVars(s.reviewerView(), s.logsWriter)
 	if err != nil {
 		return nil, err
@@ -163,6 +211,7 @@ func (s *reviewStage) reviewSpawnEnv(round int) ([]string, error) {
 		round:        round,
 		openFindings: openFindings,
 		verifyResult: s.verifyResultEnvValue(),
+		effort:       effort,
 	}), nil
 }
 
@@ -373,6 +422,9 @@ type reviewEnvInputs struct {
 	// verifyResult is the JSON REVIEW_VERIFY_RESULT payload, or "" when the
 	// Step has no verify result to send — see verifyResultEnvValue.
 	verifyResult string
+	// effort is the REVIEW_EFFORT value, or "" for the model's default — see
+	// reviewSpawnEnvWithEffort.
+	effort string
 }
 
 // applyReviewEnv turns an implement-run environment into a review-run one:
@@ -389,7 +441,7 @@ func applyReviewEnv(env []string, in reviewEnvInputs) []string {
 	for _, kv := range env {
 		key, _, _ := strings.Cut(kv, "=")
 		switch key {
-		case "STEP_PROMPT", "PREVIOUS_STEPS_SUMMARY", "AGENT_MODE", "MAX_TURNS", "REVIEW_OPEN_FINDINGS", "REVIEW_VERIFY_RESULT":
+		case "STEP_PROMPT", "PREVIOUS_STEPS_SUMMARY", "AGENT_MODE", "MAX_TURNS", "REVIEW_OPEN_FINDINGS", "REVIEW_VERIFY_RESULT", "REVIEW_EFFORT":
 			continue
 		case agentMCPSocketEnvVar:
 			// Review needs no runner tools, and the review spawn mounts no
@@ -432,6 +484,12 @@ func applyReviewEnv(env []string, in reviewEnvInputs) []string {
 	if strings.TrimSpace(in.verifyResult) != "" {
 		out = append(out, "REVIEW_VERIFY_RESULT="+in.verifyResult)
 	}
+	// Absent unless asked for, so a round runs at the model's default effort
+	// exactly as before the variable existed. Stripped above so nothing
+	// inherited can set it either.
+	if in.effort != "" {
+		out = append(out, "REVIEW_EFFORT="+in.effort)
+	}
 	return out
 }
 
@@ -454,6 +512,11 @@ func applyReviewEnv(env []string, in reviewEnvInputs) []string {
 type reviewOutputSwap struct {
 	workDirHost string
 	round       int
+	// outputDir is where the run's own output is parked while it is copied
+	// into the job log, and label is how the log names the run. Empty means
+	// the loop round's: reviewRoundOutputPath and "Review round N".
+	outputDir string
+	label     string
 	// displaced records whether there was an implementer directory to move.
 	// There always is in practice; a round that found none must not invent
 	// one on the way back.
@@ -488,7 +551,7 @@ const reviewRoundResultLogMaxBytes = 16000
 // round directory is removed, so nothing that only lived on disk is lost with
 // it. Best-effort throughout: a round that wrote no result is the case the
 // caller is already handling.
-func logRoundOutput(dir string, round int, logsWriter io.Writer) {
+func logRoundOutput(dir string, label string, logsWriter io.Writer) {
 	data, err := os.ReadFile(filepath.Join(dir, agentboxResultFile))
 	if err != nil || len(data) == 0 {
 		return
@@ -496,7 +559,7 @@ func logRoundOutput(dir string, round int, logsWriter io.Writer) {
 	if len(data) > reviewRoundResultLogMaxBytes {
 		data = append(data[:reviewRoundResultLogMaxBytes], []byte("\n[… truncated]")...)
 	}
-	io.WriteString(logsWriter, fmt.Sprintf("Review round %d result.json:\n%s\n", round, data))
+	io.WriteString(logsWriter, fmt.Sprintf("%s result.json:\n%s\n", label, data))
 }
 
 // cleanupReviewStageSiblings removes every host directory the stage parked
@@ -579,16 +642,22 @@ func (s *reviewOutputSwap) restore(logsWriter io.Writer) {
 	}
 	s.restored = true
 	implementerDir := filepath.Join(s.workDirHost, agentboxResultDirRel)
-	roundDir := reviewRoundOutputPath(s.workDirHost, s.round)
+	roundDir, label := s.outputDir, s.label
+	if roundDir == "" {
+		roundDir = reviewRoundOutputPath(s.workDirHost, s.round)
+	}
+	if label == "" {
+		label = fmt.Sprintf("Review round %d", s.round)
+	}
 	_ = os.RemoveAll(roundDir)
 	if _, err := os.Stat(implementerDir); err == nil {
 		// Park the round's output under its own name first, so the copy into
 		// the log cannot race the implementer's directory coming back.
 		if err := os.Rename(implementerDir, roundDir); err != nil {
-			io.WriteString(logsWriter, fmt.Sprintf("warning: could not set aside review round %d's output: %s\n", s.round, err))
+			io.WriteString(logsWriter, fmt.Sprintf("warning: could not set aside %s's output: %s\n", label, err))
 			_ = os.RemoveAll(implementerDir)
 		} else {
-			logRoundOutput(roundDir, s.round, logsWriter)
+			logRoundOutput(roundDir, label, logsWriter)
 			_ = os.RemoveAll(roundDir)
 		}
 	}
