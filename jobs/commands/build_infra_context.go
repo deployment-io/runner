@@ -18,6 +18,9 @@ import (
 
 const contextPackVersion = 1
 
+// infraSources lists the context sources buildInfraPacks runs; a seam so tests can run fakes.
+var infraSources = context_sources.All
+
 // infraBuildTimeout is a generous wall-clock bound on the whole source-build pass, passed into every
 // source's Build. The heartbeat is a separate ticker that keeps beating even if a source blocks, so
 // it can't reclaim a hung command; this deadline is what bounds a pathological cloud-API hang.
@@ -44,6 +47,27 @@ type BuildInfraContext struct{}
 func (b *BuildInfraContext) Run(parameters map[string]interface{}, logsWriter io.Writer) (map[string]interface{}, error) {
 	io.WriteString(logsWriter, "Building infra context pack...\n")
 
+	ctx, cancel := context.WithTimeout(context.Background(), infraBuildTimeout)
+	defer cancel()
+	scopedPacks, err := buildInfraPacks(ctx, parameters, logsWriter)
+	if err != nil {
+		return parameters, err
+	}
+
+	out, err := json.Marshal(scopedPacks)
+	if err != nil {
+		return parameters, fmt.Errorf("failed to encode context packs: %w", err)
+	}
+	_ = jobs.SetParameterValue[string](parameters, parameters_enums.JobOutput, string(out))
+	io.WriteString(logsWriter, fmt.Sprintf("Context pack built: %d scope(s)\n", len(scopedPacks)))
+	return parameters, nil
+}
+
+// buildInfraPacks runs every registered context source under ctx (the caller's deadline), groups
+// their results into one pack per scope, and applies the runner-side redaction backstop to each.
+// Shared by the BuildInfraContext Job and MaterializeContext's inline refresh. A failed source is
+// logged and skipped (its scopes keep their last-good record); only a redaction failure is an error.
+func buildInfraPacks(ctx context.Context, parameters map[string]interface{}, logsWriter io.Writer) ([]context_pack.ScopedPack, error) {
 	builtTs := time.Now().Unix()
 	byScope := map[context_pack.Scope]*context_pack.Pack{}
 	var order []context_pack.Scope // deterministic emit order
@@ -69,9 +93,7 @@ func (b *BuildInfraContext) Run(parameters map[string]interface{}, logsWriter io
 		return pack
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), infraBuildTimeout)
-	defer cancel()
-	sources := context_sources.All()
+	sources := infraSources()
 	io.WriteString(logsWriter, fmt.Sprintf("Running %d context source(s)...\n", len(sources)))
 	for _, src := range sources {
 		results, err := src.Build(ctx, parameters, logsWriter)
@@ -104,16 +126,10 @@ func (b *BuildInfraContext) Run(parameters map[string]interface{}, logsWriter io
 	for _, scope := range order {
 		pack := byScope[scope]
 		if err := context_sources.Redact(pack); err != nil {
-			return parameters, fmt.Errorf("redaction failed: %w", err)
+			return nil, fmt.Errorf("redaction failed: %w", err)
 		}
 		scopedPacks = append(scopedPacks, context_pack.ScopedPack{Scope: scope, Pack: *pack})
 	}
 
-	out, err := json.Marshal(scopedPacks)
-	if err != nil {
-		return parameters, fmt.Errorf("failed to encode context packs: %w", err)
-	}
-	_ = jobs.SetParameterValue[string](parameters, parameters_enums.JobOutput, string(out))
-	io.WriteString(logsWriter, fmt.Sprintf("Context pack built: %d scope(s)\n", len(scopedPacks)))
-	return parameters, nil
+	return scopedPacks, nil
 }
