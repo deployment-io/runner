@@ -3,8 +3,10 @@ package commands
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 
 	"github.com/deployment-io/deployment-runner-kit/context_pack"
@@ -50,7 +52,10 @@ func (b *BuildInfraContext) Run(parameters map[string]interface{}, logsWriter io
 	ctx, cancel := context.WithTimeout(context.Background(), infraBuildTimeout)
 	defer cancel()
 	scopedPacks, err := buildInfraPacks(ctx, parameters, logsWriter)
-	if err != nil {
+	// A failed source is already logged and its scopes keep their last-good record; this Job still
+	// stores what the other sources built. Only another error (redaction) fails it.
+	var failed *infraSourceFailures
+	if err != nil && !errors.As(err, &failed) {
 		return parameters, err
 	}
 
@@ -63,10 +68,22 @@ func (b *BuildInfraContext) Run(parameters map[string]interface{}, logsWriter io
 	return parameters, nil
 }
 
+// infraSourceFailures is buildInfraPacks' error when one or more context sources failed: the packs
+// it returns alongside hold only what the other sources built. The BuildInfraContext Job stores
+// those anyway (it always has); the inline refresh treats the scan as failed.
+type infraSourceFailures struct {
+	sources []string
+}
+
+func (e *infraSourceFailures) Error() string {
+	return "context source(s) failed: " + strings.Join(e.sources, ", ")
+}
+
 // buildInfraPacks runs every registered context source under ctx (the caller's deadline), groups
 // their results into one pack per scope, and applies the runner-side redaction backstop to each.
 // Shared by the BuildInfraContext Job and MaterializeContext's inline refresh. A failed source is
-// logged and skipped (its scopes keep their last-good record); only a redaction failure is an error.
+// logged and skipped (its scopes keep their last-good record) and named in an *infraSourceFailures
+// returned with the other sources' packs; a redaction failure returns no packs.
 func buildInfraPacks(ctx context.Context, parameters map[string]interface{}, logsWriter io.Writer) ([]context_pack.ScopedPack, error) {
 	builtTs := time.Now().Unix()
 	byScope := map[context_pack.Scope]*context_pack.Pack{}
@@ -94,6 +111,7 @@ func buildInfraPacks(ctx context.Context, parameters map[string]interface{}, log
 	}
 
 	sources := infraSources()
+	var failedSources []string
 	io.WriteString(logsWriter, fmt.Sprintf("Running %d context source(s)...\n", len(sources)))
 	for _, src := range sources {
 		results, err := src.Build(ctx, parameters, logsWriter)
@@ -106,6 +124,7 @@ func buildInfraPacks(ctx context.Context, parameters map[string]interface{}, log
 			// retry refreshes it; a persistent failure shows up in logs, not by overwriting good
 			// context with a worse snapshot.
 			io.WriteString(logsWriter, fmt.Sprintf("  source %s failed (skipping; last-good context retained): %v\n", src.Name(), err))
+			failedSources = append(failedSources, src.Name())
 			continue
 		}
 		// Success path: each Result is one scope's contribution — artifacts + any gaps the connector
@@ -131,5 +150,8 @@ func buildInfraPacks(ctx context.Context, parameters map[string]interface{}, log
 		scopedPacks = append(scopedPacks, context_pack.ScopedPack{Scope: scope, Pack: *pack})
 	}
 
+	if len(failedSources) > 0 {
+		return scopedPacks, &infraSourceFailures{sources: failedSources}
+	}
 	return scopedPacks, nil
 }

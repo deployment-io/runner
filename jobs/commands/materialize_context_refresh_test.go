@@ -285,3 +285,31 @@ func TestMaterializeContext_StalledSaveTimesOut(t *testing.T) {
 		t.Errorf("materialize calls = %d, want 1", len(c.materializeCalls))
 	}
 }
+
+// A source that fails makes the inline rescan a failure: nothing is saved, the failure line names
+// the source, and the stored context is still materialized. (BuildInfraContext keeps storing the
+// other sources' packs — TestBuildInfraContext_Output.)
+func TestMaterializeContext_FailedSourceIsAFailedRescan(t *testing.T) {
+	prev := infraSources
+	t.Cleanup(func() { infraSources = prev })
+	infraSources = func() []context_sources.Source {
+		return []context_sources.Source{&fakeSource{name: "aws-ecs", err: errors.New("AccessDenied")}}
+	}
+	c := &fakeContextClient{}
+	withContextFakes(t, c, buildInfraPacks)
+	p := taskParameters(t)
+	jobs.SetParameterValue[bool](p, parameters_enums.RefreshInfraContext, true)
+	logs := runMaterialize(t, p)
+	if len(c.saves) != 0 {
+		t.Errorf("saved %d time(s) after a failed source, want none", len(c.saves))
+	}
+	if !strings.Contains(logs, "Context refresh: infrastructure rescan failed (context source(s) failed: aws-ecs) — using the stored context") {
+		t.Errorf("logs missing the failure line:\n%s", logs)
+	}
+	if strings.Contains(logs, "Context refresh: saved") {
+		t.Errorf("logs report a save after a failed source:\n%s", logs)
+	}
+	if len(c.materializeCalls) != 1 {
+		t.Errorf("materialize calls = %d, want 1", len(c.materializeCalls))
+	}
+}
