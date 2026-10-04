@@ -136,8 +136,12 @@ type resolvedDeployRequirement struct {
 	// environment is known, so the variable can be added on the dashboard.
 	Managed bool `json:"managed,omitempty"`
 	// Found is false when no row of services.json names the service.
-	Found    bool   `json:"found"`
-	Location string `json:"location,omitempty"`
+	Found bool `json:"found"`
+	// ContextUnavailable is true when the stage had no copy of the context to
+	// resolve against, so nothing about the service could be checked. Found is
+	// false then too, but "not in the context" would be untrue.
+	ContextUnavailable bool   `json:"context_unavailable,omitempty"`
+	Location           string `json:"location,omitempty"`
 }
 
 // maxDeployRequirements bounds the resolved list, as agentbox bounds the raw
@@ -194,6 +198,37 @@ func latestCompletedDeployRequirements(rounds []reviewRoundOutput) []reviewDeplo
 		}
 	}
 	return nil
+}
+
+// resolveDeployRequirementsFrom resolves the requirements against the stage's
+// copy of the context in contextDir. With no copy ("" — it could not be
+// fetched), nothing can be checked: each valid requirement becomes one entry
+// marked ContextUnavailable, so the pull request does not claim the service is
+// missing from a context nobody read.
+func resolveDeployRequirementsFrom(reqs []reviewDeployRequirement, contextDir string, logsWriter io.Writer) []resolvedDeployRequirement {
+	if contextDir != "" {
+		return resolveDeployRequirements(reqs, readDeployServiceRows(contextDir), logsWriter)
+	}
+	var out []resolvedDeployRequirement
+	seen := map[[3]string]bool{}
+	for _, req := range reqs {
+		if !deployVariableName.MatchString(req.Variable) || strings.TrimSpace(req.Service) == "" {
+			continue
+		}
+		if len(out) == maxDeployRequirements {
+			break
+		}
+		key := [3]string{req.Variable, req.Service, req.Environment}
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		r := resolvedDeployRequirement{Variable: req.Variable, Service: req.Service, Environment: req.Environment,
+			ContextUnavailable: true, Location: req.Location}
+		out = append(out, r)
+		logDeployRequirement(logsWriter, r, deployRequirementOutcome(r))
+	}
+	return out
 }
 
 // resolveDeployRequirements resolves each requirement against the copy's
@@ -266,6 +301,8 @@ func resolveDeployRequirement(req reviewDeployRequirement, rows []deployServiceR
 
 func deployRequirementOutcome(r resolvedDeployRequirement) string {
 	switch {
+	case r.ContextUnavailable:
+		return "context unavailable, not checked"
 	case !r.Found:
 		return "service not found"
 	case r.Managed:
@@ -282,11 +319,13 @@ func deployRequirementsOf(result agentResult) []reviewDeployRequirement {
 }
 
 func logDeployRequirement(logsWriter io.Writer, r resolvedDeployRequirement, outcome string) {
-	environment := r.Environment
+	// The service and environment can be the reviewer's own text: strip line
+	// breaks and backticks and cap them, so they cannot forge a log line.
+	environment := deployName(r.Environment)
 	if environment == "" {
 		environment = "-"
 	}
-	io.WriteString(logsWriter, fmt.Sprintf("Review stage: deploy requirement %s for %s in %s: %s\n", r.Variable, r.Service, environment, outcome))
+	io.WriteString(logsWriter, fmt.Sprintf("Review stage: deploy requirement %s for %s in %s: %s\n", r.Variable, deployName(r.Service), environment, outcome))
 }
 
 func containsString(list []string, s string) bool {

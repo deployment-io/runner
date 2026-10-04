@@ -63,6 +63,11 @@ func deployRequirementLine(r resolvedDeployRequirement, dashboardURL string) str
 	if service == "" {
 		service = "-"
 	}
+	if r.ContextUnavailable {
+		// The stage could not fetch the context, so nothing was checked — not
+		// even whether the service is in it.
+		return fmt.Sprintf("- %s for service `%s` — deployment.io's context could not be read, so this was not checked against the service's environment", name, service)
+	}
 	return fmt.Sprintf("- %s for service `%s` — this service is not in deployment.io's context", name, service)
 }
 

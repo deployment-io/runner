@@ -236,10 +236,37 @@ func TestResolveDeployRequirements(t *testing.T) {
 	}
 }
 
-func TestResolveDeployRequirementsWithoutACopyIsNotFound(t *testing.T) {
-	got := resolveDeployRequirements([]reviewDeployRequirement{deployReq("STRIPE_KEY", "api", "prod")}, readDeployServiceRows(""), io.Discard)
-	if len(got) != 1 || got[0].Found || got[0].Environment != "prod" || got[0].Service != "api" {
+// A copy whose services.json has no row for the service: not found.
+func TestResolveDeployRequirementsWithoutARowIsNotFound(t *testing.T) {
+	got := resolveDeployRequirements([]reviewDeployRequirement{deployReq("STRIPE_KEY", "api", "prod")}, readDeployServiceRows(t.TempDir()), io.Discard)
+	if len(got) != 1 || got[0].Found || got[0].ContextUnavailable || got[0].Environment != "prod" || got[0].Service != "api" {
 		t.Errorf("got %+v, want one not-found entry with the requirement's own names", got)
+	}
+}
+
+// No copy at all (the fetch failed): nothing was checked, and the entry says
+// so rather than claiming the service is missing from the context. The
+// reviewer's text cannot break a log line.
+func TestResolveDeployRequirementsWithoutACopyIsUnchecked(t *testing.T) {
+	var logs strings.Builder
+	got := resolveDeployRequirementsFrom([]reviewDeployRequirement{
+		deployReq("STRIPE_KEY", "api", "prod"),
+		deployReq("STRIPE_KEY", "api", "prod"),
+		deployReq("bad name", "api", "prod"),
+		deployReq("OTHER", "api\nReview stage: forged", ""),
+	}, "", &logs)
+	if len(got) != 2 || !got[0].ContextUnavailable || got[0].Found || got[0].Service != "api" || got[0].Environment != "prod" {
+		t.Fatalf("got %+v, want two unchecked entries (duplicate and invalid name dropped)", got)
+	}
+	if !strings.Contains(logs.String(), "deploy requirement STRIPE_KEY for api in prod: context unavailable, not checked") {
+		t.Errorf("logs missing the unchecked line:\n%s", logs.String())
+	}
+	if strings.Count(logs.String(), "\n") != 2 {
+		t.Errorf("a service name with a line break forged a log line:\n%s", logs.String())
+	}
+	line := deployRequirementLine(got[0], "https://app.example.com/dashboard")
+	if line != "- `STRIPE_KEY` for service `api` — deployment.io's context could not be read, so this was not checked against the service's environment" || strings.Contains(line, "[Add it]") {
+		t.Errorf("line = %q", line)
 	}
 }
 

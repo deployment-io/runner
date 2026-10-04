@@ -606,9 +606,9 @@ func (s *reviewStage) finish() (map[string]interface{}, error) {
 		StoppedNoChange:   s.stoppedNoChange,
 		FinalTreeReviewed: s.finalTreeReviewed,
 		// Never findings: resolved for the "Before deploying" part of the
-		// pull request and nothing else — see resolveDeployRequirements.
-		DeployRequirements: resolveDeployRequirements(
-			latestCompletedDeployRequirements(s.rounds), readDeployServiceRows(s.contextCopyDir), s.logsWriter),
+		// pull request and nothing else — see resolveDeployRequirementsFrom.
+		DeployRequirements: resolveDeployRequirementsFrom(
+			latestCompletedDeployRequirements(s.rounds), s.contextCopyDir, s.logsWriter),
 	}
 	s.logFullReview(out)
 	if err := mergeReviewIntoJobOutput(s.parameters, out); err != nil {
