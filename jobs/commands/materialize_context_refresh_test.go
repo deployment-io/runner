@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"os"
@@ -311,5 +312,20 @@ func TestMaterializeContext_FailedSourceIsAFailedRescan(t *testing.T) {
 	}
 	if len(c.materializeCalls) != 1 {
 		t.Errorf("materialize calls = %d, want 1", len(c.materializeCalls))
+	}
+}
+
+// A save whose dial or TLS handshake ran out of time (context.DeadlineExceeded, not a connection
+// deadline) is reported as the save timing out, like a stalled reply.
+func TestMaterializeContext_SaveDialTimeoutIsReportedAsATimeout(t *testing.T) {
+	c := &fakeContextClient{saveErr: &net.OpError{Op: "dial", Net: "tcp", Err: context.DeadlineExceeded}}
+	withContextFakes(t, c, oneClusterScan)
+	p := taskParameters(t)
+	jobs.SetParameterValue[bool](p, parameters_enums.RefreshInfraContext, true)
+
+	logs := runMaterialize(t, p)
+	want := fmt.Sprintf("Context refresh: infrastructure rescan failed (saving timed out after %s) — using the stored context", infraSaveTimeout)
+	if !strings.Contains(logs, want) {
+		t.Errorf("logs missing %q:\n%s", want, logs)
 	}
 }

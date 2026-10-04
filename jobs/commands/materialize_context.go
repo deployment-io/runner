@@ -181,7 +181,9 @@ func rescanAndSaveInfra(orgID string, parameters map[string]interface{}, logsWri
 	}
 
 	saved, err := contextClient.SaveInfraContext(orgID, string(packsJSON), infraSaveTimeout)
-	if errors.Is(err, os.ErrDeadlineExceeded) {
+	// A connection deadline reports os.ErrDeadlineExceeded; a dial or TLS handshake that runs out of
+	// time reports context.DeadlineExceeded. Both are the save's timeout.
+	if errors.Is(err, os.ErrDeadlineExceeded) || errors.Is(err, context.DeadlineExceeded) {
 		return 0, fmt.Errorf("saving timed out after %s", infraSaveTimeout)
 	}
 	return saved, err
