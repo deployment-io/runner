@@ -258,6 +258,11 @@ type reviewStage struct {
 	// "" — a TEMPORARY measurement knob the control plane stamps for the orgs
 	// being measured; see run_review_stage_shadow.go.
 	shadowEffort string
+	// loopEffortValue is the REVIEW_EFFORT the loop's rounds run at, from the
+	// Job's ReviewLevel; resolved on first use by loopEffort, which also logs
+	// once when the level is unavailable for the reviewer.
+	loopEffortValue    string
+	loopEffortResolved bool
 	// contextCopyDir is the stage's own copy of the org's deployment context,
 	// written outside the work dir and bound read-only at /work/context in
 	// every review spawn (see prepareContextCopy), or "" when it could not be
