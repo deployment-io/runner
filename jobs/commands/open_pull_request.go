@@ -245,14 +245,16 @@ const (
 // first line > generic fallback; see that function for the policy).
 //
 // The body has a fixed layout, every part left out when it has nothing to
-// show: the one-line review tally, the agent's summary, what the Task asks
-// for, how the change was checked, the Review section, the blocked hosts, and
+// show: the one-line review tally, "Before deploying" (the configuration the
+// change needs that its environment lacks), the agent's summary, what the Task
+// asks for, how the change was checked, the Review section, the blocked hosts, and
 // the trailer last. What a reviewer reads first is what the review did and
 // what the change is; the reference material sits below it, collapsed.
 //
 // EVERYTHING EXCEPT THE SUMMARY IS BUILT FIRST and the summary is given what
 // is left of prBodyMaxRunes. Each of those parts is bounded — the Review
-// section by reviewSectionMaxRunes, the criteria and blocked hosts by their
+// section by reviewSectionMaxRunes, "Before deploying" by its entry cap and
+// its capped names, the criteria and blocked hosts by their
 // item caps, a verify step's output by boundVerifyTail — and the agent's
 // summary is the one part that is not, so it is the part that yields when the
 // body has to fit.
@@ -265,6 +267,7 @@ const (
 func (opr *taskOpenPR) buildPRTitleAndBody() (string, string) {
 	subject, leadIn := opr.subjectAndLeadIn()
 	tally := reviewTally(opr.review)
+	deploy := beforeDeployingSection(opr.review, opr.ctx.DashboardURL)
 	asks := acceptanceSection(opr.acceptance)
 	review := strings.Trim(opr.reviewSection(), "\n")
 	hosts := opr.blockedHostsSection()
@@ -273,11 +276,11 @@ func (opr *taskOpenPR) buildPRTitleAndBody() (string, string) {
 	// step's output is bounded by boundVerifyTail, but the number of failing
 	// steps follows the Task's repositories — so it is given what the rest of
 	// the body leaves, less the separator in front of it.
-	others := joinBodyParts(tally, asks, review, hosts, trailer) + "\n"
+	others := joinBodyParts(tally, deploy, asks, review, hosts, trailer) + "\n"
 	checked := opr.howCheckedSection(prBodyMaxRunes - utf8.RuneCountInString(others) - len(bodyPartSeparator))
-	rest := joinBodyParts(tally, asks, checked, review, hosts, trailer) + "\n"
+	rest := joinBodyParts(tally, deploy, asks, checked, review, hosts, trailer) + "\n"
 	leadIn = boundPRSummary(leadIn, prBodyMaxRunes-utf8.RuneCountInString(rest)-len(bodyPartSeparator))
-	body := joinBodyParts(tally, leadIn, asks, checked, review, hosts, trailer) + "\n"
+	body := joinBodyParts(tally, deploy, leadIn, asks, checked, review, hosts, trailer) + "\n"
 	return subject, cutToRuneBudget(body, prBodyMaxRunes, prBodyTruncatedNote)
 }
 

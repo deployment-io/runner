@@ -987,6 +987,14 @@ func agentboxMounts(spec agentboxSpawnSpec) []mount.Mount {
 			ReadOnly: true,
 		})
 	}
+	if spec.readOnlyContextDir != "" {
+		mounts = append(mounts, mount.Mount{
+			Type:     mount.TypeBind,
+			Source:   spec.readOnlyContextDir,
+			Target:   filepath.Join(agentboxWorkDirInContainer, reviewContextDirName),
+			ReadOnly: true,
+		})
+	}
 	return mounts
 }
 
@@ -1210,6 +1218,11 @@ type reviewResult struct {
 	// reviewer whose entries were all unusable. The runner treats all three
 	// the same way, by holding every open finding.
 	Previous []reviewPreviousFinding `json:"previous,omitempty"`
+	// DeployRequirements are the variables the deploy readiness pass found
+	// this change newly reads and the service's environment does not provide.
+	// Present only when that pass ran. NOT findings — see
+	// reviewDeployRequirement.
+	DeployRequirements []reviewDeployRequirement `json:"deploy_requirements,omitempty"`
 }
 
 // reviewPreviousFinding is one entry of review_result.previous: the key the
@@ -1780,6 +1793,11 @@ type agentboxSpawnSpec struct {
 	// own sandbox cannot start from either editing the change or, as happened,
 	// failing every command it ran and reporting nothing.
 	readOnlyRepoDirs []string
+	// readOnlyContextDir is a host directory bound READ-ONLY at /work/context
+	// on top of the /work bind: the Review stage's own copy of the org's
+	// deployment context (see prepareContextCopy). Set by REVIEW spawns only;
+	// a fix run is an implement run and never gets it.
+	readOnlyContextDir string
 }
 
 // agentMCPSocketHostPath returns the host path for a task's MCP tool socket: a
