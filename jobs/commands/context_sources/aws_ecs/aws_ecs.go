@@ -80,7 +80,7 @@ type taskDefContainer struct {
 // region); the cluster ARN carries account+region, so records stay unambiguous across runners.
 func (s *source) Build(ctx context.Context, parameters map[string]interface{}, logsWriter io.Writer) ([]context_sources.Result, error) {
 	runnerData := utils.RunnerData.Get()
-	if err := ensurePolicy(parameters, runnerData); err != nil {
+	if err := ensurePolicy(ctx, parameters, runnerData); err != nil {
 		return nil, err
 	}
 
@@ -147,13 +147,13 @@ func (s *source) Build(ctx context.Context, parameters map[string]interface{}, l
 
 // ensurePolicy self-grants the infra-context read bundle (ecs:*) on the runner's own task role,
 // mirroring every other command's policy self-grant. Idempotent; a no-op on a runner that already
-// has ecs:* from a prior deployment.
-func ensurePolicy(parameters map[string]interface{}, runnerData utils.RunnerDataType) error {
+// has ecs:* from a prior deployment. Bounded by ctx, so an inline refresh's deadline covers it.
+func ensurePolicy(ctx context.Context, parameters map[string]interface{}, runnerData utils.RunnerDataType) error {
 	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIDNamespace)
 	if err != nil {
 		return err
 	}
-	return iam_policies.AddAwsPolicyForDeploymentRunner(iam_policy_enums.AwsInfraContext, runnerData.OsType.String(),
+	return iam_policies.AddAwsPolicyForDeploymentRunnerWithContext(ctx, iam_policy_enums.AwsInfraContext, runnerData.OsType.String(),
 		runnerData.CpuArchEnum.String(), organizationID, runnerData.RunnerRegion, runnerData.Mode, runnerData.TargetCloud)
 }
 
