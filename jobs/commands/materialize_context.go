@@ -82,14 +82,27 @@ func (m *MaterializeContext) Run(parameters map[string]interface{}, logsWriter i
 		return parameters, nil
 	}
 
-	if err := os.MkdirAll(contextDir, 0o755); err != nil {
+	written, err := writeContextFiles(contextDir, files, logsWriter)
+	if err != nil {
 		io.WriteString(logsWriter, fmt.Sprintf("Could not create context dir, continuing without it: %s\n", err))
 		return parameters, nil
 	}
+	io.WriteString(logsWriter, fmt.Sprintf("Materialized %d context file(s) into /work/context\n", written))
+	return parameters, nil
+}
+
+// writeContextFiles writes the context files under dir — creating it — and chowns the tree to
+// the agentbox user so the agent can read it through a bind mount. Each path is anchored under
+// dir; a file that cannot be written is logged and skipped. It returns how many were written,
+// and an error only when dir itself cannot be created.
+func writeContextFiles(dir string, files []context_pack.ContextFileV1, logsWriter io.Writer) (int, error) {
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return 0, err
+	}
 	written := 0
 	for _, f := range files {
-		// Anchor under contextDir; filepath.Clean("/"+Path) defends against a stray ".." in Path.
-		dest := filepath.Join(contextDir, filepath.Clean("/"+f.Path))
+		// Anchor under dir; filepath.Clean("/"+Path) defends against a stray ".." in Path.
+		dest := filepath.Join(dir, filepath.Clean("/"+f.Path))
 		if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
 			io.WriteString(logsWriter, fmt.Sprintf("  skipping %s: %s\n", f.Path, err))
 			continue
@@ -101,11 +114,10 @@ func (m *MaterializeContext) Run(parameters map[string]interface{}, logsWriter i
 		written++
 	}
 	// Make the tree readable by the agentbox (UID 1000) through the bind mount.
-	if err := chownTreeToAgentbox(contextDir); err != nil {
+	if err := chownTreeToAgentbox(dir); err != nil {
 		io.WriteString(logsWriter, fmt.Sprintf("Could not chown context dir: %s\n", err))
 	}
-	io.WriteString(logsWriter, fmt.Sprintf("Materialized %d context file(s) into /work/context\n", written))
-	return parameters, nil
+	return written, nil
 }
 
 // contextDirFor returns the host path that bind-mounts to /work/context for a Task or Session

@@ -594,6 +594,10 @@ type reviewRoundOutput struct {
 	Turns     int    `json:"turns,omitempty"`
 	Completed bool   `json:"completed"`
 	Error     string `json:"error,omitempty"`
+	// DeployRequirements is the round's review_result.deploy_requirements as
+	// agentbox reported it. Not findings: never sent back, never held, never
+	// counted, never posted inline.
+	DeployRequirements []reviewDeployRequirement `json:"deploy_requirements,omitempty"`
 }
 
 // reviewOutput is the Review stage's whole record for this Step run.
@@ -625,6 +629,10 @@ type reviewOutput struct {
 	// Only then do its findings' locations describe the code on the branch,
 	// so only then are they posted as inline comments on the pull request.
 	FinalTreeReviewed bool `json:"final_tree_reviewed,omitempty"`
+	// DeployRequirements is the latest completed round's deploy requirements,
+	// resolved against the stage's copy of services.json at finish(). The pull
+	// request lists them under "Before deploying"; nothing else reads them.
+	DeployRequirements []resolvedDeployRequirement `json:"deploy_requirements,omitempty"`
 }
 
 type agentOutput struct {

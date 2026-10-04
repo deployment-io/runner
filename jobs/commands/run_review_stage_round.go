@@ -11,6 +11,7 @@ import (
 
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
+	"github.com/deployment-io/deployment-runner/agenttools"
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
 )
 
@@ -88,7 +89,13 @@ func (s *reviewStage) spawnReviewRun(spec reviewRunSpec, env []string) (agentRes
 	defer swap.restore(s.logsWriter)
 
 	impl := &RunAgentStep{stopSignal: s.stopSignal, progressSink: s.progressSink}
-	return impl.spawnAgentboxAndWait(agentboxSpawnSpec{
+	return impl.spawnAgentboxAndWait(s.reviewSpawnSpec(imageRef, workDirHost, env, readOnly), s.logsWriter)
+}
+
+// reviewSpawnSpec is the container configuration of every review run — each
+// loop round and the shadow review.
+func (s *reviewStage) reviewSpawnSpec(imageRef, workDirHost string, env, readOnly []string) agentboxSpawnSpec {
+	return agentboxSpawnSpec{
 		imageRef:    imageRef,
 		workDirHost: workDirHost,
 		cacheVolume: cacheVolumeName(s.ctx),
@@ -96,7 +103,10 @@ func (s *reviewStage) spawnReviewRun(spec reviewRunSpec, env []string) (agentRes
 		waitTimeout: reviewRunTimeout,
 		// The repositories are read-only FOR THE ROUND, at the mount level.
 		readOnlyRepoDirs: readOnly,
-	}, s.logsWriter)
+		// So is the deployment context the deploy readiness pass reads: the
+		// stage's own copy, not what the implement run left at /work/context.
+		readOnlyContextDir: s.contextCopyDir,
+	}
 }
 
 // logReviewRunLimits logs the turn cap and the effort a review run is ACTUALLY
@@ -416,7 +426,15 @@ func parameterKeyString(k parameters_enums.Key) string {
 // back. agentbox runs it on documentation- and lockfile-only changes too, and
 // skips it when the Task has no spec. An agentbox image older than 1.9.25 does
 // not know the pass and ignores the name, so the order of release is safe.
-const reviewPasses = "security,correctness,spec"
+//
+// deploy ("deploy readiness": will the change deploy and run the way the org
+// deploys it) reads /work/context/services.json — the stage's read-only copy
+// (see prepareContextCopy) — and agentbox skips it when no row there names a
+// changed repository. A variable the change newly needs is reported as a
+// deploy requirement, which the pull request lists under "Before deploying"
+// and which is never a finding. An agentbox image without the pass drops the
+// name with a warning (parseReviewPasses), so this can ship first.
+const reviewPasses = "security,correctness,spec,deploy"
 
 type reviewEnvInputs struct {
 	spec        string
@@ -579,7 +597,8 @@ func logRoundOutput(dir string, label string, logsWriter io.Writer) {
 
 // cleanupReviewStageSiblings removes every host directory the stage parked
 // beside the work dir: the implementer's stash, any round directory a failed
-// restore left behind, and any fix round's undo copy.
+// restore left behind, any fix round's undo copy, and the stage's copy of the
+// deployment context.
 //
 // Deferred at the top of the stage so it runs however the stage ends. Each
 // round removes its own directory and a fix run's snapshot is removed as soon
@@ -589,7 +608,7 @@ func logRoundOutput(dir string, label string, logsWriter io.Writer) {
 func cleanupReviewStageSiblings(workDirHost string) {
 	_ = os.RemoveAll(implementerOutputStashPath(workDirHost))
 	base := strings.TrimRight(workDirHost, "/")
-	for _, pattern := range []string{base + "-review-round-*-output", base + "-fix-round-*-snapshot"} {
+	for _, pattern := range []string{base + "-review-round-*-output", base + "-fix-round-*-snapshot", base + "-review-context-*"} {
 		matches, err := filepath.Glob(pattern)
 		if err != nil {
 			continue
@@ -738,7 +757,14 @@ func (s *reviewStage) runMustFixRound(mustFix []reviewFindingOutput) error {
 	}
 	io.WriteString(s.logsWriter, fmt.Sprintf("Routing %d finding(s) back to the implementer (%d must-fix)\n", len(mustFix), holding))
 	impl := &RunAgentStep{stopSignal: s.stopSignal, progressSink: s.progressSink}
-	result, err := impl.spawnAgentboxAndWait(agentboxSpawnSpec{
+	result, err := impl.spawnAgentboxAndWait(s.fixSpawnSpec(imageRef, workDirHost, env, previewDeps), s.logsWriter)
+	return recordFixRunResult(s.parameters, result, err, s.logsWriter)
+}
+
+// fixSpawnSpec is a fix run's container configuration. A fix run is an
+// implement run: no read-only repositories and no read-only context copy.
+func (s *reviewStage) fixSpawnSpec(imageRef, workDirHost string, env []string, previewDeps *agenttools.DeployStaticSitePreviewDeps) agentboxSpawnSpec {
+	return agentboxSpawnSpec{
 		imageRef:      imageRef,
 		workDirHost:   workDirHost,
 		cacheVolume:   cacheVolumeName(s.ctx),
@@ -746,8 +772,7 @@ func (s *reviewStage) runMustFixRound(mustFix []reviewFindingOutput) error {
 		mcpSocketHost: agentMCPSocketHostPath(workDirHost),
 		previewDeps:   previewDeps,
 		waitTimeout:   mustFixRunTimeout,
-	}, s.logsWriter)
-	return recordFixRunResult(s.parameters, result, err, s.logsWriter)
+	}
 }
 
 // recordFixRunResult attributes a finished fix run to the Step and says what

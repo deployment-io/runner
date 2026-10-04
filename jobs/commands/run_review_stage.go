@@ -258,6 +258,11 @@ type reviewStage struct {
 	// "" — a TEMPORARY measurement knob the control plane stamps for the orgs
 	// being measured; see run_review_stage_shadow.go.
 	shadowEffort string
+	// contextCopyDir is the stage's own copy of the org's deployment context,
+	// written outside the work dir and bound read-only at /work/context in
+	// every review spawn (see prepareContextCopy), or "" when it could not be
+	// fetched. Removed when run() returns.
+	contextCopyDir string
 
 	rounds      []reviewRoundOutput
 	fixedInLoop []reviewFindingOutput
@@ -390,6 +395,10 @@ func (s *reviewStage) run() (map[string]interface{}, error) {
 	if s.participation == participationAdvisory {
 		io.WriteString(s.logsWriter, "Review stage: participation is advisory — every finding will be annotated on the pull request, nothing is routed back to the agent, and nothing holds the pull request\n")
 	}
+	// The deploy readiness pass's facts, as a copy the implementer cannot
+	// have changed. Removed on every path out of the stage, after finish()
+	// has resolved the deploy requirements against it.
+	defer s.prepareContextCopy()()
 	s.openSentBack = map[string]reviewFindingOutput{}
 	round := 1
 	mustFixRounds := 0
@@ -596,6 +605,10 @@ func (s *reviewStage) finish() (map[string]interface{}, error) {
 		FixNotAttempted:   s.fixNotAttempted,
 		StoppedNoChange:   s.stoppedNoChange,
 		FinalTreeReviewed: s.finalTreeReviewed,
+		// Never findings: resolved for the "Before deploying" part of the
+		// pull request and nothing else — see resolveDeployRequirementsFrom.
+		DeployRequirements: resolveDeployRequirementsFrom(
+			latestCompletedDeployRequirements(s.rounds), s.contextCopyDir, s.logsWriter),
 	}
 	s.logFullReview(out)
 	if err := mergeReviewIntoJobOutput(s.parameters, out); err != nil {
@@ -871,6 +884,8 @@ func (s *reviewStage) recordRound(round int, findings []reviewFindingOutput, res
 		CostUSD:    result.CostUSD,
 		Turns:      result.Turns,
 		Completed:  true,
+		// Carried, never classified: a deploy requirement is not a finding.
+		DeployRequirements: deployRequirementsOf(result),
 	})
 }
 
