@@ -50,6 +50,10 @@ type DeployStaticSitePreviewDeps struct {
 	// it — the control-plane seam. Bound to one serviceType by the commands layer, so a
 	// web-service or database preview tool reuses this same struct with its own store.
 	Store PreviewStore
+
+	// Record is the agent run's preview record, shared with verify_preview_reachable:
+	// the host of every URL this tool returns is added to it.
+	Record *PreviewRecord
 }
 
 // deployStaticSitePreviewResult is the JSON the agent receives from a tools/call.
@@ -161,8 +165,10 @@ func handleDeployStaticSitePreview(ctx context.Context, deps DeployStaticSitePre
 		})
 	}
 
+	previewURL := "https://" + domain
+	deps.Record.AddURL(previewURL)
 	out := deployStaticSitePreviewResult{
-		URL:            "https://" + domain,
+		URL:            previewURL,
 		Status:         "deployed",
 		DistributionID: distID,
 		Note:           "CDN propagation may take a few minutes before the URL serves the latest content.",

@@ -32,3 +32,22 @@ func (r *RunnerClient) EnsureTaskPreview(organizationID, taskID, serviceName, se
 	}
 	return reply.PreviewID, reply.ExistingDistID, reply.ExistingDomain, nil
 }
+
+// ListTaskPreviews returns the previews of the task's active ephemeral preview
+// environment (one per service that has a URL, sorted by service name) — empty when
+// the task has none. Used to validate the URLs the agent's preview tools fetch and to
+// list the previews in the task's pull request body.
+func (r *RunnerClient) ListTaskPreviews(organizationID, taskID string) ([]task_previews.TaskPreviewV1, error) {
+	if !r.isConnected {
+		return nil, ErrConnection
+	}
+	args := task_previews.ListTaskPreviewsArgsV1{}
+	args.OrganizationID = r.GetComputedOrganizationID(organizationID)
+	args.Token = r.token
+	args.TaskID = taskID
+	var reply task_previews.ListTaskPreviewsReplyV1
+	if err := r.c.Call("TaskPreviews.ListV1", args, &reply); err != nil {
+		return nil, err
+	}
+	return reply.Previews, nil
+}

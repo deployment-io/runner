@@ -788,7 +788,7 @@ func (rs *RunAgentStep) spawnAgentboxAndWait(spec agentboxSpawnSpec, logsWriter 
 		agentmcp.RegisterPing(mcpSrv)
 		if spec.previewDeps != nil {
 			agenttools.RegisterDeployStaticSitePreview(mcpSrv, *spec.previewDeps)
-			agenttools.RegisterVerifyPreviewReachable(mcpSrv, spec.previewDeps.LogsWriter)
+			agenttools.RegisterVerifyPreviewReachable(mcpSrv, spec.previewDeps.Record, spec.previewDeps.LogsWriter)
 		}
 		ln, lerr := mcpSrv.Listen(spec.mcpSocketHost)
 		if lerr != nil {
@@ -1876,6 +1876,20 @@ func buildStaticSitePreviewDeps(ctx commandUtils.TaskJobContext, parameters map[
 			taskID:      taskID,
 			serviceType: task_previews.ServiceTypeStaticSite,
 		},
+		// The agent run's preview record: verify_preview_reachable fetches only hosts
+		// deploy_static_site_preview returned in this run or the Task's previews as
+		// deployment-server lists them.
+		Record: agenttools.NewPreviewRecord(func() ([]string, error) {
+			previews, err := runnerclient.Get().ListTaskPreviews(orgID, taskID)
+			if err != nil {
+				return nil, err
+			}
+			urls := make([]string, 0, len(previews))
+			for _, p := range previews {
+				urls = append(urls, p.URL)
+			}
+			return urls, nil
+		}, logsWriter),
 	}
 }
 
