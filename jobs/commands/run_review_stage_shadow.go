@@ -56,6 +56,11 @@ func (s *reviewStage) shadowReview(round1 agentResult) error {
 	if s.shadowEffort == "" {
 		return nil
 	}
+	// Nothing to measure when round 1 already ran at the shadow's effort.
+	if s.shadowEffort == s.loopEffort() {
+		io.WriteString(s.logsWriter, fmt.Sprintf("Shadow review: skipped — round 1 already ran at effort %s\n", s.shadowEffort))
+		return nil
+	}
 	// The shadow review plus the round that may follow a fix: never spend the
 	// budget the loop itself needs.
 	if !s.canAfford(2 * reviewRunTimeout) {
@@ -119,7 +124,7 @@ func (s *reviewStage) accumulateShadowRun(result agentResult) {
 func (s *reviewStage) logEffortComparison(round1, shadow agentResult) {
 	var b strings.Builder
 	b.WriteString("--- Review effort comparison (round 1's tree) ---\n")
-	b.WriteString(effortComparisonLine("Round 1 (effort "+effortName("")+")", round1))
+	b.WriteString(effortComparisonLine("Round 1 (effort "+effortName(s.loopEffort())+")", round1))
 	b.WriteString(effortComparisonLine("Shadow (effort "+s.shadowEffort+")", shadow))
 	for _, f := range shadow.ReviewResult.Findings {
 		b.WriteString(fmt.Sprintf("  [shadow] %s/%s at %s — %s\n", f.Parameter, f.Severity, f.Location, f.What))

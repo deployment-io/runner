@@ -128,9 +128,9 @@ func TestNoShadowReviewWhenTheEffortIsUnset(t *testing.T) {
 	}
 }
 
-// Every review round logs its effort next to its turn cap; the loop never sets
-// REVIEW_EFFORT, so it is always the model's default — even when the reviewer's
-// own environment carries one.
+// Every review round logs its effort next to its turn cap; with no ReviewLevel
+// on the Job the loop sets no REVIEW_EFFORT, so it is the model's default —
+// even when the reviewer's own environment carries one.
 func TestEveryReviewRoundLogsItsEffort(t *testing.T) {
 	parameters := implementerJobParameters(t)
 	jobs.SetParameterValue[map[string]string](parameters, parameters_enums.AgentEnvVars,
@@ -145,7 +145,7 @@ func TestEveryReviewRoundLogsItsEffort(t *testing.T) {
 			t.Fatalf("reviewSpawnEnv(%d): %s", round, err)
 		}
 		if v, present := envMap(env)["REVIEW_EFFORT"]; present {
-			t.Errorf("round %d spawns with REVIEW_EFFORT=%s; the loop never sets it", round, v)
+			t.Errorf("round %d spawns with REVIEW_EFFORT=%s; with no ReviewLevel the loop sets none", round, v)
 		}
 		stage.logReviewRunLimits(fmt.Sprintf("Review round %d", round), env)
 		want := fmt.Sprintf("Review round %d: turn cap %d model responses\nReview round %d: effort model default\n", round, reviewRunMaxTurns, round)

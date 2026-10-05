@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/deployment-io/deployment-runner-kit/enums/llm_provider_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner/agenttools"
@@ -123,6 +124,47 @@ func (s *reviewStage) logReviewRunLimits(label string, env []string) {
 	io.WriteString(s.logsWriter, fmt.Sprintf("%s: effort %s\n", label, effortName(envValue(env, "REVIEW_EFFORT"))))
 }
 
+// reviewEffortForLevel maps the Job's ReviewLevel and the reviewer's agent
+// type to the REVIEW_EFFORT the review loop's rounds run at. Only "thorough"
+// on a claude-code or codex reviewer raises it, to "high"; anything else —
+// standard, absent, an unknown value — sends none, the model's default.
+// unavailable reports a Thorough level on an opencode reviewer, whose
+// catalogue has no effort variants for the models we run, so it too runs at
+// the default.
+func reviewEffortForLevel(level, agentType string) (effort string, unavailable bool) {
+	if strings.ToLower(strings.TrimSpace(level)) != "thorough" {
+		return "", false
+	}
+	resolved, err := llm_provider_enums.ResolveAgentType(agentType)
+	if err != nil {
+		return "", false
+	}
+	switch resolved {
+	case llm_provider_enums.ClaudeCode, llm_provider_enums.Codex:
+		return "high", false
+	case llm_provider_enums.Opencode:
+		return "", true
+	}
+	return "", false
+}
+
+// loopEffort is the REVIEW_EFFORT every round of the review loop spawns with,
+// resolved once per stage from the Job's ReviewLevel and the reviewer's agent
+// type. Fix runs are implement runs and never use it.
+func (s *reviewStage) loopEffort() string {
+	if s.loopEffortResolved {
+		return s.loopEffortValue
+	}
+	level, _ := jobs.GetParameterValue[string](s.parameters, parameters_enums.ReviewLevel)
+	effort, unavailable := reviewEffortForLevel(level, s.jobAgentType())
+	if unavailable {
+		io.WriteString(s.logsWriter, "Review stage: review level Thorough is not available for opencode reviewers; the rounds run at the model's default\n")
+	}
+	s.loopEffortValue = effort
+	s.loopEffortResolved = true
+	return effort
+}
+
 // effortName is how the job log names a REVIEW_EFFORT value.
 func effortName(effort string) string {
 	if effort == "" {
@@ -194,12 +236,12 @@ func withoutEnv(env []string, key string) []string {
 // do rather than against what the change actually does — and to keep going
 // where the implementer left off.
 func (s *reviewStage) reviewSpawnEnv(round int) ([]string, error) {
-	return s.reviewSpawnEnvWithEffort(round, "")
+	return s.reviewSpawnEnvWithEffort(round, s.loopEffort())
 }
 
-// reviewSpawnEnvWithEffort is reviewSpawnEnv plus REVIEW_EFFORT. Only the
-// shadow review sets an effort; the loop's rounds always run at the model's
-// default.
+// reviewSpawnEnvWithEffort is reviewSpawnEnv with an explicit REVIEW_EFFORT
+// ("" sends none). The loop's rounds pass the effort their review level maps
+// to (loopEffort); the shadow review passes its own.
 func (s *reviewStage) reviewSpawnEnvWithEffort(round int, effort string) ([]string, error) {
 	env, err := buildAgentSpawnEnvVars(s.reviewerView(), s.logsWriter)
 	if err != nil {
