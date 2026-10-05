@@ -60,7 +60,7 @@ func TestPreviewSection_SixPreviews(t *testing.T) {
 		"- svc-3: https://d3.cloudfront.net\n" +
 		"- svc-4: https://d4.cloudfront.net\n" +
 		"- svc-5: https://d5.cloudfront.net\n" +
-		"- and 1 more on the Task page\n\n" +
+		"- and 1 more under Context → Previews in the dashboard\n\n" +
 		previewFootnote + "\n"
 	if got != want {
 		t.Fatalf("got:\n%q\nwant:\n%q", got, want)
