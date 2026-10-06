@@ -10,6 +10,7 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner-kit/oauth"
+	"github.com/deployment-io/deployment-runner-kit/task_previews"
 	"github.com/deployment-io/deployment-runner-kit/tasks"
 	"github.com/deployment-io/deployment-runner/client"
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
@@ -111,6 +112,21 @@ type taskOpenPR struct {
 	// pullRequests is the deployment-server RPC surface this command uses.
 	// Nil means the runner client; tests substitute a stub.
 	pullRequests pullRequestRPC
+	// taskPreviews lists the Task's previews for the body's Preview part. Nil
+	// means the runner client; tests substitute a stub.
+	taskPreviews taskPreviewRPC
+}
+
+// taskPreviewRPC is the part of the runner client that lists a Task's previews.
+type taskPreviewRPC interface {
+	ListTaskPreviews(organizationID, taskID string) ([]task_previews.TaskPreviewV1, error)
+}
+
+func (opr *taskOpenPR) previewRPC() taskPreviewRPC {
+	if opr.taskPreviews != nil {
+		return opr.taskPreviews
+	}
+	return client.Get()
 }
 
 // pullRequestRPC is the part of the runner client that opens pull requests and
@@ -245,7 +261,7 @@ const (
 // first line > generic fallback; see that function for the policy).
 //
 // The body has a fixed layout, every part left out when it has nothing to
-// show: the one-line review tally, "Before deploying" (the configuration the
+// show: the one-line review tally, the Task's previews, "Before deploying" (the configuration the
 // change needs that its environment lacks), the agent's summary, what the Task
 // asks for, how the change was checked, the Review section, the blocked hosts, and
 // the trailer last. What a reviewer reads first is what the review did and
@@ -253,7 +269,7 @@ const (
 //
 // EVERYTHING EXCEPT THE SUMMARY IS BUILT FIRST and the summary is given what
 // is left of prBodyMaxRunes. Each of those parts is bounded — the Review
-// section by reviewSectionMaxRunes, "Before deploying" by its entry cap and
+// section by reviewSectionMaxRunes, the Preview part by its line and name caps, "Before deploying" by its entry cap and
 // its capped names, the criteria and blocked hosts by their
 // item caps, a verify step's output by boundVerifyTail — and the agent's
 // summary is the one part that is not, so it is the part that yields when the
@@ -267,6 +283,7 @@ const (
 func (opr *taskOpenPR) buildPRTitleAndBody() (string, string) {
 	subject, leadIn := opr.subjectAndLeadIn()
 	tally := reviewTally(opr.review)
+	preview := opr.previewSection()
 	deploy := beforeDeployingSection(opr.review, opr.ctx.DashboardURL)
 	asks := acceptanceSection(opr.acceptance)
 	review := strings.Trim(opr.reviewSection(), "\n")
@@ -276,11 +293,11 @@ func (opr *taskOpenPR) buildPRTitleAndBody() (string, string) {
 	// step's output is bounded by boundVerifyTail, but the number of failing
 	// steps follows the Task's repositories — so it is given what the rest of
 	// the body leaves, less the separator in front of it.
-	others := joinBodyParts(tally, deploy, asks, review, hosts, trailer) + "\n"
+	others := joinBodyParts(tally, preview, deploy, asks, review, hosts, trailer) + "\n"
 	checked := opr.howCheckedSection(prBodyMaxRunes - utf8.RuneCountInString(others) - len(bodyPartSeparator))
-	rest := joinBodyParts(tally, deploy, asks, checked, review, hosts, trailer) + "\n"
+	rest := joinBodyParts(tally, preview, deploy, asks, checked, review, hosts, trailer) + "\n"
 	leadIn = boundPRSummary(leadIn, prBodyMaxRunes-utf8.RuneCountInString(rest)-len(bodyPartSeparator))
-	body := joinBodyParts(tally, deploy, leadIn, asks, checked, review, hosts, trailer) + "\n"
+	body := joinBodyParts(tally, preview, deploy, leadIn, asks, checked, review, hosts, trailer) + "\n"
 	return subject, cutToRuneBudget(body, prBodyMaxRunes, prBodyTruncatedNote)
 }
 
@@ -309,6 +326,55 @@ func (opr *taskOpenPR) trailer() string {
 	if len(opr.ctx.DashboardURL) > 0 {
 		sb.WriteString(fmt.Sprintf("Task-URL: %s/tasks/%s\n", strings.TrimRight(opr.ctx.DashboardURL, "/"), opr.ctx.TaskID))
 	}
+	return sb.String()
+}
+
+// Bounds on the Preview part.
+const (
+	prBodyPreviewMaxItems     = 5
+	prBodyPreviewNameMaxRunes = 100
+)
+
+// previewSection lists the Task's previews so the approver can open them. The
+// previews are the Task's (not this repository's), so a multi-repo Task shows
+// the same list on every pull request. Empty when the Task has no previews or
+// they can't be listed — the pull request never fails over it.
+func (opr *taskOpenPR) previewSection() string {
+	previews, err := opr.previewRPC().ListTaskPreviews(opr.ctx.OrganizationID, opr.ctx.TaskID)
+	if err != nil {
+		if opr.logsWriter != nil {
+			io.WriteString(opr.logsWriter, fmt.Sprintf("Could not list the Task's previews for the pull request description: %s\n", err))
+		}
+		return ""
+	}
+	return formatPreviewSection(previews)
+}
+
+// formatPreviewSection renders the Preview part: at most prBodyPreviewMaxItems
+// lines, each name cut to prBodyPreviewNameMaxRunes. Empty for no previews.
+func formatPreviewSection(previews []task_previews.TaskPreviewV1) string {
+	if len(previews) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	sb.WriteString("**Preview**\n\n")
+	sb.WriteString("The agent deployed this Task's change to a preview while working on it:\n\n")
+	shown := previews
+	if len(shown) > prBodyPreviewMaxItems {
+		shown = shown[:prBodyPreviewMaxItems]
+	}
+	for _, p := range shown {
+		name := p.ServiceName
+		if r := []rune(name); len(r) > prBodyPreviewNameMaxRunes {
+			name = string(r[:prBodyPreviewNameMaxRunes])
+		}
+		sb.WriteString(fmt.Sprintf("- %s: %s\n", name, p.URL))
+	}
+	if omitted := len(previews) - len(shown); omitted > 0 {
+		sb.WriteString(fmt.Sprintf("- and %d more under Context → Previews in the dashboard\n", omitted))
+	}
+	sb.WriteString("\nA preview shows the code as of the agent's last deploy to it, which can be earlier than this pull request's final commit. ")
+	sb.WriteString("Previews are removed about 72 hours after the Task's last preview deploy, or when the Task is deleted.\n")
 	return sb.String()
 }
 
