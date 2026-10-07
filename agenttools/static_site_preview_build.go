@@ -159,13 +159,19 @@ func resolveTaskRepository(entries []tasks.RepositoryEntry, repository string) (
 // chooseStaticSite picks the site to build: the first when all sites build the same
 // way, else the one (or the identically-built ones) whose root directory is
 // rootDirectory — nil when the agent didn't pass it; "" or "." is the repository
-// root. Otherwise the error lists each site's root directory.
+// root. Otherwise the error lists each site's root directory. A rootDirectory that
+// leaves the repository is an error, never the repository root.
 func chooseStaticSite(sites []task_previews.StaticSiteBuildSettingsV1, rootDirectory *string) (task_previews.StaticSiteBuildSettingsV1, error) {
+	if rootDirectory != nil {
+		if _, err := cleanRelativeDir(*rootDirectory); err != nil {
+			return task_previews.StaticSiteBuildSettingsV1{}, fmt.Errorf("root_directory: %w", err)
+		}
+	}
 	if sameBuild(sites) {
 		return sites[0], nil
 	}
 	if rootDirectory != nil {
-		want, _ := cleanRelativeDir(*rootDirectory)
+		want, _ := cleanRelativeDir(*rootDirectory) // validated above
 		var matches []task_previews.StaticSiteBuildSettingsV1
 		for _, s := range sites {
 			if root, _ := cleanRelativeDir(s.RootDirectory); root == want {

@@ -10,6 +10,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
@@ -254,5 +255,57 @@ func TestUploadFilesHandlesDegenerateInputs(t *testing.T) {
 				t.Fatalf("got %d uploads, want %d", got, count)
 			}
 		})
+	}
+}
+
+// An upload that fails before reading its file — as CreateMultipartUpload does when
+// it is refused — must not leave the file's reader blocked handing over its first
+// chunk: once uploadFiles returns, every reader has exited and closed its stream.
+func TestUploadFilesReleasesReadersOfFailedUploads(t *testing.T) {
+	dir := t.TempDir()
+	files := make([]fileToUpload, 0, 3)
+	for i := 0; i < 3; i++ {
+		path := filepath.Join(dir, fmt.Sprintf("f%d.txt", i))
+		if err := os.WriteFile(path, []byte("contents"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		files = append(files, fileToUpload{path: path, objectKey: filepath.Base(path)})
+	}
+	uploader, err := NewUploader("region", "bucket", &s3.Client{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var streams []<-chan fileByteStreamDTO
+	uploader.uploadFile = func(path, key string, abort chan interface{}) <-chan uploadFileDoneDTO {
+		stream := uploader.fileByteStreamGenerator(path, abort)
+		mu.Lock()
+		streams = append(streams, stream)
+		mu.Unlock()
+		done := make(chan uploadFileDoneDTO, 1)
+		done <- uploadFileDoneDTO{objectKey: key, err: errors.New("CreateMultipartUpload refused")}
+		return done
+	}
+	if err := uploader.uploadFiles(files, io.Discard); err == nil {
+		t.Fatal("uploadFiles: want the upload error")
+	}
+	// Nothing reads the streams: a reader still blocked handing over its chunk would
+	// get this receive and report open. Given a moment, a released reader has
+	// already exited and closed its stream.
+	time.Sleep(200 * time.Millisecond)
+	mu.Lock()
+	defer mu.Unlock()
+	if len(streams) != len(files) {
+		t.Fatalf("%d readers started, want %d", len(streams), len(files))
+	}
+	for i, stream := range streams {
+		select {
+		case _, open := <-stream:
+			if open {
+				t.Errorf("reader %d was still blocked handing over its chunk after uploadFiles returned", i)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("reader %d still blocked after uploadFiles returned", i)
+		}
 	}
 }

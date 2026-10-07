@@ -63,6 +63,13 @@ func TestChooseStaticSite(t *testing.T) {
 			t.Errorf("root_directory %q: got %+v, %v; want the repository-root site", root, got, err)
 		}
 	}
+	// A selector that leaves the repository is refused — never read as the
+	// repository root, which cleanRelativeDir returns alongside its error.
+	for _, sites := range [][]task_previews.StaticSiteBuildSettingsV1{{web, admin, repoRoot}, {web, webStaging}} {
+		if got, err := chooseStaticSite(sites, strPtr("apps/../../other")); err == nil || !strings.Contains(err.Error(), "leaves the repository") {
+			t.Errorf("escaping root_directory: got %+v, %v; want a refusal", got, err)
+		}
+	}
 	for _, root := range []*string{nil, strPtr("apps/other")} {
 		_, err := chooseStaticSite([]task_previews.StaticSiteBuildSettingsV1{web, admin, repoRoot}, root)
 		if err == nil {
@@ -672,5 +679,32 @@ func TestEnsurePreviewGivesUpWhenCancelled(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("ensurePreview kept waiting for the RPC after cancellation")
+	}
+}
+
+func TestHandlerRefusesEscapingRootDirectory(t *testing.T) {
+	workDir, _ := newWorkDir(t)
+	var lookups int
+	deps := DeployStaticSitePreviewDeps{
+		WorkDirHost:  workDir,
+		LogsWriter:   io.Discard,
+		Repositories: testRepositories,
+		BuildSettings: func(string) (task_previews.StaticSiteBuildSettingsReplyV1, error) {
+			lookups++
+			return task_previews.StaticSiteBuildSettingsReplyV1{Sites: []task_previews.StaticSiteBuildSettingsV1{site("web", "", "npm run build", "dist", false)}}, nil
+		},
+		BuildSite: func(context.Context, string, string, []string, io.Writer) error {
+			t.Error("an escaping root_directory must never start a build")
+			return nil
+		},
+	}
+	builds := newPreviewBuilds()
+	defer builds.stop()
+	args := json.RawMessage(`{"repository":"0-acme/web","root_directory":"apps/../../other"}`)
+	if out, err := handleDeployStaticSitePreview(context.Background(), deps, builds, args); err == nil || !strings.Contains(err.Error(), "root_directory") {
+		t.Fatalf("escaping root_directory: %q, %v; want a refusal", out, err)
+	}
+	if lookups != 0 {
+		t.Errorf("settings looked up %d times, want none", lookups)
 	}
 }

@@ -163,7 +163,12 @@ func handleDeployStaticSitePreview(ctx context.Context, deps DeployStaticSitePre
 		started := time.Now()
 		request := strings.TrimSpace(args.Repository) + "\x00"
 		if args.RootDirectory != nil {
-			root, _ := cleanRelativeDir(*args.RootDirectory)
+			// Refused here, before it keys a request: an invalid selector must
+			// never attach to (or start) the repository root's build.
+			root, err := cleanRelativeDir(*args.RootDirectory)
+			if err != nil {
+				return "", fmt.Errorf("root_directory: %w", err)
+			}
 			request += "root:" + root
 		}
 		if out, err, ok := builds.attach(ctx, request, previewBuildCallWait); ok {

@@ -28,9 +28,12 @@ func (u *Uploader) fileByteStreamGenerator(inputFilePath string, abort chan inte
 		defer close(dataByteStream)
 		file, err := os.Open(inputFilePath)
 		if err != nil {
-			dataByteStream <- fileByteStreamDTO{
+			select {
+			case <-abort:
+			case dataByteStream <- fileByteStreamDTO{
 				err:  err,
 				data: nil,
+			}:
 			}
 			return
 		}
