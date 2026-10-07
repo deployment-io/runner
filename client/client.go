@@ -7,6 +7,7 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/enums/runner_enums"
 	"github.com/deployment-io/deployment-runner-kit/types"
 	"log"
+	"net"
 	"net/rpc"
 	"strings"
 	"sync"
@@ -26,9 +27,12 @@ type RunnerClient struct {
 	runnerMode         runner_enums.Mode
 	targetCloud        runner_enums.TargetCloud
 	userID             string
+	// dial opens a new connection to deployment-server with the options of the last connect, for
+	// calls that need their own deadline-bounded connection (see SaveInfraContext).
+	dial func(timeout time.Duration) (net.Conn, error)
 }
 
-func getTlsClient(service, clientCertPem, clientKeyPem string) (*rpc.Client, error) {
+func getTlsConfig(clientCertPem, clientKeyPem string) *tls.Config {
 	cert, err := tls.X509KeyPair([]byte(clientCertPem), []byte(clientKeyPem))
 	if err != nil {
 		log.Fatalf("client: loadkeys: %s", err)
@@ -42,17 +46,27 @@ func getTlsClient(service, clientCertPem, clientKeyPem string) (*rpc.Client, err
 	}
 	certPool := x509.NewCertPool()
 	certPool.AddCert(ca)
-	config := tls.Config{
+	return &tls.Config{
 		Certificates: []tls.Certificate{cert},
 		RootCAs:      certPool,
 	}
-	conn, err := tls.Dial("tcp", service, &config)
-	if err != nil {
-		return nil, err
-	}
+}
 
-	//create and connect RPC client
-	return rpc.NewClient(conn), nil
+// dialerFor returns a function dialing service the way connect does: over TLS when the client
+// certificate is configured, plain TCP otherwise.
+func dialerFor(options Options) func(timeout time.Duration) (net.Conn, error) {
+	var tlsConfig *tls.Config
+	if len(options.ClientCertPem) > 0 && len(options.ClientKeyPem) > 0 {
+		tlsConfig = getTlsConfig(strings.Replace(options.ClientCertPem, "\\n", "\n", -1),
+			strings.Replace(options.ClientKeyPem, "\\n", "\n", -1))
+	}
+	return func(timeout time.Duration) (net.Conn, error) {
+		dialer := &net.Dialer{Timeout: timeout}
+		if tlsConfig != nil {
+			return tls.DialWithDialer(dialer, "tcp", options.Service, tlsConfig)
+		}
+		return dialer.Dial("tcp", options.Service)
+	}
 }
 
 var client = RunnerClient{}
@@ -60,20 +74,17 @@ var client = RunnerClient{}
 func connect(options Options) (err error) {
 	var c *rpc.Client
 	if !client.isConnected {
-		if len(options.ClientCertPem) > 0 && len(options.ClientKeyPem) > 0 {
-			options.ClientCertPem = strings.Replace(options.ClientCertPem, "\\n", "\n", -1)
-			options.ClientKeyPem = strings.Replace(options.ClientKeyPem, "\\n", "\n", -1)
-			c, err = getTlsClient(options.Service, options.ClientCertPem, options.ClientKeyPem)
-		} else {
-			c, err = rpc.Dial("tcp", options.Service)
-		}
-
+		dial := dialerFor(options)
+		var conn net.Conn
+		conn, err = dial(0)
 		if err != nil {
 			client.isConnected = false
 			return err
 		}
+		c = rpc.NewClient(conn)
 
 		client.c = c
+		client.dial = dial
 		//client.organizationID = options.OrganizationID
 		client.userID = options.UserID
 		client.token = options.Token

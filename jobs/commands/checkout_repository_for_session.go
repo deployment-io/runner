@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -52,27 +53,52 @@ func (cr *CheckoutRepository) runForSession(parameters map[string]interface{}, l
 	for idx, entry := range entries {
 		repoDir := commandUtils.GetSessionRepositoryDir(orgID, jobID, idx, entry.Name)
 		io.WriteString(logsWriter, fmt.Sprintf("Cloning %s (%s) read-only into %s\n", entry.Name, entry.BaseBranch, repoDir))
-		if err := cloneSessionRepoReadOnly(repoDir, entry, orgID, tokenCache, logsWriter); err != nil {
+		req := sessionCloneRequest{entry: entry, orgID: orgID, tokenCache: tokenCache, logsWriter: logsWriter}
+		if err := cloneSessionRepoReadOnly(sessionStartCloneContext(), repoDir, req); err != nil {
 			return parameters, fmt.Errorf("error checking out repo %s: %s", entry.Name, err)
 		}
 	}
 	return parameters, nil
 }
 
+// sessionStartCloneContext is the context a SESSION-START clone runs under:
+// deliberately unbounded, so a big monorepo checkout keeps exactly the timing it
+// has today (nothing is waiting on it — the session hasn't begun). Only the
+// mid-session add path bounds its clone, with sessionCloneDeadline, because
+// there a stuck clone holds back every later turn of a live conversation.
+// A named function so "no deadline here" is an invariant a test can assert.
+func sessionStartCloneContext() context.Context {
+	return context.Background()
+}
+
+// sessionCloneRequest groups the per-repo clone inputs that travel together, so
+// threading ctx through doesn't push the clone helpers past four parameters.
+type sessionCloneRequest struct {
+	entry      tasks.RepositoryEntry
+	orgID      string // OrganizationIDNamespace — the org the installation token is minted for
+	tokenCache map[string]string
+	logsWriter io.Writer
+}
+
 // cloneSessionRepoReadOnly clones one repo at its base branch into repoDir for an
 // interactive session, retrying once with a refreshed token on auth failure
 // (mirrors the Task clone). Chowns the tree to the agentbox `agent` user so the
 // UID-1000 container can read it through the bind mount. The caller wipes the
-// base dir once, so this doesn't remove repoDir itself.
-func cloneSessionRepoReadOnly(repoDir string, entry tasks.RepositoryEntry, orgID string, tokenCache map[string]string, logsWriter io.Writer) error {
-	token, err := sessionToken(tokenCache, entry.InstallationID, orgID)
+// base dir once, so this doesn't remove repoDir itself — which is also what
+// makes it safe to call per-repo mid-session, where nothing is wiped at all.
+//
+// ctx bounds the clone. Session start passes one with no deadline; the
+// mid-session add passes a 5-minute one.
+func cloneSessionRepoReadOnly(ctx context.Context, repoDir string, req sessionCloneRequest) error {
+	token, err := sessionToken(req.tokenCache, req.entry.InstallationID, req.orgID)
 	if err != nil {
 		return fmt.Errorf("error getting installation token: %s", err)
 	}
-	repository, _, err := cloneSessionWithRetry(repoDir, entry, token, orgID, tokenCache, logsWriter)
+	repository, _, err := cloneSessionWithRetry(ctx, repoDir, req, token)
 	if err != nil {
 		return err
 	}
+	entry := req.entry
 	if err := checkoutSessionBaseBranch(repository, entry.BaseBranch); err != nil {
 		return err
 	}
@@ -148,31 +174,41 @@ func sessionToken(cache map[string]string, installationID, orgID string) (string
 	return token, nil
 }
 
-// cloneSessionWithRetry runs the clone, refreshing the token + retrying once on
-// go-git's "authentication required" error. A refreshed token is written back to
-// the cache so later repos sharing the installation use it. Returns the
-// (possibly-refreshed) token used for the successful clone.
-func cloneSessionWithRetry(repoDir string, entry tasks.RepositoryEntry, token, orgID string, tokenCache map[string]string, logsWriter io.Writer) (*git.Repository, string, error) {
+// cloneSessionWithRetry runs the clone under ctx, refreshing the token +
+// retrying once on go-git's "authentication required" error. A refreshed token
+// is written back to the cache so later repos sharing the installation use it.
+// Returns the (possibly-refreshed) token used for the successful clone.
+//
+// It goes through commandUtils.CloneRepositoryWithContext rather than
+// CloneRepository so the mid-session add can impose a deadline;
+// CloneRepository's signature and behaviour are untouched for Tasks and
+// deployments, and an unbounded ctx here behaves exactly as it did before.
+func cloneSessionWithRetry(ctx context.Context, repoDir string, req sessionCloneRequest, token string) (*git.Repository, string, error) {
+	entry := req.entry
 	cloneURL, err := commandUtils.GetRepoUrlWithToken(entry.Provider, token, entry.CloneURL)
 	if err != nil {
 		return nil, token, err
 	}
-	repository, err := commandUtils.CloneRepository(repoDir, cloneURL, token, entry.Provider, logsWriter)
+	opts := commandUtils.CloneOptions{
+		CloneURLWithToken: cloneURL, Token: token, Provider: entry.Provider, LogsWriter: req.logsWriter,
+	}
+	repository, err := commandUtils.CloneRepositoryWithContext(ctx, repoDir, opts)
 	if err == nil {
 		return repository, token, nil
 	}
 	if !commandUtils.IsErrorAuthenticationRequired(err) {
 		return nil, token, err
 	}
-	token, err = commandUtils.RefreshGitTokenForInstallation(entry.InstallationID, orgID)
+	token, err = commandUtils.RefreshGitTokenForInstallation(entry.InstallationID, req.orgID)
 	if err != nil {
 		return nil, token, err
 	}
-	tokenCache[entry.InstallationID] = token
+	req.tokenCache[entry.InstallationID] = token
 	cloneURL, err = commandUtils.GetRepoUrlWithToken(entry.Provider, token, entry.CloneURL)
 	if err != nil {
 		return nil, token, err
 	}
-	repository, err = commandUtils.CloneRepository(repoDir, cloneURL, token, entry.Provider, logsWriter)
+	opts.CloneURLWithToken, opts.Token = cloneURL, token
+	repository, err = commandUtils.CloneRepositoryWithContext(ctx, repoDir, opts)
 	return repository, token, err
 }

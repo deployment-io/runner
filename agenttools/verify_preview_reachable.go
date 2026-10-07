@@ -7,11 +7,14 @@ package agenttools
 // itself; the runner (open network) polls it and returns the result.
 //
 // SECURITY: the runner fetches an agent-supplied URL, which is an SSRF vector — a
-// prompt-injected agent could ask it to fetch cloud-metadata (169.254.169.254) or
-// an internal host and exfiltrate the response through the tool result. So
-// verify_preview_reachable ONLY fetches hosts under *.cloudfront.net (every preview is a
-// CloudFront distribution). That allowlist is the whole SSRF defense; widen it
-// deliberately when custom preview domains land (Cw).
+// prompt-injected agent could ask it to fetch cloud-metadata (169.254.169.254), an
+// internal host, or someone else's site and exfiltrate the response through the tool
+// result. So verify_preview_reachable validates every URL against the record of
+// previews this Task deployed (PreviewRecord): it fetches a URL only when it is https
+// on the default port, carries no user info, and its host is a preview host this
+// Task deployed — one deploy_static_site_preview returned in this run, or one the
+// control plane lists for the Task. Redirects are followed only when their target
+// passes the same check. That record is the whole SSRF defense.
 
 import (
 	"context"
@@ -38,6 +41,8 @@ const (
 	verifyPreviewReachablePerRequestTO   = 10 * time.Second
 	verifyPreviewReachableSnippetRunes   = 500
 	verifyPreviewReachableReadLimitBytes = 64 * 1024
+	// verifyPreviewReachableMaxRedirects matches net/http's default redirect limit.
+	verifyPreviewReachableMaxRedirects = 10
 )
 
 const verifyPreviewReachableInputSchema = `{
@@ -45,7 +50,7 @@ const verifyPreviewReachableInputSchema = `{
   "properties": {
     "url": {
       "type": "string",
-      "description": "The preview URL returned by deploy_static_site_preview (an https://*.cloudfront.net URL). Only CloudFront preview hosts are accepted."
+      "description": "The preview URL returned by deploy_static_site_preview. Only previews this Task deployed are accepted; redirects are followed only when they stay on such a preview."
     },
     "contains": {
       "type": "string",
@@ -70,24 +75,26 @@ type verifyPreviewReachableResult struct {
 	Message        string `json:"message,omitempty"`
 }
 
-// RegisterVerifyPreviewReachable registers the verify_preview_reachable tool. logsWriter is the Step
-// Job's log writer; poll progress streams there.
-func RegisterVerifyPreviewReachable(s *agentmcp.Server, logsWriter io.Writer) {
+// RegisterVerifyPreviewReachable registers the verify_preview_reachable tool. record is the
+// agent run's preview record (shared with deploy_static_site_preview) that every URL is
+// validated against. logsWriter is the Step Job's log writer; poll progress streams there.
+func RegisterVerifyPreviewReachable(s *agentmcp.Server, record *PreviewRecord, logsWriter io.Writer) {
 	s.Register(agentmcp.Tool{
 		Name: "verify_preview_reachable",
 		Description: "Confirm a deployed preview URL is live. Polls it until it returns HTTP 200 (a first-time " +
 			"distribution can take a few minutes to propagate), and returns live=true as soon as it does — that 200 is " +
 			"your success signal. Runs on the runner, so it works even though your sandbox can't reach the URL directly. " +
-			"Only *.cloudfront.net preview URLs are accepted. Do NOT pass `contains` expecting rendered SPA text — an " +
+			"Only a preview URL this Task deployed (the URL deploy_static_site_preview returned) is accepted, and " +
+			"redirects are followed only when they stay on such a preview. Do NOT pass `contains` expecting rendered SPA text — an " +
 			"SPA's body is the HTML shell, so verify the change in the built bundle instead.",
 		InputSchema: json.RawMessage(verifyPreviewReachableInputSchema),
 		Handler: func(ctx context.Context, args json.RawMessage) (string, error) {
-			return handleVerifyPreviewReachable(ctx, logsWriter, args)
+			return handleVerifyPreviewReachable(ctx, record, logsWriter, args)
 		},
 	})
 }
 
-func handleVerifyPreviewReachable(ctx context.Context, logsWriter io.Writer, rawArgs json.RawMessage) (string, error) {
+func handleVerifyPreviewReachable(ctx context.Context, record *PreviewRecord, logsWriter io.Writer, rawArgs json.RawMessage) (string, error) {
 	var args struct {
 		URL            string `json:"url"`
 		Contains       string `json:"contains"`
@@ -102,8 +109,9 @@ func handleVerifyPreviewReachable(ctx context.Context, logsWriter io.Writer, raw
 	if target == "" {
 		return "", fmt.Errorf("url is required")
 	}
-	if !isAllowedPreviewURL(target) {
-		return "", fmt.Errorf("url must be an https://*.cloudfront.net preview URL (got %q) — verify_preview_reachable only fetches CloudFront preview hosts", target)
+	check := newPreviewURLCheck(record)
+	if !check.allowedRaw(target) {
+		return "", fmt.Errorf("url must be a preview URL this Task deployed (the URL deploy_static_site_preview returned) — got %q", target)
 	}
 
 	maxWait := verifyPreviewReachableDefaultMaxWait
@@ -114,7 +122,7 @@ func handleVerifyPreviewReachable(ctx context.Context, logsWriter io.Writer, raw
 		}
 	}
 
-	res := pollURL(ctx, target, args.Contains, maxWait, verifyPreviewReachablePollInterval, logsWriter)
+	res := pollURL(ctx, target, args.Contains, maxWait, verifyPreviewReachablePollInterval, check.allowed, logsWriter)
 	b, err := json.Marshal(res)
 	if err != nil {
 		return "", err
@@ -122,26 +130,41 @@ func handleVerifyPreviewReachable(ctx context.Context, logsWriter io.Writer, raw
 	return string(b), nil
 }
 
-// isAllowedPreviewURL is the SSRF guard: only https URLs whose host is under
-// *.cloudfront.net. Blocks cloud-metadata IPs, localhost, internal hosts, and
-// lookalike domains (evil.cloudfront.net.attacker.com ends in .attacker.com, and
-// bare cloudfront.net has no leading dot).
-func isAllowedPreviewURL(raw string) bool {
-	u, err := url.Parse(raw)
-	if err != nil {
-		return false
-	}
-	if u.Scheme != "https" {
-		return false
-	}
-	host := strings.ToLower(u.Hostname())
-	return strings.HasSuffix(host, ".cloudfront.net")
+// redirectBlockedError is returned by the redirect policy when a redirect target
+// isn't a preview this Task deployed.
+type redirectBlockedError struct {
+	host string
 }
 
-// pollURL GETs target until it returns 200 (and, when contains != "", the body
-// holds it) or maxWait elapses. Host-agnostic — the handler applies the SSRF
-// allowlist before calling this.
-func pollURL(ctx context.Context, target, contains string, maxWait, interval time.Duration, logsWriter io.Writer) verifyPreviewReachableResult {
+func (e *redirectBlockedError) Error() string {
+	return fmt.Sprintf("redirected to %s, which is not a preview this Task deployed", e.host)
+}
+
+// previewRedirectPolicy is the http.Client CheckRedirect for preview polling: it
+// follows a redirect only when allow accepts its target, and otherwise stops with a
+// *redirectBlockedError (and onBlocked is called with it), so a preview can't bounce
+// the runner to an arbitrary host. It also keeps net/http's redirect limit.
+func previewRedirectPolicy(allow func(*url.URL) bool, onBlocked func(*redirectBlockedError)) func(*http.Request, []*http.Request) error {
+	return func(req *http.Request, via []*http.Request) error {
+		if allow == nil || !allow(req.URL) {
+			blocked := &redirectBlockedError{host: req.URL.Hostname()}
+			if onBlocked != nil {
+				onBlocked(blocked)
+			}
+			// Stop here and hand the redirect response itself back to the caller.
+			return http.ErrUseLastResponse
+		}
+		if len(via) >= verifyPreviewReachableMaxRedirects {
+			return fmt.Errorf("stopped after %d redirects", verifyPreviewReachableMaxRedirects)
+		}
+		return nil
+	}
+}
+
+// pollURL GETs target until it returns 200 or maxWait elapses. The handler validates
+// target before calling this; allowRedirect validates each redirect target, and a
+// redirect it refuses ends the poll with live=false.
+func pollURL(ctx context.Context, target, contains string, maxWait, interval time.Duration, allowRedirect func(*url.URL) bool, logsWriter io.Writer) verifyPreviewReachableResult {
 	// Floor the interval. The guaranteed sleep between attempts is what caps the
 	// attempt count (together with the maxWait deadline); a non-positive interval
 	// would turn the loop into a tight spin, so never allow that regardless of caller.
@@ -150,7 +173,11 @@ func pollURL(ctx context.Context, target, contains string, maxWait, interval tim
 	}
 	ctx, cancel := context.WithTimeout(ctx, maxWait)
 	defer cancel()
-	client := &http.Client{Timeout: verifyPreviewReachablePerRequestTO}
+	var blocked *redirectBlockedError
+	client := &http.Client{
+		Timeout:       verifyPreviewReachablePerRequestTO,
+		CheckRedirect: previewRedirectPolicy(allowRedirect, func(e *redirectBlockedError) { blocked = e }),
+	}
 	start := time.Now()
 	wantContains := contains != ""
 
@@ -165,6 +192,19 @@ func pollURL(ctx context.Context, target, contains string, maxWait, interval tim
 		if status != 0 {
 			lastStatus = status
 			lastSnippet = snippet(body, verifyPreviewReachableSnippetRunes)
+		}
+		if blocked != nil {
+			if logsWriter != nil {
+				io.WriteString(logsWriter, fmt.Sprintf("verify_preview_reachable: %s — not following it\n", blocked.Error()))
+			}
+			return verifyPreviewReachableResult{
+				Live:           false,
+				StatusCode:     lastStatus,
+				Attempts:       attempts,
+				ElapsedSeconds: int(time.Since(start).Seconds()),
+				BodySnippet:    lastSnippet,
+				Message:        blocked.Error(),
+			}
 		}
 		// A 200 means the URL is reachable → LIVE. `contains` is a separate content
 		// assertion, reported but NOT a gate: we do NOT keep polling a live URL hoping

@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"io/fs"
@@ -45,14 +46,86 @@ func (cr *CheckoutRepository) runForTask(parameters map[string]interface{}, logs
 		tokenCache: make(map[string]string),
 		logsWriter: logsWriter,
 	}
+	baseDir := commandUtils.GetTaskRepositoriesBaseDir(ctx.OrganizationID, ctx.TaskID)
+	baseCommits := make([]baseCommitOutput, 0, len(ctx.Entries))
 	for idx, entry := range ctx.Entries {
 		repoDir := commandUtils.GetTaskRepositoryDir(ctx.OrganizationID, ctx.TaskID, idx, entry.Name)
 		io.WriteString(logsWriter, fmt.Sprintf("Checking out repo %s into %s\n", entry.Name, repoDir))
 		if err := tc.checkoutOne(repoDir, entry); err != nil {
 			return parameters, fmt.Errorf("error checking out repo %s: %s", entry.Name, err)
 		}
+		baseCommits = append(baseCommits, recordBaseCommit(idx, entry.Name, repoDir, baseDir, logsWriter))
+	}
+	if err := mergeBaseCommitsIntoJobOutput(parameters, baseCommits); err != nil {
+		// Not fatal: the Step's real work is the checkout, which succeeded.
+		// A missing baseline costs the Review stage its diff — it records
+		// that and proceeds — and costs nothing else.
+		io.WriteString(logsWriter, fmt.Sprintf("warning: could not record base commits: %s\n", err))
 	}
 	return parameters, nil
+}
+
+// recordBaseCommit captures the commit this repository is at RIGHT NOW, the
+// moment after checkout and before any agent can move it.
+//
+// The timing is the whole point. The Review stage diffs each repository
+// against this commit, and HEAD at review time is NOT a substitute: an
+// implementer committing its own work is explicitly supported, and on that
+// path HEAD already contains the change, so a diff against it would be empty
+// and the review would pass work it never saw.
+//
+// Keyed by BOTH index and directory path: the index is the stable identifier
+// the rest of the JobOutput envelope uses (repo names collide across orgs),
+// and the path relative to /work is what agentbox needs, because that is how
+// the container sees the repository.
+func recordBaseCommit(idx int, name, repoDir, baseDir string, logsWriter io.Writer) baseCommitOutput {
+	out := baseCommitOutput{Index: idx, Name: name, Dir: repoDirRelativeToWorkDir(repoDir, baseDir)}
+	repository, err := git.PlainOpen(repoDir)
+	if err == nil {
+		var head *plumbing.Reference
+		if head, err = repository.Head(); err == nil {
+			out.CommitSHA = head.Hash().String()
+			return out
+		}
+	}
+	// Best-effort by construction, exactly like agentbox's own start-commit
+	// snapshot: a repository with no resolvable HEAD contributes no baseline,
+	// the review reports that it could not diff it, and nothing fails.
+	io.WriteString(logsWriter, fmt.Sprintf("warning: could not record the base commit for repo %s: %s\n", name, err))
+	return out
+}
+
+// repoDirRelativeToWorkDir is the repository's path AS THE CONTAINER SEES IT:
+// relative to the work dir, which is bind-mounted at /work.
+//
+// It is not the directory's base name. A repository is checked out into
+// "<idx>-<owner>/<repo>", so the path is TWO segments — "0-deployment-io/kit",
+// not "kit" — and a key of "kit" would name a directory that does not exist
+// inside the container, leaving the review with no diff for that repository
+// and no idea why.
+func repoDirRelativeToWorkDir(repoDir, baseDir string) string {
+	rel, err := filepath.Rel(baseDir, repoDir)
+	if err != nil {
+		return filepath.Base(repoDir)
+	}
+	return rel
+}
+
+// mergeBaseCommitsIntoJobOutput writes the base_commits block onto the
+// accumulated envelope, beside the agent and repositories blocks.
+func mergeBaseCommitsIntoJobOutput(parameters map[string]interface{}, baseCommits []baseCommitOutput) error {
+	data := jobOutputData{}
+	if existing, err := jobs.GetParameterValue[string](parameters, parameters_enums.JobOutput); err == nil && len(existing) > 0 {
+		_ = json.Unmarshal([]byte(existing), &data)
+	}
+	data.SchemaVersion = jobOutputSchemaVersion
+	data.BaseCommits = baseCommits
+	merged, err := json.Marshal(data)
+	if err != nil {
+		return err
+	}
+	jobs.SetParameterValue[string](parameters, parameters_enums.JobOutput, string(merged))
+	return nil
 }
 
 // taskCheckout bundles the per-Step-Job state shared across the per-repo

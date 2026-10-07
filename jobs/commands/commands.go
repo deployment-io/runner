@@ -74,6 +74,8 @@ func Get(p commands_enums.Type) (jobs.Command, error) {
 		return &GetDeploymentLogsAws{}, nil
 	case commands_enums.RunAgentStep:
 		return &RunAgentStep{}, nil
+	case commands_enums.RunReviewStage:
+		return &RunReviewStage{}, nil
 	case commands_enums.RunAssistantSession:
 		return &RunAssistantSession{}, nil
 	case commands_enums.CommitAndPush:
@@ -157,6 +159,11 @@ func MarkDeploymentDone(parameters map[string]interface{}, err error) <-chan str
 				Status:       status,
 				ErrorMessage: errorMessage,
 			})
+			return
+		}
+
+		if restartOnly, _ := jobs.GetParameterValue[bool](parameters, parameters_enums.RestartOnly); restartOnly {
+			//a restart records nothing on the deployment or the build; the Job reports its own result
 			return
 		}
 

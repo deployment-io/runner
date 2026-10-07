@@ -14,6 +14,7 @@ import (
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/config"
+	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/object"
 	"github.com/go-git/go-git/v5/plumbing/transport/http"
 )
@@ -143,8 +144,32 @@ func (tcp *taskCommitPush) commitAndPushOne(repoDir string, entry tasks.Reposito
 		return repoOutput{}, fmt.Errorf("error reading status: %s", err)
 	}
 	if status.IsClean() {
-		io.WriteString(tcp.logsWriter, fmt.Sprintf("No changes in repo %s — skipping commit/push\n", entry.Name))
-		return repoOutput{Index: idx, Name: entry.Name, HasChanges: false}, nil
+		// A clean worktree is not the same as no work: an agent told to
+		// "open a PR" runs git commit itself (push is blocked by the egress
+		// allowlist, so the commits sit on the local task branch). Push those
+		// as they are rather than reporting no changes — which used to fail
+		// the Step as "written outside the repository", the one diagnosis
+		// that was certainly wrong.
+		ahead, headSHA, err := unpushedCommits(repository, tcp.ctx.BranchName, entry.BaseBranch, tcp.logsWriter)
+		if err != nil {
+			return repoOutput{}, fmt.Errorf("error comparing local branch to origin: %s", err)
+		}
+		if !ahead {
+			io.WriteString(tcp.logsWriter, fmt.Sprintf("No changes in repo %s — skipping commit/push\n", entry.Name))
+			return repoOutput{Index: idx, Name: entry.Name, HasChanges: false}, nil
+		}
+		io.WriteString(tcp.logsWriter, fmt.Sprintf("Repo %s has no uncommitted changes but the agent committed on %s itself — pushing as-is\n", entry.Name, tcp.ctx.BranchName))
+		if err := tcp.pushWithRetry(repository, entry); err != nil {
+			return repoOutput{}, fmt.Errorf("error pushing: %s", err)
+		}
+		io.WriteString(tcp.logsWriter, fmt.Sprintf("Pushed %s (%s) for repo %s\n", headSHA[:7], tcp.ctx.BranchName, entry.Name))
+		return repoOutput{
+			Index:      idx,
+			Name:       entry.Name,
+			HasChanges: true,
+			CommitSHA:  headSHA,
+			Branch:     tcp.ctx.BranchName,
+		}, nil
 	}
 	if err := worktree.AddGlob("."); err != nil {
 		return repoOutput{}, fmt.Errorf("error staging changes: %s", err)
@@ -152,6 +177,13 @@ func (tcp *taskCommitPush) commitAndPushOne(repoDir string, entry tasks.Reposito
 	commitSHA, err := tcp.commit(worktree)
 	if err != nil {
 		return repoOutput{}, err
+	}
+	// The commit landed on HEAD, which is the task branch unless the agent
+	// switched branches; either way the task branch is what gets pushed.
+	if tip, err := reconcileTaskBranch(repository, tcp.ctx.BranchName, tcp.logsWriter); err != nil {
+		return repoOutput{}, err
+	} else {
+		commitSHA = tip.String()
 	}
 	if err := tcp.pushWithRetry(repository, entry); err != nil {
 		return repoOutput{}, fmt.Errorf("error pushing: %s", err)
@@ -313,6 +345,86 @@ func (tcp *taskCommitPush) push(repository *git.Repository, entry tasks.Reposito
 	})
 }
 
+// reconcileTaskBranch makes refs/heads/<task branch> — the only ref we ever
+// push — point at the agent's work, and returns its tip. An agent told to
+// "create a branch feature/x" commits on that branch, so HEAD descends from
+// the task branch but the task branch never moved; fast-forward it to HEAD.
+// A HEAD that does not descend from the task branch (the agent checked out
+// something unrelated) is left alone and logged.
+func reconcileTaskBranch(repository *git.Repository, branchName string, logsWriter io.Writer) (plumbing.Hash, error) {
+	taskRefName := plumbing.NewBranchReferenceName(branchName)
+	taskRef, err := repository.Reference(taskRefName, true)
+	if err != nil {
+		return plumbing.ZeroHash, fmt.Errorf("error reading task branch %s: %s", branchName, err)
+	}
+	head, err := repository.Head()
+	if err != nil {
+		return plumbing.ZeroHash, fmt.Errorf("error reading HEAD: %s", err)
+	}
+	tip := taskRef.Hash()
+	if head.Hash() == tip {
+		return tip, nil
+	}
+	descends, err := isAncestor(repository, tip, head.Hash())
+	if err != nil {
+		return plumbing.ZeroHash, err
+	}
+	if !descends {
+		io.WriteString(logsWriter, fmt.Sprintf("HEAD (%s at %s) is not on the task branch and does not descend from it — only %s is pushed\n", head.Name().Short(), head.Hash().String()[:7], branchName))
+		return tip, nil
+	}
+	if err := repository.Storer.SetReference(plumbing.NewHashReference(taskRefName, head.Hash())); err != nil {
+		return plumbing.ZeroHash, fmt.Errorf("error fast-forwarding task branch %s: %s", branchName, err)
+	}
+	io.WriteString(logsWriter, fmt.Sprintf("HEAD (%s) moved off the task branch but descends from it — fast-forwarded %s to %s\n", head.Name().Short(), branchName, head.Hash().String()[:7]))
+	return head.Hash(), nil
+}
+
+// unpushedCommits reports whether the task branch holds commits origin
+// doesn't, after reconcileTaskBranch, and returns the task branch's SHA.
+//
+// The tip is "already on origin" if it equals ANY remote reference point that
+// exists: origin/<task branch> (later Steps and re-runs fetch it) or
+// origin/<base branch> (a first Step creates the task branch locally off base).
+// Both are checked, not the first found: the clone fetches every remote
+// branch, so a stale origin/<task branch> from an earlier, abandoned run can
+// sit next to a fresh task branch that still equals base — comparing against
+// the stale ref alone would call that "ahead" and push base onto it
+// (non-fast-forward, Step fails) where the right answer is "nothing to push".
+// With no remote reference point at all the answer is "no" — never a spurious
+// push.
+func unpushedCommits(repository *git.Repository, branchName, baseBranch string, logsWriter io.Writer) (bool, string, error) {
+	tip, err := reconcileTaskBranch(repository, branchName, logsWriter)
+	if err != nil {
+		return false, "", err
+	}
+	found := false
+	for _, name := range []string{branchName, baseBranch} {
+		ref, err := repository.Reference(plumbing.NewRemoteReferenceName("origin", name), true)
+		if err != nil {
+			continue
+		}
+		found = true
+		if ref.Hash() == tip {
+			return false, tip.String(), nil
+		}
+	}
+	return found, tip.String(), nil
+}
+
+// isAncestor reports whether commit a is an ancestor of (or equal to) commit b.
+func isAncestor(repository *git.Repository, a, b plumbing.Hash) (bool, error) {
+	ca, err := repository.CommitObject(a)
+	if err != nil {
+		return false, fmt.Errorf("error reading commit %s: %s", a.String()[:7], err)
+	}
+	cb, err := repository.CommitObject(b)
+	if err != nil {
+		return false, fmt.Errorf("error reading commit %s: %s", b.String()[:7], err)
+	}
+	return ca.IsAncestor(cb)
+}
+
 // repoOutput is one entry in the JobOutput repositories block.
 // CommitAndPush populates Index + Name + HasChanges + CommitSHA + Branch.
 // OpenPullRequest (chunk #4) extends each entry with PRURL + PRNumber.
@@ -351,6 +463,16 @@ type jobOutputData struct {
 	SchemaVersion int          `json:"schema_version"`
 	Agent         *agentOutput `json:"agent,omitempty"`
 	Repositories  []repoOutput `json:"repositories,omitempty"`
+	// BaseCommits is each repository's commit at checkout, recorded by
+	// CheckoutRepository before any agent could move it. The Review stage
+	// diffs against these; see recordBaseCommit for why HEAD at review time
+	// is not a substitute.
+	BaseCommits []baseCommitOutput `json:"base_commits,omitempty"`
+	// Review is the Review stage's record: every round, what was fixed
+	// inside the loop, and whether a must-fix finding was still open at the
+	// end. Nil when the stage did not run (participation Off, or a runner
+	// older than the stage).
+	Review *reviewOutput `json:"review,omitempty"`
 	// Cost is what the run cost, RESOLVED ONCE HERE and never recomputed.
 	//
 	// Deliberately outside Agent: that block is agentbox's result.json passed
@@ -389,6 +511,130 @@ const (
 	costSourceEstimated = "estimated"
 )
 
+// baseCommitOutput is one repository's start-of-run commit.
+//
+// Index is the position in Task.Repositories — the stable identifier every
+// other block in this envelope merges on. Dir is the directory name relative
+// to /work ("0-acme-api"), which is what the review container needs: it sees
+// the repository at that path and nowhere else.
+type baseCommitOutput struct {
+	Index     int    `json:"index"`
+	Name      string `json:"name,omitempty"`
+	Dir       string `json:"dir,omitempty"`
+	CommitSHA string `json:"commit_sha,omitempty"`
+}
+
+// reviewFindingOutput mirrors agentbox's review finding, plus the one field
+// agentbox cannot supply: whether this finding meets the org's must-fix
+// threshold. That is the runner's decision, made from the thresholds stamped
+// into the Job, and is never read from the agent.
+type reviewFindingOutput struct {
+	Key       string `json:"key,omitempty"`
+	Parameter string `json:"parameter,omitempty"`
+	Severity  string `json:"severity,omitempty"`
+	Location  string `json:"location,omitempty"`
+	What      string `json:"what,omitempty"`
+	Why       string `json:"why,omitempty"`
+	Stage     string `json:"stage,omitempty"`
+	Pass      string `json:"pass,omitempty"`
+	MustFix   bool   `json:"must_fix,omitempty"`
+	// SentBack marks a finding at or above its parameter's FIX threshold: it
+	// was routed back to the implementer for a fix round. MustFix is the HOLD
+	// half: a must-fix finding still open at the end holds the pull request,
+	// a sent-back one below the hold threshold is only noted. Every must-fix
+	// finding is sent back; records written before the split carry MustFix
+	// alone.
+	SentBack bool `json:"sent_back,omitempty"`
+	// New marks a finding no earlier round reported. On a second or third
+	// round it is the difference between "the fix did not work" and "the fix
+	// introduced something else" — two very different things for a reader to
+	// see, and indistinguishable from the finding alone.
+	New bool `json:"new,omitempty"`
+	// Held marks a sent-back finding an earlier round opened that the reviewer
+	// has since said is STILL PRESENT — or has not said is resolved, which the
+	// runner reads the same way. It is the opposite of fixed-in-loop, and it is
+	// recorded rather than inferred because the inference (the key stopped
+	// appearing) once listed a Critical finding as fixed while the code still
+	// had it. See (s *reviewStage).classify.
+	Held bool `json:"held,omitempty"`
+	// StillPresentNote is the reviewer's one sentence on what it still sees,
+	// from the latest round that held the finding. It is kept apart from Why,
+	// which stays the round-that-opened-it's account: folded into Why it
+	// stacked round after round, survived into "Fixed during review", and
+	// relabelled a note written for a "resolved" status as evidence the
+	// problem persists. Set only with Held; cleared when the finding resolves.
+	StillPresentNote string `json:"still_present_note,omitempty"`
+}
+
+// reviewCoverageOutput mirrors agentbox's coverage entry: what happened to one
+// review parameter, and why.
+type reviewCoverageOutput struct {
+	Parameter string `json:"parameter,omitempty"`
+	State     string `json:"state,omitempty"`
+	Reason    string `json:"reason,omitempty"`
+}
+
+// reviewRoundOutput is one review run. Completed=false with an Error is a
+// round that did not produce a usable report — never a failed Step, but
+// something the PR body has to say out loud rather than pass over.
+type reviewRoundOutput struct {
+	Round      int                    `json:"round"`
+	Findings   []reviewFindingOutput  `json:"findings,omitempty"`
+	Coverage   []reviewCoverageOutput `json:"coverage,omitempty"`
+	AgentType  string                 `json:"agent_type,omitempty"`
+	Model      string                 `json:"model,omitempty"`
+	TokenUsage tokenUsage             `json:"token_usage"`
+	CostUSD    *float64               `json:"cost_usd,omitempty"`
+	// Turns is the agent's own reported turn count — roughly one per tool
+	// call, a different unit from the cap, which counts model responses. It
+	// measures how much reading a review did; it is NOT directly comparable
+	// with the cap, and a round that exceeds the cap's number here has not
+	// exceeded the cap. A round the cap did stop fails with the harness's
+	// max-turns error instead.
+	Turns     int    `json:"turns,omitempty"`
+	Completed bool   `json:"completed"`
+	Error     string `json:"error,omitempty"`
+	// DeployRequirements is the round's review_result.deploy_requirements as
+	// agentbox reported it. Not findings: never sent back, never held, never
+	// counted, never posted inline.
+	DeployRequirements []reviewDeployRequirement `json:"deploy_requirements,omitempty"`
+}
+
+// reviewOutput is the Review stage's whole record for this Step run.
+//
+// FixedInLoop is what the implementer resolved without a human ever seeing it
+// — the stage's actual product, and the thing a reader most wants to know.
+// MustFixOpen is the decision that follows from the last round: true means the
+// work still carries an unresolved must-fix finding and the pull request says
+// so.
+type reviewOutput struct {
+	Participation string                `json:"participation,omitempty"`
+	Rounds        []reviewRoundOutput   `json:"rounds,omitempty"`
+	FixedInLoop   []reviewFindingOutput `json:"fixed_in_loop,omitempty"`
+	MustFixOpen   bool                  `json:"must_fix_open"`
+	// FixError is why a fix run did not finish, or empty. When it is set the
+	// change on the branch is the one the implement run produced: the failed
+	// fix was undone, and the findings it was sent to fix are still open.
+	FixError string `json:"fix_error,omitempty"`
+	// FixNotAttempted is true when no fix run happened because its undo copy
+	// could not be taken; FixError then holds the plain reason.
+	FixNotAttempted bool `json:"fix_not_attempted,omitempty"`
+	// StoppedNoChange is true when the loop ended because the last fix run
+	// finished and changed no file — it declined the findings it was sent and
+	// said why in the description. A further review round would only report the
+	// same findings again, so the loop handed them to a human instead.
+	StoppedNoChange bool `json:"stopped_no_change,omitempty"`
+	// FinalTreeReviewed is true when the latest completed review round
+	// reviewed the tree being committed: no fix run's work was kept after it.
+	// Only then do its findings' locations describe the code on the branch,
+	// so only then are they posted as inline comments on the pull request.
+	FinalTreeReviewed bool `json:"final_tree_reviewed,omitempty"`
+	// DeployRequirements is the latest completed round's deploy requirements,
+	// resolved against the stage's copy of services.json at finish(). The pull
+	// request lists them under "Before deploying"; nothing else reads them.
+	DeployRequirements []resolvedDeployRequirement `json:"deploy_requirements,omitempty"`
+}
+
 type agentOutput struct {
 	ChangesSummary string `json:"changes_summary,omitempty"`
 	// FilesChanged is the agent's self-reported changed-file list. Used by
@@ -422,6 +668,13 @@ type agentOutput struct {
 	// field; OpenPullRequest falls back to truncated first line of
 	// ChangesSummary in that case.
 	PRTitle string `json:"pr_title,omitempty"`
+	// VerifyResult is agentbox's verify_result carried onto the envelope so
+	// OpenPullRequest — a separate command that sees only JobOutput, never
+	// /result.json — can put a pre-existing verification failure in the PR
+	// body. Without this field the PR is the one place the failure ISN'T
+	// mentioned, which is the place the reviewer is actually looking.
+	// Nil for older agentbox images and for runs that reported no verify.
+	VerifyResult *verifyResult `json:"verify_result,omitempty"`
 }
 
 // mergeRepositoriesIntoJobOutput reads existing JobOutput JSON (any prior

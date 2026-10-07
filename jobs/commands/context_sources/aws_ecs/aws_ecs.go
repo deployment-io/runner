@@ -13,11 +13,13 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ecs"
+	ecsTypes "github.com/aws/aws-sdk-go-v2/service/ecs/types"
 	"github.com/deployment-io/deployment-runner-kit/cloud_api_clients"
 	"github.com/deployment-io/deployment-runner-kit/context_pack"
 	"github.com/deployment-io/deployment-runner-kit/enums/context_pack_enums"
@@ -53,6 +55,22 @@ type observedService struct {
 	// so it enriches to the managed record instead of showing a rediscovered image-name row. Not a
 	// secret (a resource identifier), so it rides through the redaction backstop unchanged.
 	Arn string `json:"arn,omitempty"`
+	// The container's environment variable NAMES (Environment and Secrets entries — never a Value or
+	// ValueFrom) and its container ports. VariablesScanned marks a record that carries the scan, so an
+	// empty list reads "no variables" rather than "not scanned". These keys must stay lists under names
+	// free of every redaction substring (see context_sources.Redact): "secretNames", or a map keyed by
+	// variable name, would be blanked.
+	VariableNames    []string `json:"variableNames"`
+	Ports            []int32  `json:"ports"`
+	VariablesScanned bool     `json:"variablesScanned"`
+}
+
+// taskDefContainer is what we read of one container definition: its image, the NAMES of its
+// variables and its container ports.
+type taskDefContainer struct {
+	image         string
+	variableNames []string
+	ports         []int32
 }
 
 // Build self-provisions ECS read access, then emits one Cluster-scoped Result per ECS cluster in
@@ -62,7 +80,7 @@ type observedService struct {
 // region); the cluster ARN carries account+region, so records stay unambiguous across runners.
 func (s *source) Build(ctx context.Context, parameters map[string]interface{}, logsWriter io.Writer) ([]context_sources.Result, error) {
 	runnerData := utils.RunnerData.Get()
-	if err := ensurePolicy(parameters, runnerData); err != nil {
+	if err := ensurePolicy(ctx, parameters, runnerData); err != nil {
 		return nil, err
 	}
 
@@ -129,13 +147,13 @@ func (s *source) Build(ctx context.Context, parameters map[string]interface{}, l
 
 // ensurePolicy self-grants the infra-context read bundle (ecs:*) on the runner's own task role,
 // mirroring every other command's policy self-grant. Idempotent; a no-op on a runner that already
-// has ecs:* from a prior deployment.
-func ensurePolicy(parameters map[string]interface{}, runnerData utils.RunnerDataType) error {
+// has ecs:* from a prior deployment. Bounded by ctx, so an inline refresh's deadline covers it.
+func ensurePolicy(ctx context.Context, parameters map[string]interface{}, runnerData utils.RunnerDataType) error {
 	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIDNamespace)
 	if err != nil {
 		return err
 	}
-	return iam_policies.AddAwsPolicyForDeploymentRunner(iam_policy_enums.AwsInfraContext, runnerData.OsType.String(),
+	return iam_policies.AddAwsPolicyForDeploymentRunnerWithContext(ctx, iam_policy_enums.AwsInfraContext, runnerData.OsType.String(),
 		runnerData.CpuArchEnum.String(), organizationID, runnerData.RunnerRegion, runnerData.Mode, runnerData.TargetCloud)
 }
 
@@ -168,7 +186,7 @@ func observeCluster(ctx context.Context, c *ecs.Client, clusterArn string, logsW
 		return nil, nil
 	}
 	clusterName := nameFromArn(clusterArn)
-	taskDefImages := map[string][]string{} // task-def ARN -> image URIs; services often share a task def
+	taskDefContainers := map[string][]taskDefContainer{} // task-def ARN -> containers; services often share a task def
 	var observed []observedService
 	// DescribeServices accepts at most 10 services per call.
 	for _, batch := range chunk(serviceArns, 10) {
@@ -197,29 +215,18 @@ func observeCluster(ctx context.Context, c *ecs.Client, clusterArn string, logsW
 			if taskDef == "" {
 				continue
 			}
-			images, cached := taskDefImages[taskDef]
+			containers, cached := taskDefContainers[taskDef]
 			if !cached {
-				images, err = imagesForTaskDef(ctx, c, taskDef)
+				containers, err = containersForTaskDef(ctx, c, taskDef)
 				if err != nil {
 					io.WriteString(logsWriter, fmt.Sprintf("aws-ecs: task def %s unreadable (skipping service %s): %v\n",
 						nameFromArn(taskDef), aws.ToString(svc.ServiceName), err))
-					taskDefImages[taskDef] = nil
+					taskDefContainers[taskDef] = nil
 					continue
 				}
-				taskDefImages[taskDef] = images
+				taskDefContainers[taskDef] = containers
 			}
-			for _, img := range images {
-				repo, by := recoverRepo(img)
-				observed = append(observed, observedService{
-					Service:     aws.ToString(svc.ServiceName),
-					Cluster:     clusterName,
-					Image:       img,
-					Repo:        repo,
-					RecoveredBy: by,
-					Cloud:       "aws",
-					Arn:         aws.ToString(svc.ServiceArn),
-				})
-			}
+			observed = append(observed, observedForService(clusterName, aws.ToString(svc.ServiceName), aws.ToString(svc.ServiceArn), containers)...)
 		}
 	}
 	return observed, nil
@@ -243,22 +250,77 @@ func listServices(ctx context.Context, c *ecs.Client, clusterArn string) ([]stri
 	}
 }
 
-// imagesForTaskDef returns the container image URIs declared in a task definition.
-func imagesForTaskDef(ctx context.Context, c *ecs.Client, taskDefArn string) ([]string, error) {
+// observedForService emits one record per container of a service's task definition.
+func observedForService(clusterName, serviceName, serviceArn string, containers []taskDefContainer) []observedService {
+	out := make([]observedService, 0, len(containers))
+	for _, ct := range containers {
+		repo, by := recoverRepo(ct.image)
+		out = append(out, observedService{
+			Service:          serviceName,
+			Cluster:          clusterName,
+			Image:            ct.image,
+			Repo:             repo,
+			RecoveredBy:      by,
+			Cloud:            "aws",
+			Arn:              serviceArn,
+			VariableNames:    ct.variableNames,
+			Ports:            ct.ports,
+			VariablesScanned: true,
+		})
+	}
+	return out
+}
+
+// containersForTaskDef reads a task definition's containers (image, variable names, ports).
+func containersForTaskDef(ctx context.Context, c *ecs.Client, taskDefArn string) ([]taskDefContainer, error) {
 	out, err := c.DescribeTaskDefinition(ctx, &ecs.DescribeTaskDefinitionInput{TaskDefinition: aws.String(taskDefArn)})
 	if err != nil {
 		return nil, err
 	}
-	if out.TaskDefinition == nil {
-		return nil, nil
+	return containersFromTaskDef(out.TaskDefinition), nil
+}
+
+// containersFromTaskDef returns, per container definition with an image, the image, the NAMES of its
+// Environment and Secrets entries (blank dropped, deduplicated, sorted) and its container ports above
+// 0 (deduplicated, sorted). Value and ValueFrom are never read.
+func containersFromTaskDef(td *ecsTypes.TaskDefinition) []taskDefContainer {
+	if td == nil {
+		return nil
 	}
-	var images []string
-	for _, cd := range out.TaskDefinition.ContainerDefinitions {
-		if img := aws.ToString(cd.Image); img != "" {
-			images = append(images, img)
+	var out []taskDefContainer
+	for _, cd := range td.ContainerDefinitions {
+		img := aws.ToString(cd.Image)
+		if img == "" {
+			continue
 		}
+		names := map[string]bool{}
+		for _, kv := range cd.Environment {
+			if n := aws.ToString(kv.Name); n != "" {
+				names[n] = true
+			}
+		}
+		for _, sec := range cd.Secrets {
+			if n := aws.ToString(sec.Name); n != "" {
+				names[n] = true
+			}
+		}
+		variableNames := make([]string, 0, len(names))
+		for n := range names {
+			variableNames = append(variableNames, n)
+		}
+		sort.Strings(variableNames)
+		seenPort := map[int32]bool{}
+		ports := []int32{}
+		for _, pm := range cd.PortMappings {
+			if p := aws.ToInt32(pm.ContainerPort); p > 0 && !seenPort[p] {
+				seenPort[p] = true
+				ports = append(ports, p)
+			}
+		}
+		sort.Slice(ports, func(i, j int) bool { return ports[i] < ports[j] })
+		out = append(out, taskDefContainer{image: img, variableNames: variableNames, ports: ports})
 	}
-	return images, nil
+	return out
 }
 
 // scopedResult packs one cluster's observations into a Cluster-scoped Result. The scope ID is the

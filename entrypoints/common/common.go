@@ -24,6 +24,7 @@ import (
 	"github.com/deployment-io/deployment-runner/jobs/commands"
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
 	"github.com/deployment-io/deployment-runner/jobs/resources"
+	"github.com/deployment-io/deployment-runner/utils/hostinfo"
 	"github.com/deployment-io/deployment-runner/utils/loggers"
 )
 
@@ -76,6 +77,21 @@ func getJobResult(job pendingJobType, error string, parameters map[string]interf
 // record exists. Nothing else reaps a Running job. Giving up here would
 // leave a job invisible, never retried and never failed.
 var releaseJobsPipeline *goPipeline.Pipeline[string, string]
+
+// capacityLogged is true while the runner is in a saturated spell that has
+// already been reported, so the log carries one line per spell rather than one
+// per refusal. Job workers run concurrently, hence the atomic; a lost race
+// costs at most a duplicate or a skipped line, which is acceptable for a log
+// and not worth a mutex on the admission path.
+var capacityLogged atomic.Bool
+
+// enteringCapacitySpell reports true exactly once per saturated spell, and
+// leavingCapacitySpell exactly once per recovery. They are compare-and-swaps,
+// not a load followed by a store: several job workers hit this concurrently,
+// and a read-then-write would let two of them both decide they were first.
+func enteringCapacitySpell() bool { return capacityLogged.CompareAndSwap(false, true) }
+
+func leavingCapacitySpell() bool { return capacityLogged.CompareAndSwap(true, false) }
 
 func handleLogEnd(err error, jobID string, logsWriter io.Writer) {
 	if err != nil {
@@ -150,19 +166,28 @@ func executeJobs(jobsStream <-chan pendingJobType, noOfWorkers int, mode runner_
 								// resultsStream — that path marks the job
 								// complete. The job returns to pending and is
 								// offered again once capacity frees.
-								// Logged to the RUNNER's log, not the job's.
-								// The job's log has to stay clean for its
-								// eventual real run (this fires ~1440 times
-								// behind a 4h session), but going silent would
-								// leave an operator unable to tell "runner at
-								// capacity" apart from a job that was never
-								// picked up at all. The runner's log is
-								// operator-facing and ships to CloudWatch,
-								// where this cadence is unremarkable.
-								log.Printf("runner at memory capacity (%d MB needed of a %d MB budget); "+
-									"returning job %s to the pending queue",
-									requiredMemory/(1024*1024), resources.MemoryBudgetBytes()/(1024*1024),
-									pendingJob.jobID)
+								//
+								// Logged to the RUNNER's log, not the job's:
+								// the job's log has to stay clean for its
+								// eventual real run.
+								//
+								// Only the FIRST refusal of a saturated spell
+								// is logged. A blocked job is re-offered every
+								// 10s, so logging each one buries real errors
+								// under ~360 identical lines an hour per job —
+								// and on a small host, where one agent
+								// container can take the whole budget, every
+								// queued job takes this path. The operator
+								// still needs to tell "runner at capacity"
+								// apart from "never picked up", but one line
+								// per spell says that; the repeats add nothing.
+								if enteringCapacitySpell() {
+									log.Printf("runner at memory capacity (%d MB needed of a %d MB budget); "+
+										"returning job %s to the pending queue. Further jobs will be "+
+										"returned silently until capacity frees",
+										requiredMemory/(1024*1024), resources.MemoryBudgetBytes()/(1024*1024),
+										pendingJob.jobID)
+								}
 								// Handed to the pipeline rather than sent
 								// here, so releases batch per org and the
 								// retry runs off this worker.
@@ -194,6 +219,14 @@ func executeJobs(jobsStream <-chan pendingJobType, noOfWorkers int, mode runner_
 								// that rather than a new behaviour.
 								releaseJobsPipeline.Add(pendingJob.organizationID, pendingJob.jobID)
 								return
+							}
+							// Capacity exists again, so the next refusal is a
+							// new spell and gets logged. Cleared on admission
+							// rather than on release because only an admission
+							// proves a job actually fit.
+							if leavingCapacitySpell() {
+								log.Printf("runner has memory capacity again (%d MB budget); resuming normally",
+									resources.MemoryBudgetBytes()/(1024*1024))
 							}
 							defer releaseMemory()
 						}
@@ -438,6 +471,32 @@ func Init() {
 	commandUtils.Init()
 	loggers.Init()
 	jobs.RegisterGobDataTypes()
+	logResourceBudget()
+}
+
+// logResourceBudget records, once at boot, the sizing this runner derived from
+// its host. Every other signal that admission control is active only appears
+// under contention, so without this line a runner that computed a small budget
+// looks exactly like one running a build that predates admission control.
+//
+// It also surfaces a failed memory probe: a host reporting 0 MB measured is
+// sizing every container off the fallback, which is a guess, not a measurement.
+func logResourceBudget() {
+	const mb = 1024 * 1024
+	agentMemory, agentNanoCPUs := resources.LimitsForAgentContainer()
+	staticMemory, _ := resources.LimitsForStaticSiteBuild()
+	imageMemory, _ := resources.LimitsForImageBuild()
+
+	measured := "measured"
+	if hostinfo.MeasuredMemoryBytes() == 0 {
+		measured = "UNMEASURED, using fallback"
+	}
+	log.Printf("host %d MB (%s), %d vCPU; job memory budget %d MB; caps: agent %d MB/%d vCPU, "+
+		"static build %d MB, image build %d MB, assistant session %d MB",
+		hostinfo.MemoryBytes()/mb, measured, hostinfo.CPUCores(),
+		resources.MemoryBudgetBytes()/mb,
+		agentMemory/mb, agentNanoCPUs/1_000_000_000,
+		staticMemory/mb, imageMemory/mb, resources.MemoryForAssistantSession()/mb)
 }
 
 func GetRuntimeEnvironment() (cpu_architecture_enums.Type, os_enums.Type) {
