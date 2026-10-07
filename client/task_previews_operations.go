@@ -1,7 +1,9 @@
 package client
 
 import (
+	"net/rpc"
 	"runtime"
+	"time"
 
 	"github.com/deployment-io/deployment-runner-kit/task_previews"
 )
@@ -50,4 +52,38 @@ func (r *RunnerClient) ListTaskPreviews(organizationID, taskID string) ([]task_p
 		return nil, err
 	}
 	return reply.Previews, nil
+}
+
+// StaticSiteBuildSettings returns how the org deploys the repository at cloneURL as a
+// static site (empty Sites when deployment.io doesn't) and, when it does, the org's
+// preview configuration. The reply carries the configuration's values: never log it.
+//
+// Like SaveInfraContext, the call runs over its own connection whose deadline is
+// timeout from now, so a stalled request fails instead of holding the agent's tool
+// call (or the shared connection).
+func (r *RunnerClient) StaticSiteBuildSettings(organizationID, taskID, cloneURL string, timeout time.Duration) (task_previews.StaticSiteBuildSettingsReplyV1, error) {
+	if !r.isConnected || r.dial == nil {
+		return task_previews.StaticSiteBuildSettingsReplyV1{}, ErrConnection
+	}
+	deadline := time.Now().Add(timeout)
+	conn, err := r.dial(timeout)
+	if err != nil {
+		return task_previews.StaticSiteBuildSettingsReplyV1{}, err
+	}
+	if err := conn.SetDeadline(deadline); err != nil {
+		conn.Close()
+		return task_previews.StaticSiteBuildSettingsReplyV1{}, err
+	}
+	c := rpc.NewClient(conn)
+	defer c.Close()
+	args := task_previews.StaticSiteBuildSettingsArgsV1{}
+	args.OrganizationID = r.GetComputedOrganizationID(organizationID)
+	args.Token = r.token
+	args.TaskID = taskID
+	args.CloneURL = cloneURL
+	var reply task_previews.StaticSiteBuildSettingsReplyV1
+	if err := c.Call("TaskPreviews.StaticSiteBuildSettingsV1", args, &reply); err != nil {
+		return task_previews.StaticSiteBuildSettingsReplyV1{}, err
+	}
+	return reply, nil
 }
