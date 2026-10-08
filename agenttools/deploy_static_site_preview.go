@@ -4,8 +4,9 @@ package agenttools
 // coding agent calls this to stand up (or refresh) a live preview of a static site on
 // the project's cloud and get back a URL. For a repository deployment.io deploys as a
 // static site, the runner builds the preview itself the way the deploy does (see
-// static_site_preview_build.go); for any other repository the agent builds it inside
-// its /work tree and passes the output directory.
+// static_site_preview_build.go); for any other repository it builds the preview from
+// build settings detected in the repository, and only when none can be detected does
+// the agent build it inside its /work tree and pass the output directory.
 //
 // C4: the preview is a persisted control-plane record. On each call the tool asks the
 // injected PreviewStore to find-or-create the task's ephemeral Environment + the lean
@@ -76,6 +77,19 @@ type DeployStaticSitePreviewDeps struct {
 	// BuildSite runs the deploy build's container steps (pull, start, install, build,
 	// remove) in dir with buildCommand and env ("KEY=value"), streaming to logs.
 	BuildSite func(ctx context.Context, dir, buildCommand string, env []string, logs io.Writer) error
+
+	// DetectSite detects how to build the static site in siteDir (a host directory of
+	// the agent's working tree) for a repository deployment.io doesn't deploy: the
+	// site, or why nothing was detected. It only reads files; nothing is executed.
+	DetectSite func(siteDir string) (DetectedSite, string, bool)
+}
+
+// DetectedSite is how to build a static site, detected from its repository.
+type DetectedSite struct {
+	Framework        string // e.g. "Vite"
+	BuildCommand     string // "<manager> run build"
+	PublishDirectory string // the framework's output directory, relative to the site
+	IsSPA            bool   // a client-side router is a dependency
 }
 
 // Values of deployStaticSitePreviewResult.BuiltBy.
@@ -92,6 +106,7 @@ type deployStaticSitePreviewResult struct {
 	DistributionID string `json:"distribution_id"`
 	BuiltBy        string `json:"built_by"`
 	Configuration  string `json:"configuration,omitempty"`
+	Settings       string `json:"settings,omitempty"`
 	Note           string `json:"note,omitempty"`
 	LogTail        string `json:"log_tail,omitempty"`
 }
@@ -101,7 +116,7 @@ const deployStaticSitePreviewInputSchema = `{
   "properties": {
     "repository": {
       "type": "string",
-      "description": "The repository's directory under /work (e.g. \"0-deployment-io/dashboard\"). Pass it for any repository: if deployment.io deploys it as a static site, deployment.io builds the preview the way the deploy does, with the org's preview configuration."
+      "description": "The repository's directory under /work (e.g. \"0-deployment-io/dashboard\"). Pass it for any repository: if deployment.io deploys it as a static site, deployment.io builds the preview the way the deploy does, with the org's preview configuration; otherwise it builds it from settings it detects in the repository, when it can."
     },
     "root_directory": {
       "type": "string",
@@ -109,7 +124,7 @@ const deployStaticSitePreviewInputSchema = `{
     },
     "publish_dir": {
       "type": "string",
-      "description": "Only for a repository deployment.io doesn't deploy: the directory your build produced, relative to /work (e.g. \"0-org/repo/dist\"). Must contain index.html. Ignored when deployment.io builds the site."
+      "description": "Only when the tool says it couldn't detect how to build the repository, or without repository: the directory your build produced, relative to /work (e.g. \"0-org/repo/dist\"). Must contain index.html. Ignored when deployment.io builds the site."
     },
     "is_spa": {
       "type": "boolean",
@@ -128,9 +143,11 @@ func RegisterDeployStaticSitePreview(s *agentmcp.Server, deps DeployStaticSitePr
 		Description: "Deploy a static site to a live preview URL on the project's cloud and return the URL. " +
 			"Pass repository (its directory under /work) for any repository: if deployment.io deploys it as a static " +
 			"site, deployment.io builds the preview itself the way the deploy does, from your working tree, with the " +
-			"org's preview configuration — you don't build it and never see that configuration. If the build takes a " +
-			"while the result is status \"building\": call again with the same arguments to wait for it. " +
-			"Only for other repositories (the tool says so), build it yourself and pass publish_dir (relative to /work) — " +
+			"org's preview configuration — you don't build it and never see that configuration. For a repository " +
+			"deployment.io doesn't deploy, deployment.io builds it the same way from build settings it detects in the " +
+			"repository (build command, publish directory, single-page app), when they can be detected. If the build " +
+			"takes a while the result is status \"building\": call again with the same arguments to wait for it. " +
+			"Only when the tool says it couldn't detect how to build the repository, build it yourself and pass publish_dir (relative to /work) — " +
 			"the output of your REAL build command, containing index.html — and is_spa=true for single-page apps with " +
 			"client-side routing. NEVER hand-create files to deploy; if the build fails, report that instead of " +
 			"deploying a placeholder. Re-call to redeploy after changes (the same preview URL is reused), then use " +
@@ -143,8 +160,18 @@ func RegisterDeployStaticSitePreview(s *agentmcp.Server, deps DeployStaticSitePr
 	return builds.stop
 }
 
-// errNotDeployedSite is the agent-built path's error when publish_dir is missing.
+// errNotDeployedSite is the agent-built path's error when publish_dir is missing and
+// detection isn't available.
 const errNotDeployedSite = "this repository isn't a site deployment.io deploys, so build it yourself and pass publish_dir"
+
+// notDetectedError is the agent-built path's error when publish_dir is missing and no
+// build settings could be detected, for reason.
+func notDetectedError(reason string) error {
+	if reason == "" {
+		return errors.New(errNotDeployedSite)
+	}
+	return fmt.Errorf("deployment.io doesn't deploy this repository and couldn't detect how to build it (%s), so build it yourself and pass publish_dir", reason)
+}
 
 func handleDeployStaticSitePreview(ctx context.Context, deps DeployStaticSitePreviewDeps, builds *previewBuilds, rawArgs json.RawMessage) (string, error) {
 	var args struct {
@@ -185,11 +212,11 @@ func handleDeployStaticSitePreview(ctx context.Context, deps DeployStaticSitePre
 			}, previewBuildCallWait-time.Since(started))
 		}
 		if strings.TrimSpace(args.PublishDir) == "" {
-			return "", errors.New(errNotDeployedSite)
+			return "", notDetectedError(plan.notDetected)
 		}
 	}
 	if strings.TrimSpace(args.PublishDir) == "" {
-		return "", fmt.Errorf("publish_dir is required — or pass repository, and deployment.io builds a site it deploys itself")
+		return "", fmt.Errorf("publish_dir is required — or pass repository, and deployment.io builds the site itself when it deploys it or can detect how to build it")
 	}
 	// The reuse key is derived solely from publish_dir (repo + build-dir) — deterministic
 	// and reproducible across steps/runners, with no name for the agent to remember. A

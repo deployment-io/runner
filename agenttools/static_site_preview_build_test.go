@@ -243,7 +243,7 @@ func writeTree(t *testing.T, root string, files map[string]string) {
 
 func TestCopyRepositoryForBuild(t *testing.T) {
 	workDir, repoDir := newWorkDir(t)
-	dst, err := copyRepositoryForBuild(repoDir, workDir)
+	dst, err := copyRepositoryForBuild(repoDir, workDir, io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -240,8 +240,8 @@ type toolchain struct {
 // the two cannot disagree about a repo.
 func resolveToolchain(repoDir string) toolchain {
 	pinned, pinnedVersion := packageManagerPin(repoDir)
-	switch {
-	case fileExistsAt(repoDir, "pnpm-lock.yaml"):
+	switch lockfileManager(repoDir) {
+	case "pnpm":
 		tc := toolchain{manager: "pnpm", corepack: true, source: "pnpm-lock.yaml"}
 		switch pinned {
 		case "pnpm":
@@ -253,7 +253,7 @@ func resolveToolchain(repoDir string) toolchain {
 		}
 		return tc
 
-	case fileExistsAt(repoDir, "yarn.lock"):
+	case "yarn":
 		return resolveYarn(repoDir, pinned, pinnedVersion)
 
 	default:
@@ -263,6 +263,21 @@ func resolveToolchain(repoDir string) toolchain {
 		// version is therefore honoured by neither — deliberately, and the
 		// same way on both sides.
 		return toolchain{manager: "npm", source: "the build image's npm"}
+	}
+}
+
+// lockfileManager is the package manager the repo's lockfile selects: pnpm for
+// pnpm-lock.yaml, else yarn for yarn.lock, else npm. The one place that precedence
+// lives — resolveToolchain and preview-site detection both use it, so they can't
+// disagree.
+func lockfileManager(repoDir string) string {
+	switch {
+	case fileExistsAt(repoDir, "pnpm-lock.yaml"):
+		return "pnpm"
+	case fileExistsAt(repoDir, "yarn.lock"):
+		return "yarn"
+	default:
+		return "npm"
 	}
 }
 
