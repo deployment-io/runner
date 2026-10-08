@@ -5,13 +5,17 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
@@ -51,7 +55,7 @@ func TestCollectFilesToUploadCoversEveryFile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	filesToUpload, uploadedKeys, err := collectFilesToUpload(root)
+	filesToUpload, uploadedKeys, err := collectFilesToUpload(root, io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,8 +79,249 @@ func TestCollectFilesToUploadCoversEveryFile(t *testing.T) {
 }
 
 func TestCollectFilesToUploadMissingDirectory(t *testing.T) {
-	if _, _, err := collectFilesToUpload(filepath.Join(t.TempDir(), "nope")); err == nil {
+	if _, _, err := collectFilesToUpload(filepath.Join(t.TempDir(), "nope"), io.Discard); err == nil {
 		t.Fatal("expected an error for a directory that does not exist")
+	}
+}
+
+// buildTreeWithSymlinks makes a publish dir holding two regular files, a
+// symlink to a file outside it, and a symlink to a directory with a file in it.
+func buildTreeWithSymlinks(t *testing.T) string {
+	t.Helper()
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "assets"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	for _, file := range []string{"index.html", filepath.Join("assets", "main.js")} {
+		if err := os.WriteFile(filepath.Join(root, file), []byte("x"), 0644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	outside := t.TempDir()
+	secret := filepath.Join(outside, "secret.txt")
+	if err := os.WriteFile(secret, []byte("secret"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(secret, filepath.Join(root, "leak.txt")); err != nil {
+		t.Fatal(err)
+	}
+	linkedTarget := filepath.Join(outside, "dir")
+	if err := os.MkdirAll(linkedTarget, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(linkedTarget, "inner.txt"), []byte("inner"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(linkedTarget, filepath.Join(root, "linked-dir")); err != nil {
+		t.Fatal(err)
+	}
+	return root
+}
+
+func assertOnlyRegularFilesCollected(t *testing.T, filesToUpload []fileToUpload, uploadedKeys map[string]bool) {
+	t.Helper()
+	want := map[string]bool{"index.html": true, "assets/main.js": true}
+	if len(uploadedKeys) != len(want) {
+		t.Errorf("uploadedKeys = %v, want exactly %v", uploadedKeys, want)
+	}
+	for key := range want {
+		if !uploadedKeys[key] {
+			t.Errorf("key %q missing from uploadedKeys", key)
+		}
+	}
+	if len(filesToUpload) != len(want) {
+		t.Errorf("got %d files to upload, want %d: %v", len(filesToUpload), len(want), filesToUpload)
+	}
+	for _, file := range filesToUpload {
+		if !want[file.objectKey] {
+			t.Errorf("unexpected file queued for upload: %q", file.objectKey)
+		}
+	}
+	for key := range uploadedKeys {
+		if key == "leak.txt" || key == "linked-dir" || strings.HasPrefix(key, "linked-dir/") {
+			t.Errorf("symlinked entry %q must not be uploaded", key)
+		}
+	}
+}
+
+// os.Open follows symlinks, so a queued symlink would publish whatever it
+// points to — /proc/self/environ, a runner config file. Only regular files
+// may be collected.
+func TestCollectFilesToUploadSkipsSymlinks(t *testing.T) {
+	root := buildTreeWithSymlinks(t)
+	var logs bytes.Buffer
+	filesToUpload, uploadedKeys, err := collectFilesToUpload(root, &logs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertOnlyRegularFilesCollected(t, filesToUpload, uploadedKeys)
+
+	var skipped []string
+	for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
+		if strings.HasPrefix(line, "Skipping") {
+			skipped = append(skipped, line)
+		}
+		if strings.Contains(line, root) {
+			t.Errorf("log line leaks the absolute host path: %q", line)
+		}
+	}
+	wantLines := map[string]bool{
+		"Skipping leak.txt: symlink, not a regular file":   true,
+		"Skipping linked-dir: symlink, not a regular file": true,
+	}
+	if len(skipped) != len(wantLines) {
+		t.Fatalf("got skip lines %q, want one per symlink", skipped)
+	}
+	for _, line := range skipped {
+		if !wantLines[line] {
+			t.Errorf("unexpected skip line %q", line)
+		}
+	}
+}
+
+func TestCollectFilesToUploadSkipsSymlinksWithNilLogsWriter(t *testing.T) {
+	root := buildTreeWithSymlinks(t)
+	filesToUpload, uploadedKeys, err := collectFilesToUpload(root, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertOnlyRegularFilesCollected(t, filesToUpload, uploadedKeys)
+}
+
+// A symlinked publish directory is refused, not resolved: resolving it would
+// publish whatever the link points to.
+func TestCollectFilesToUploadRejectsSymlinkedRoot(t *testing.T) {
+	target := t.TempDir()
+	if err := os.WriteFile(filepath.Join(target, "index.html"), []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(t.TempDir(), "dist")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	// "dist/." and "dist/" make the kernel resolve the link, so they must be
+	// refused too.
+	for _, root := range []string{link, link + "/.", link + "/"} {
+		filesToUpload, _, err := collectFilesToUpload(root, io.Discard)
+		if !errors.Is(err, DirectoryErr) {
+			t.Errorf("%q: err = %v, want one wrapping DirectoryErr", root, err)
+		}
+		if len(filesToUpload) != 0 {
+			t.Errorf("%q: got %d files for a symlinked root, want none", root, len(filesToUpload))
+		}
+	}
+}
+
+// A real publish directory spelled "dist/." still yields relative keys.
+func TestCollectFilesToUploadCleansRootPath(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "index.html"), []byte("x"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	_, uploadedKeys, err := collectFilesToUpload(root+"/.", io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(uploadedKeys) != 1 || !uploadedKeys["index.html"] {
+		t.Errorf("got keys %v, want only index.html", uploadedKeys)
+	}
+}
+
+// A read error mid-file must abort the multipart upload and fail the file,
+// not upload an empty part and complete as if it succeeded.
+func TestUploadByteStreamToS3AbortsOnReadError(t *testing.T) {
+	var mu sync.Mutex
+	var calls []string
+	emptyPart := false
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		query := r.URL.Query()
+		var call string
+		switch {
+		case r.Method == http.MethodPost && query.Has("uploads"):
+			call = "create"
+			w.Header().Set("Content-Type", "application/xml")
+			io.WriteString(w, `<InitiateMultipartUploadResult><Bucket>b</Bucket><Key>k</Key><UploadId>u1</UploadId></InitiateMultipartUploadResult>`)
+		case r.Method == http.MethodPut && query.Has("partNumber"):
+			call = "part"
+			body, _ := io.ReadAll(r.Body)
+			if len(body) == 0 {
+				mu.Lock()
+				emptyPart = true
+				mu.Unlock()
+			}
+			w.Header().Set("ETag", `"p"`)
+			w.WriteHeader(http.StatusOK)
+		case r.Method == http.MethodDelete && query.Has("uploadId"):
+			call = "abort"
+			w.WriteHeader(http.StatusNoContent)
+		case r.Method == http.MethodPost && query.Has("uploadId"):
+			call = "complete"
+			w.Header().Set("Content-Type", "application/xml")
+			io.WriteString(w, `<CompleteMultipartUploadResult><Bucket>b</Bucket><Key>k</Key><ETag>"e"</ETag></CompleteMultipartUploadResult>`)
+		default:
+			call = r.Method + " " + r.URL.String()
+			w.WriteHeader(http.StatusBadRequest)
+		}
+		mu.Lock()
+		calls = append(calls, call)
+		mu.Unlock()
+	}))
+	defer server.Close()
+
+	client := s3.New(s3.Options{
+		Region:       "us-east-1",
+		BaseEndpoint: aws.String(server.URL),
+		UsePathStyle: true,
+		Credentials:  aws.AnonymousCredentials{},
+	})
+	uploader, err := NewUploader("us-east-1", "b", client)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Opened to sniff the content type, so it must exist and be non-empty.
+	filePath := filepath.Join(t.TempDir(), "k.txt")
+	if err := os.WriteFile(filePath, []byte("good"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	readErr := errors.New("read failed")
+	stream := make(chan fileByteStreamDTO)
+	go func() {
+		defer close(stream)
+		stream <- fileByteStreamDTO{data: []byte("good")}
+		stream <- fileByteStreamDTO{err: readErr}
+	}()
+
+	abort := make(chan interface{})
+	defer close(abort)
+	var result uploadFileDoneDTO
+	select {
+	case result = <-uploader.uploadByteStreamToS3(filePath, "k", stream, abort):
+	case <-time.After(10 * time.Second):
+		t.Fatal("upload did not finish")
+	}
+
+	if result.done {
+		t.Error("done = true for a file whose read failed")
+	}
+	if !errors.Is(result.err, readErr) {
+		t.Errorf("err = %v, want one wrapping the read error", result.err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	called := map[string]bool{}
+	for _, call := range calls {
+		called[call] = true
+	}
+	if !called["abort"] {
+		t.Errorf("AbortMultipartUpload not called; calls = %v", calls)
+	}
+	if called["complete"] {
+		t.Errorf("CompleteMultipartUpload called after a read error; calls = %v", calls)
+	}
+	if emptyPart {
+		t.Errorf("an UploadPart request had an empty body; calls = %v", calls)
 	}
 }
 

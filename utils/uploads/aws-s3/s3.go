@@ -78,7 +78,7 @@ type fileToUpload struct {
 // down to this set, so it must describe the build in full: a key missing from
 // it is a live file the prune would delete.
 func (u *Uploader) uploadDirectory(directoryPath string, logsWriter io.Writer) (map[string]bool, error) {
-	filesToUpload, uploadedKeys, err := collectFilesToUpload(directoryPath)
+	filesToUpload, uploadedKeys, err := collectFilesToUpload(directoryPath, logsWriter)
 	if err != nil {
 		return nil, err
 	}
@@ -88,36 +88,79 @@ func (u *Uploader) uploadDirectory(directoryPath string, logsWriter io.Writer) (
 	return uploadedKeys, nil
 }
 
-// collectFilesToUpload walks the build directory and returns every file in it,
-// along with the set of object keys those files will occupy.
-func collectFilesToUpload(directoryPath string) ([]fileToUpload, map[string]bool, error) {
+// collectFilesToUpload walks the build directory and returns every regular
+// file in it, along with the set of object keys those files will occupy.
+//
+// Regular files ONLY. WalkDir reports a symlink as a symlink, not as its
+// target, but the upload later opens each path with os.Open, which follows
+// the link. So a link like dist/x -> /proc/self/environ would publish that
+// host file to the bucket — and the build tree can be written by the
+// customer's build or by a coding agent. Symlinks (to files or directories),
+// named pipes, sockets and devices are skipped with a log line instead. The
+// publish directory itself must be a real directory: a symlinked root is
+// refused rather than resolved, since resolving it would publish whatever it
+// points to.
+func collectFilesToUpload(directoryPath string, logsWriter io.Writer) ([]fileToUpload, map[string]bool, error) {
 	filesToUpload := make([]fileToUpload, 0)
 	uploadedKeys := map[string]bool{}
-	root := directoryPath
+	// Cleaned so spellings like "dist/." or "dist/" name the root itself:
+	// the kernel resolves those through a symlinked root, so WalkDir would
+	// see the target directory and descend into it.
+	root := filepath.Clean(directoryPath)
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-		if !d.IsDir() {
-			//	upload if it's not directory
-			outputS3ObjectKey := strings.TrimPrefix(path, directoryPath+"/")
-			// Recorded HERE, from the same expression that names the object,
-			// so the caller's view of the build cannot diverge from what was
-			// actually written. Re-deriving these keys from the directory
-			// somewhere else would usually agree and occasionally not, and the
-			// failure mode of disagreeing is deleting the live site.
-			uploadedKeys[outputS3ObjectKey] = true
-			filesToUpload = append(filesToUpload, fileToUpload{
-				path:      path,
-				objectKey: outputS3ObjectKey,
-			})
+		if path == root && !d.IsDir() {
+			// WalkDir does not follow or descend into a symlinked root.
+			return fmt.Errorf("publish directory is a symlink: %w", DirectoryErr)
 		}
-		return err
+		if d.IsDir() {
+			return nil
+		}
+		outputS3ObjectKey := strings.TrimPrefix(path, root+"/")
+		if !d.Type().IsRegular() {
+			// Log the relative key only: customers read these logs, and the
+			// absolute path would reveal the host's layout.
+			if logsWriter != nil {
+				io.WriteString(logsWriter, fmt.Sprintf("Skipping %s: %s, not a regular file\n",
+					outputS3ObjectKey, describeFileType(d.Type())))
+			}
+			return nil
+		}
+		// Recorded HERE, from the same expression that names the object,
+		// so the caller's view of the build cannot diverge from what was
+		// actually written. Re-deriving these keys from the directory
+		// somewhere else would usually agree and occasionally not, and the
+		// failure mode of disagreeing is deleting the live site.
+		uploadedKeys[outputS3ObjectKey] = true
+		filesToUpload = append(filesToUpload, fileToUpload{
+			path:      path,
+			objectKey: outputS3ObjectKey,
+		})
+		return nil
 	})
 	if err != nil {
 		return nil, nil, err
 	}
 	return filesToUpload, uploadedKeys, nil
+}
+
+// describeFileType names a non-regular, non-directory file type for the
+// skip log line.
+func describeFileType(mode fs.FileMode) string {
+	switch {
+	case mode&fs.ModeSymlink != 0:
+		return "symlink"
+	case mode&fs.ModeNamedPipe != 0:
+		return "named pipe"
+	case mode&fs.ModeSocket != 0:
+		return "socket"
+	case mode&fs.ModeDevice != 0:
+		return "device"
+	default:
+		return "special file"
+	}
 }
 
 // uploadFiles sends every file through a pool of uploadConcurrency workers and

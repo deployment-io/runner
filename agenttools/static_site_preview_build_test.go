@@ -181,6 +181,40 @@ func TestHandlerAgentPathBuiltByAgent(t *testing.T) {
 	}
 }
 
+// A symlinked component of publish_dir must not lead the upload outside /work, even
+// when the target holds an index.html; a symlink that stays inside /work is fine.
+func TestHandlerAgentPathRefusesPublishDirOutsideWork(t *testing.T) {
+	restore := fakeDeploy(t)
+	defer restore()
+	deps := planDeps(task_previews.StaticSiteBuildSettingsReplyV1{}, nil)
+	workDir, repoDir := newWorkDir(t)
+	outside := t.TempDir()
+	writeTree(t, outside, map[string]string{"site/index.html": "<html>"})
+	writeTree(t, repoDir, map[string]string{"dist/index.html": "<html>"})
+	if err := os.Symlink(outside, filepath.Join(repoDir, "link")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(repoDir, "dist"), filepath.Join(repoDir, "inside")); err != nil {
+		t.Fatal(err)
+	}
+	deps.WorkDirHost = workDir
+	builds := newPreviewBuilds()
+	defer builds.stop()
+	for _, dir := range []string{"0-acme/web/link/site", "0-acme/web/link"} {
+		args := json.RawMessage(`{"repository":"0-acme/web","publish_dir":"` + dir + `"}`)
+		out, err := handleDeployStaticSitePreview(context.Background(), deps, builds, args)
+		if err == nil || !strings.Contains(err.Error(), "outside /work") {
+			t.Errorf("publish_dir %s: got %s, %v; want refused", dir, out, err)
+		} else if strings.Contains(err.Error(), outside) {
+			t.Errorf("publish_dir %s: error shows the host path: %v", dir, err)
+		}
+	}
+	args := json.RawMessage(`{"repository":"0-acme/web","publish_dir":"0-acme/web/inside"}`)
+	if _, err := handleDeployStaticSitePreview(context.Background(), deps, builds, args); err != nil {
+		t.Errorf("symlink inside /work: %v", err)
+	}
+}
+
 // newWorkDir returns <tmp>/<task> holding a repository "0-acme/web".
 func newWorkDir(t *testing.T) (workDir, repoDir string) {
 	t.Helper()

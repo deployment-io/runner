@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -198,6 +199,15 @@ func handleDeployStaticSitePreview(ctx context.Context, deps DeployStaticSitePre
 		return "", fmt.Errorf("could not derive a service name from publish_dir %q — point it at the built output inside your repo (e.g. %q)", args.PublishDir, "<repo>/dist")
 	}
 	distDir := resolvePublishDir(deps.WorkDirHost, args.PublishDir)
+	// resolvePublishDir only guards lexically: a symlinked component of publish_dir
+	// (e.g. repo/link -> /srv with publish_dir repo/link/site) would still lead the
+	// upload outside /work. A publish_dir that doesn't exist is left to the deploy's
+	// own index.html check to report.
+	if _, err := os.Lstat(distDir); err == nil {
+		if err := checkInside(deps.WorkDirHost, distDir); err != nil {
+			return "", fmt.Errorf("publish_dir %q resolves outside %s through a symlink", args.PublishDir, containerWorkDir)
+		}
+	}
 	// Not cancelled with the call: as before, an agent-built deploy runs to its end.
 	out, err := deployPreviewDir(context.Background(), deps, serviceName, distDir, args.IsSPA)
 	if err != nil {
