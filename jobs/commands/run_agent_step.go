@@ -787,7 +787,10 @@ func (rs *RunAgentStep) spawnAgentboxAndWait(spec agentboxSpawnSpec, logsWriter 
 		mcpSrv := agentmcp.New("deployment-io-runner", agentMCPServerVersion)
 		agentmcp.RegisterPing(mcpSrv)
 		if spec.previewDeps != nil {
-			agenttools.RegisterDeployStaticSitePreview(mcpSrv, *spec.previewDeps)
+			// Preview builds still running when the agent run ends are cancelled
+			// and their copies removed.
+			stopPreviewBuilds := agenttools.RegisterDeployStaticSitePreview(mcpSrv, *spec.previewDeps)
+			defer stopPreviewBuilds()
 			agenttools.RegisterVerifyPreviewReachable(mcpSrv, spec.previewDeps.Record, spec.previewDeps.LogsWriter)
 		}
 		ln, lerr := mcpSrv.Listen(spec.mcpSocketHost)
@@ -1890,6 +1893,14 @@ func buildStaticSitePreviewDeps(ctx commandUtils.TaskJobContext, parameters map[
 			}
 			return urls, nil
 		}, logsWriter),
+		// The runner-built preview: the Task's repositories (checked out at
+		// <workDirHost>/<idx>-<name>), how the org deploys each as a static site with
+		// its preview configuration, and the deploy build's container steps.
+		Repositories: ctx.Entries,
+		BuildSettings: func(cloneURL string) (task_previews.StaticSiteBuildSettingsReplyV1, error) {
+			return runnerclient.Get().StaticSiteBuildSettings(orgID, taskID, cloneURL, agenttools.PreviewBuildSettingsTimeout)
+		},
+		BuildSite: runStaticSiteBuild,
 	}
 }
 

@@ -2,6 +2,7 @@ package commands
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
@@ -13,7 +14,6 @@ import (
 	"io"
 	"os"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -86,7 +86,7 @@ func decodeEnvironmentVariablesToSlice(envVariables string) ([]string, error) {
 // execCommand runs command inside containerID and streams output to
 // logsWriter. The caller supplies the context so the wall-clock cap
 // (defaultBuildTimeout) lives at the call site and a fired deadline
-// surfaces here as ctx.Err() — the deferred container removal in Run
+// surfaces here as ctx.Err() — the deferred container removal in runStaticSiteBuild
 // then SIGKILLs the still-running exec.
 //
 // Pre-existing bug fixed in this revision: the `defer resp.Close()`
@@ -163,12 +163,20 @@ func execCommand(ctx context.Context, containerID, repoDir string, command []str
 	return nil
 }
 
-var imagePullLock = sync.Mutex{}
+// imagePullLock serializes image pulls. A channel rather than a mutex so a caller
+// whose ctx is cancelled stops waiting for it.
+var imagePullLock = make(chan struct{}, 1)
 
-func pullDockerImageForBuilding(imageID string) error {
-	imagePullLock.Lock()
-	defer imagePullLock.Unlock()
-	ctx, cancel := context.WithTimeout(context.Background(), defaultBuildImagePullTimeout)
+// pullDockerImageForBuilding pulls imageID, giving up when ctx is cancelled — while
+// waiting for another pull as well as during its own.
+func pullDockerImageForBuilding(ctx context.Context, imageID string) error {
+	select {
+	case imagePullLock <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	defer func() { <-imagePullLock }()
+	ctx, cancel := context.WithTimeout(ctx, defaultBuildImagePullTimeout)
 	defer cancel()
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
@@ -184,8 +192,11 @@ func pullDockerImageForBuilding(imageID string) error {
 	defer reader.Close()
 
 	if _, err := io.ReadAll(reader); err != nil {
-		if ctx.Err() != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			return fmt.Errorf("image pull exceeded %s timeout for %s", defaultBuildImagePullTimeout, imageID)
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
 		}
 		return err
 	}
@@ -208,8 +219,15 @@ func pullDockerImageForBuilding(imageID string) error {
 // build just works" (many install scripts chown/chmod, fetch from
 // arbitrary CDNs, etc.). Tightening those further requires per-deploy
 // allowlist work tracked separately.
-func startBuildContainer(imageId, repoDir string) (string, error) {
-	ctx := context.Background()
+//
+// It refuses to start once ctx is cancelled, and removes a container it created
+// when ctx is cancelled before the container starts. The create itself isn't
+// cancelled: a create cut off mid-request can leave a container without
+// returning its ID to remove.
+func startBuildContainer(ctx context.Context, imageId, repoDir string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
 	if err != nil {
 		return "", err
@@ -217,7 +235,7 @@ func startBuildContainer(imageId, repoDir string) (string, error) {
 	defer cli.Close()
 
 	memoryBytes, nanoCPUs := resources.LimitsForStaticSiteBuild()
-	resp, err := cli.ContainerCreate(ctx, &container.Config{
+	resp, err := cli.ContainerCreate(context.Background(), &container.Config{
 		Image: imageId,
 		Cmd:   []string{"tail", "-f", "/dev/null"},
 		Tty:   false,
@@ -238,7 +256,11 @@ func startBuildContainer(imageId, repoDir string) (string, error) {
 		return "", err
 	}
 
-	if err = cli.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
+	if err = cli.ContainerStart(ctx, resp.ID, container.StartOptions{}); err == nil {
+		err = ctx.Err()
+	}
+	if err != nil {
+		_ = removeBuildContainer(resp.ID)
 		return "", err
 	}
 
@@ -314,7 +336,7 @@ func (b *BuildStaticSite) Run(parameters map[string]interface{}, logsWriter io.W
 		return parameters, err
 	}
 
-	// nodeVersion is read and defaulted here but is never used: imageId below is
+	// nodeVersion is read and defaulted here but is never used: staticSiteBuildImage is
 	// hardcoded, so every build runs on the same Node major no matter what the
 	// deployment's node version setting says. The comment that used to sit here
 	// claimed the image was chosen "according to node version" — it never was.
@@ -326,57 +348,6 @@ func (b *BuildStaticSite) Run(parameters map[string]interface{}, logsWriter io.W
 		nodeVersion = "--lts"
 	}
 
-	// Build image for customer static-site builds. Each part of this tag is a
-	// deliberate choice:
-	//
-	//   - Major-pinned ("22"), not a floating node:lts-* tag. Floating across
-	//     majors is what broke this. The previous pin, node:lts-buster, meant
-	//     "current LTS" until the Buster variant was discontinued; nothing
-	//     announced that, so it silently froze at Node 20.15.0 until a
-	//     dashboard deploy failed outright — Vite 8 requires
-	//     ^20.19.0 || >=22.12.0 and yarn refuses to run when the project's
-	//     engines field isn't satisfied. A floating tag is wrong in the other
-	//     direction too: Node 24 is already LTS, so node:lts-* would jump every
-	//     customer's build a major with no change on their side. A major pin
-	//     still collects patch and minor updates, so security fixes arrive
-	//     automatically while a major move stays a reviewed PR.
-	//
-	//   - 22 rather than 24, for now. Both are mature LTS. This change should
-	//     move exactly one variable — replacing a rotted pin — and customers
-	//     currently have no escape hatch (see nodeVersion above), so any
-	//     breakage from a two-major jump would land on them with no way out.
-	//     The default moves to 24 after the version selector ships.
-	//
-	//   - bookworm rather than trixie. Trixie ships a newer glibc, and prebuilt
-	//     native modules (sharp, node-gyp output, anything with a binary) are
-	//     most likely to be built against the older base. Conservative libc is
-	//     right for arbitrary customer builds.
-	//
-	//   - The full image, not -slim. -slim omits the build toolchain, and
-	//     node-gyp needs python3/make/g++ whenever npm install has to compile a
-	//     native module from source. We run a customer-supplied build command
-	//     against an arbitrary repo, and node:lts-buster was itself a full
-	//     buildpack-deps-based image — so -slim would break builds that work
-	//     today. A ~400MB pull, cached per host, is not worth that.
-	//
-	// Watch for: a tag that stops tracking what its name implies is invisible
-	// until a customer's build fails a version requirement — that is exactly
-	// how the Buster pin surfaced, years late. Revisit before Node 22 goes
-	// end-of-life (April 2027), and check the tag still exists and is being
-	// rebuilt on Docker Hub rather than assuming it.
-	//
-	// LOAD-BEARING BEYOND THE NODE VERSION: static_site_install.go picks the
-	// install command on the assumption that this image ships (a) Yarn Classic
-	// on the PATH and (b) corepack, which is how a repo's packageManager pin
-	// and any pnpm repo get the right binary. Node bundles corepack today but
-	// has been moving to unbundle it, and a -slim or non-official base may
-	// carry neither. Changing this tag without checking both silently costs
-	// every yarn and pnpm customer their lockfile again — the exact failure
-	// mode #115 and the install step were written to end. That step tests for
-	// corepack rather than assuming it, and logs the fallback, so the loss
-	// shows up in the build log rather than in the shipped bundle.
-	imageId := "node:22-bookworm"
-
 	envVariables, err := jobs.GetParameterValue[string](parameters, parameters_enums.EnvironmentVariables)
 	var envVariablesSlice []string
 	if err == nil {
@@ -386,14 +357,81 @@ func (b *BuildStaticSite) Run(parameters map[string]interface{}, logsWriter io.W
 		}
 	}
 
-	err = pullDockerImageForBuilding(imageId)
-	if err != nil {
+	// The container part of the build is shared with the Task preview build
+	// (runStaticSiteBuild), so a change to how a deploy builds applies to
+	// previews too.
+	if err = runStaticSiteBuild(context.Background(), repoDirectoryPath, buildCommand, envVariablesSlice, logsWriter); err != nil {
 		return parameters, err
 	}
 
-	containerID, err := startBuildContainer(imageId, repoDirectoryPath)
+	return parameters, nil
+}
+
+// Build image for customer static-site builds. Each part of this tag is a
+// deliberate choice:
+//
+//   - Major-pinned ("22"), not a floating node:lts-* tag. Floating across
+//     majors is what broke this. The previous pin, node:lts-buster, meant
+//     "current LTS" until the Buster variant was discontinued; nothing
+//     announced that, so it silently froze at Node 20.15.0 until a
+//     dashboard deploy failed outright — Vite 8 requires
+//     ^20.19.0 || >=22.12.0 and yarn refuses to run when the project's
+//     engines field isn't satisfied. A floating tag is wrong in the other
+//     direction too: Node 24 is already LTS, so node:lts-* would jump every
+//     customer's build a major with no change on their side. A major pin
+//     still collects patch and minor updates, so security fixes arrive
+//     automatically while a major move stays a reviewed PR.
+//
+//   - 22 rather than 24, for now. Both are mature LTS. This change should
+//     move exactly one variable — replacing a rotted pin — and customers
+//     currently have no escape hatch (see nodeVersion in BuildStaticSite.Run), so any
+//     breakage from a two-major jump would land on them with no way out.
+//     The default moves to 24 after the version selector ships.
+//
+//   - bookworm rather than trixie. Trixie ships a newer glibc, and prebuilt
+//     native modules (sharp, node-gyp output, anything with a binary) are
+//     most likely to be built against the older base. Conservative libc is
+//     right for arbitrary customer builds.
+//
+//   - The full image, not -slim. -slim omits the build toolchain, and
+//     node-gyp needs python3/make/g++ whenever npm install has to compile a
+//     native module from source. We run a customer-supplied build command
+//     against an arbitrary repo, and node:lts-buster was itself a full
+//     buildpack-deps-based image — so -slim would break builds that work
+//     today. A ~400MB pull, cached per host, is not worth that.
+//
+// Watch for: a tag that stops tracking what its name implies is invisible
+// until a customer's build fails a version requirement — that is exactly
+// how the Buster pin surfaced, years late. Revisit before Node 22 goes
+// end-of-life (April 2027), and check the tag still exists and is being
+// rebuilt on Docker Hub rather than assuming it.
+//
+// LOAD-BEARING BEYOND THE NODE VERSION: static_site_install.go picks the
+// install command on the assumption that this image ships (a) Yarn Classic
+// on the PATH and (b) corepack, which is how a repo's packageManager pin
+// and any pnpm repo get the right binary. Node bundles corepack today but
+// has been moving to unbundle it, and a -slim or non-official base may
+// carry neither. Changing this tag without checking both silently costs
+// every yarn and pnpm customer their lockfile again — the exact failure
+// mode #115 and the install step were written to end. That step tests for
+// corepack rather than assuming it, and logs the fallback, so the loss
+// shows up in the build log rather than in the shipped bundle.
+const staticSiteBuildImage = "node:22-bookworm"
+
+// runStaticSiteBuild is the container part of a static-site build, shared by the
+// deploy build (BuildStaticSite) and the Task preview build: it pulls
+// staticSiteBuildImage, starts the hardened build container with repoDir
+// bind-mounted, chooses the install step from the tree, runs install and
+// buildCommand with env under defaultBuildTimeout (or until ctx is cancelled),
+// streaming output to logsWriter, and removes the container.
+func runStaticSiteBuild(ctx context.Context, repoDir, buildCommand string, env []string, logsWriter io.Writer) error {
+	if err := pullDockerImageForBuilding(ctx, staticSiteBuildImage); err != nil {
+		return err
+	}
+
+	containerID, err := startBuildContainer(ctx, staticSiteBuildImage, repoDir)
 	if err != nil {
-		return parameters, err
+		return err
 	}
 
 	// Force-remove the container on exit (success or failure). Replaces
@@ -405,13 +443,13 @@ func (b *BuildStaticSite) Run(parameters map[string]interface{}, logsWriter io.W
 	// Install with the repo's own toolchain, not always npm — see
 	// static_site_install.go. Decided here, on the runner, from the cloned
 	// tree; the container only runs the result.
-	installCommand, installReason := installCommandForRepo(repoDirectoryPath, buildCommand)
+	installCommand, installReason := installCommandForRepo(repoDir, buildCommand)
 	logInstallChoice(logsWriter, installReason)
 
 	// Wall-clock cap on the install + build phase. A build that
 	// exceeds this is genuinely broken — surface the deadline as an
 	// error rather than tying up a runner slot indefinitely.
-	execCtx, cancelExec := context.WithTimeout(context.Background(), defaultBuildTimeout)
+	execCtx, cancelExec := context.WithTimeout(ctx, defaultBuildTimeout)
 	defer cancelExec()
 	// Newline, not ";", between the two. The install command is no longer one
 	// word: it is a small shell program (a corepack test, a frozen install, a
@@ -421,10 +459,5 @@ func (b *BuildStaticSite) Run(parameters map[string]interface{}, logsWriter io.W
 	// line, which is a bash syntax error. A newline separator is correct
 	// whatever the block ends with. Sequencing is otherwise identical: the
 	// build still runs whether or not the install succeeded, as before.
-	err = execCommand(execCtx, containerID, repoDirectoryPath, []string{"bash", "-c", installCommand + "\n" + buildCommand}, envVariablesSlice, logsWriter)
-	if err != nil {
-		return parameters, err
-	}
-
-	return parameters, nil
+	return execCommand(execCtx, containerID, repoDir, []string{"bash", "-c", installCommand + "\n" + buildCommand}, env, logsWriter)
 }

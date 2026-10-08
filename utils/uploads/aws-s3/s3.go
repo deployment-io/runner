@@ -126,6 +126,12 @@ func collectFilesToUpload(directoryPath string) ([]fileToUpload, map[string]bool
 // guarantee this scheduling needs.
 func (u *Uploader) uploadFiles(filesToUpload []fileToUpload, logsWriter io.Writer) error {
 	abortUploadSignal := make(chan interface{})
+	// Closed once every upload has returned. A file's reader (fileByteStreamGenerator)
+	// blocks handing over its next chunk until the upload takes it or abort closes;
+	// an upload that fails before reading everything — CreateMultipartUpload or a
+	// part refused — leaves it blocked, holding the file open and up to two parts in
+	// memory, forever in a long-lived runner. Closing here releases every such reader.
+	defer close(abortUploadSignal)
 	// Unbuffered, like every other channel here: the feeder hands a file over
 	// only when a worker is free to take it, so nothing about this queue grows
 	// with the size of the build. The feeder cannot be left blocked, because

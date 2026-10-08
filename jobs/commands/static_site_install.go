@@ -74,7 +74,7 @@ import (
 //   - The build image must ship what is selected. `yarn install` has always
 //     assumed node:22-bookworm carries Yarn Classic, and this file now also
 //     assumes it carries corepack. Both are true; neither is guaranteed by
-//     anything but the tag. The coupling is called out at the imageId constant
+//     anything but the tag. The coupling is called out at the staticSiteBuildImage constant
 //     in build_static_site.go, and every corepack path degrades through the
 //     `else` branch of a `corepack enable` test rather than exploding, so an
 //     image that drops corepack loses reproducibility loudly instead of
