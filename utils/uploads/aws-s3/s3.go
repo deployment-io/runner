@@ -78,7 +78,7 @@ type fileToUpload struct {
 // down to this set, so it must describe the build in full: a key missing from
 // it is a live file the prune would delete.
 func (u *Uploader) uploadDirectory(directoryPath string, logsWriter io.Writer) (map[string]bool, error) {
-	filesToUpload, uploadedKeys, err := collectFilesToUpload(directoryPath)
+	filesToUpload, uploadedKeys, err := collectFilesToUpload(directoryPath, logsWriter)
 	if err != nil {
 		return nil, err
 	}
@@ -88,36 +88,78 @@ func (u *Uploader) uploadDirectory(directoryPath string, logsWriter io.Writer) (
 	return uploadedKeys, nil
 }
 
-// collectFilesToUpload walks the build directory and returns every file in it,
-// along with the set of object keys those files will occupy.
-func collectFilesToUpload(directoryPath string) ([]fileToUpload, map[string]bool, error) {
+// collectFilesToUpload walks the build directory and returns every REGULAR
+// file in it, along with the set of object keys those files will occupy.
+//
+// Regular files only, because the upload opens each queued path with os.Open,
+// which follows symlinks. WalkDir reports a symlink as a symlink, not as its
+// target, so queuing every non-directory used to publish whatever a link
+// pointed at — `dist/x -> /proc/self/environ`, or a runner config file — to
+// the bucket. Symlinks, named pipes, sockets and devices are skipped with one
+// log line each, naming only the object key, never a host path.
+//
+// The root itself must be a real directory: a symlinked root is refused, not
+// resolved. The root is cleaned first because Linux resolves `link/.` and
+// `link/` through the link, so WalkDir would otherwise see a directory and
+// walk the target.
+func collectFilesToUpload(directoryPath string, logsWriter io.Writer) ([]fileToUpload, map[string]bool, error) {
 	filesToUpload := make([]fileToUpload, 0)
 	uploadedKeys := map[string]bool{}
-	root := directoryPath
+	root := filepath.Clean(directoryPath)
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
-		if !d.IsDir() {
-			//	upload if it's not directory
-			outputS3ObjectKey := strings.TrimPrefix(path, directoryPath+"/")
-			// Recorded HERE, from the same expression that names the object,
-			// so the caller's view of the build cannot diverge from what was
-			// actually written. Re-deriving these keys from the directory
-			// somewhere else would usually agree and occasionally not, and the
-			// failure mode of disagreeing is deleting the live site.
-			uploadedKeys[outputS3ObjectKey] = true
-			filesToUpload = append(filesToUpload, fileToUpload{
-				path:      path,
-				objectKey: outputS3ObjectKey,
-			})
+		if path == root {
+			if !d.IsDir() {
+				return fmt.Errorf("publish directory is a symlink: %w", DirectoryErr)
+			}
+			return nil
 		}
-		return err
+		if d.IsDir() {
+			return nil
+		}
+		outputS3ObjectKey := strings.TrimPrefix(path, root+"/")
+		if !d.Type().IsRegular() {
+			if logsWriter != nil {
+				io.WriteString(logsWriter, fmt.Sprintf("Skipping %s: %s, not a regular file\n",
+					outputS3ObjectKey, describeFileType(d.Type())))
+			}
+			return nil
+		}
+		// Recorded HERE, from the same expression that names the object,
+		// so the caller's view of the build cannot diverge from what was
+		// actually written. Re-deriving these keys from the directory
+		// somewhere else would usually agree and occasionally not, and the
+		// failure mode of disagreeing is deleting the live site. Skipped
+		// entries above add no key.
+		uploadedKeys[outputS3ObjectKey] = true
+		filesToUpload = append(filesToUpload, fileToUpload{
+			path:      path,
+			objectKey: outputS3ObjectKey,
+		})
+		return nil
 	})
 	if err != nil {
 		return nil, nil, err
 	}
 	return filesToUpload, uploadedKeys, nil
+}
+
+// describeFileType names a non-regular file type for the skip log line.
+func describeFileType(mode fs.FileMode) string {
+	switch {
+	case mode&fs.ModeSymlink != 0:
+		return "symlink"
+	case mode&fs.ModeNamedPipe != 0:
+		return "named pipe"
+	case mode&fs.ModeSocket != 0:
+		return "socket"
+	case mode&fs.ModeDevice != 0, mode&fs.ModeCharDevice != 0:
+		return "device"
+	default:
+		return "special file"
+	}
 }
 
 // uploadFiles sends every file through a pool of uploadConcurrency workers and

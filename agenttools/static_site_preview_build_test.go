@@ -162,6 +162,35 @@ func TestHandlerAgentPathRequiresPublishDir(t *testing.T) {
 	}
 }
 
+// resolvePublishDir is lexical, so a symlink under /work whose target is
+// outside it must be refused before anything is uploaded.
+func TestHandlerAgentPathRefusesSymlinkOutsideWorkDir(t *testing.T) {
+	saved := deployPreviewDir
+	defer func() { deployPreviewDir = saved }()
+	deployed := false
+	deployPreviewDir = func(context.Context, DeployStaticSitePreviewDeps, string, string, bool) (deployStaticSitePreviewResult, error) {
+		deployed = true
+		return deployStaticSitePreviewResult{}, nil
+	}
+	deps := planDeps(task_previews.StaticSiteBuildSettingsReplyV1{}, nil)
+	workDir, repoDir := newWorkDir(t)
+	outside := t.TempDir()
+	writeTree(t, outside, map[string]string{"dist/index.html": "<html>", "dist/secret.env": "TOKEN=1"})
+	if err := os.Symlink(outside, filepath.Join(repoDir, "link")); err != nil {
+		t.Fatal(err)
+	}
+	deps.WorkDirHost = workDir
+	builds := newPreviewBuilds()
+	defer builds.stop()
+	_, err := handleDeployStaticSitePreview(context.Background(), deps, builds, json.RawMessage(`{"repository":"0-acme/web","publish_dir":"0-acme/web/link/dist"}`))
+	if err == nil || !strings.Contains(err.Error(), "resolves outside /work through a symlink") {
+		t.Errorf("got %v, want a symlink refusal", err)
+	}
+	if deployed {
+		t.Error("deployed a publish_dir that resolves outside /work")
+	}
+}
+
 func TestHandlerAgentPathBuiltByAgent(t *testing.T) {
 	restore := fakeDeploy(t)
 	defer restore()
