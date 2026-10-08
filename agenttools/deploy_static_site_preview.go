@@ -204,7 +204,7 @@ func handleDeployStaticSitePreview(ctx context.Context, deps DeployStaticSitePre
 	// upload outside /work. A publish_dir that doesn't exist is left to the deploy's
 	// own index.html check to report.
 	if _, err := os.Lstat(distDir); err == nil {
-		if err := checkInside(deps.WorkDirHost, distDir); err != nil {
+		if err := CheckInside(deps.WorkDirHost, distDir); err != nil {
 			return "", fmt.Errorf("publish_dir %q resolves outside %s through a symlink", args.PublishDir, containerWorkDir)
 		}
 	}

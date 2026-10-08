@@ -2,9 +2,11 @@ package commands
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -20,6 +22,7 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/iam_policies"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner-kit/previews"
+	"github.com/deployment-io/deployment-runner/agenttools"
 	"github.com/deployment-io/deployment-runner/client"
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
 	"github.com/deployment-io/deployment-runner/utils"
@@ -60,6 +63,48 @@ func getDistDirectory(parameters map[string]interface{}) (string, error) {
 		return "", fmt.Errorf("publish directory path is same as the root directory")
 	}
 	return fmt.Sprintf("%s/%s", repoDirectory, publishDirectory), nil
+}
+
+var (
+	errPublishDirectoryOutsideRepo = errors.New("publish directory resolves outside the repository")
+	errPublishDirectoryIsRepoRoot  = errors.New("publish directory resolves to the repository root")
+	errPublishDirectoryInGitDir    = errors.New("publish directory resolves into the repository's .git directory")
+)
+
+// resolvePublishDirectory refuses a publish directory that, symlinks resolved, isn't
+// inside the repository (a symlinked parent such as link -> /srv, or a ".." in the
+// configured path), and returns its resolved path. The uploader refuses a symlinked
+// root, so a publish directory that is a symlink inside the repo (dist -> build) is
+// passed on as its target. A publish directory that resolves to the repository root
+// itself (dist -> ., or dist/..) is refused too: getDistDirectory already refuses the
+// root, which holds the checkout's environment files. So is one that resolves into
+// the .git directory (dist -> .git), which holds the checkout's credentials in
+// .git/config. The error never names the absolute host path.
+func resolvePublishDirectory(repoDirectory, distDirectory string) (string, error) {
+	if err := agenttools.CheckInside(repoDirectory, distDirectory); err != nil {
+		return "", errPublishDirectoryOutsideRepo
+	}
+	resolved, err := filepath.EvalSymlinks(distDirectory)
+	if err != nil {
+		return "", fmt.Errorf("resolving publish directory failed")
+	}
+	resolvedRepo, err := filepath.EvalSymlinks(repoDirectory)
+	if err != nil {
+		return "", fmt.Errorf("resolving repository directory failed")
+	}
+	rel, err := filepath.Rel(resolvedRepo, resolved)
+	if err != nil {
+		return "", errPublishDirectoryOutsideRepo
+	}
+	if rel == "." {
+		return "", errPublishDirectoryIsRepoRoot
+	}
+	for _, part := range strings.Split(rel, string(filepath.Separator)) {
+		if part == ".git" {
+			return "", errPublishDirectoryInGitDir
+		}
+	}
+	return resolved, nil
 }
 
 func getCommentForCloudfront(parameters map[string]interface{}) (string, error) {
@@ -328,7 +373,23 @@ func (d *DeployAwsStaticSite) Run(parameters map[string]interface{}, logsWriter 
 	// The prune runs AFTER the CloudFront invalidation below, not here.
 	io.WriteString(logsWriter, fmt.Sprintf("Uploading site to S3 bucket: %s\n", bucketName))
 
-	uploadedKeys, err := aws_utils.UploadToS3(distDirectory, region_enums.Type(region).String(), bucketName, s3Client, logsWriter)
+	repoDirectory, err := jobs.GetParameterValue[string](parameters, parameters_enums.RepoDirectoryPath)
+	if err != nil {
+		return parameters, err
+	}
+	uploadDirectory, err := resolvePublishDirectory(repoDirectory, distDirectory)
+	if err != nil {
+		if errors.Is(err, errPublishDirectoryIsRepoRoot) {
+			io.WriteString(logsWriter, "Publish directory resolves to the repository root\n")
+		} else if errors.Is(err, errPublishDirectoryInGitDir) {
+			io.WriteString(logsWriter, "Publish directory resolves into the repository's .git directory\n")
+		} else {
+			io.WriteString(logsWriter, "Publish directory resolves outside the repository\n")
+		}
+		return parameters, err
+	}
+
+	uploadedKeys, err := aws_utils.UploadToS3(uploadDirectory, region_enums.Type(region).String(), bucketName, s3Client, logsWriter)
 	if err != nil {
 		io.WriteString(logsWriter, fmt.Sprintf("Error uploading site to S3 bucket: %s\n", bucketName))
 		return parameters, err

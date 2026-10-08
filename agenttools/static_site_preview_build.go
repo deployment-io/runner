@@ -278,7 +278,7 @@ func runRunnerBuiltPreview(ctx context.Context, deps DeployStaticSitePreviewDeps
 	if info, err := os.Stat(siteDir); err != nil || !info.IsDir() {
 		return "", fmt.Errorf("%s's root directory %q isn't a directory in %s", p.site.DeploymentName, p.site.RootDirectory, p.repository)
 	}
-	if err := checkInside(copyDir, siteDir); err != nil {
+	if err := CheckInside(copyDir, siteDir); err != nil {
 		return "", fmt.Errorf("%s's root directory: %w", p.site.DeploymentName, err)
 	}
 	if p.configuration.ConfigurationSet {
@@ -300,7 +300,7 @@ func runRunnerBuiltPreview(ctx context.Context, deps DeployStaticSitePreviewDeps
 	if info, err := os.Stat(filepath.Join(outDir, "index.html")); err != nil || info.IsDir() {
 		return "", fmt.Errorf("the build of %s didn't produce %s/index.html", p.site.DeploymentName, shown)
 	}
-	if err := checkInside(copyDir, outDir); err != nil {
+	if err := CheckInside(copyDir, outDir); err != nil {
 		return "", fmt.Errorf("%s's publish directory: %w", p.site.DeploymentName, err)
 	}
 	if ctx.Err() != nil {
@@ -425,7 +425,7 @@ func mkdirInside(base, dir string) error {
 		} else if err != nil {
 			return err
 		}
-		if err := checkInside(base, cur); err != nil {
+		if err := CheckInside(base, cur); err != nil {
 			return errors.New("would be written outside the site's root directory")
 		}
 		if info, err := os.Stat(cur); err != nil || !info.IsDir() {
@@ -445,8 +445,8 @@ func previewFilePath(siteDir, name string) (string, error) {
 	return target, nil
 }
 
-// checkInside refuses p when, symlinks resolved, it isn't base or inside it.
-func checkInside(base, p string) error {
+// CheckInside refuses p when, symlinks resolved, it isn't base or inside it.
+func CheckInside(base, p string) error {
 	rb, err := filepath.EvalSymlinks(base)
 	if err != nil {
 		return err
