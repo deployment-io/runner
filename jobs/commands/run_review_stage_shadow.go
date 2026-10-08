@@ -114,7 +114,7 @@ func (s *reviewStage) accumulateShadowRun(result agentResult) {
 			strings.Join(result.DeniedHosts, ", ")))
 	}
 	result.DeniedHosts = nil
-	if err := accumulateReviewRunUsage(s.parameters, s.reviewerView(), result); err != nil {
+	if err := accumulateReviewRunUsage(s.parameters, s.reviewerView(), usageStageReview, result); err != nil {
 		io.WriteString(s.logsWriter, fmt.Sprintf("warning: could not record the shadow review's usage: %s\n", err))
 	}
 }

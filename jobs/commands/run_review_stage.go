@@ -497,7 +497,7 @@ func (s *reviewStage) accumulateReviewRun(round int, result agentResult) {
 			round, strings.Join(result.DeniedHosts, ", ")))
 	}
 	result.DeniedHosts = nil
-	_ = accumulateReviewRunUsage(s.parameters, s.reviewerView(), result)
+	_ = accumulateReviewRunUsage(s.parameters, s.reviewerView(), usageStageReview, result)
 }
 
 // attemptFix takes the undo copy, runs the fix, and decides what its outcome

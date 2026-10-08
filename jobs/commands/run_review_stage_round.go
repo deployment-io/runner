@@ -830,11 +830,11 @@ func recordFixRunResult(parameters map[string]interface{}, result agentResult, s
 	if spawnErr != nil {
 		// Includes the user-stop sentinel, which the caller routes to the
 		// existing stop path.
-		_ = accumulateReviewRunUsage(parameters, parameters, result)
+		_ = accumulateReviewRunUsage(parameters, parameters, usageStageImplement, result)
 		return spawnErr
 	}
 	if outcome := fixRunOutcome(result, logsWriter); outcome != nil {
-		if err := accumulateReviewRunUsage(parameters, parameters, result); err != nil {
+		if err := accumulateReviewRunUsage(parameters, parameters, usageStageImplement, result); err != nil {
 			io.WriteString(logsWriter, fmt.Sprintf("warning: could not record the failed fix run's usage: %s\n", err))
 		}
 		return outcome
