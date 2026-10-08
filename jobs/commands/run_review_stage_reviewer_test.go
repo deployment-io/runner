@@ -249,7 +249,7 @@ func TestReviewCostIsPricedWithTheReviewersModel(t *testing.T) {
 
 	// No agent-reported cost, so the catalogue's (model, provider) rate is
 	// what prices it — which is the path the reviewer's model has to reach.
-	if err := accumulateReviewRunUsage(stage.parameters, stage.reviewerView(), agentResult{
+	if err := accumulateReviewRunUsage(stage.parameters, stage.reviewerView(), usageStageReview, agentResult{
 		Status: "success", Turns: 4,
 		TokenUsage: tokenUsage{InputTokens: 10_000, OutputTokens: 2_000},
 	}); err != nil {

@@ -480,6 +480,29 @@ type jobOutputData struct {
 	// agent's own figure, sometimes our arithmetic. Mixing the two would lose
 	// the distinction between what was measured and what was inferred.
 	Cost *costOutput `json:"cost,omitempty"`
+	// Usage splits the Step's spend by STAGE. Agent.TokenUsage and Cost are
+	// the totals over every run; this says which part was the implementer's
+	// work (the implement run and every fix run) and which the reviewer's
+	// (every review round and the shadow review), so a reader never has to
+	// subtract the rounds back out of the total.
+	Usage *usageOutput `json:"usage,omitempty"`
+}
+
+// usageOutput is the Step's usage per stage. A stage no run belonged to is
+// absent.
+type usageOutput struct {
+	Implement *stageUsageOutput `json:"implement,omitempty"`
+	Review    *stageUsageOutput `json:"review,omitempty"`
+}
+
+// stageUsageOutput is one stage's tokens and cost. USD is absent while no run
+// of the stage could be priced — an unknown cost, never zero — and sums the
+// priced runs once any was. Estimated is true when any part of USD was our
+// estimate rather than the agent's figure.
+type stageUsageOutput struct {
+	TokenUsage tokenUsage `json:"token_usage"`
+	USD        *float64   `json:"usd,omitempty"`
+	Estimated  bool       `json:"estimated"`
 }
 
 // costOutput is a run's cost with its PROVENANCE.

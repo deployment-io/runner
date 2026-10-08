@@ -1587,7 +1587,9 @@ func mergeRunResultIntoJobOutput(parameters map[string]interface{}, result agent
 		_ = json.Unmarshal([]byte(existing), &data)
 	}
 	data.SchemaVersion = jobOutputSchemaVersion
-	data.Cost = accumulateCost(data.Cost, resolveRunCost(parameters, result))
+	cost := resolveRunCost(parameters, result)
+	data.Cost = accumulateCost(data.Cost, cost)
+	data.Usage = accumulateStageUsage(data.Usage, usageStageImplement, result.TokenUsage, cost)
 	data.Agent = accumulateAgentOutput(data.Agent, result)
 	merged, err := json.Marshal(data)
 	if err != nil {
@@ -1664,13 +1666,20 @@ func accumulateAgentOutput(prev *agentOutput, result agentResult) *agentOutput {
 // accumulated envelope is written back: the reviewer's view is a shallow copy,
 // so an envelope written into it would be discarded with the copy and the
 // Step's cost would silently lose every review it ran.
-func accumulateReviewRunUsage(parameters, pricingView map[string]interface{}, result agentResult) error {
+//
+// stage is the stage the run's usage belongs to, named by the caller: Review
+// for a review round or the shadow review, Implement for a fix run that
+// failed or was stopped — the implementer's work, even though its result is
+// not kept.
+func accumulateReviewRunUsage(parameters, pricingView map[string]interface{}, stage usageStage, result agentResult) error {
 	data := jobOutputData{}
 	if existing, err := jobs.GetParameterValue[string](parameters, parameters_enums.JobOutput); err == nil && len(existing) > 0 {
 		_ = json.Unmarshal([]byte(existing), &data)
 	}
 	data.SchemaVersion = jobOutputSchemaVersion
-	data.Cost = accumulateCost(data.Cost, resolveRunCost(pricingView, result))
+	cost := resolveRunCost(pricingView, result)
+	data.Cost = accumulateCost(data.Cost, cost)
+	data.Usage = accumulateStageUsage(data.Usage, stage, result.TokenUsage, cost)
 	if data.Agent == nil {
 		data.Agent = &agentOutput{}
 	}
@@ -1730,6 +1739,52 @@ func accumulateCost(prev, next *costOutput) *costOutput {
 		Model:    prev.Model,
 		Provider: prev.Provider,
 	}
+}
+
+// usageStage names the stage of a Step a run's usage is attributed to.
+type usageStage string
+
+const (
+	// usageStageImplement is the implement run and every fix run.
+	usageStageImplement usageStage = "implement"
+	// usageStageReview is every review round and the shadow review.
+	usageStageReview usageStage = "review"
+)
+
+// accumulateStageUsage adds one run's tokens and resolved cost to its stage.
+// A nil cost (the run could not be priced) adds tokens only, so the stage's
+// USD stays absent until some run of it is priced, as accumulateCost does.
+func accumulateStageUsage(prev *usageOutput, stage usageStage, tokens tokenUsage, cost *costOutput) *usageOutput {
+	next := usageOutput{}
+	if prev != nil {
+		next = *prev
+	}
+	var slot **stageUsageOutput
+	switch stage {
+	case usageStageImplement:
+		slot = &next.Implement
+	case usageStageReview:
+		slot = &next.Review
+	default:
+		return prev
+	}
+	s := stageUsageOutput{}
+	if *slot != nil {
+		s = **slot
+	}
+	s.TokenUsage = addTokenUsage(s.TokenUsage, tokens)
+	if cost != nil {
+		usd := cost.USD
+		if s.USD != nil {
+			usd += *s.USD
+		}
+		s.USD = &usd
+		if cost.Source == costSourceEstimated {
+			s.Estimated = true
+		}
+	}
+	*slot = &s
+	return &next
 }
 
 // unionStrings appends the entries of b that a does not already have,
