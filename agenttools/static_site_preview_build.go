@@ -8,6 +8,12 @@ package agenttools
 // never sees those values: they reach the build and nothing else, and neither the
 // tool's result nor the Step log line names one.
 //
+// For a repository deployment.io doesn't deploy, the runner detects the build settings
+// from the repository (DetectSite: the build command from package.json, the publish
+// directory from the framework, is_spa from the router) and builds the preview the
+// same way, with the same configuration. Only when nothing can be detected does the
+// agent build it itself.
+//
 // A build can outlast an MCP tool call (the agent's CLI gives up on a call after about
 // two minutes), so it runs in the background per service and a call waits for it at
 // most previewBuildCallWait; the agent calls again to keep waiting.
@@ -51,17 +57,38 @@ const previewBuildingMessage = "The preview is still building. Call deploy_stati
 // runnerBuiltPreview is everything a runner-built preview needs, decided before the
 // build starts.
 type runnerBuiltPreview struct {
-	repository    string // the repository's directory under the work dir, "<idx>-<name>"
-	site          task_previews.StaticSiteBuildSettingsV1
+	repository string // the repository's directory under the work dir, "<idx>-<name>"
+	// site is the deployment's build settings or, for a detected build, the detected
+	// ones (its DeploymentName then the name below).
+	site task_previews.StaticSiteBuildSettingsV1
+	// name names the site in messages and the log line: the deployment's name, or
+	// "<repository>" / "<repository>/<root>" for a detected build. "" → site's
+	// DeploymentName.
+	name string
+	// detected is the site detected from the repository; nil for a deployed site.
+	detected *DetectedSite
+	// notDetected is, when planRunnerBuiltPreview returns ok=false, why no settings
+	// could be detected ("" when detection isn't available).
+	notDetected   string
 	rootDirectory string // site.RootDirectory, cleaned; "" for the repository root
 	publishDir    string // site.PublishDirectory, cleaned, relative to rootDirectory
 	serviceName   string
 	configuration task_previews.StaticSiteBuildSettingsReplyV1 // ConfigurationSet, Variables, Files
 }
 
+// displayName names the site in messages and the Step log line.
+func (p runnerBuiltPreview) displayName() string {
+	if p.name != "" {
+		return p.name
+	}
+	return p.site.DeploymentName
+}
+
 // planRunnerBuiltPreview resolves repository among the Task's repositories and asks
-// deployment-server how it's deployed. ok=false (no error) when deployment.io doesn't
-// deploy it as a static site — the agent-built path.
+// deployment-server how it's deployed. When deployment.io doesn't deploy it as a static
+// site, the settings are detected from the repository (planDetectedPreview).
+// ok=false (no error) when nothing can be detected either — the agent-built path, with
+// the reason in the returned plan's notDetected.
 func planRunnerBuiltPreview(deps DeployStaticSitePreviewDeps, repository string, rootDirectory *string) (runnerBuiltPreview, bool, error) {
 	repoDir, entry, err := resolveTaskRepository(deps.Repositories, repository)
 	if err != nil {
@@ -75,7 +102,7 @@ func planRunnerBuiltPreview(deps DeployStaticSitePreviewDeps, repository string,
 		return runnerBuiltPreview{}, false, fmt.Errorf("look up how deployment.io deploys %s: %w", repoDir, err)
 	}
 	if len(settings.Sites) == 0 {
-		return runnerBuiltPreview{}, false, nil
+		return planDetectedPreview(deps, repoDir, rootDirectory, settings)
 	}
 	site, err := chooseStaticSite(settings.Sites, rootDirectory)
 	if err != nil {
@@ -106,6 +133,67 @@ func planRunnerBuiltPreview(deps DeployStaticSitePreviewDeps, repository string,
 	return runnerBuiltPreview{
 		repository:    repoDir,
 		site:          site,
+		name:          site.DeploymentName,
+		rootDirectory: root,
+		publishDir:    publish,
+		serviceName:   serviceName,
+		configuration: settings,
+	}, true, nil
+}
+
+// planDetectedPreview plans the preview of a repository deployment.io doesn't deploy
+// from the settings DetectSite finds in <WorkDirHost>/<repoDir>/<root_directory>.
+// ok=false when nothing is detected, with the reason in the plan's notDetected.
+func planDetectedPreview(deps DeployStaticSitePreviewDeps, repoDir string, rootDirectory *string, settings task_previews.StaticSiteBuildSettingsReplyV1) (runnerBuiltPreview, bool, error) {
+	if deps.DetectSite == nil {
+		return runnerBuiltPreview{}, false, nil
+	}
+	root := ""
+	if rootDirectory != nil {
+		r, err := cleanRelativeDir(*rootDirectory)
+		if err != nil {
+			return runnerBuiltPreview{}, false, fmt.Errorf("root_directory: %w", err)
+		}
+		root = r
+	}
+	repoHostDir := filepath.Join(deps.WorkDirHost, repoDir)
+	siteDir := filepath.Join(repoHostDir, root)
+	if info, err := os.Stat(siteDir); err != nil || !info.IsDir() {
+		return runnerBuiltPreview{}, false, fmt.Errorf("root_directory %q isn't a directory in %s", root, repoDir)
+	}
+	if err := checkInside(repoHostDir, siteDir); err != nil {
+		return runnerBuiltPreview{}, false, fmt.Errorf("root_directory %q resolves outside %s", root, repoDir)
+	}
+	detected, reason, found := deps.DetectSite(siteDir)
+	if !found {
+		return runnerBuiltPreview{notDetected: reason}, false, nil
+	}
+	name := repoDir
+	if root != "" {
+		name = repoDir + "/" + root
+	}
+	publish, err := cleanRelativeDir(detected.PublishDirectory)
+	if err != nil {
+		return runnerBuiltPreview{}, false, fmt.Errorf("%s's detected publish directory: %w", name, err)
+	}
+	if publish == "" {
+		return runnerBuiltPreview{}, false, fmt.Errorf("%s's publish directory is its root directory, so its preview can't be built", name)
+	}
+	serviceName, ok := deriveServiceName(repoDir + "/" + root + "/" + publish)
+	if !ok {
+		return runnerBuiltPreview{}, false, fmt.Errorf("could not derive a service name for %s", name)
+	}
+	return runnerBuiltPreview{
+		repository: repoDir,
+		site: task_previews.StaticSiteBuildSettingsV1{
+			DeploymentName:   name,
+			RootDirectory:    root,
+			BuildCommand:     detected.BuildCommand,
+			PublishDirectory: publish,
+			IsSpa:            detected.IsSPA,
+		},
+		name:          name,
+		detected:      &detected,
 		rootDirectory: root,
 		publishDir:    publish,
 		serviceName:   serviceName,
@@ -237,9 +325,27 @@ func configurationText(c task_previews.StaticSiteBuildSettingsReplyV1) string {
 	return fmt.Sprintf("preview configuration (%d variables, %d secret files)", len(c.Variables), len(c.Files))
 }
 
+// detectedSettingsText describes the settings of a detected build, without a value
+// of the configuration.
+func detectedSettingsText(p runnerBuiltPreview) string {
+	if p.detected == nil {
+		return ""
+	}
+	spa := "no"
+	if p.detected.IsSPA {
+		spa = "yes"
+	}
+	return fmt.Sprintf("detected from the repository: %s, build %q, publish directory %q, single-page app: %s",
+		p.detected.Framework, p.detected.BuildCommand, p.publishDir, spa)
+}
+
 // previewBuildLogLine is the Step log's line for a runner-built preview.
 func previewBuildLogLine(p runnerBuiltPreview) string {
-	return fmt.Sprintf("Preview build: %s built by deployment.io from %s with %s\n", p.serviceName, p.site.DeploymentName, configurationText(p.configuration))
+	if p.detected != nil {
+		return fmt.Sprintf("Preview build: %s built by deployment.io from settings detected in %s (%s) with %s\n",
+			p.serviceName, p.displayName(), p.detected.Framework, configurationText(p.configuration))
+	}
+	return fmt.Sprintf("Preview build: %s built by deployment.io from %s with %s\n", p.serviceName, p.displayName(), configurationText(p.configuration))
 }
 
 // previewBuildEnv is the build's environment: the preview configuration's variables
@@ -267,7 +373,7 @@ func runRunnerBuiltPreview(ctx context.Context, deps DeployStaticSitePreviewDeps
 	if deps.BuildSite == nil {
 		return "", fmt.Errorf("deployment.io can't build previews here")
 	}
-	copyDir, err := copyRepositoryForBuild(filepath.Join(deps.WorkDirHost, p.repository), deps.WorkDirHost)
+	copyDir, err := copyRepositoryForBuild(filepath.Join(deps.WorkDirHost, p.repository), deps.WorkDirHost, deps.LogsWriter)
 	if copyDir != "" {
 		defer os.RemoveAll(copyDir)
 	}
@@ -276,10 +382,10 @@ func runRunnerBuiltPreview(ctx context.Context, deps DeployStaticSitePreviewDeps
 	}
 	siteDir := filepath.Join(copyDir, p.rootDirectory)
 	if info, err := os.Stat(siteDir); err != nil || !info.IsDir() {
-		return "", fmt.Errorf("%s's root directory %q isn't a directory in %s", p.site.DeploymentName, p.site.RootDirectory, p.repository)
+		return "", fmt.Errorf("%s's root directory %q isn't a directory in %s", p.displayName(), p.site.RootDirectory, p.repository)
 	}
 	if err := checkInside(copyDir, siteDir); err != nil {
-		return "", fmt.Errorf("%s's root directory: %w", p.site.DeploymentName, err)
+		return "", fmt.Errorf("%s's root directory: %w", p.displayName(), err)
 	}
 	if p.configuration.ConfigurationSet {
 		if err := writePreviewFiles(siteDir, p.configuration.Files); err != nil {
@@ -290,21 +396,24 @@ func runRunnerBuiltPreview(ctx context.Context, deps DeployStaticSitePreviewDeps
 	io.WriteString(deps.LogsWriter, previewBuildLogLine(p))
 	if err := deps.BuildSite(ctx, siteDir, p.site.BuildCommand, previewBuildEnv(p.configuration), deps.LogsWriter); err != nil {
 		if ctx.Err() != nil {
-			return "", fmt.Errorf("the preview build of %s was cancelled", p.site.DeploymentName)
+			return "", fmt.Errorf("the preview build of %s was cancelled", p.displayName())
 		}
-		return "", fmt.Errorf("the preview build of %s failed (%s): %w. Its output is in the Step log; it isn't returned here because it can show the preview configuration", p.site.DeploymentName, p.site.BuildCommand, err)
+		return "", fmt.Errorf("the preview build of %s failed (%s): %w. Its output is in the Step log; it isn't returned here because it can show the preview configuration", p.displayName(), p.site.BuildCommand, err)
 	}
 
 	outDir := filepath.Join(siteDir, p.publishDir)
 	shown := path.Join(p.repository, p.rootDirectory, p.publishDir)
 	if info, err := os.Stat(filepath.Join(outDir, "index.html")); err != nil || info.IsDir() {
-		return "", fmt.Errorf("the build of %s didn't produce %s/index.html", p.site.DeploymentName, shown)
+		if p.detected != nil {
+			return "", fmt.Errorf("the build of %s didn't produce %s/index.html. If the project writes its build somewhere else, build it yourself and call deploy_static_site_preview with publish_dir and without repository", p.displayName(), shown)
+		}
+		return "", fmt.Errorf("the build of %s didn't produce %s/index.html", p.displayName(), shown)
 	}
 	if err := checkInside(copyDir, outDir); err != nil {
-		return "", fmt.Errorf("%s's publish directory: %w", p.site.DeploymentName, err)
+		return "", fmt.Errorf("%s's publish directory: %w", p.displayName(), err)
 	}
 	if ctx.Err() != nil {
-		return "", fmt.Errorf("the preview build of %s was cancelled", p.site.DeploymentName)
+		return "", fmt.Errorf("the preview build of %s was cancelled", p.displayName())
 	}
 	out, err := deployPreviewDir(ctx, deps, p.serviceName, outDir, p.site.IsSpa)
 	if err != nil {
@@ -312,13 +421,20 @@ func runRunnerBuiltPreview(ctx context.Context, deps DeployStaticSitePreviewDeps
 	}
 	out.BuiltBy = builtByDeploymentIO
 	out.Configuration = configurationText(p.configuration)
+	out.Settings = detectedSettingsText(p)
 	return marshalResult(out)
 }
 
 // copyRepositoryForBuild copies src into a new temporary directory beside workDir —
 // never inside it, so the agent can't see it — leaving out .git and node_modules at
-// any depth. Returns the copy's path (also on a copy error, so the caller removes it).
-func copyRepositoryForBuild(src, workDir string) (string, error) {
+// any depth, and every symlink whose target leaves the repository (see
+// symlinkLeavesRepository and symlinkResolvesOutside), each with a line to logs naming the link's path inside the
+// repository. So nothing reading the copy on the host follows a link out of it.
+// Returns the copy's path (also on a copy error, so the caller removes it).
+func copyRepositoryForBuild(src, workDir string, logs io.Writer) (string, error) {
+	if logs == nil {
+		logs = io.Discard
+	}
 	work := filepath.Clean(workDir)
 	dst, err := os.MkdirTemp(filepath.Dir(work), filepath.Base(work)+"-preview-build-")
 	if err != nil {
@@ -354,6 +470,10 @@ func copyRepositoryForBuild(src, workDir string) (string, error) {
 			if err != nil {
 				return err
 			}
+			if symlinkLeavesRepository(rel, link) || symlinkResolvesOutside(src, rel) {
+				fmt.Fprintf(logs, "Preview build: left out the symlink %s, whose target is outside the repository\n", filepath.ToSlash(rel))
+				return nil
+			}
 			return os.Symlink(link, target)
 		case info.Mode().IsRegular():
 			return copyFile(p, target, info.Mode().Perm())
@@ -362,6 +482,76 @@ func copyRepositoryForBuild(src, workDir string) (string, error) {
 		}
 	})
 	return dst, err
+}
+
+// symlinkLeavesRepository reports whether the symlink at rel (relative to the
+// repository root) with target link leaves the repository: an absolute target, or a
+// relative one resolving — lexically, from the link's own directory — outside the root.
+func symlinkLeavesRepository(rel, link string) bool {
+	if filepath.IsAbs(link) || strings.HasPrefix(link, "/") {
+		return true
+	}
+	resolved := filepath.Clean(filepath.Join(filepath.Dir(rel), link))
+	return resolved == ".." || strings.HasPrefix(resolved, ".."+string(filepath.Separator))
+}
+
+// symlinkResolvesOutside reports whether the symlink at rel (relative to the source
+// repository src) leaves the repository once the links on its way are followed in src
+// — which the lexical check misses for a chain of links that each stay inside, such
+// as a -> . with b -> a/../outside. It walks the target one component at a time and
+// never needs the target to exist: a ".." above the root counts as leaving whether or
+// not anything is there now, since the copy sits in a different directory. Past a
+// component missing from src (or left out of the copy: .git, node_modules), what the
+// copy will hold is unknown, so any later ".." counts as leaving. An absolute target
+// anywhere on the way, or too many links (a loop), counts as leaving too.
+func symlinkResolvesOutside(src, rel string) bool {
+	const maxLinks = 255
+	var cur []string // resolved components below src
+	pending := splitPath(filepath.ToSlash(rel))
+	links := 0
+	for len(pending) > 0 {
+		part := pending[0]
+		pending = pending[1:]
+		switch part {
+		case "", ".":
+			continue
+		case "..":
+			if len(cur) == 0 {
+				return true
+			}
+			cur = cur[:len(cur)-1]
+			continue
+		}
+		cur = append(cur, part)
+		full := filepath.Join(append([]string{src}, cur...)...)
+		info, err := os.Lstat(full)
+		if err != nil || part == ".git" || part == "node_modules" {
+			for _, rest := range pending {
+				if rest == ".." {
+					return true
+				}
+			}
+			return false
+		}
+		if info.Mode()&fs.ModeSymlink == 0 {
+			continue
+		}
+		links++
+		if links > maxLinks {
+			return true
+		}
+		link, err := os.Readlink(full)
+		if err != nil || filepath.IsAbs(link) || strings.HasPrefix(link, "/") {
+			return true
+		}
+		cur = cur[:len(cur)-1]
+		pending = append(splitPath(filepath.ToSlash(link)), pending...)
+	}
+	return false
+}
+
+func splitPath(p string) []string {
+	return strings.Split(p, "/")
 }
 
 func copyFile(src, dst string, perm fs.FileMode) error {

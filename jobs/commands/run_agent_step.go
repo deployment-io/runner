@@ -1901,6 +1901,9 @@ func buildStaticSitePreviewDeps(ctx commandUtils.TaskJobContext, parameters map[
 			return runnerclient.Get().StaticSiteBuildSettings(orgID, taskID, cloneURL, agenttools.PreviewBuildSettingsTimeout)
 		},
 		BuildSite: runStaticSiteBuild,
+		// A repository deployment.io doesn't deploy: its build settings, detected
+		// from the repository.
+		DetectSite: detectPreviewSite,
 	}
 }
 
