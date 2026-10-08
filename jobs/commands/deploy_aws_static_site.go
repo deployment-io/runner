@@ -2,9 +2,11 @@ package commands
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -60,6 +62,82 @@ func getDistDirectory(parameters map[string]interface{}) (string, error) {
 		return "", fmt.Errorf("publish directory path is same as the root directory")
 	}
 	return fmt.Sprintf("%s/%s", repoDirectory, publishDirectory), nil
+}
+
+var (
+	errPublishDirectoryOutsideRepo = errors.New("publish directory resolves outside the repository")
+	errPublishDirectoryIsRepoRoot  = errors.New("publish directory resolves to the repository root")
+	errPublishDirectoryInGitDir    = errors.New("publish directory resolves into the repository's .git directory")
+	errPublishDirectoryNotFound    = errors.New("publish directory not found")
+	errPublishDirectoryHasSymlink  = errors.New("publish directory must be a real directory: a symlink in its path is not followed, so set it to the directory the build writes to")
+)
+
+// checkPublishDirectory enforces one rule: the publish directory, and every
+// directory between it and the checkout root, must be a real directory. No
+// symlink in that path is followed, whether it points inside or outside the
+// repository.
+//
+// It deliberately does not resolve the publish directory and then check where
+// it landed. A link in the repository can point the upload at any directory
+// that holds an index.html — a host config directory, the runner's own files,
+// the checkout's .git (whose config carries the token-bearing remote URL) —
+// and blocking such targets one by one can never be complete. Requiring the
+// resolved path to equal the lexical one refuses every redirect at once.
+//
+// The trusted base is the bare checkout directory, not repoDirectory:
+// repoDirectory is the checkout plus the deployment's root-directory setting,
+// and that setting can itself name a symlink in the repository.
+//
+// The returned errors never include a host path.
+func checkPublishDirectory(checkoutDirectory, repoDirectory, distDirectory string) error {
+	rel, err := filepath.Rel(filepath.Clean(repoDirectory), filepath.Clean(distDirectory))
+	if err != nil || rel == ".." || strings.HasPrefix(rel, "../") {
+		return errPublishDirectoryOutsideRepo
+	}
+	if rel == "." {
+		return errPublishDirectoryIsRepoRoot
+	}
+	relCheckout, err := filepath.Rel(filepath.Clean(checkoutDirectory), filepath.Clean(distDirectory))
+	if err != nil || relCheckout == ".." || strings.HasPrefix(relCheckout, "../") {
+		return errPublishDirectoryOutsideRepo
+	}
+	for _, component := range strings.Split(relCheckout, "/") {
+		if component == ".git" {
+			return errPublishDirectoryInGitDir
+		}
+	}
+	// The EvalSymlinks errors carry host paths, so they are not wrapped.
+	resolvedCheckout, err := filepath.EvalSymlinks(checkoutDirectory)
+	if err != nil {
+		return errPublishDirectoryNotFound
+	}
+	resolved, err := filepath.EvalSymlinks(distDirectory)
+	if err != nil {
+		return errPublishDirectoryNotFound
+	}
+	// Resolving the checkout too keeps a symlink above it (macOS's
+	// /var -> /private/var) from reading as one inside the repository.
+	if resolved != filepath.Join(resolvedCheckout, relCheckout) {
+		return errPublishDirectoryHasSymlink
+	}
+	return nil
+}
+
+// publishDirectoryLogLine is the customer-facing line for a refused publish
+// directory. Like the errors, it names no path.
+func publishDirectoryLogLine(err error) string {
+	switch {
+	case errors.Is(err, errPublishDirectoryIsRepoRoot):
+		return "Publish directory resolves to the repository root\n"
+	case errors.Is(err, errPublishDirectoryInGitDir):
+		return "Publish directory resolves into the repository's .git directory\n"
+	case errors.Is(err, errPublishDirectoryHasSymlink):
+		return "Publish directory must be a real directory: a symlink in its path is not followed. Set it to the directory the build writes to\n"
+	case errors.Is(err, errPublishDirectoryNotFound):
+		return "Publish directory not found\n"
+	default:
+		return "Publish directory resolves outside the repository\n"
+	}
 }
 
 func getCommentForCloudfront(parameters map[string]interface{}) (string, error) {
@@ -327,6 +405,23 @@ func (d *DeployAwsStaticSite) Run(parameters map[string]interface{}, logsWriter 
 	//
 	// The prune runs AFTER the CloudFront invalidation below, not here.
 	io.WriteString(logsWriter, fmt.Sprintf("Uploading site to S3 bucket: %s\n", bucketName))
+
+	// Refuse a publish directory that leaves the build tree or goes through
+	// a symlink. distDirectory is passed to the upload unchanged, not
+	// resolved, so the uploader's own symlinked-root refusal stays as a
+	// second layer.
+	repoDirectory, err := jobs.GetParameterValue[string](parameters, parameters_enums.RepoDirectoryPath)
+	if err != nil {
+		return parameters, err
+	}
+	checkoutDirectory, err := commandUtils.GetRepositoryDirectoryPath(parameters)
+	if err != nil {
+		return parameters, err
+	}
+	if err = checkPublishDirectory(checkoutDirectory, repoDirectory, distDirectory); err != nil {
+		io.WriteString(logsWriter, publishDirectoryLogLine(err))
+		return parameters, err
+	}
 
 	uploadedKeys, err := aws_utils.UploadToS3(distDirectory, region_enums.Type(region).String(), bucketName, s3Client, logsWriter)
 	if err != nil {

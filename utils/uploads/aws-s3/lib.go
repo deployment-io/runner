@@ -3,6 +3,7 @@ package aws_s3
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
@@ -322,7 +323,17 @@ func (u *Uploader) uploadByteStreamToS3(filePath, outputS3ObjectKey string, data
 		partNumber := 1
 		for dataBytes := range dataByteStream {
 			if dataBytes.err != nil {
-
+				// A failed read must fail the file. Uploading it as an empty
+				// part would complete the object and report it as uploaded.
+				// The generator sends at most one error and then closes, so
+				// returning here leaves nothing blocked.
+				_ = abortMultipartUpload(client, resp)
+				fileDoneStream <- uploadFileDoneDTO{
+					err:       fmt.Errorf("reading %s: %w", outputS3ObjectKey, dataBytes.err),
+					done:      false,
+					objectKey: outputS3ObjectKey,
+				}
+				return
 			}
 			completedPart, err := uploadPart(client, resp, dataBytes.data, partNumber)
 			if err != nil {
