@@ -40,7 +40,7 @@ type StaticPreviewDeployInput struct {
 	PreviewID     string // the ephemeral preview Deployment's id — bucket + resource naming
 	DistDirectory string // host path to the built static site (agent's /work publish dir)
 	Region        string // AWS region string, e.g. region_enums.Type(r).String()
-	IsSPA         bool   // rewrite 403/404 -> /index.html so client-side routes resolve
+	IsSPA         bool   // SPA: rewrite 403/404 -> /index.html; else serve <page>/index.html at <page>/
 
 	// SkipDeployWait returns as soon as the distribution is created/invalidated
 	// (content uploaded, config applied) WITHOUT blocking on CloudFront's global
@@ -51,7 +51,8 @@ type StaticPreviewDeployInput struct {
 
 	// ExistingDistID is the CloudFront distribution id from a prior iteration.
 	// Empty on the first preview of a task (create the distribution); set on
-	// reuse (just re-upload — the CachingDisabled policy serves it immediately).
+	// reuse (re-upload — the CachingDisabled policy serves it immediately — and
+	// bring the distribution's routing in line with IsSPA if it differs).
 	ExistingDistID string
 
 	S3Client         *s3.Client
@@ -83,7 +84,7 @@ type StaticPreviewDeployResult struct {
 // retried — harden later (describe-or-create). The cache policy is the AWS-managed
 // CachingDisabled one, so it's no longer a per-preview resource that can orphan.
 func DeployStaticSitePreview(in StaticPreviewDeployInput, logsWriter io.Writer) (StaticPreviewDeployResult, error) {
-	bucketName := in.OrgID + "-" + in.PreviewID // matches deploy_aws_static_site's <org>-<deploymentID> scheme
+	bucketName := previewBucketName(in)
 
 	if _, err := os.Stat(in.DistDirectory + "/index.html"); err != nil {
 		return StaticPreviewDeployResult{}, fmt.Errorf("no index.html in build dir %s: %w", in.DistDirectory, err)
@@ -120,32 +121,14 @@ func DeployStaticSitePreview(in StaticPreviewDeployInput, logsWriter io.Writer) 
 		io.WriteString(logsWriter, fmt.Sprintf("Could not mark previous preview files as stale (the preview is live): %s\n", err))
 	}
 
-	cf := in.CloudfrontClient
-
-	// Reuse path: the distribution already serves this bucket. It uses the managed
-	// CachingDisabled policy, so the re-uploaded content is served immediately — no
-	// invalidation needed.
-	if in.ExistingDistID != "" {
-		io.WriteString(logsWriter, fmt.Sprintf("Redeployed preview to existing distribution: %s\n", in.ExistingDistID))
+	dist, err := deployPreviewDistribution(in.CloudfrontClient, in, bucketLocation, logsWriter)
+	if err != nil {
+		return StaticPreviewDeployResult{}, err
+	}
+	if dist == nil {
 		return StaticPreviewDeployResult{DistributionID: in.ExistingDistID}, nil
 	}
-
-	// First deploy: stand up the distribution. Uses the managed CachingDisabled
-	// policy (cachingDisabledPolicyID) rather than creating a per-preview one.
-	oacID, err := aws_utils.CreateOriginAccessControl("preview-"+in.PreviewID, cf)
-	if err != nil {
-		return StaticPreviewDeployResult{}, fmt.Errorf("create OAC: %w", err)
-	}
-	behavior := aws_utils.CreateDefaultCacheBehavior(bucketLocation, aws.String(cachingDisabledPolicyID))
-	s3Domain := bucketName + ".s3." + in.Region + ".amazonaws.com"
-	distConfig := buildPreviewDistributionConfig(bucketLocation, oacID, in.PreviewID, s3Domain, behavior, in.IsSPA)
-
-	io.WriteString(logsWriter, "Creating preview CloudFront distribution\n")
-	out, err := cf.CreateDistribution(context.TODO(), &cloudfront.CreateDistributionInput{DistributionConfig: distConfig})
-	if err != nil {
-		return StaticPreviewDeployResult{}, fmt.Errorf("create preview distribution: %w", err)
-	}
-	dist := out.Distribution
+	cf := in.CloudfrontClient
 
 	if err = aws_utils.AttachPolicyToS3Bucket(dist.ARN, bucketName,
 		"AllowCloudFrontServicePrincipal-"+in.PreviewID, "PolicyForCloudFrontPrivateContent-"+in.PreviewID, in.S3Client); err != nil {
@@ -169,6 +152,71 @@ func DeployStaticSitePreview(in StaticPreviewDeployInput, logsWriter io.Writer) 
 	}, nil
 }
 
+// previewBucketName matches deploy_aws_static_site's <org>-<deploymentID> scheme.
+func previewBucketName(in StaticPreviewDeployInput) string {
+	return in.OrgID + "-" + in.PreviewID
+}
+
+// deployPreviewDistribution is the CloudFront half of DeployStaticSitePreview.
+// On reuse (ExistingDistID set) it brings the existing distribution's routing in
+// line with IsSPA and returns a nil distribution; on a first deploy it creates
+// the OAC and a distribution already configured that way.
+func deployPreviewDistribution(cf previewCloudfront, in StaticPreviewDeployInput, bucketLocation *string,
+	logsWriter io.Writer) (*cloudfrontTypes.Distribution, error) {
+	// A plain static site writes <page>/index.html; S3 only serves that at
+	// <page>/index.html, so a viewer-request function maps <page>/ onto it, as
+	// production does. An SPA instead relies on the 403/404 → /index.html rewrite.
+	routingARN := ""
+	if !in.IsSPA {
+		arn, err := ensurePreviewRoutingFunction(cf)
+		if err != nil {
+			return nil, err
+		}
+		routingARN = arn
+	}
+
+	// Reuse path: the distribution already serves this bucket. It uses the managed
+	// CachingDisabled policy, so the re-uploaded content is served immediately — no
+	// invalidation needed.
+	if in.ExistingDistID != "" {
+		return nil, redeployPreviewDistribution(cf, in, routingARN, logsWriter)
+	}
+
+	// First deploy: stand up the distribution. Uses the managed CachingDisabled
+	// policy (cachingDisabledPolicyID) rather than creating a per-preview one.
+	oacID, err := aws_utils.CreateOriginAccessControl("preview-"+in.PreviewID, cf)
+	if err != nil {
+		return nil, fmt.Errorf("create OAC: %w", err)
+	}
+	behavior := aws_utils.CreateDefaultCacheBehavior(bucketLocation, aws.String(cachingDisabledPolicyID))
+	s3Domain := previewBucketName(in) + ".s3." + in.Region + ".amazonaws.com"
+	distConfig := buildPreviewDistributionConfig(bucketLocation, oacID, in.PreviewID, s3Domain, behavior, in.IsSPA)
+	reconcilePreviewRouting(distConfig, in.IsSPA, routingARN)
+
+	io.WriteString(logsWriter, "Creating preview CloudFront distribution\n")
+	out, err := cf.CreateDistribution(context.TODO(), &cloudfront.CreateDistributionInput{DistributionConfig: distConfig})
+	if err != nil {
+		return nil, fmt.Errorf("create preview distribution: %w", err)
+	}
+	return out.Distribution, nil
+}
+
+// redeployPreviewDistribution updates an existing preview distribution's routing
+// to match IsSPA when it differs.
+func redeployPreviewDistribution(cf previewDistributions, in StaticPreviewDeployInput, routingARN string, logsWriter io.Writer) error {
+	io.WriteString(logsWriter, fmt.Sprintf("Redeployed preview to existing distribution: %s\n", in.ExistingDistID))
+	changed, err := reconcileExistingPreviewDistribution(cf, in.ExistingDistID, in.IsSPA, routingARN)
+	if err != nil || !changed {
+		return err
+	}
+	if in.IsSPA {
+		io.WriteString(logsWriter, fmt.Sprintf("Updated preview distribution %s to serve /index.html for client-side routes (takes a few minutes to propagate)\n", in.ExistingDistID))
+	} else {
+		io.WriteString(logsWriter, fmt.Sprintf("Updated preview distribution %s to serve <page>/index.html at <page>/ (takes a few minutes to propagate)\n", in.ExistingDistID))
+	}
+	return nil
+}
+
 // buildPreviewDistributionConfig is a param-free distribution config for a preview
 // (cf. createDistributionConfigForNewCloudfront, which reads error pages from the
 // Job params map). For an SPA, 403/404 are rewritten to /index.html (200) so
@@ -187,12 +235,7 @@ func buildPreviewDistributionConfig(bucketLocation, oacID *string, previewID, s3
 
 	errorResponses := &cloudfrontTypes.CustomErrorResponses{Quantity: aws.Int32(0)}
 	if isSPA {
-		// ErrorCachingMinTTL 0 so a redeploy's changes show immediately (the default
-		// is 300s), matching the no-cache CachingDisabled policy on the behavior.
-		items := []cloudfrontTypes.CustomErrorResponse{
-			{ErrorCode: aws.Int32(403), ResponsePagePath: aws.String("/index.html"), ResponseCode: aws.String("200"), ErrorCachingMinTTL: aws.Int64(0)},
-			{ErrorCode: aws.Int32(404), ResponsePagePath: aws.String("/index.html"), ResponseCode: aws.String("200"), ErrorCachingMinTTL: aws.Int64(0)},
-		}
+		items := spaErrorResponses()
 		errorResponses = &cloudfrontTypes.CustomErrorResponses{Quantity: aws.Int32(int32(len(items))), Items: items}
 	}
 

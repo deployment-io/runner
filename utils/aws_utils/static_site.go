@@ -61,9 +61,16 @@ func CreateCachePolicy(cachePolicyName string, cloudFrontClient *cloudfront.Clie
 	return cachePolicyOutput.CachePolicy.Id, nil
 }
 
+// OriginAccessControlCreator is the one CloudFront call CreateOriginAccessControl
+// makes; *cloudfront.Client satisfies it.
+type OriginAccessControlCreator interface {
+	CreateOriginAccessControl(ctx context.Context, params *cloudfront.CreateOriginAccessControlInput,
+		optFns ...func(*cloudfront.Options)) (*cloudfront.CreateOriginAccessControlOutput, error)
+}
+
 // CreateOriginAccessControl creates a CloudFront OAC (sigv4, S3 origin) and
 // returns its id.
-func CreateOriginAccessControl(name string, cloudFrontClient *cloudfront.Client) (*string, error) {
+func CreateOriginAccessControl(name string, cloudFrontClient OriginAccessControlCreator) (*string, error) {
 	originAccessControlConfig := &cloudfrontTypes.OriginAccessControlConfig{
 		Name:                          aws.String(name),
 		OriginAccessControlOriginType: cloudfrontTypes.OriginAccessControlOriginTypesS3,

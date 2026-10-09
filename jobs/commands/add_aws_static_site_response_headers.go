@@ -10,6 +10,7 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
+	"github.com/deployment-io/deployment-runner/utils/aws_utils"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"io"
 	"strings"
@@ -236,7 +237,7 @@ func (a *AddAwsStaticSiteResponseHeaders) Run(parameters map[string]interface{},
 		return parameters, err
 	}
 
-	associate := associateFunctionToCloudfrontDistribution(distributionConfig, functionARN, cloudfront_types.EventTypeViewerResponse)
+	associate := aws_utils.AssociateFunctionToCloudfrontDistribution(distributionConfig, functionARN, cloudfront_types.EventTypeViewerResponse)
 	if associate {
 		io.WriteString(logsWriter, fmt.Sprintf("Associating cloudfront function %s to distribution %s\n", responseHeadersFunctionName, cloudfrontDistributionId))
 		_, err = cloudfrontClient.UpdateDistribution(context.TODO(), &cloudfront.UpdateDistributionInput{
