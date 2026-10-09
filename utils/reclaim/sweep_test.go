@@ -209,6 +209,58 @@ func TestSelectStaleWorkDirs(t *testing.T) {
 	}
 }
 
+// The directories commands park beside a work dir — the Review stage's round
+// outputs, fix-round snapshots and context copies, the Task preview build's
+// copies — are reclaimed with it. Near misses, symlinks, plain files and a
+// sibling an active container bind-mounts are not.
+func TestSelectStaleWorkDirsIncludesWorkDirSiblings(t *testing.T) {
+	root := t.TempDir()
+	org := filepath.Join(root, orgID)
+	var want []string
+	for _, name := range []string{
+		taskID,
+		taskID + "-review-round-1-output",
+		taskID + "-review-round-1-shadow-output",
+		taskID + "-fix-round-2-snapshot",
+		taskID + "-review-context-1234",
+		taskID + "-preview-build-987654",
+	} {
+		dir := filepath.Join(org, name)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		want = append(want, dir)
+	}
+	liveSibling := filepath.Join(org, taskID+"-preview-build-live")
+	outside := filepath.Join(root, "outside")
+	for _, dir := range []string{
+		liveSibling,
+		outside,
+		filepath.Join(org, "deadbeef-preview-build-1"),           // prefix isn't an ObjectID
+		filepath.Join(org, taskID[:23]+"-review-round-1-output"), // 23 hex characters
+		filepath.Join(org, taskID+"preview-build-1"),             // no "-" after the ID
+	} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A symlink named like a sibling must never be listed: removing it would
+	// only remove the link, but following it would reach outside the root.
+	if err := os.Symlink(outside, filepath.Join(org, taskID+"-preview-build-link")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(org, taskID+"-review-round-3-output"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got := selectStaleWorkDirs(root, map[string]bool{liveSibling: true})
+	sort.Strings(got)
+	sort.Strings(want)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("stale dirs = %v, want %v", got, want)
+	}
+}
+
 func TestSelectStaleWorkDirsOnAMissingRoot(t *testing.T) {
 	if got := selectStaleWorkDirs(filepath.Join(t.TempDir(), "does-not-exist"), nil); got != nil {
 		t.Fatalf("expected no candidates under a missing root, got %v", got)

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/deployment-io/deployment-runner/utils/reclaim"
 	"io"
 	"os"
 	"path/filepath"
@@ -129,6 +130,20 @@ func (rs *RunReviewStage) Run(parameters map[string]interface{}, logsWriter io.W
 	participation := readReviewParticipation(parameters, logsWriter)
 	if participation == participationOff {
 		return parameters, nil
+	}
+	// The review rounds and fix runs spawn the same agentbox image RunAgentStep
+	// pulled, but RunAgentStep's hold on it ends when that command returns. Held
+	// again here for the whole stage, so a concurrent Step pulling a newer
+	// agentbox tag can't prune this one between rounds; re-pulled only if it
+	// went missing in the moment between the two commands.
+	imageRef, err := jobs.GetParameterValue[string](parameters, parameters_enums.AgentboxImage)
+	if err != nil {
+		return parameters, fmt.Errorf("agentbox image missing: %s", err)
+	}
+	releaseImage := reclaim.MarkImageInUse(imageRef)
+	defer releaseImage()
+	if err := ensureAgentboxImage(imageRef); err != nil {
+		return parameters, fmt.Errorf("error pulling agentbox image: %s", err)
 	}
 	// Nothing between here and stage.run() returns early, which is what makes the
 	// stage's own defer the single owner of the cache volume below. This parse is

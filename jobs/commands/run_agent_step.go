@@ -455,6 +455,22 @@ func pullAgentboxImage(imageRef string) error {
 	return nil
 }
 
+// ensureAgentboxImage pulls imageRef only when it isn't on the host — for a
+// command that runs after RunAgentStep already pulled it, where a registry
+// round trip on every Step would be wasted.
+func ensureAgentboxImage(imageRef string) error {
+	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		return err
+	}
+	_, _, inspectErr := cli.ImageInspectWithRaw(context.Background(), imageRef)
+	cli.Close()
+	if inspectErr == nil {
+		return nil
+	}
+	return pullAgentboxImage(imageRef)
+}
+
 // prepareAgentboxHostDirs creates the on-host directories agentbox writes
 // into through the bind mount: the result dir for /result.json, and the tmp
 // dir backing TMPDIR/GOTMPDIR (see agentboxTmpDirRel). Both must exist and be

@@ -35,6 +35,17 @@ var (
 	// commandUtils.GetTaskRepositoriesBaseDir — /<root>/<orgID>/<taskID>.
 	// Anything else under the root belongs to someone else.
 	objectIDRe = regexp.MustCompile(`^[0-9a-fA-F]{24}$`)
+
+	// workDirSiblingRe matches the directories the runner parks BESIDE a work
+	// dir, named after it: "<id>-<anything>". Today's producers are the Review
+	// stage ("-review-round-<n>-output", the shadow review's
+	// "-review-round-1-shadow-output", "-fix-round-<n>-snapshot",
+	// "-review-context-*") and the Task preview build ("-preview-build-*").
+	// Each removes its own on the way out; a killed process leaves them —
+	// and the fix-round snapshots are full copies of every repository. A
+	// prefix rule rather than a list of suffixes, so the next sibling a
+	// command adds is reclaimed too instead of leaking until someone notices.
+	workDirSiblingRe = regexp.MustCompile(`^[0-9a-fA-F]{24}-.+$`)
 )
 
 // Sweep reclaims the resources a previous runner process left behind.
@@ -253,13 +264,17 @@ func sweepWorkDirs(containers []types.Container) {
 	}
 }
 
-// selectStaleWorkDirs lists the <orgID>/<taskID> directories under root.
+// selectStaleWorkDirs lists the <orgID>/<taskID> directories under root, and
+// the <orgID>/<taskID>-<suffix> directories parked beside them (see
+// workDirSiblingRe).
 //
-// Both path segments must be ObjectID hex — that two-level shape is the
-// runner's own scheme, and matching it is what keeps the sweep out of the
-// rest of a shared /tmp. A directory an active container bind-mounts is
-// skipped, which covers the (unsupported but survivable) case of a second
-// runner process on the same host.
+// The org segment must be ObjectID hex, and the second segment an ObjectID or
+// an ObjectID followed by "-" — that two-level shape is the runner's own
+// scheme, and matching it is what keeps the sweep out of the rest of a shared
+// /tmp. A directory an active container bind-mounts is skipped, which covers
+// the (unsupported but survivable) case of a second runner process on the
+// same host. Only real directories are listed: a symlink is never followed or
+// removed.
 func selectStaleWorkDirs(root string, bound map[string]bool) []string {
 	orgDirs, err := os.ReadDir(root)
 	if err != nil {
@@ -276,7 +291,10 @@ func selectStaleWorkDirs(root string, bound map[string]bool) []string {
 			continue
 		}
 		for _, taskDir := range taskDirs {
-			if !taskDir.IsDir() || !objectIDRe.MatchString(taskDir.Name()) {
+			if !taskDir.IsDir() {
+				continue
+			}
+			if name := taskDir.Name(); !objectIDRe.MatchString(name) && !workDirSiblingRe.MatchString(name) {
 				continue
 			}
 			taskPath := filepath.Join(orgPath, taskDir.Name())
