@@ -13,6 +13,7 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
+	"github.com/deployment-io/deployment-runner/utils/aws_utils"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
@@ -156,45 +157,6 @@ func describeViewerRequestFunction(parameters map[string]interface{}, cloudfront
 		return nil, false, nil
 	}
 	return describeFunctionOutput, true, nil
-}
-
-func associateFunctionToCloudfrontDistribution(distributionConfig *cloudfront_types.DistributionConfig,
-	functionARN *string, eventType cloudfront_types.EventType) bool {
-	functionAssociations := distributionConfig.DefaultCacheBehavior.FunctionAssociations
-	items := functionAssociations.Items
-	quantity := functionAssociations.Quantity
-	associate := true
-	for _, item := range items {
-		//check if already associated
-		associatedArn := aws.ToString(item.FunctionARN)
-		newArn := aws.ToString(functionARN)
-		if (associatedArn == newArn) && (item.EventType == eventType) {
-			associate = false
-		}
-	}
-	if !associate {
-		return false
-	}
-
-	var q int32
-	if quantity == nil {
-		q = 0
-	} else {
-		q = aws.ToInt32(quantity)
-	}
-	q++
-	quantity = aws.Int32(q)
-	items = append(items, cloudfront_types.FunctionAssociation{
-		EventType:   eventType,
-		FunctionARN: functionARN,
-	})
-	functionAssociations = &cloudfront_types.FunctionAssociations{
-		Quantity: quantity,
-		Items:    items,
-	}
-	distributionConfig.DefaultCacheBehavior.FunctionAssociations = functionAssociations
-
-	return true
 }
 
 func updateCustomErrorResponses(parameters map[string]interface{}, distributionConfig *cloudfront_types.DistributionConfig) bool {
@@ -344,7 +306,7 @@ func (d *DeployAwsCloudfrontViewerRequestFunction) Run(parameters map[string]int
 	distributionConfig := distributionConfigOutput.DistributionConfig
 
 	//associate function to distribution config
-	associate := associateFunctionToCloudfrontDistribution(distributionConfig, functionARN, cloudfront_types.EventTypeViewerRequest)
+	associate := aws_utils.AssociateFunctionToCloudfrontDistribution(distributionConfig, functionARN, cloudfront_types.EventTypeViewerRequest)
 
 	errorPagesUpdated := updateCustomErrorResponses(parameters, distributionConfig)
 
