@@ -217,3 +217,106 @@ func TestUsage_USDAbsentWhenNothingInTheStageIsPriced(t *testing.T) {
 		t.Errorf("usage.implement.usd = %v, want the key absent", implement["usd"])
 	}
 }
+
+// Each stage records the provider its runs used: the implement run's and every
+// fix run's from the Job's own parameters, every review round's and the shadow
+// review's from the reviewer's view. Nothing else about the usage block, the
+// agent block or "cost" changes.
+func TestUsage_RecordsEachStagesProvider(t *testing.T) {
+	sub := llm_provider_enums.AnthropicSubscription
+	openAI := llm_provider_enums.OpenAIDirect
+	parameters := withReviewer(t, implementerJobParameters(t), "codex", "gpt-5.5", &openAI,
+		map[string]string{"OPENAI_API_KEY": "sk-openai-reviewer"})
+	jobs.SetParameterValue[string](parameters, parameters_enums.AgentProvider, sub.Key())
+	stage := reviewStageFor(t, parameters)
+
+	if err := mergeAgentResultIntoJobOutput(parameters, agentResult{
+		Status: "success", Turns: 10, PRTitle: "Add export",
+		TokenUsage: tokenUsage{InputTokens: 1000, OutputTokens: 100}, CostUSD: f64(0.40),
+	}); err != nil {
+		t.Fatalf("merge: %s", err)
+	}
+	// Review round: 0.05 + 0.06.
+	round1 := agentResult{Status: "success", Turns: 3, TokenUsage: tokenUsage{InputTokens: 10_000, OutputTokens: 2_000}}
+	stage.accumulateReviewRun(1, round1)
+	stage.recordRound(1, nil, round1)
+	// Failed fix run, priced against the Job's own (subscription) view.
+	if err := recordFixRunResult(parameters, agentResult{
+		Status: "failed", Turns: 1, TokenUsage: tokenUsage{InputTokens: 200, OutputTokens: 20},
+	}, nil, io.Discard); err == nil {
+		t.Fatal("failed fix run: want its outcome error")
+	}
+	// Shadow review: 0.025 + 0.015.
+	stage.accumulateShadowRun(agentResult{Status: "success", Turns: 2, TokenUsage: tokenUsage{InputTokens: 5_000, OutputTokens: 500}})
+	if err := mergeReviewIntoJobOutput(parameters, &reviewOutput{Rounds: stage.rounds}); err != nil {
+		t.Fatalf("merge review: %s", err)
+	}
+
+	data := readJobOutput(t, parameters)
+	if data.Usage == nil {
+		t.Fatal("usage absent")
+	}
+	if got := data.Usage.Implement.Provider; got != "anthropic-subscription" {
+		t.Errorf("usage.implement.provider = %q, want anthropic-subscription", got)
+	}
+	if got := data.Usage.Review.Provider; got != "openai-direct" {
+		t.Errorf("usage.review.provider = %q, want openai-direct", got)
+	}
+	assertStageUsage(t, "implement", data.Usage.Implement,
+		tokenUsage{InputTokens: 1200, OutputTokens: 120}, f64(0.40), false)
+	assertStageUsage(t, "review", data.Usage.Review,
+		tokenUsage{InputTokens: 15_000, OutputTokens: 2_500}, f64(0.11+0.04), true)
+	if want := (tokenUsage{InputTokens: 16_200, OutputTokens: 2_620}); data.Agent == nil || data.Agent.TokenUsage != want || data.Agent.Turns != 16 {
+		t.Errorf("agent = %+v, want tokens %+v over 16 turns", data.Agent, want)
+	}
+	if data.Cost == nil || !approxEqual(data.Cost.USD, 0.40+0.15) || data.Cost.Source != costSourceAgent ||
+		data.Cost.Provider != sub.String() {
+		t.Errorf("cost = %+v, want 0.55, the first run's source and its provider's display name", data.Cost)
+	}
+}
+
+// The first run of a stage whose provider is known sets it; a later run on
+// another provider never overwrites it, and an earlier unknown one does not
+// block it.
+func TestUsage_FirstKnownProviderStands(t *testing.T) {
+	parameters := map[string]interface{}{}
+	jobs.SetParameterValue[string](parameters, parameters_enums.Model, "gpt-5.5")
+	if err := mergeAgentResultIntoJobOutput(parameters, agentResult{
+		Status: "success", TokenUsage: tokenUsage{InputTokens: 10},
+	}); err != nil {
+		t.Fatalf("merge: %s", err)
+	}
+	if data := readJobOutput(t, parameters); data.Usage.Implement.Provider != "" {
+		t.Errorf("provider = %q after an unknown-provider run, want empty", data.Usage.Implement.Provider)
+	}
+	for _, p := range []llm_provider_enums.Provider{llm_provider_enums.OpenAIDirect, llm_provider_enums.OpenRouter} {
+		if err := accumulateReviewRunUsage(parameters, costParams("gpt-5.5", p), usageStageImplement, agentResult{
+			TokenUsage: tokenUsage{InputTokens: 10},
+		}); err != nil {
+			t.Fatalf("accumulate: %s", err)
+		}
+	}
+	if got := readJobOutput(t, parameters).Usage.Implement.Provider; got != llm_provider_enums.OpenAIDirect.Key() {
+		t.Errorf("provider = %q, want the first known one %q", got, llm_provider_enums.OpenAIDirect.Key())
+	}
+}
+
+// A stage none of whose runs had a known provider omits the key.
+func TestUsage_UnknownProviderOmitted(t *testing.T) {
+	parameters := map[string]interface{}{}
+	jobs.SetParameterValue[string](parameters, parameters_enums.AgentProvider, "no-such-provider")
+	if err := mergeAgentResultIntoJobOutput(parameters, agentResult{
+		Status: "success", TokenUsage: tokenUsage{InputTokens: 10},
+	}); err != nil {
+		t.Fatalf("merge: %s", err)
+	}
+	raw, _ := jobs.GetParameterValue[string](parameters, parameters_enums.JobOutput)
+	var generic map[string]interface{}
+	if err := json.Unmarshal([]byte(raw), &generic); err != nil {
+		t.Fatalf("unmarshal: %s", err)
+	}
+	implement := generic["usage"].(map[string]interface{})["implement"].(map[string]interface{})
+	if _, ok := implement["provider"]; ok {
+		t.Errorf("usage.implement.provider = %v, want the key absent", implement["provider"])
+	}
+}

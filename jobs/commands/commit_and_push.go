@@ -498,11 +498,15 @@ type usageOutput struct {
 // stageUsageOutput is one stage's tokens and cost. USD is absent while no run
 // of the stage could be priced — an unknown cost, never zero — and sums the
 // priced runs once any was. Estimated is true when any part of USD was our
-// estimate rather than the agent's figure.
+// estimate rather than the agent's figure. Provider is the slug (Key()) of the
+// provider the stage's runs used — set by the first run of the stage whose
+// provider is known, never overwritten, absent while none was — so a reader
+// can tell a subscription's notional dollars from another stage's real ones.
 type stageUsageOutput struct {
 	TokenUsage tokenUsage `json:"token_usage"`
 	USD        *float64   `json:"usd,omitempty"`
 	Estimated  bool       `json:"estimated"`
+	Provider   string     `json:"provider,omitempty"`
 }
 
 // costOutput is a run's cost with its PROVENANCE.
