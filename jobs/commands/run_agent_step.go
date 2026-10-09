@@ -1903,6 +1903,37 @@ func (s taskPreviewStore) SavePreview(previewID string, r agenttools.PreviewStat
 	})
 }
 
+// grantPreviewDeployAccess self-grants this runner the static-site policy
+// (s3, cloudfront, route53, secretsmanager). A var so tests can replace it.
+var grantPreviewDeployAccess = func(parameters map[string]interface{}) error {
+	organizationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIDNamespace)
+	if err != nil {
+		return err
+	}
+	runnerData := utils.RunnerData.Get()
+	return iam_policies.AddAwsPolicyForDeploymentRunner(iam_policy_enums.AwsStaticSiteDeployment,
+		runnerData.OsType.String(), runnerData.CpuArchEnum.String(), organizationID,
+		runnerData.RunnerRegion, runnerData.Mode, runnerData.TargetCloud)
+}
+
+// ensurePreviewDeployAccess grants this runner what a Task preview deploy needs —
+// an S3 bucket, a CloudFront distribution and the shared preview routing function.
+// The runner starts with almost no AWS permissions and self-grants a policy per
+// kind of work; the static-site one was only ever granted by a production
+// static-site deploy (DeployAwsStaticSite), so a runner that had never deployed a
+// site failed every preview with AccessDenied at "create bucket". Same helper,
+// same policy, same behaviour: it returns at once when the actions are already
+// in place and waits for IAM only the first time it adds them.
+//
+// Best-effort: a failure is logged and the deploy carries on, so a runner whose
+// permissions come from elsewhere keeps working, and one that truly lacks them
+// fails at the AWS call exactly as before.
+func ensurePreviewDeployAccess(parameters map[string]interface{}, logsWriter io.Writer) {
+	if err := grantPreviewDeployAccess(parameters); err != nil {
+		io.WriteString(logsWriter, fmt.Sprintf("Preview: could not grant this runner the static-site permissions previews need (%s); continuing\n", err))
+	}
+}
+
 func buildStaticSitePreviewDeps(ctx commandUtils.TaskJobContext, parameters map[string]interface{}, workDirHost string, logsWriter io.Writer) *agenttools.DeployStaticSitePreviewDeps {
 	runnerRegion := utils.RunnerData.Get().RunnerRegion
 	if rt, err := region_enums.GetType(runnerRegion); err == nil {
@@ -1916,6 +1947,7 @@ func buildStaticSitePreviewDeps(ctx commandUtils.TaskJobContext, parameters map[
 		WorkDirHost: workDirHost,
 		LogsWriter:  logsWriter,
 		BuildClients: func() (*s3.Client, *cloudfront.Client, error) {
+			ensurePreviewDeployAccess(parameters, logsWriter)
 			s3Client, err := cloud_api_clients.GetS3Client(parameters)
 			if err != nil {
 				return nil, nil, err
