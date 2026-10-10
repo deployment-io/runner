@@ -10,6 +10,7 @@ import (
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/mount"
+	"github.com/docker/docker/pkg/stdcopy"
 	"github.com/moby/moby/client"
 	"io"
 	"os"
@@ -83,6 +84,15 @@ func decodeEnvironmentVariablesToSlice(envVariables string) ([]string, error) {
 	return envVariablesSlice, nil
 }
 
+// copyExecOutput demultiplexes a non-TTY exec attach stream into
+// logsWriter. With Tty false Docker prefixes every stdout/stderr chunk
+// with an 8-byte header; StdCopy strips it and writes both streams to
+// the log in the order Docker delivers them.
+func copyExecOutput(logsWriter io.Writer, r io.Reader) error {
+	_, err := stdcopy.StdCopy(logsWriter, logsWriter, r)
+	return err
+}
+
 // execCommand runs command inside containerID and streams output to
 // logsWriter. The caller supplies the context so the wall-clock cap
 // (defaultBuildTimeout) lives at the call site and a fired deadline
@@ -125,12 +135,12 @@ func execCommand(ctx context.Context, containerID, repoDir string, command []str
 	}
 	defer resp.Close()
 
-	// Watchdog: close the hijacked conn when ctx cancels so io.Copy
+	// Watchdog: close the hijacked conn when ctx cancels so the copy
 	// unblocks. ContainerExecAttach hijacks the underlying TCP conn
 	// (see moby/client/hijack.go's setupHijackConn) — the conn is
 	// raw net.Conn after that, with no awareness of the original ctx.
 	// Without this watchdog a wall-clock-timeout firing would not
-	// unblock io.Copy below; we'd hang waiting for the misbehaving
+	// unblock the copy below; we'd hang waiting for the misbehaving
 	// build to produce more output, defeating the timeout entirely.
 	copyDone := make(chan struct{})
 	defer close(copyDone)
@@ -142,7 +152,7 @@ func execCommand(ctx context.Context, containerID, repoDir string, command []str
 		}
 	}()
 
-	if _, err := io.Copy(logsWriter, resp.Reader); err != nil && ctx.Err() != nil {
+	if err := copyExecOutput(logsWriter, resp.Reader); err != nil && ctx.Err() != nil {
 		// Copy returned because the watchdog closed the conn after
 		// ctx fired. Surface the deadline error so the caller sees
 		// the wall-clock cap rather than a generic conn-closed error.
@@ -150,7 +160,7 @@ func execCommand(ctx context.Context, containerID, repoDir string, command []str
 	}
 
 	// Use a fresh background context for Inspect — ctx may have fired
-	// while io.Copy was running but the exec finished cleanly anyway,
+	// while the copy was running but the exec finished cleanly anyway,
 	// in which case we still want the real exit code instead of
 	// ctx.Err().
 	res, err := cli.ContainerExecInspect(context.Background(), execID)
