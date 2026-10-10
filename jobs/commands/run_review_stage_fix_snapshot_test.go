@@ -409,7 +409,7 @@ func TestAFixRunThatChangedNothingEndsTheLoopAndHandsOff(t *testing.T) {
 				t.Error("the pull request was not requested as a draft")
 			}
 			section := pr.reviewSection()
-			if !strings.Contains(section, "_The last fix round changed nothing; the description says why._") {
+			if !strings.Contains(section, "_The last fix round changed nothing._") {
 				t.Errorf("the review section does not carry the no-change line:\n%s", section)
 			}
 			if strings.Contains(section, "A fix attempt did not complete") {

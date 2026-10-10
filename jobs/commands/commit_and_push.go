@@ -648,9 +648,13 @@ type reviewOutput struct {
 	FixNotAttempted bool `json:"fix_not_attempted,omitempty"`
 	// StoppedNoChange is true when the loop ended because the last fix run
 	// finished and changed no file — it declined the findings it was sent and
-	// said why in the description. A further review round would only report the
+	// said why in DeclinedExplanation. A further review round would only report the
 	// same findings again, so the loop handed them to a human instead.
 	StoppedNoChange bool `json:"stopped_no_change,omitempty"`
+	// DeclinedExplanation is that last fix run's summary — why it changed
+	// nothing — or empty. It is shown beside the findings it answers; the
+	// pull request's description stays the implementer's.
+	DeclinedExplanation string `json:"declined_explanation,omitempty"`
 	// FinalTreeReviewed is true when the latest completed review round
 	// reviewed the tree being committed: no fix run's work was kept after it.
 	// Only then do its findings' locations describe the code on the branch,

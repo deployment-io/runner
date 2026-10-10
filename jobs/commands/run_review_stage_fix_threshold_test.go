@@ -268,7 +268,7 @@ func TestANoChangeStopWithOnlyLowsOpenIsNotADraft(t *testing.T) {
 	}
 	section := (&taskOpenPR{review: review}).reviewSection()
 	notedAt := strings.Index(section, "_"+stillOpenBelowHoldHeading+"_")
-	lineAt := strings.Index(section, "_The last fix round changed nothing; the description says why._")
+	lineAt := strings.Index(section, "_The last fix round changed nothing._")
 	if notedAt < 0 || lineAt < notedAt {
 		t.Errorf("the no-change line is not under the still-open-below-hold group:\n%s", section)
 	}

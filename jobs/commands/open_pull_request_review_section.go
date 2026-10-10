@@ -108,6 +108,10 @@ func (opr *taskOpenPR) reviewSection() string {
 	// holds the findings that attempt was sent: the must-fix heading when any
 	// of them holds the pull request, the below-hold heading otherwise.
 	outcome := fixOutcomeLine(opr.review, fixError)
+	// The line is written whatever the findings leave, so its runes come out
+	// of the findings' allowance first — a declining fix run's explanation can
+	// be long, and must not push the section past its budget.
+	budget.runes -= utf8.RuneCountInString(outcome)
 	writeFindingGroup(&sb, mustFixHeading(unverified), stillOpen, budget)
 	if len(stillOpen) > 0 {
 		sb.WriteString(outcome)
@@ -254,11 +258,37 @@ func fixOutcomeLine(review *reviewOutput, fixError string) string {
 	case review.StoppedNoChange:
 		// The last fix run SUCCEEDED and left the code alone: it judged these
 		// findings wrong, or fixing them contrary to the Step, and said so in its
-		// summary — which is this pull request's description. Without the line
-		// the findings read as ones nobody has answered.
-		return "\n_The last fix round changed nothing; the description says why._\n"
+		// summary. That explanation goes HERE, beside the findings it answers;
+		// the description stays the implementer's account of the change. Without
+		// the line the findings read as ones nobody has answered.
+		explanation := strings.TrimSpace(review.DeclinedExplanation)
+		if explanation == "" {
+			return "\n_The last fix round changed nothing._\n"
+		}
+		return "\n_The last fix round changed nothing. The agent's explanation:_\n\n" +
+			quoteBlock(neutraliseModelText(capRunes(explanation, declinedExplanationMaxRunes)))
 	}
 	return ""
+}
+
+// declinedExplanationMaxRunes caps a declining fix run's explanation: longer
+// than one finding's detail, since it may answer several, and still a small
+// part of the section's budget.
+const declinedExplanationMaxRunes = reviewDetailMaxRunes * 4
+
+// quoteBlock renders text as a Markdown block quote, every line of it, so a
+// blank line in the text cannot end the quote early.
+func quoteBlock(text string) string {
+	var sb strings.Builder
+	for _, line := range strings.Split(text, "\n") {
+		line = strings.TrimRight(line, " \t\r")
+		if line == "" {
+			sb.WriteString(">\n")
+			continue
+		}
+		sb.WriteString("> " + line + "\n")
+	}
+	return sb.String()
 }
 
 // reviewedByLine says WHO reviewed, because that is no longer implied by the
