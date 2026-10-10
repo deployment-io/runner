@@ -1589,7 +1589,7 @@ func mergeRunResultIntoJobOutput(parameters map[string]interface{}, result agent
 	data.SchemaVersion = jobOutputSchemaVersion
 	cost := resolveRunCost(parameters, result)
 	data.Cost = accumulateCost(data.Cost, cost)
-	data.Usage = accumulateStageUsage(data.Usage, usageStageImplement, result.TokenUsage, cost)
+	data.Usage = accumulateStageUsage(data.Usage, usageStageImplement, resolveJobProvider(parameters, io.Discard), result.TokenUsage, cost)
 	data.Agent = accumulateAgentOutput(data.Agent, result)
 	merged, err := json.Marshal(data)
 	if err != nil {
@@ -1679,7 +1679,7 @@ func accumulateReviewRunUsage(parameters, pricingView map[string]interface{}, st
 	data.SchemaVersion = jobOutputSchemaVersion
 	cost := resolveRunCost(pricingView, result)
 	data.Cost = accumulateCost(data.Cost, cost)
-	data.Usage = accumulateStageUsage(data.Usage, stage, result.TokenUsage, cost)
+	data.Usage = accumulateStageUsage(data.Usage, stage, resolveJobProvider(pricingView, io.Discard), result.TokenUsage, cost)
 	if data.Agent == nil {
 		data.Agent = &agentOutput{}
 	}
@@ -1754,7 +1754,9 @@ const (
 // accumulateStageUsage adds one run's tokens and resolved cost to its stage.
 // A nil cost (the run could not be priced) adds tokens only, so the stage's
 // USD stays absent until some run of it is priced, as accumulateCost does.
-func accumulateStageUsage(prev *usageOutput, stage usageStage, tokens tokenUsage, cost *costOutput) *usageOutput {
+// provider is the provider the run used (resolved from the view it is priced
+// against); the first known one recorded on the stage stands.
+func accumulateStageUsage(prev *usageOutput, stage usageStage, provider llm_provider_enums.Provider, tokens tokenUsage, cost *costOutput) *usageOutput {
 	next := usageOutput{}
 	if prev != nil {
 		next = *prev
@@ -1773,6 +1775,9 @@ func accumulateStageUsage(prev *usageOutput, stage usageStage, tokens tokenUsage
 		s = **slot
 	}
 	s.TokenUsage = addTokenUsage(s.TokenUsage, tokens)
+	if s.Provider == "" && provider.IsValid() {
+		s.Provider = provider.Key()
+	}
 	if cost != nil {
 		usd := cost.USD
 		if s.USD != nil {
