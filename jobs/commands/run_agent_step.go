@@ -1565,9 +1565,9 @@ func mergeAgentResultIntoJobOutput(parameters map[string]interface{}, result age
 //
 // A SEPARATE ENTRY POINT from the implement run's, so the caller says which
 // run it is holding rather than the fold inferring it from whether a record
-// already exists. recordFixRunResult calls this one, and only for a run whose
-// work is kept: a rolled-back fix run's result never reaches the record at
-// all (see recordFixRunResult).
+// already exists. Called only for a run whose work is kept (recordFixRunResult,
+// and the Review stage's keepFixResult): a rolled-back fix run's result never
+// reaches the record at all, and neither does one that changed no file.
 //
 // What that distinction buys the reader is the title and the summary. The
 // implement run's title names the change and stands for the whole pull

@@ -488,7 +488,7 @@ func readAcceptanceCriteria(parameters map[string]interface{}) []string {
 }
 
 func parseAcceptanceCriteria(spec string) []string {
-	trimmed := strings.TrimSpace(spec)
+	trimmed := strings.TrimSpace(stripRerunInstructions(spec))
 	if !strings.HasPrefix(trimmed, "{") {
 		return nil
 	}
@@ -515,6 +515,27 @@ func parseAcceptanceCriteria(spec string) []string {
 		out = append(out, capRunes(c, prBodyAcceptanceMaxRunes))
 	}
 	return out
+}
+
+// reviewSpecRerunInstructionsPrefix opens the ReviewSpec of a Step re-run
+// with feedback: kit lists the feedback first, then "[Spec]" and the spec.
+const (
+	reviewSpecRerunInstructionsPrefix = "[Re-run instructions"
+	reviewSpecMarker                  = "\n[Spec]\n"
+)
+
+// stripRerunInstructions returns the spec part of a ReviewSpec that opens
+// with re-run instructions, and any other value unchanged. The last marker is
+// taken: feedback is free text and may contain one, while a JSON spec cannot
+// (its newlines are escaped).
+func stripRerunInstructions(spec string) string {
+	if !strings.HasPrefix(spec, reviewSpecRerunInstructionsPrefix) {
+		return spec
+	}
+	if i := strings.LastIndex(spec, reviewSpecMarker); i >= 0 {
+		return spec[i+len(reviewSpecMarker):]
+	}
+	return spec
 }
 
 // acceptanceSection renders "What the Task asks for": the Task's acceptance

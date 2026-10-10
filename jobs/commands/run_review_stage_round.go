@@ -800,7 +800,14 @@ func (s *reviewStage) runMustFixRound(mustFix []reviewFindingOutput) error {
 	io.WriteString(s.logsWriter, fmt.Sprintf("Routing %d finding(s) back to the implementer (%d must-fix)\n", len(mustFix), holding))
 	impl := &RunAgentStep{stopSignal: s.stopSignal, progressSink: s.progressSink}
 	result, err := impl.spawnAgentboxAndWait(s.fixSpawnSpec(imageRef, workDirHost, env, previewDeps), s.logsWriter)
-	return recordFixRunResult(s.parameters, result, err, s.logsWriter)
+	if err := recordFailedFixRun(s.parameters, result, err, s.logsWriter); err != nil {
+		return err
+	}
+	// Finished, and its work may stand — but whether it is KEPT as the Step's
+	// record depends on whether it changed anything, which only attemptFix can
+	// tell. See keepFixResult and declineFixResult.
+	s.finishedFix = &result
+	return nil
 }
 
 // fixSpawnSpec is a fix run's container configuration. A fix run is an
@@ -827,6 +834,21 @@ func (s *reviewStage) fixSpawnSpec(imageRef, workDirHost string, env []string, p
 // fix that is not in them, and replace a passing verify result with the
 // failing one of a tree that no longer exists.
 func recordFixRunResult(parameters map[string]interface{}, result agentResult, spawnErr error, logsWriter io.Writer) error {
+	if err := recordFailedFixRun(parameters, result, spawnErr, logsWriter); err != nil {
+		return err
+	}
+	if err := mergeFixResultIntoJobOutput(parameters, result); err != nil {
+		io.WriteString(logsWriter, fmt.Sprintf("warning: could not merge the fix run's result: %s\n", err))
+	}
+	return nil
+}
+
+// recordFailedFixRun is recordFixRunResult's first half: for a fix run that
+// did not finish or did not pass its gates, it records the usage and returns
+// why; for one whose work may stand it records nothing and returns nil, leaving
+// the merge to the caller. The Review stage merges only once it knows the run
+// changed a file (see reviewStage.keepFixResult).
+func recordFailedFixRun(parameters map[string]interface{}, result agentResult, spawnErr error, logsWriter io.Writer) error {
 	if spawnErr != nil {
 		// Includes the user-stop sentinel, which the caller routes to the
 		// existing stop path.
@@ -838,9 +860,6 @@ func recordFixRunResult(parameters map[string]interface{}, result agentResult, s
 			io.WriteString(logsWriter, fmt.Sprintf("warning: could not record the failed fix run's usage: %s\n", err))
 		}
 		return outcome
-	}
-	if err := mergeFixResultIntoJobOutput(parameters, result); err != nil {
-		io.WriteString(logsWriter, fmt.Sprintf("warning: could not merge the fix run's result: %s\n", err))
 	}
 	return nil
 }

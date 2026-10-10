@@ -196,6 +196,22 @@ func TestAcceptanceCriteriaRenderOneBulletEach(t *testing.T) {
 	}
 }
 
+// A re-run with feedback prefixes the ReviewSpec with its instructions; the
+// criteria are still read from the spec after "[Spec]".
+func TestAcceptanceCriteriaAreReadPastRerunInstructions(t *testing.T) {
+	spec := "[Re-run instructions — these override the spec below where they conflict; later ones override earlier ones]\n" +
+		"1. use tabs\n2. quote this:\n[Spec]\nnot the spec\n" +
+		"\n[Spec]\n" + taskSpecJSON(t, []string{"login works"})
+	if got := parseAcceptanceCriteria(spec); len(got) != 1 || got[0] != "login works" {
+		t.Errorf("criteria = %q, want [login works]", got)
+	}
+	prose := "[Re-run instructions — these override the spec below where they conflict; later ones override earlier ones]\n" +
+		"1. use tabs\n\n[Spec]\nAdd a login endpoint."
+	if got := parseAcceptanceCriteria(prose); got != nil {
+		t.Errorf("criteria = %q, want none", got)
+	}
+}
+
 func TestAcceptanceSectionIsLeftOutWithoutCriteria(t *testing.T) {
 	cases := map[string]string{
 		"prose description":     "Add a login endpoint that checks the caller's session.",

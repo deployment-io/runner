@@ -306,6 +306,17 @@ type reviewStage struct {
 	// its summary says why it left the findings alone. Recorded so the pull
 	// request can say that rather than leaving the findings looking untouched.
 	stoppedNoChange bool
+	// declinedExplanation is that fix run's changes_summary — why it left the
+	// findings alone. Kept on the review record, beside the findings, and never
+	// merged into the Step's description: see declineFixResult.
+	declinedExplanation string
+	// finishedFix is the latest fix run that finished and passed its gates,
+	// waiting for attemptFix to learn whether it changed anything. Its result
+	// is merged into the Step's record only then (keepFixResult) — a run that
+	// changed no file must not retitle or redescribe the change. Nil when no
+	// fix run finished, and always nil for a fix run supplied by a test seam
+	// that does not set it.
+	finishedFix *agentResult
 	// finalTreeReviewed tracks whether the latest completed review round
 	// reviewed the tree as it now stands. ONE RULE, not a list of exits: set
 	// when a review round completes, cleared when a fix run's work is kept; a
@@ -544,6 +555,7 @@ func (s *reviewStage) attemptFix(round int, mustFix []reviewFindingOutput) (bool
 	// held in a temporary directory that goes on every path out of here.
 	trees := s.takeFixTrees()
 	defer trees.remove()
+	s.finishedFix = nil
 	fixErr := s.fixRound(mustFix)
 	if fixErr == nil {
 		// THE UNDO COPY IS ALSO THE ANSWER TO "DID THIS RUN CHANGE ANYTHING",
@@ -554,6 +566,7 @@ func (s *reviewStage) attemptFix(round int, mustFix []reviewFindingOutput) (bool
 			// Fail-open, like the rest of the stage: a comparison nobody could
 			// make must not end the loop on a guess. Reviewed again as before.
 			io.WriteString(s.logsWriter, fmt.Sprintf("warning: could not tell whether fix round %d changed anything (%s) — reviewing it as usual\n", round, err))
+			s.keepFixResult()
 			s.pendingFixDiffs = trees.fixDiffs()
 			return true, nil
 		}
@@ -564,11 +577,15 @@ func (s *reviewStage) attemptFix(round int, mustFix []reviewFindingOutput) (bool
 			// never sees that explanation, by design — at the cost of up to two
 			// more rounds and another fix run. So the loop stops here and the
 			// findings go to a human with the explanation the fix run wrote,
-			// which recordFixRunResult has already merged into the description.
+			// shown beside them on the pull request. The change itself is the
+			// implementer's, so its description, title and verify result stay
+			// the implementer's too.
 			s.stoppedNoChange = true
+			s.declineFixResult()
 			io.WriteString(s.logsWriter, fmt.Sprintf("Fix round %d changed no file — the findings it was sent stay open; handing them to a human on the pull request\n", round))
 			return false, nil
 		}
+		s.keepFixResult()
 		s.pendingFixDiffs = trees.fixDiffs()
 		return true, nil
 	}
@@ -591,6 +608,35 @@ func (s *reviewStage) attemptFix(round int, mustFix []reviewFindingOutput) (bool
 	return false, nil
 }
 
+// keepFixResult merges the finished fix run into the Step's record — its
+// usage, and its summary, title, files and verify result in place of the
+// ones before it. Only for a fix whose work is kept on the tree.
+func (s *reviewStage) keepFixResult() {
+	if s.finishedFix == nil {
+		return
+	}
+	if err := mergeFixResultIntoJobOutput(s.parameters, *s.finishedFix); err != nil {
+		io.WriteString(s.logsWriter, fmt.Sprintf("warning: could not merge the fix run's result: %s\n", err))
+	}
+	s.finishedFix = nil
+}
+
+// declineFixResult records a finished fix run that changed no file. Its usage
+// and cost count, exactly as a failed fix run's do; its result does not touch
+// the Step's record, which still describes the implementer's change — the only
+// change there is. Its summary is the explanation of why it declined, kept for
+// the review section instead of replacing the description.
+func (s *reviewStage) declineFixResult() {
+	if s.finishedFix == nil {
+		return
+	}
+	if err := accumulateReviewRunUsage(s.parameters, s.parameters, usageStageImplement, *s.finishedFix); err != nil {
+		io.WriteString(s.logsWriter, fmt.Sprintf("warning: could not record the declining fix run's usage: %s\n", err))
+	}
+	s.declinedExplanation = strings.TrimSpace(s.finishedFix.ChangesSummary)
+	s.finishedFix = nil
+}
+
 // canAfford reports whether the stage budget can accommodate a run of this
 // length. Checked BEFORE starting a round: a round the budget cuts short
 // spends its tokens and produces nothing.
@@ -602,14 +648,15 @@ func (s *reviewStage) canAfford(d time.Duration) bool {
 // plane, and returns. Always nil error — see run.
 func (s *reviewStage) finish() (map[string]interface{}, error) {
 	out := &reviewOutput{
-		Participation:     participationName(s.participation),
-		Rounds:            s.rounds,
-		FixedInLoop:       s.fixedInLoop,
-		MustFixOpen:       s.mustFixOpen(),
-		FixError:          s.fixError,
-		FixNotAttempted:   s.fixNotAttempted,
-		StoppedNoChange:   s.stoppedNoChange,
-		FinalTreeReviewed: s.finalTreeReviewed,
+		Participation:       participationName(s.participation),
+		Rounds:              s.rounds,
+		FixedInLoop:         s.fixedInLoop,
+		MustFixOpen:         s.mustFixOpen(),
+		FixError:            s.fixError,
+		FixNotAttempted:     s.fixNotAttempted,
+		StoppedNoChange:     s.stoppedNoChange,
+		DeclinedExplanation: s.declinedExplanation,
+		FinalTreeReviewed:   s.finalTreeReviewed,
 		// Never findings: resolved for the "Before deploying" part of the
 		// pull request and nothing else — see resolveDeployRequirementsFrom.
 		DeployRequirements: resolveDeployRequirementsFrom(
