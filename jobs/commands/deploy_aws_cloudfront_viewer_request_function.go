@@ -126,11 +126,21 @@ func getViewerRequestFunctionCode(parameters map[string]interface{}) (string, er
      }`
 	}
 
+	// buildQS keeps every value of a repeated key (?tag=a&tag=b), which
+	// CloudFront delivers in multiValue; same text as previewRoutingFunctionCode.
 	cloudfrontFunction := fmt.Sprintf(`function buildQS(querystring) {
-    var qs = Object.keys(querystring).map(function(k) {
-        return k + '=' + querystring[k].value;
-    }).join('&');
-    return qs ? '?' + qs : '';
+    var parts = [];
+    Object.keys(querystring).forEach(function(k) {
+        var entry = querystring[k];
+        if (entry.multiValue) {
+            entry.multiValue.forEach(function(mv) {
+                parts.push(k + '=' + mv.value);
+            });
+        } else {
+            parts.push(k + '=' + entry.value);
+        }
+    });
+    return parts.length ? '?' + parts.join('&') : '';
 }
 
 function handler(event) {
