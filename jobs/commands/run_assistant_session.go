@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/deployment-io/deployment-runner/jobs/resources"
+	"github.com/deployment-io/deployment-runner/utils/reclaim"
 	"io"
 	"net/http"
 	"os"
@@ -142,6 +143,11 @@ func (rs *RunAssistantSession) Run(parameters map[string]interface{}, logsWriter
 	if err != nil {
 		return parameters, fmt.Errorf("agentbox image missing: %s", err)
 	}
+	// Held until the session ends: between this pull and the session's
+	// container there is a window where a Step pulling a newer agentbox tag
+	// would otherwise prune this one (see RunAgentStep).
+	releaseImage := reclaim.MarkImageInUse(imageRef)
+	defer releaseImage()
 	if err := pullAgentboxImage(imageRef); err != nil {
 		return parameters, fmt.Errorf("error pulling agentbox image: %s", err)
 	}
