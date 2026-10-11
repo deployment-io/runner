@@ -82,6 +82,11 @@ type DeployStaticSitePreviewDeps struct {
 	// the agent's working tree) for a repository deployment.io doesn't deploy: the
 	// site, or why nothing was detected. It only reads files; nothing is executed.
 	DetectSite func(siteDir string) (DetectedSite, string, bool)
+
+	// VerifyBrowser runs one verify_preview_rendered check in a verify-browser
+	// container. Not used by deploy_static_site_preview itself; carried here so the
+	// preview tools of a run are wired from one place.
+	VerifyBrowser RunVerifyBrowser
 }
 
 // DetectedSite is how to build a static site, detected from its repository.

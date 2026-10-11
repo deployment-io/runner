@@ -1,0 +1,462 @@
+package agenttools
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"strings"
+	"testing"
+	"time"
+	"unicode/utf8"
+)
+
+const renderedPreview = "https://d111.cloudfront.net/"
+
+// fakeBrowser records the requests it gets and answers with outcome/err.
+type fakeBrowser struct {
+	requests []VerifyBrowserRequest
+	outcome  VerifyBrowserOutcome
+	err      error
+}
+
+func (f *fakeBrowser) run(_ context.Context, req VerifyBrowserRequest, _ io.Writer) (VerifyBrowserOutcome, error) {
+	f.requests = append(f.requests, req)
+	return f.outcome, f.err
+}
+
+func (f *fakeBrowser) input(t *testing.T) verifyBrowserInput {
+	t.Helper()
+	if len(f.requests) != 1 {
+		t.Fatalf("browser ran %d times, want 1", len(f.requests))
+	}
+	var in verifyBrowserInput
+	if err := json.Unmarshal(f.requests[0].Input, &in); err != nil {
+		t.Fatalf("input.json: %v", err)
+	}
+	return in
+}
+
+func passResult() []byte {
+	return []byte(`{"schema_version":1,"status":"completed","verdict":"pass","http_status":200,
+		"final_url":"https://d111.cloudfront.net/","steps":[],"assertions":[{"index":0,"type":"text_visible","passed":true,"detail":"visible"}],
+		"page_errors":[],"console_errors":[],"failed_requests":[],"blocked_navigations":[],
+		"timings_ms":{"dom_content_loaded":120,"load":300},"dom_text_snippet":"Hello"}`)
+}
+
+func newRenderedTool(record *PreviewRecord, fb *fakeBrowser) (*verifyPreviewRendered, *bytes.Buffer) {
+	logs := &bytes.Buffer{}
+	return &verifyPreviewRendered{record: record, run: fb.run, logsWriter: logs}, logs
+}
+
+func renderedRecord(urls ...string) *PreviewRecord {
+	r := NewPreviewRecord(nil, nil)
+	for _, u := range urls {
+		r.AddURL(u)
+	}
+	return r
+}
+
+func call(t *testing.T, tool *verifyPreviewRendered, args string) (string, error) {
+	t.Helper()
+	return tool.handle(context.Background(), json.RawMessage(args))
+}
+
+func TestVerifyRendered_AllowedURLRunsWithRecordHosts(t *testing.T) {
+	fb := &fakeBrowser{outcome: VerifyBrowserOutcome{Result: passResult()}}
+	tool, logs := newRenderedTool(renderedRecord(renderedPreview, "https://d222.cloudfront.net/"), fb)
+	out, err := call(t, tool, `{"url":"https://D111.cloudfront.net/about","steps":[{"action":"goto","url":"https://d222.cloudfront.net/x"},{"action":"fill","selector":"#q","value":""}],"assertions":[{"type":"url_path","path":"/x"}]}`)
+	if err != nil {
+		t.Fatalf("handle: %v", err)
+	}
+	in := fb.input(t)
+	if strings.Join(in.AllowedHosts, ",") != "d111.cloudfront.net,d222.cloudfront.net" {
+		t.Errorf("allowed_hosts = %v", in.AllowedHosts)
+	}
+	if in.SchemaVersion != 1 || in.TimeoutMS != 45000 || fb.requests[0].Timeout != 45*time.Second {
+		t.Errorf("schema_version %d, timeout_ms %d, timeout %s", in.SchemaVersion, in.TimeoutMS, fb.requests[0].Timeout)
+	}
+	if len(in.Steps) != 2 || in.Steps[1].Value == nil || *in.Steps[1].Value != "" {
+		t.Errorf("steps = %+v; an empty fill value must be sent", in.Steps)
+	}
+	var res renderedResult
+	if err := json.Unmarshal([]byte(out), &res); err != nil {
+		t.Fatalf("result: %v", err)
+	}
+	if res.Message != "pass — 1 of 1 assertions passed; no page errors; no failed requests" {
+		t.Errorf("message = %q", res.Message)
+	}
+	if !strings.Contains(logs.String(), "checking https://D111.cloudfront.net/about") || !strings.Contains(logs.String(), "verify_preview_rendered: pass after") {
+		t.Errorf("logs = %q", logs.String())
+	}
+}
+
+func TestVerifyRendered_SendsEveryRecordedHost(t *testing.T) {
+	urls := []string{renderedPreview}
+	for i := 0; i < 150; i++ {
+		urls = append(urls, fmt.Sprintf("https://p%03d.example.net/", i))
+	}
+	fb := &fakeBrowser{outcome: VerifyBrowserOutcome{Result: passResult()}}
+	tool, _ := newRenderedTool(renderedRecord(urls...), fb)
+	if _, err := call(t, tool, `{"url":"`+renderedPreview+`"}`); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(fb.input(t).AllowedHosts); got != len(urls) {
+		t.Fatalf("allowed_hosts has %d hosts, want all %d in the record", got, len(urls))
+	}
+}
+
+func TestVerifyRendered_RefusesURLNotInRecord(t *testing.T) {
+	for _, u := range []string{
+		"https://d999.cloudfront.net/",
+		"http://d111.cloudfront.net/",
+		"https://d111.cloudfront.net:8443/",
+		"https://user@d111.cloudfront.net/",
+		"https://169.254.169.254/latest/meta-data/",
+	} {
+		fb := &fakeBrowser{}
+		tool, _ := newRenderedTool(renderedRecord(renderedPreview), fb)
+		_, err := call(t, tool, fmt.Sprintf(`{"url":%q}`, u))
+		if err == nil || !strings.Contains(err.Error(), "must be a preview URL this Task deployed") {
+			t.Errorf("%s: err = %v", u, err)
+		}
+		if len(fb.requests) != 0 {
+			t.Errorf("%s: browser ran", u)
+		}
+	}
+}
+
+func TestVerifyRendered_RefusesGotoNotInRecord(t *testing.T) {
+	fb := &fakeBrowser{}
+	tool, _ := newRenderedTool(renderedRecord(renderedPreview), fb)
+	_, err := call(t, tool, `{"url":"https://d111.cloudfront.net/","steps":[{"action":"goto","url":"https://www.iana.org/"}]}`)
+	if err == nil || !strings.Contains(err.Error(), "steps[0]: goto url must be a preview URL this Task deployed") {
+		t.Fatalf("err = %v", err)
+	}
+	if len(fb.requests) != 0 {
+		t.Fatal("browser ran")
+	}
+}
+
+func TestVerifyRendered_ListsTaskPreviewsOncePerCall(t *testing.T) {
+	lists := 0
+	record := NewPreviewRecord(func() ([]string, error) {
+		lists++
+		return []string{"https://d333.cloudfront.net/"}, nil
+	}, nil)
+	fb := &fakeBrowser{outcome: VerifyBrowserOutcome{Result: passResult()}}
+	tool, _ := newRenderedTool(record, fb)
+	_, err := call(t, tool, `{"url":"https://d333.cloudfront.net/","steps":[{"action":"goto","url":"https://d444.cloudfront.net/"}]}`)
+	if err == nil {
+		t.Fatal("goto to an unlisted host was accepted")
+	}
+	if lists != 1 {
+		t.Fatalf("listed %d times, want 1", lists)
+	}
+	if _, err := call(t, tool, `{"url":"https://d333.cloudfront.net/"}`); err != nil {
+		t.Fatalf("listed preview refused: %v", err)
+	}
+	if hosts := fb.input(t).AllowedHosts; len(hosts) != 1 || hosts[0] != "d333.cloudfront.net" {
+		t.Fatalf("allowed_hosts = %v", hosts)
+	}
+}
+
+func TestVerifyRendered_InputLimits(t *testing.T) {
+	long := strings.Repeat("a", verifyRenderedMaxStringChars+1)
+	steps := func(n int) string {
+		return "[" + strings.TrimSuffix(strings.Repeat(`{"action":"click","selector":"a"},`, n), ",") + "]"
+	}
+	assertions := func(n int) string {
+		return "[" + strings.TrimSuffix(strings.Repeat(`{"type":"text_visible","text":"a"},`, n), ",") + "]"
+	}
+	cases := map[string]string{
+		"no url":                  `{}`,
+		"timeout too long":        `{"url":"` + renderedPreview + `","timeout_seconds":91}`,
+		"timeout too short":       `{"url":"` + renderedPreview + `","timeout_seconds":4}`,
+		"too many steps":          `{"url":"` + renderedPreview + `","steps":` + steps(31) + `}`,
+		"too many assertions":     `{"url":"` + renderedPreview + `","assertions":` + assertions(31) + `}`,
+		"unknown action":          `{"url":"` + renderedPreview + `","steps":[{"action":"hover","selector":"a"}]}`,
+		"click no selector":       `{"url":"` + renderedPreview + `","steps":[{"action":"click"}]}`,
+		"fill no value":           `{"url":"` + renderedPreview + `","steps":[{"action":"fill","selector":"a"}]}`,
+		"press no key":            `{"url":"` + renderedPreview + `","steps":[{"action":"press","selector":"a"}]}`,
+		"wait_for both":           `{"url":"` + renderedPreview + `","steps":[{"action":"wait_for","selector":"a","text":"b"}]}`,
+		"wait_for neither":        `{"url":"` + renderedPreview + `","steps":[{"action":"wait_for"}]}`,
+		"unknown assertion":       `{"url":"` + renderedPreview + `","assertions":[{"type":"title","text":"a"}]}`,
+		"relative url_path":       `{"url":"` + renderedPreview + `","assertions":[{"type":"url_path","path":"x"}]}`,
+		"long selector":           `{"url":"` + renderedPreview + `","steps":[{"action":"click","selector":"` + long + `"}]}`,
+		"long assertion text":     `{"url":"` + renderedPreview + `","assertions":[{"type":"text_absent","text":"` + long + `"}]}`,
+		"long unused step value":  `{"url":"` + renderedPreview + `","steps":[{"action":"click","selector":"a","value":"` + long + `"}]}`,
+		"long unused assert path": `{"url":"` + renderedPreview + `","assertions":[{"type":"text_visible","text":"a","path":"` + long + `"}]}`,
+		"arguments not an object": `[]`,
+	}
+	for name, args := range cases {
+		t.Run(name, func(t *testing.T) {
+			lists := 0
+			record := NewPreviewRecord(func() ([]string, error) { lists++; return nil, nil }, nil)
+			record.AddURL(renderedPreview)
+			fb := &fakeBrowser{}
+			tool, _ := newRenderedTool(record, fb)
+			if _, err := call(t, tool, args); err == nil {
+				t.Fatal("accepted")
+			}
+			if len(fb.requests) != 0 || lists != 0 {
+				t.Fatal("started something before rejecting the input")
+			}
+		})
+	}
+	// The limits themselves are accepted.
+	fb := &fakeBrowser{outcome: VerifyBrowserOutcome{Result: passResult()}}
+	tool, _ := newRenderedTool(renderedRecord(renderedPreview), fb)
+	if _, err := call(t, tool, `{"url":"`+renderedPreview+`","timeout_seconds":90,"steps":`+steps(30)+`,"assertions":`+assertions(30)+`}`); err != nil {
+		t.Fatalf("limits refused: %v", err)
+	}
+	if in := fb.input(t); in.TimeoutMS != 90000 || len(in.Steps) != 30 || len(in.Assertions) != 30 {
+		t.Fatalf("input = %+v", in)
+	}
+}
+
+func TestVerifyRendered_Preparing(t *testing.T) {
+	fb := &fakeBrowser{outcome: VerifyBrowserOutcome{Preparing: true}}
+	tool, _ := newRenderedTool(renderedRecord(renderedPreview), fb)
+	out, err := call(t, tool, `{"url":"`+renderedPreview+`"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]string
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["status"] != "preparing" || got["message"] != verifyRenderedPreparingMessage {
+		t.Fatalf("result = %s", out)
+	}
+	if tool.calls != 1 {
+		t.Fatalf("calls = %d, want the preparing call counted", tool.calls)
+	}
+}
+
+func TestVerifyRendered_CallLimit(t *testing.T) {
+	fb := &fakeBrowser{outcome: VerifyBrowserOutcome{Result: passResult()}}
+	tool, _ := newRenderedTool(renderedRecord(renderedPreview), fb)
+	// Every call counts: one the browser couldn't run, one with invalid input,
+	// one "preparing", then checks that ran.
+	fb.err = fmt.Errorf("%w: busy", ErrVerifyBrowserNotRun)
+	if _, err := call(t, tool, `{"url":"`+renderedPreview+`"}`); err == nil || !strings.Contains(err.Error(), "busy") {
+		t.Fatalf("err = %v", err)
+	}
+	fb.err = nil
+	if _, err := call(t, tool, `{"url":"https://elsewhere.example.com/"}`); err == nil {
+		t.Fatal("url outside the record accepted")
+	}
+	fb.outcome = VerifyBrowserOutcome{Preparing: true}
+	if _, err := call(t, tool, `{"url":"`+renderedPreview+`"}`); err != nil {
+		t.Fatal(err)
+	}
+	fb.outcome = VerifyBrowserOutcome{Result: passResult()}
+	for i := 3; i < verifyRenderedMaxCalls; i++ {
+		if _, err := call(t, tool, `{"url":"`+renderedPreview+`"}`); err != nil {
+			t.Fatalf("call %d: %v", i+1, err)
+		}
+	}
+	_, err := call(t, tool, `{"url":"`+renderedPreview+`"}`)
+	if err == nil || !strings.Contains(err.Error(), "report what you have found") {
+		t.Fatalf("21st call: err = %v", err)
+	}
+	if len(fb.requests) != verifyRenderedMaxCalls-1 {
+		t.Fatalf("browser ran %d times", len(fb.requests))
+	}
+}
+
+func TestVerifyRendered_ErrorsCarryOutputTail(t *testing.T) {
+	output := strings.Repeat("x", 3000) + "chromium: fatal error"
+	cases := map[string]struct {
+		outcome VerifyBrowserOutcome
+		want    string
+		tail    bool
+	}{
+		"image status error": {
+			outcome: VerifyBrowserOutcome{Result: []byte(`{"schema_version":1,"status":"error","error":"the page could not be loaded: net::ERR_NAME_NOT_RESOLVED"}`), Output: output},
+			want:    "ERR_NAME_NOT_RESOLVED",
+		},
+		"missing result": {outcome: VerifyBrowserOutcome{ExitCode: 1, Output: output}, want: "without a result", tail: true},
+		"invalid result": {outcome: VerifyBrowserOutcome{Result: []byte("{"), Output: output}, want: "not valid JSON", tail: true},
+		"wrong schema":   {outcome: VerifyBrowserOutcome{Result: []byte(`{"schema_version":2,"status":"completed","verdict":"pass"}`), Output: output}, want: "schema_version 2", tail: true},
+		"timeout":        {outcome: VerifyBrowserOutcome{TimedOut: true, Output: output}, want: "did not finish in time", tail: true},
+		"oom":            {outcome: VerifyBrowserOutcome{OOMKilled: true, ExitCode: 137, Output: output}, want: "ran out of memory", tail: true},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			fb := &fakeBrowser{outcome: c.outcome}
+			tool, logs := newRenderedTool(renderedRecord(renderedPreview), fb)
+			_, err := call(t, tool, `{"url":"`+renderedPreview+`"}`)
+			if err == nil {
+				t.Fatal("no error")
+			}
+			msg := err.Error()
+			if !strings.HasPrefix(msg, "QA couldn't check the page: ") || !strings.Contains(msg, c.want) {
+				t.Errorf("err = %q", firstLine(msg))
+			}
+			if c.tail {
+				if !strings.Contains(msg, "chromium: fatal error") {
+					t.Error("error lacks the output tail")
+				}
+				if strings.Count(msg, "x") > verifyRenderedOutputTailBytes {
+					t.Error("error carries more than the output's tail")
+				}
+			}
+			if !strings.Contains(logs.String(), "chromium: fatal error") {
+				t.Error("container output not logged on failure")
+			}
+		})
+	}
+}
+
+func TestVerifyRendered_NoOutputLoggedOnSuccess(t *testing.T) {
+	fb := &fakeBrowser{outcome: VerifyBrowserOutcome{Result: passResult(), Output: "chromium noise"}}
+	tool, logs := newRenderedTool(renderedRecord(renderedPreview), fb)
+	if _, err := call(t, tool, `{"url":"`+renderedPreview+`"}`); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(logs.String(), "chromium noise") {
+		t.Fatal("container output logged on success")
+	}
+}
+
+func bigResult() []byte {
+	many := func(n, chars int) []string {
+		out := make([]string, n)
+		for i := range out {
+			out[i] = fmt.Sprintf("%d%s", i, strings.Repeat("e", chars))
+		}
+		return out
+	}
+	var steps []renderedStepResult
+	for i := 0; i < 40; i++ {
+		steps = append(steps, renderedStepResult{Index: i, Action: "click", OK: i < 39, Error: strings.Repeat("s", 900)})
+	}
+	var assertions []renderedAssertionResult
+	for i := 0; i < 40; i++ {
+		assertions = append(assertions, renderedAssertionResult{Index: i, Type: "text_visible", Passed: false, Detail: strings.Repeat("d", 900)})
+	}
+	var failed []renderedFailedRequest
+	for i := 0; i < 30; i++ {
+		failed = append(failed, renderedFailedRequest{URL: "https://d111.cloudfront.net/" + strings.Repeat("u", 3000), Method: "GET", Status: 500})
+	}
+	b, _ := json.Marshal(map[string]any{
+		"schema_version": 1, "status": "completed", "verdict": "fail", "http_status": 200,
+		"final_url": "https://d111.cloudfront.net/" + strings.Repeat("f", 5000),
+		"steps":     steps, "assertions": assertions,
+		"page_errors": many(30, 2000), "console_errors": many(40, 2000), "failed_requests": failed,
+		"blocked_navigations": many(30, 3000), "timings_ms": map[string]int{"load": 1},
+		"dom_text_snippet": strings.Repeat("t", 5000),
+	})
+	return b
+}
+
+func TestRenderVerifyBrowserOutcome_Caps(t *testing.T) {
+	r := renderedResult{}
+	if err := json.Unmarshal(bigResult(), &r); err != nil {
+		t.Fatal(err)
+	}
+	capRenderedResult(&r)
+	maxChars := func(list []string) int {
+		m := 0
+		for _, s := range list {
+			if n := utf8.RuneCountInString(s); n > m {
+				m = n
+			}
+		}
+		return m
+	}
+	checks := []struct {
+		name      string
+		got, want int
+	}{
+		{"steps", len(r.Steps), 30},
+		{"assertions", len(r.Assertions), 30},
+		{"page_errors", len(r.PageErrors), 10},
+		{"page_error chars", maxChars(r.PageErrors), 500},
+		{"console_errors", len(r.ConsoleErrors), 20},
+		{"console_error chars", maxChars(r.ConsoleErrors), 300},
+		{"failed_requests", len(r.FailedRequests), 20},
+		{"blocked_navigations", len(r.BlockedNavigations), 10},
+		{"step error chars", utf8.RuneCountInString(r.Steps[0].Error), 300},
+		{"assertion detail chars", utf8.RuneCountInString(r.Assertions[0].Detail), 300},
+		{"dom_text_snippet chars", utf8.RuneCountInString(r.DOMTextSnippet), 1000},
+	}
+	for _, c := range checks {
+		if c.got != c.want {
+			t.Errorf("%s = %d, want %d", c.name, c.got, c.want)
+		}
+	}
+	if r.Message != "fail — all 30 steps succeeded; 0 of 30 assertions passed; 10 page errors; 20 failed requests; 10 blocked navigations" {
+		t.Errorf("message = %q", r.Message)
+	}
+}
+
+func TestRenderVerifyBrowserOutcome_SizeCap(t *testing.T) {
+	text, verdict, err := renderVerifyBrowserOutcome(VerifyBrowserOutcome{Result: bigResult()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if verdict != "fail" {
+		t.Errorf("verdict = %q", verdict)
+	}
+	if len(text) > verifyRenderedMaxResultBytes {
+		t.Fatalf("result is %d bytes, cap %d", len(text), verifyRenderedMaxResultBytes)
+	}
+	var r renderedResult
+	if err := json.Unmarshal([]byte(text), &r); err != nil {
+		t.Fatal(err)
+	}
+	if !r.Truncated || !strings.HasSuffix(r.Message, "(result shortened to fit)") {
+		t.Errorf("truncated = %v, message = %q", r.Truncated, r.Message)
+	}
+	if len(r.Steps) != 30 || len(r.Assertions) != 30 {
+		t.Errorf("steps/assertions dropped: %d/%d", len(r.Steps), len(r.Assertions))
+	}
+}
+
+func TestRenderVerifyBrowserOutcome_Summary(t *testing.T) {
+	res := `{"schema_version":1,"status":"completed","verdict":"fail","http_status":404,
+		"steps":[{"index":0,"action":"click","ok":true},{"index":1,"action":"wait_for","ok":false,"error":"Timeout"}],
+		"page_errors":["TypeError: x"],"failed_requests":[{"url":"https://d111.cloudfront.net/a.json","method":"GET","status":404}],
+		"blocked_navigations":["https://evil.example/"]}`
+	text, _, err := renderVerifyBrowserOutcome(VerifyBrowserOutcome{Result: []byte(res)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var r renderedResult
+	_ = json.Unmarshal([]byte(text), &r)
+	want := "fail — the first load returned HTTP 404; step 1 (wait_for) failed; 1 page error; 1 failed request; 1 blocked navigation"
+	if r.Message != want {
+		t.Errorf("message = %q\nwant      %q", r.Message, want)
+	}
+	if !strings.Contains(text, `"assertions":[]`) {
+		t.Errorf("missing assertions not rendered as []: %s", text)
+	}
+}
+
+func TestVerifyRendered_RunErrorIsReported(t *testing.T) {
+	fb := &fakeBrowser{err: errors.New("creating the QA browser container: no space left on device")}
+	tool, _ := newRenderedTool(renderedRecord(renderedPreview), fb)
+	_, err := call(t, tool, `{"url":"`+renderedPreview+`"}`)
+	if err == nil || !strings.Contains(err.Error(), "QA couldn't check the page: creating the QA browser container") {
+		t.Fatalf("err = %v", err)
+	}
+	if tool.calls != 1 {
+		t.Fatalf("calls = %d; a run that failed after starting counts", tool.calls)
+	}
+}
+
+func TestPreviewRecord_Hosts(t *testing.T) {
+	r := renderedRecord("https://B.example.net/x", "https://a.example.net/", "https://b.example.net/y")
+	if got := strings.Join(r.Hosts(), ","); got != "a.example.net,b.example.net" {
+		t.Fatalf("Hosts() = %s", got)
+	}
+	var nilRecord *PreviewRecord
+	if nilRecord.Hosts() != nil {
+		t.Fatal("nil record has hosts")
+	}
+}
