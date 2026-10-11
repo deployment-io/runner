@@ -312,6 +312,26 @@ func TestVerifyBrowser_TwoContainersAtOnce(t *testing.T) {
 	}
 }
 
+// The slot wait shrinks with the check's timeout so a whole call stays under the
+// agent's tool-call timeout.
+func TestVerifyBrowser_SlotWaitKeepsTheCallUnderBudget(t *testing.T) {
+	v := newVerifyBrowser()
+	cases := map[time.Duration]time.Duration{
+		45 * time.Second:  verifyBrowserSlotWait,
+		90 * time.Second:  5 * time.Second,
+		100 * time.Second: 0,
+	}
+	for timeout, want := range cases {
+		got := v.slotWaitFor(timeout)
+		if got != want {
+			t.Errorf("slotWaitFor(%s) = %s, want %s", timeout, got, want)
+		}
+		if got+timeout+verifyBrowserWallClockExtra > verifyBrowserCallBudget && got != 0 {
+			t.Errorf("a %s check can take %s, over the %s budget", timeout, got+timeout+verifyBrowserWallClockExtra, verifyBrowserCallBudget)
+		}
+	}
+}
+
 func TestCheckPullStream(t *testing.T) {
 	ok := `{"status":"Pulling from deploymenthq/verify-browser"}
 {"status":"Download complete","id":"abc"}

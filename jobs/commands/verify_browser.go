@@ -44,8 +44,13 @@ const verifyBrowserImageEnv = "VERIFY_BROWSER_IMAGE"
 const (
 	// verifyBrowserSlots is how many browser containers may run at once on a runner.
 	verifyBrowserSlots = 2
-	// verifyBrowserSlotWait is how long a check waits for a free slot.
+	// verifyBrowserSlotWait is how long a check waits for a free slot, at most —
+	// see slotWaitFor.
 	verifyBrowserSlotWait = 20 * time.Second
+	// verifyBrowserCallBudget keeps a whole call under the agent's MCP tool-call
+	// timeout (~120 s observed for codex), the same bound verify_preview_reachable
+	// keeps: slot wait + the check's timeout + verifyBrowserWallClockExtra.
+	verifyBrowserCallBudget = 110 * time.Second
 	// verifyBrowserWallClockExtra is added to the check's own timeout for the
 	// container's start, browser launch and shutdown.
 	verifyBrowserWallClockExtra = 15 * time.Second
@@ -140,7 +145,7 @@ func (v *verifyBrowser) run(ctx context.Context, req agenttools.VerifyBrowserReq
 	if !ready {
 		return agenttools.VerifyBrowserOutcome{Preparing: true}, nil
 	}
-	release, err := v.acquireSlot(ctx)
+	release, err := v.acquireSlot(ctx, v.slotWaitFor(req.Timeout))
 	if err != nil {
 		return agenttools.VerifyBrowserOutcome{}, err
 	}
@@ -259,15 +264,29 @@ func checkPullStream(r io.Reader) error {
 	}
 }
 
-// acquireSlot takes one of the runner's browser slots, waiting up to slotWait.
-func (v *verifyBrowser) acquireSlot(ctx context.Context) (func(), error) {
+// slotWaitFor is how long a check with this timeout may wait for a slot: slotWait,
+// shortened so the wait and the container's wall clock together stay within
+// verifyBrowserCallBudget. A 90-second check waits 5 seconds at most.
+func (v *verifyBrowser) slotWaitFor(checkTimeout time.Duration) time.Duration {
+	wait := verifyBrowserCallBudget - checkTimeout - verifyBrowserWallClockExtra
+	if wait > v.slotWait {
+		wait = v.slotWait
+	}
+	if wait < 0 {
+		wait = 0
+	}
+	return wait
+}
+
+// acquireSlot takes one of the runner's browser slots, waiting up to wait.
+func (v *verifyBrowser) acquireSlot(ctx context.Context, wait time.Duration) (func(), error) {
 	release := func() { <-v.slots }
 	select {
 	case v.slots <- struct{}{}:
 		return release, nil
 	default:
 	}
-	timer := time.NewTimer(v.slotWait)
+	timer := time.NewTimer(wait)
 	defer timer.Stop()
 	select {
 	case v.slots <- struct{}{}:
