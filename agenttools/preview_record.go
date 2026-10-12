@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 )
@@ -56,6 +57,22 @@ func (r *PreviewRecord) AddURL(rawURL string) {
 	r.mu.Lock()
 	r.hosts[host] = struct{}{}
 	r.mu.Unlock()
+}
+
+// Hosts returns the recorded preview hosts, sorted. Call it after a
+// previewURLCheck has run so the hosts the control plane listed are included.
+func (r *PreviewRecord) Hosts() []string {
+	if r == nil {
+		return nil
+	}
+	r.mu.Lock()
+	hosts := make([]string, 0, len(r.hosts))
+	for h := range r.hosts {
+		hosts = append(hosts, h)
+	}
+	r.mu.Unlock()
+	sort.Strings(hosts)
+	return hosts
 }
 
 func (r *PreviewRecord) has(host string) bool {

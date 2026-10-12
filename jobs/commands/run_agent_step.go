@@ -434,6 +434,12 @@ var agentboxImagePullLock sync.Mutex
 func pullAgentboxImage(imageRef string) error {
 	agentboxImagePullLock.Lock()
 	defer agentboxImagePullLock.Unlock()
+	return pullImageWithTimeout(imageRef)
+}
+
+// pullImageWithTimeout pulls imageRef, giving up after defaultImagePullTimeout.
+// Callers serialize their own pulls.
+func pullImageWithTimeout(imageRef string) error {
 	dockerCtx, cancel := context.WithTimeout(context.Background(), defaultImagePullTimeout)
 	defer cancel()
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
@@ -821,6 +827,7 @@ func (rs *RunAgentStep) spawnAgentboxAndWait(spec agentboxSpawnSpec, logsWriter 
 			stopPreviewBuilds := agenttools.RegisterDeployStaticSitePreview(mcpSrv, *spec.previewDeps)
 			defer stopPreviewBuilds()
 			agenttools.RegisterVerifyPreviewReachable(mcpSrv, spec.previewDeps.Record, spec.previewDeps.LogsWriter)
+			agenttools.RegisterVerifyPreviewRendered(mcpSrv, spec.previewDeps.Record, spec.previewDeps.VerifyBrowser, spec.previewDeps.LogsWriter)
 		}
 		ln, lerr := mcpSrv.Listen(spec.mcpSocketHost)
 		if lerr != nil {
@@ -2029,6 +2036,9 @@ func buildStaticSitePreviewDeps(ctx commandUtils.TaskJobContext, parameters map[
 		// A repository deployment.io doesn't deploy: its build settings, detected
 		// from the repository.
 		DetectSite: detectPreviewSite,
+		// verify_preview_rendered's browser: a verify-browser container per check,
+		// shared by every Step on this runner (one image download, two at once).
+		VerifyBrowser: runnerVerifyBrowser.run,
 	}
 }
 
