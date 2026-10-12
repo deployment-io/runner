@@ -282,3 +282,145 @@ func TestCopyRepositoryForBuildLeavesOutChainedEscapingSymlinks(t *testing.T) {
 		t.Errorf("log %q names the target", logs.String())
 	}
 }
+
+// swapForSymlink replaces p with a symlink to target.
+func swapForSymlink(t *testing.T, p, target string) {
+	t.Helper()
+	if err := os.RemoveAll(p); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, p); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// assertNotInCopy fails if any file in dst holds secret.
+func assertNotInCopy(t *testing.T, dst, secret string) {
+	t.Helper()
+	filepath.WalkDir(dst, func(p string, d os.DirEntry, err error) error {
+		if err == nil && d.Type().IsRegular() {
+			if b, _ := os.ReadFile(p); strings.Contains(string(b), secret) {
+				t.Errorf("%s in the copy holds the outside content", p)
+			}
+		}
+		return nil
+	})
+}
+
+func TestCopyRepositoryForBuildRefusesDirectorySwappedForSymlink(t *testing.T) {
+	workDir, repoDir := newWorkDir(t)
+	outside := t.TempDir()
+	writeTree(t, outside, map[string]string{"environ": "CONTROL_PLANE_TOKEN"})
+	logs := &syncBuffer{}
+	dst, err := copyRepository(repoDir, workDir, logs, func(rel string) {
+		if rel == "src" {
+			swapForSymlink(t, filepath.Join(repoDir, "src"), outside)
+		}
+	})
+	defer os.RemoveAll(dst)
+	if err == nil || !strings.Contains(err.Error(), "src") {
+		t.Fatalf("got %v, want an error naming src", err)
+	}
+	if strings.Contains(err.Error(), repoDir) {
+		t.Errorf("error %q names the host path", err)
+	}
+	if !strings.Contains(logs.String(), err.Error()) {
+		t.Errorf("log %q doesn't hold the error %q", logs.String(), err)
+	}
+	assertNotInCopy(t, dst, "CONTROL_PLANE_TOKEN")
+}
+
+func TestCopyRepositoryForBuildRefusesFileSwappedForSymlink(t *testing.T) {
+	workDir, repoDir := newWorkDir(t)
+	outside := filepath.Join(t.TempDir(), "environ")
+	if err := os.WriteFile(outside, []byte("CONTROL_PLANE_TOKEN"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dst, err := copyRepository(repoDir, workDir, io.Discard, func(rel string) {
+		if rel == "package.json" {
+			swapForSymlink(t, filepath.Join(repoDir, "package.json"), outside)
+		}
+	})
+	defer os.RemoveAll(dst)
+	if err == nil || !strings.Contains(err.Error(), "package.json") {
+		t.Fatalf("got %v, want an error naming package.json", err)
+	}
+	assertNotInCopy(t, dst, "CONTROL_PLANE_TOKEN")
+}
+
+func TestCopyRepositoryForBuildChecksSymlinksInTheCopy(t *testing.T) {
+	workDir, repoDir := newWorkDir(t)
+	writeTree(t, repoDir, map[string]string{"d/e/f": "x"})
+	for name, target := range map[string]string{"a": "c/..", "c": "d/e"} {
+		if err := os.Symlink(target, filepath.Join(repoDir, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	logs := &syncBuffer{}
+	// a is copied while c -> d/e (a resolves to d); then c changes to "." before it is read.
+	dst, err := copyRepository(repoDir, workDir, logs, func(rel string) {
+		if rel == "c" {
+			swapForSymlink(t, filepath.Join(repoDir, "c"), ".")
+		}
+	})
+	defer os.RemoveAll(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(filepath.Join(dst, "a")); !os.IsNotExist(err) {
+		t.Errorf("a must be removed from the copy (err %v)", err)
+	}
+	if !strings.Contains(logs.String(), "left out the symlink a,") {
+		t.Errorf("log %q doesn't name a", logs.String())
+	}
+	if got, err := os.Readlink(filepath.Join(dst, "c")); err != nil || got != "." {
+		t.Errorf("c: got %q, %v; want the symlink kept", got, err)
+	}
+}
+
+func TestCopyRepositoryForBuildRechecksLinksThroughRemovedOnes(t *testing.T) {
+	workDir, repoDir := newWorkDir(t)
+	writeTree(t, repoDir, map[string]string{"sub/deep/a/b/f": "x"})
+	// sub/z leaves lexically, so it is removed, though followed through sub/x it
+	// resolves to sub; a, checked before it in the first pass, resolves through it to
+	// the root — and, once sub/z is gone, past a missing component to above the root.
+	for name, target := range map[string]string{"sub/x": "deep/a/b", "sub/z": "x/../../..", "a": "sub/z/.."} {
+		if err := os.Symlink(target, filepath.Join(repoDir, name)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	logs := &syncBuffer{}
+	dst, err := copyRepositoryForBuild(repoDir, workDir, logs)
+	defer os.RemoveAll(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, left := range []string{"sub/z", "a"} {
+		if _, err := os.Lstat(filepath.Join(dst, left)); !os.IsNotExist(err) {
+			t.Errorf("%s must be removed from the copy (err %v)", left, err)
+		}
+		if !strings.Contains(logs.String(), "left out the symlink "+left+",") {
+			t.Errorf("log %q doesn't name %s", logs.String(), left)
+		}
+	}
+	if got, err := os.Readlink(filepath.Join(dst, "sub/x")); err != nil || got != "deep/a/b" {
+		t.Errorf("sub/x: got %q, %v; want it kept", got, err)
+	}
+}
+
+func TestCopyRepositoryForBuildRefusesRepositorySwappedForSymlink(t *testing.T) {
+	workDir, repoDir := newWorkDir(t)
+	outside := t.TempDir()
+	writeTree(t, outside, map[string]string{"environ": "CONTROL_PLANE_TOKEN"})
+	swapForSymlink(t, repoDir, outside)
+	logs := &syncBuffer{}
+	dst, err := copyRepositoryForBuild(repoDir, workDir, logs)
+	defer os.RemoveAll(dst)
+	if err == nil || !strings.Contains(err.Error(), "0-acme/web") || strings.Contains(err.Error(), workDir) {
+		t.Fatalf("got %v, want an error naming 0-acme/web and not the host path", err)
+	}
+	if !strings.Contains(logs.String(), err.Error()) {
+		t.Errorf("the log doesn't hold %q: %q", err, logs.String())
+	}
+	assertNotInCopy(t, dst, "CONTROL_PLANE_TOKEN")
+}
