@@ -30,6 +30,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/deployment-io/deployment-runner-kit/task_previews"
@@ -430,58 +431,215 @@ func runRunnerBuiltPreview(ctx context.Context, deps DeployStaticSitePreviewDeps
 // any depth, and every symlink whose target leaves the repository (see
 // symlinkLeavesRepository and symlinkResolvesOutside), each with a line to logs naming the link's path inside the
 // repository. So nothing reading the copy on the host follows a link out of it.
+//
+// The agent is still running and can change its tree during the walk — swap a listed
+// directory or file for a symlink, or change where a link points. So every read of src
+// goes through an os.Root on it (itself opened through one on workDir, so a repository
+// swapped for a symlink out of workDir is refused), and a path that leads outside src fails the copy
+// instead of being followed; and symlinks are copied as they are and only checked
+// afterwards, against the copy, which the agent can't change.
 // Returns the copy's path (also on a copy error, so the caller removes it).
 func copyRepositoryForBuild(src, workDir string, logs io.Writer) (string, error) {
+	return copyRepository(src, workDir, logs, nil)
+}
+
+// copyRepository is copyRepositoryForBuild, calling beforeRead (if set) with each
+// entry's repository-relative path after deciding what the entry is and before
+// reading it — a seam for tests to change src at that moment.
+func copyRepository(src, workDir string, logs io.Writer, beforeRead func(rel string)) (string, error) {
 	if logs == nil {
 		logs = io.Discard
+	}
+	if beforeRead == nil {
+		beforeRead = func(string) {}
 	}
 	work := filepath.Clean(workDir)
 	dst, err := os.MkdirTemp(filepath.Dir(work), filepath.Base(work)+"-preview-build-")
 	if err != nil {
 		return "", err
 	}
-	err = filepath.WalkDir(src, func(p string, d fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
+	root, err := openRepositoryRoot(src, work)
+	if err != nil {
+		fmt.Fprintf(logs, "Preview build: %v\n", err)
+		return dst, err
+	}
+	defer root.Close()
+	c := repositoryCopier{root: root, dst: dst, beforeRead: beforeRead}
+	if err := c.copyDir("."); err != nil {
+		fmt.Fprintf(logs, "Preview build: %v\n", err)
+		return dst, err
+	}
+	return dst, removeEscapingSymlinks(dst, logs)
+}
+
+// openRepositoryRoot opens an os.Root on src through one on workDir, so a repository
+// (or a directory above it) the agent has swapped for a symlink leading out of
+// workDir is refused instead of becoming the root the copy trusts, and one swapped for
+// a pipe fails instead of blocking.
+func openRepositoryRoot(src, workDir string) (*os.Root, error) {
+	rel, err := filepath.Rel(workDir, filepath.Clean(src))
+	if err != nil || !filepath.IsLocal(rel) {
+		return nil, errors.New("the repository isn't inside the work directory")
+	}
+	work, err := os.OpenRoot(workDir)
+	if err != nil {
+		return nil, err
+	}
+	defer work.Close()
+	// Through rel's "." so os.Root opens rel itself as a directory (O_DIRECTORY): opened
+	// as the last component, a pipe swapped in for it would block the open for good.
+	root, err := work.OpenRoot(rel + string(filepath.Separator) + ".")
+	if err != nil {
+		var pathErr *fs.PathError
+		if errors.As(err, &pathErr) {
+			err = pathErr.Err
 		}
-		rel, err := filepath.Rel(src, p)
-		if err != nil {
+		return nil, fmt.Errorf("couldn't open the repository %s: %w", filepath.ToSlash(rel), err)
+	}
+	return root, nil
+}
+
+// repositoryCopier copies the tree under root into dst, reading only through root.
+type repositoryCopier struct {
+	root       *os.Root
+	dst        string
+	beforeRead func(rel string)
+}
+
+// copyDir copies the entries of the directory rel (already created in dst).
+func (c repositoryCopier) copyDir(rel string) error {
+	f, err := openNonBlocking(c.root, rel)
+	if err != nil {
+		return copyError(rel, err)
+	}
+	entries, err := f.ReadDir(-1)
+	f.Close()
+	if err != nil {
+		return copyError(rel, err)
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+	for _, e := range entries {
+		if e.Name() == ".git" || e.Name() == "node_modules" {
+			continue
+		}
+		if err := c.copyEntry(path.Join(rel, e.Name())); err != nil {
 			return err
 		}
-		if rel == "." {
-			return nil
+	}
+	return nil
+}
+
+func (c repositoryCopier) copyEntry(rel string) error {
+	info, err := c.root.Lstat(rel)
+	if err != nil {
+		return copyError(rel, err)
+	}
+	target := filepath.Join(c.dst, filepath.FromSlash(rel))
+	mode := info.Mode()
+	switch {
+	case mode.IsDir():
+		if err := os.Mkdir(target, mode.Perm()|0o700); err != nil {
+			return copyError(rel, err)
 		}
-		if d.Name() == ".git" || d.Name() == "node_modules" {
-			if d.IsDir() {
-				return filepath.SkipDir
+		c.beforeRead(rel)
+		return c.copyDir(rel)
+	case mode&fs.ModeSymlink != 0:
+		c.beforeRead(rel)
+		link, err := c.root.Readlink(rel)
+		if err != nil {
+			return copyError(rel, err)
+		}
+		if err := os.Symlink(link, target); err != nil {
+			return copyError(rel, err)
+		}
+		return nil
+	case mode.IsRegular():
+		c.beforeRead(rel)
+		if err := c.copyFile(rel, target, mode.Perm()); err != nil {
+			return copyError(rel, err)
+		}
+		return nil
+	default:
+		return nil // sockets, devices, pipes: not part of a build
+	}
+}
+
+// copyFile copies the file rel to dst if it is still a regular file once opened.
+func (c repositoryCopier) copyFile(rel, dst string, perm fs.FileMode) error {
+	in, err := openNonBlocking(c.root, rel)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	info, err := in.Stat()
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return nil // changed since listed: not a file to copy
+	}
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		return err
+	}
+	return out.Close()
+}
+
+// openNonBlocking opens rel in root for reading without blocking on a pipe swapped in
+// for what was listed.
+func openNonBlocking(root *os.Root, rel string) (*os.File, error) {
+	return root.OpenFile(rel, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+}
+
+// copyError names rel (relative to the repository) and drops the host path an error
+// may carry.
+func copyError(rel string, err error) error {
+	var pathErr *fs.PathError
+	if errors.As(err, &pathErr) {
+		err = pathErr.Err
+	}
+	return fmt.Errorf("couldn't copy %s from the repository: %w", rel, err)
+}
+
+// removeEscapingSymlinks removes every symlink in the copy dst whose target leaves it,
+// logging each, and repeats until a pass removes nothing: a removed link can make
+// another that pointed through it leave.
+func removeEscapingSymlinks(dst string, logs io.Writer) error {
+	for {
+		removed := false
+		err := filepath.WalkDir(dst, func(p string, d fs.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
 			}
-			return nil
-		}
-		target := filepath.Join(dst, rel)
-		info, err := d.Info()
-		if err != nil {
-			return err
-		}
-		switch {
-		case d.IsDir():
-			return os.Mkdir(target, info.Mode().Perm()|0o700)
-		case info.Mode()&fs.ModeSymlink != 0:
+			if d.Type()&fs.ModeSymlink == 0 {
+				return nil
+			}
+			rel, err := filepath.Rel(dst, p)
+			if err != nil {
+				return err
+			}
 			link, err := os.Readlink(p)
 			if err != nil {
 				return err
 			}
-			if symlinkLeavesRepository(rel, link) || symlinkResolvesOutside(src, rel) {
-				fmt.Fprintf(logs, "Preview build: left out the symlink %s, whose target is outside the repository\n", filepath.ToSlash(rel))
+			if !symlinkLeavesRepository(rel, link) && !symlinkResolvesOutside(dst, rel) {
 				return nil
 			}
-			return os.Symlink(link, target)
-		case info.Mode().IsRegular():
-			return copyFile(p, target, info.Mode().Perm())
-		default:
-			return nil // sockets, devices, pipes: not part of a build
+			if err := os.Remove(p); err != nil {
+				return err
+			}
+			removed = true
+			fmt.Fprintf(logs, "Preview build: left out the symlink %s, whose target is outside the repository\n", filepath.ToSlash(rel))
+			return nil
+		})
+		if err != nil || !removed {
+			return err
 		}
-	})
-	return dst, err
+	}
 }
 
 // symlinkLeavesRepository reports whether the symlink at rel (relative to the
@@ -495,16 +653,16 @@ func symlinkLeavesRepository(rel, link string) bool {
 	return resolved == ".." || strings.HasPrefix(resolved, ".."+string(filepath.Separator))
 }
 
-// symlinkResolvesOutside reports whether the symlink at rel (relative to the source
-// repository src) leaves the repository once the links on its way are followed in src
+// symlinkResolvesOutside reports whether the symlink at rel (relative to the tree
+// root, the copy) leaves the tree once the links on its way are followed in root
 // — which the lexical check misses for a chain of links that each stay inside, such
 // as a -> . with b -> a/../outside. It walks the target one component at a time and
 // never needs the target to exist: a ".." above the root counts as leaving whether or
-// not anything is there now, since the copy sits in a different directory. Past a
-// component missing from src (or left out of the copy: .git, node_modules), what the
-// copy will hold is unknown, so any later ".." counts as leaving. An absolute target
-// anywhere on the way, or too many links (a loop), counts as leaving too.
-func symlinkResolvesOutside(src, rel string) bool {
+// not anything is there now. Past a component missing from root (or named .git or
+// node_modules), what will be there is unknown, so any later ".." counts as leaving.
+// An absolute target anywhere on the way, or too many links (a loop), counts as
+// leaving too.
+func symlinkResolvesOutside(root, rel string) bool {
 	const maxLinks = 255
 	var cur []string // resolved components below src
 	pending := splitPath(filepath.ToSlash(rel))
@@ -523,7 +681,7 @@ func symlinkResolvesOutside(src, rel string) bool {
 			continue
 		}
 		cur = append(cur, part)
-		full := filepath.Join(append([]string{src}, cur...)...)
+		full := filepath.Join(append([]string{root}, cur...)...)
 		info, err := os.Lstat(full)
 		if err != nil || part == ".git" || part == "node_modules" {
 			for _, rest := range pending {
@@ -552,23 +710,6 @@ func symlinkResolvesOutside(src, rel string) bool {
 
 func splitPath(p string) []string {
 	return strings.Split(p, "/")
-}
-
-func copyFile(src, dst string, perm fs.FileMode) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, perm)
-	if err != nil {
-		return err
-	}
-	if _, err := io.Copy(out, in); err != nil {
-		out.Close()
-		return err
-	}
-	return out.Close()
 }
 
 // writePreviewFiles writes each secret file at <siteDir>/<name>, as the deploy's
