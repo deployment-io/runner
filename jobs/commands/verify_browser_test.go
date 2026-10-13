@@ -3,6 +3,7 @@ package commands
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -11,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
+	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner/agenttools"
 	"github.com/deployment-io/deployment-runner/utils/reclaim"
 	"github.com/docker/docker/api/types/container"
@@ -218,14 +221,153 @@ func TestVerifyBrowser_ContainerConfig(t *testing.T) {
 	}
 }
 
-func TestVerifyBrowser_ImageOverride(t *testing.T) {
+// The runner's env var (development) wins, then the Job's VerifyBrowserImage,
+// then the constant.
+func TestVerifyBrowser_ImageRefPrecedence(t *testing.T) {
+	const jobRef = "docker.io/deploymenthq/verify-browser:0.9.0"
 	t.Setenv(verifyBrowserImageEnv, "localhost:5000/verify-browser:dev")
-	if got := verifyBrowserImageRef(); got != "localhost:5000/verify-browser:dev" {
-		t.Fatalf("image = %s", got)
+	if got := verifyBrowserImageRef(jobRef); got != "localhost:5000/verify-browser:dev" {
+		t.Fatalf("with the env var set: image = %s", got)
 	}
 	t.Setenv(verifyBrowserImageEnv, "")
-	if got := verifyBrowserImageRef(); got != verifyBrowserImage {
-		t.Fatalf("image = %s", got)
+	if got := verifyBrowserImageRef(jobRef); got != jobRef {
+		t.Fatalf("with a Job image: image = %s", got)
+	}
+	if got := verifyBrowserImageRef(""); got != verifyBrowserImage {
+		t.Fatalf("with neither: image = %s", got)
+	}
+}
+
+// The ref a check asked for is the one checked, pulled and run.
+func TestVerifyBrowser_RunsTheRequestedImage(t *testing.T) {
+	t.Setenv(verifyBrowserImageEnv, "")
+	const jobRef = "docker.io/deploymenthq/verify-browser:0.9.0"
+	d := &fakeVerifyDocker{present: true, run: writeResult(`{"schema_version":1,"status":"completed","verdict":"pass"}`)}
+	v := newTestVerifyBrowser(t, d)
+	var asked []string
+	v.imagePresent = func(_ context.Context, ref string) (bool, error) {
+		asked = append(asked, ref)
+		return true, nil
+	}
+	req := verifyRequest()
+	req.ImageRef = jobRef
+	if _, err := v.run(context.Background(), req, nil); err != nil {
+		t.Fatal(err)
+	}
+	if len(asked) != 1 || asked[0] != jobRef {
+		t.Errorf("checked %v, want %s", asked, jobRef)
+	}
+	if got := d.configs[0].Image; got != jobRef {
+		t.Errorf("container image = %s, want %s", got, jobRef)
+	}
+}
+
+// A failed pull of one ref is reported only to checks that ask for that ref;
+// a check for another ref starts its own pull, and prunes after it succeeds.
+func TestVerifyBrowser_PullStateIsPerRef(t *testing.T) {
+	t.Setenv(verifyBrowserImageEnv, "")
+	const badRef, goodRef = "docker.io/deploymenthq/verify-browser:9.9.9", "docker.io/deploymenthq/verify-browser:1.0.0"
+	v := newTestVerifyBrowser(t, &fakeVerifyDocker{})
+	var mu sync.Mutex
+	present := map[string]bool{}
+	var pulled, pruned []string
+	v.imagePresent = func(_ context.Context, ref string) (bool, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		return present[ref], nil
+	}
+	v.pullImage = func(ref string) error {
+		mu.Lock()
+		defer mu.Unlock()
+		pulled = append(pulled, ref)
+		if ref == badRef {
+			return errors.New("manifest unknown")
+		}
+		present[ref] = true
+		return nil
+	}
+	v.pruneSuperseded = func(ref string) {
+		mu.Lock()
+		pruned = append(pruned, ref)
+		mu.Unlock()
+	}
+	request := func(ref string) agenttools.VerifyBrowserRequest {
+		r := verifyRequest()
+		r.ImageRef = ref
+		return r
+	}
+
+	if out, err := v.run(context.Background(), request(badRef), nil); err != nil || !out.Preparing {
+		t.Fatalf("bad ref, first call: %+v, %v", out, err)
+	}
+	<-v.pulled
+
+	// The other ref is not told about the bad ref's failure.
+	if out, err := v.run(context.Background(), request(goodRef), nil); err != nil || !out.Preparing {
+		t.Fatalf("good ref after the bad ref's failure: %+v, %v; want preparing, no error", out, err)
+	}
+	<-v.pulled
+	if len(pruned) != 1 || pruned[0] != goodRef {
+		t.Errorf("pruned = %v, want only after the good ref's successful pull", pruned)
+	}
+	if out, err := v.run(context.Background(), request(goodRef), nil); err != nil || out.Preparing {
+		t.Fatalf("good ref after its pull: %+v, %v", out, err)
+	}
+
+	// The bad ref's own next check is told, and a retry starts.
+	_, err := v.run(context.Background(), request(badRef), nil)
+	if err == nil || !strings.Contains(err.Error(), "manifest unknown") || !strings.Contains(err.Error(), badRef) {
+		t.Fatalf("bad ref, second call: err = %v; want its own pull error", err)
+	}
+	<-v.pulled
+	if want := []string{badRef, goodRef, badRef}; !reflect.DeepEqual(pulled, want) {
+		t.Errorf("pulls = %v, want %v", pulled, want)
+	}
+}
+
+// One pull at a time across refs: a check for another ref while a pull runs
+// is "preparing" and starts nothing.
+func TestVerifyBrowser_OnePullAtATimeAcrossRefs(t *testing.T) {
+	t.Setenv(verifyBrowserImageEnv, "")
+	d := &fakeVerifyDocker{pullGate: make(chan struct{})}
+	v := newTestVerifyBrowser(t, d)
+	for _, ref := range []string{"a/verify-browser:1", "a/verify-browser:2"} {
+		r := verifyRequest()
+		r.ImageRef = ref
+		if out, err := v.run(context.Background(), r, nil); err != nil || !out.Preparing {
+			t.Fatalf("%s: %+v, %v", ref, out, err)
+		}
+	}
+	close(d.pullGate)
+	<-v.pulled
+	if d.pulls != 1 {
+		t.Fatalf("pulls = %d, want 1", d.pulls)
+	}
+}
+
+// buildStaticSitePreviewDeps' wrapper puts the Job's image on every check.
+func TestVerifyBrowserForJobCarriesTheJobImage(t *testing.T) {
+	parameters := map[string]interface{}{}
+	jobs.SetParameterValue[string](parameters, parameters_enums.VerifyBrowserImage, "docker.io/deploymenthq/verify-browser:0.9.0")
+	var got agenttools.VerifyBrowserRequest
+	run := verifyBrowserForJob(func(_ context.Context, req agenttools.VerifyBrowserRequest, _ io.Writer) (agenttools.VerifyBrowserOutcome, error) {
+		got = req
+		return agenttools.VerifyBrowserOutcome{}, nil
+	}, parameters)
+	if _, err := run(context.Background(), verifyRequest(), nil); err != nil {
+		t.Fatal(err)
+	}
+	if got.ImageRef != "docker.io/deploymenthq/verify-browser:0.9.0" || len(got.Input) == 0 {
+		t.Errorf("request = %+v, want the Job's image and the original input", got)
+	}
+
+	run = verifyBrowserForJob(func(_ context.Context, req agenttools.VerifyBrowserRequest, _ io.Writer) (agenttools.VerifyBrowserOutcome, error) {
+		got = req
+		return agenttools.VerifyBrowserOutcome{}, nil
+	}, map[string]interface{}{})
+	run(context.Background(), verifyRequest(), nil)
+	if got.ImageRef != "" {
+		t.Errorf("a Job with no image sent %q", got.ImageRef)
 	}
 }
 

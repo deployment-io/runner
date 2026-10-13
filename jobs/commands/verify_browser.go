@@ -37,8 +37,9 @@ import (
 // exact version; bump it deliberately when a new verify-browser-vX.Y.Z ships.
 const verifyBrowserImage = "docker.io/deploymenthq/verify-browser:1.0.0"
 
-// verifyBrowserImageEnv overrides verifyBrowserImage, for developing the image
-// only — it is not a customer setting.
+// verifyBrowserImageEnv overrides both the Job's VerifyBrowserImage and
+// verifyBrowserImage, for developing the image only — it is not a customer
+// setting.
 const verifyBrowserImageEnv = "VERIFY_BROWSER_IMAGE"
 
 const (
@@ -70,9 +71,16 @@ const (
 	verifyBrowserResultMax = 1024 * 1024
 )
 
-func verifyBrowserImageRef() string {
+// verifyBrowserImageRef picks the image for one check: the runner's
+// VERIFY_BROWSER_IMAGE (development override), then jobRef — the Job's
+// VerifyBrowserImage, pinned by the control plane across a Task's Steps —
+// then verifyBrowserImage.
+func verifyBrowserImageRef(jobRef string) string {
 	if ref := os.Getenv(verifyBrowserImageEnv); ref != "" {
 		return ref
+	}
+	if jobRef != "" {
+		return jobRef
 	}
 	return verifyBrowserImage
 }
@@ -87,7 +95,7 @@ type verifyBrowserExit struct {
 
 // verifyBrowser runs checks. Its Docker calls are fields so tests can replace them.
 type verifyBrowser struct {
-	imageRef        func() string
+	imageRef        func(jobRef string) string
 	imagePresent    func(ctx context.Context, ref string) (bool, error)
 	pullImage       func(ref string) error
 	pruneSuperseded func(ref string)
@@ -100,9 +108,13 @@ type verifyBrowser struct {
 	slots    chan struct{}
 	slotWait time.Duration
 
-	mu      sync.Mutex
-	pulling bool
-	pullErr error
+	// One pull runs at a time across every ref, but what a check is told is
+	// per ref: pullingRef is the ref being pulled ("" when none), and
+	// pullErrs holds each ref's last failed pull, so a failure pulling one
+	// Task's image is never reported to a check that asked for another.
+	mu         sync.Mutex
+	pullingRef string
+	pullErrs   map[string]error
 	// pulled is closed when a background pull finishes (tests wait on it).
 	pulled chan struct{}
 }
@@ -128,12 +140,13 @@ func newVerifyBrowser() *verifyBrowser {
 		ioRoot:   "/tmp",
 		slots:    make(chan struct{}, verifyBrowserSlots),
 		slotWait: verifyBrowserSlotWait,
+		pullErrs: map[string]error{},
 	}
 }
 
 // run is agenttools.RunVerifyBrowser.
 func (v *verifyBrowser) run(ctx context.Context, req agenttools.VerifyBrowserRequest, logsWriter io.Writer) (agenttools.VerifyBrowserOutcome, error) {
-	ref := v.imageRef()
+	ref := v.imageRef(req.ImageRef)
 	// Held from before the presence check so a concurrent prune can't remove the
 	// image between the check and the container's start.
 	releaseImage := reclaim.MarkImageInUse(ref)
@@ -174,8 +187,9 @@ func (v *verifyBrowser) run(ctx context.Context, req agenttools.VerifyBrowserReq
 }
 
 // ensureImage reports whether the image is on the host. When it isn't, it starts a
-// background pull (unless one is running) and returns false — or, when the last pull
-// failed, an error naming the image and that failure, after starting a retry.
+// background pull (unless one is running, for this ref or another) and returns false
+// — or, when this ref's last pull failed, an error naming the image and that failure,
+// after starting a retry.
 func (v *verifyBrowser) ensureImage(ctx context.Context, ref string, logsWriter io.Writer) (bool, error) {
 	present, err := v.imagePresent(ctx, ref)
 	if err != nil {
@@ -186,12 +200,14 @@ func (v *verifyBrowser) ensureImage(ctx context.Context, ref string, logsWriter 
 	}
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	if v.pulling {
+	if v.pullingRef != "" {
+		// Another ref's pull holds the one download; this ref's starts on a
+		// later check once it ends. Either way the check is "preparing".
 		return false, nil
 	}
-	lastErr := v.pullErr
-	v.pullErr = nil
-	v.pulling = true
+	lastErr := v.pullErrs[ref]
+	delete(v.pullErrs, ref)
+	v.pullingRef = ref
 	v.pulled = make(chan struct{})
 	if logsWriter != nil {
 		io.WriteString(logsWriter, fmt.Sprintf("verify_preview_rendered: downloading the QA browser image %s on this runner\n", ref))
@@ -211,8 +227,12 @@ func (v *verifyBrowser) pullInBackground(ref string, done chan struct{}) {
 		v.pruneSuperseded(ref)
 	}
 	v.mu.Lock()
-	v.pulling = false
-	v.pullErr = err
+	v.pullingRef = ""
+	if err != nil {
+		v.pullErrs[ref] = err
+	} else {
+		delete(v.pullErrs, ref)
+	}
 	v.mu.Unlock()
 }
 

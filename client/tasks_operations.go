@@ -83,3 +83,23 @@ func (r *RunnerClient) UpdateTaskStepReview(organizationID string, update tasks.
 	}
 	return nil
 }
+
+// UpdateTaskStepQA sends the QA stage's final result for one Step, to be
+// bounded and stored on the Step. Like UpdateTaskStepReview.
+func (r *RunnerClient) UpdateTaskStepQA(organizationID string, update tasks.UpdateTaskStepQADtoV1) error {
+	if !r.isConnected {
+		return ErrConnection
+	}
+	args := tasks.UpdateTaskStepQAArgsV1{}
+	args.OrganizationID = r.GetComputedOrganizationID(organizationID)
+	args.Token = r.token
+	args.Update = update
+	var reply tasks.UpdateTaskStepQAReplyV1
+	if err := r.c.Call("Jobs.UpdateTaskStepQAV1", args, &reply); err != nil {
+		return err
+	}
+	if !reply.Done {
+		return fmt.Errorf("error receiving done from the server")
+	}
+	return nil
+}

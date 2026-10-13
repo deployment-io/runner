@@ -2038,7 +2038,18 @@ func buildStaticSitePreviewDeps(ctx commandUtils.TaskJobContext, parameters map[
 		DetectSite: detectPreviewSite,
 		// verify_preview_rendered's browser: a verify-browser container per check,
 		// shared by every Step on this runner (one image download, two at once).
-		VerifyBrowser: runnerVerifyBrowser.run,
+		// Each check carries this Job's pinned image.
+		VerifyBrowser: verifyBrowserForJob(runnerVerifyBrowser.run, parameters),
+	}
+}
+
+// verifyBrowserForJob stamps the Job's VerifyBrowserImage (absent on Jobs
+// from an older control plane) onto every check run sends.
+func verifyBrowserForJob(run agenttools.RunVerifyBrowser, parameters map[string]interface{}) agenttools.RunVerifyBrowser {
+	jobImage, _ := jobs.GetParameterValue[string](parameters, parameters_enums.VerifyBrowserImage)
+	return func(ctx context.Context, req agenttools.VerifyBrowserRequest, logsWriter io.Writer) (agenttools.VerifyBrowserOutcome, error) {
+		req.ImageRef = jobImage
+		return run(ctx, req, logsWriter)
 	}
 }
 
