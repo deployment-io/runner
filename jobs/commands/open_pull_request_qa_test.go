@@ -117,9 +117,11 @@ func TestQASectionOrderAndPlacement(t *testing.T) {
 
 func TestQASectionIsLeftOutWithNothingToShow(t *testing.T) {
 	for name, qa := range map[string]*qaOutput{
-		"all passed":   completedQA(qaRoundOutput{Criteria: qaCriteria(tasks.QACriterionPassed)}),
-		"smoke, clean": completedQA(qaRoundOutput{NoCriteria: true}),
-		"couldn't run": {Status: tasks.QAStatusCouldNotRun, StatusReason: "no preview", Rounds: []qaRoundOutput{{Round: 1, Status: tasks.QAStatusCouldNotRun}}},
+		"all passed":                      completedQA(qaRoundOutput{Criteria: qaCriteria(tasks.QACriterionPassed)}),
+		"smoke, clean":                    completedQA(qaRoundOutput{NoCriteria: true}),
+		"couldn't run":                    {Status: tasks.QAStatusCouldNotRun, StatusReason: "no preview", Rounds: []qaRoundOutput{{Round: 1, Status: tasks.QAStatusCouldNotRun}}},
+		"couldn't run, placeholders only": {Status: tasks.QAStatusCouldNotRun, StatusReason: "QA didn't report a result", Rounds: []qaRoundOutput{{Round: 1, Status: tasks.QAStatusCouldNotRun, Criteria: qaCriteria(tasks.QACriterionNotChecked, tasks.QACriterionNotChecked)}}},
+		"gate only":                       {Status: tasks.QAStatusSkipped, StatusReason: "no static site in this change"},
 	} {
 		opr := reviewTestOpener(nil)
 		opr.qa = qa
@@ -253,5 +255,36 @@ func TestQASectionIsDroppedBeforeTheReviewSection(t *testing.T) {
 		if !strings.Contains(body, want) {
 			t.Errorf("the body dropped %q", want)
 		}
+	}
+}
+
+// A QA run that stopped part-way still shows what it reported, under a lead-in
+// that says it did not finish.
+func TestQASectionShowsAPartialRun(t *testing.T) {
+	const p, f, n = tasks.QACriterionPassed, tasks.QACriterionFailed, tasks.QACriterionNotChecked
+	qa := &qaOutput{
+		Status:       tasks.QAStatusCouldNotRun,
+		StatusReason: "the QA run ended as timeout before it finished",
+		Rounds: []qaRoundOutput{{
+			Round: 1, Status: tasks.QAStatusCouldNotRun,
+			Criteria:     qaCriteria(p, f, n),
+			Findings:     []reviewFindingOutput{{Location: "/pricing", What: "no Sign up button", Why: "visitors cannot start"}},
+			Observations: []string{"a console error"},
+		}},
+	}
+	opr := reviewTestOpener(nil)
+	opr.qa = qa
+	got := opr.qaSection()
+	requireInOrder(t, got,
+		"**QA on a preview**",
+		"QA did not finish",
+		"does not hold this pull request",
+		"- criterion 2\n  reason 2\n",
+		"`/pricing` no Sign up button",
+		"<details><summary>Not checked (1)</summary>",
+		"<details><summary>Observations (1)</summary>",
+	)
+	if strings.Contains(got, "QA checked the change on a preview") {
+		t.Errorf("a partial run is described as a completed check:\n%s", got)
 	}
 }

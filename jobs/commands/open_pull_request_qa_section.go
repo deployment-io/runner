@@ -111,13 +111,27 @@ func qaPlainText(s string, n int) string {
 // collapsed, the criteria nobody checked, what QA's fix run fixed, and QA's
 // observations.
 //
-// Empty unless QA completed with something to show: a skipped or failed QA
-// stage is said in full by its status line, and a clean pass needs no section.
-// It never holds the pull request, and says so.
+// Empty unless there is something to show. A skipped stage is said in full by
+// its status line, and so is one that couldn't run and reported nothing — but a
+// QA run that stopped part-way (a timeout, a turn cap) can still have reported
+// verdicts, findings and observations, and those are shown under a lead-in
+// that says the run did not finish. A clean pass needs no section. It never
+// holds the pull request, and says so.
 func (opr *taskOpenPR) qaSection() string {
 	qa := opr.qa
 	final := qa.finalRound()
-	if qa == nil || qa.Status != tasks.QAStatusCompleted || final == nil {
+	if final == nil {
+		return ""
+	}
+	partial := false
+	switch qa.Status {
+	case tasks.QAStatusCompleted:
+	case tasks.QAStatusCouldNotRun:
+		if !qaReportedEvidence(final) {
+			return ""
+		}
+		partial = true
+	default:
 		return ""
 	}
 	failed, notChecked := splitCriteria(final.Criteria)
@@ -128,7 +142,11 @@ func (opr *taskOpenPR) qaSection() string {
 	var sb strings.Builder
 	sb.WriteString("\n---\n")
 	sb.WriteString("**QA on a preview**\n\n")
-	sb.WriteString("QA checked the change on a preview against the Task's acceptance criteria. It is advisory: it does not hold this pull request.\n")
+	if partial {
+		sb.WriteString("QA did not finish (see the QA line above); this is what it reported before it stopped. It is advisory: it does not hold this pull request.\n")
+	} else {
+		sb.WriteString("QA checked the change on a preview against the Task's acceptance criteria. It is advisory: it does not hold this pull request.\n")
+	}
 
 	budget := &renderBudget{items: qaSectionMaxItems, runes: qaSectionMaxRunes - utf8.RuneCountInString(sb.String()) - qaSectionReserveRunes - utf8.RuneCountInString(outcome)}
 	total := len(failed) + len(final.Findings) + len(notChecked) + len(qa.FixedByQA) + len(final.Observations)
@@ -141,6 +159,22 @@ func (opr *taskOpenPR) qaSection() string {
 		sb.WriteString(fmt.Sprintf("\n_%d further QA item(s) are not shown here._\n", omitted))
 	}
 	return boundQASection(sb.String())
+}
+
+// qaReportedEvidence is whether a QA round that couldn't run still reported
+// something of its own: a verdict on a criterion, a finding or an observation.
+// A round that only carries agentbox's placeholders (every criterion
+// not_checked because no trailer came back) reported nothing.
+func qaReportedEvidence(r *qaRoundOutput) bool {
+	if len(r.Findings) > 0 || len(r.Observations) > 0 {
+		return true
+	}
+	for _, c := range r.Criteria {
+		if c.State == tasks.QACriterionPassed || c.State == tasks.QACriterionFailed {
+			return true
+		}
+	}
+	return false
 }
 
 // splitCriteria separates the failed criteria from the ones QA did not check.
