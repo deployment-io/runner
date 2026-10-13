@@ -60,6 +60,10 @@ var ErrVerifyBrowserNotRun = errors.New("the QA browser did not run")
 type VerifyBrowserRequest struct {
 	Input   []byte        // input.json, exactly as the image reads it
 	Timeout time.Duration // the check's timeout (input.json's timeout_ms)
+	// ImageRef is the Job's VerifyBrowserImage, empty when the Job carries
+	// none. Filled by the runner where it wires the tool, not by the tool;
+	// the runner's VERIFY_BROWSER_IMAGE still wins over it.
+	ImageRef string
 }
 
 // VerifyBrowserOutcome is what one verify-browser run left behind.
