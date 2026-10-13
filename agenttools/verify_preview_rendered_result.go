@@ -29,6 +29,9 @@ const (
 	renderedShrunkURLChars      = 200
 	renderedShrunkDetailChars   = 100
 	renderedShrunkPageErrorChar = 200
+	renderedMaxOutline          = 60
+	renderedOutlineTextChars    = 120
+	renderedOutlineHrefChars    = 500
 )
 
 type renderedStepResult struct {
@@ -58,6 +61,14 @@ type renderedTimings struct {
 	LCP              *int `json:"lcp,omitempty"`
 }
 
+// renderedOutlineEntry is one entry of the page outline (verify-browser 1.1.0+).
+type renderedOutlineEntry struct {
+	Kind  string `json:"kind"`
+	Text  string `json:"text"`
+	Level *int   `json:"level,omitempty"`
+	Href  string `json:"href,omitempty"`
+}
+
 // renderedResult is the image's result.json as the agent receives it, plus message.
 type renderedResult struct {
 	SchemaVersion      int                       `json:"schema_version"`
@@ -75,6 +86,8 @@ type renderedResult struct {
 	BlockedNavigations []string                  `json:"blocked_navigations"`
 	TimingsMS          renderedTimings           `json:"timings_ms"`
 	DOMTextSnippet     string                    `json:"dom_text_snippet"`
+	// Outline is absent from 1.0.0 results, and then from the reply.
+	Outline []renderedOutlineEntry `json:"outline,omitempty"`
 	// Truncated is set when parts of the result were shortened or dropped to keep
 	// it under verifyRenderedMaxResultBytes.
 	Truncated bool `json:"truncated,omitempty"`
@@ -187,6 +200,15 @@ func capRenderedResult(r *renderedResult) {
 	}
 	r.BlockedNavigations = capStrings(r.BlockedNavigations, renderedMaxBlocked, renderedURLChars)
 	r.DOMTextSnippet = capChars(r.DOMTextSnippet, renderedDOMTextChars)
+	if len(r.Outline) > renderedMaxOutline {
+		r.Outline = r.Outline[:renderedMaxOutline]
+	}
+	for i := range r.Outline {
+		e := &r.Outline[i]
+		e.Kind = capChars(e.Kind, renderedShortChars)
+		e.Text = capChars(e.Text, renderedOutlineTextChars)
+		e.Href = capChars(e.Href, renderedOutlineHrefChars)
+	}
 	// Lists the image left out are empty, not null.
 	if r.Steps == nil {
 		r.Steps = []renderedStepResult{}
@@ -215,6 +237,11 @@ var renderedShrinks = []func(r *renderedResult){
 	func(r *renderedResult) {
 		r.PageErrors = capStrings(r.PageErrors, renderedMaxPageErrors, renderedShrunkPageErrorChar)
 	},
+	// The outline is halved a few times, then dropped, before the DOM text is cut.
+	halveOutline,
+	halveOutline,
+	halveOutline,
+	func(r *renderedResult) { r.Outline = nil },
 	func(r *renderedResult) { r.DOMTextSnippet = capChars(r.DOMTextSnippet, 300) },
 	func(r *renderedResult) {
 		for i := range r.Steps {
@@ -235,6 +262,8 @@ var renderedShrinks = []func(r *renderedResult){
 		r.DOMTextSnippet = ""
 	},
 }
+
+func halveOutline(r *renderedResult) { r.Outline = r.Outline[:len(r.Outline)/2] }
 
 // fitRenderedResult marshals r, shrinking it until it is under the size cap. Counts
 // in the summary are taken before shrinking, so they stay true.
@@ -289,6 +318,9 @@ func renderedSummary(r *renderedResult) string {
 	parts = append(parts, countPhrase(len(r.FailedRequests), "failed request", "failed requests"))
 	if n := len(r.BlockedNavigations); n > 0 {
 		parts = append(parts, countPhrase(n, "blocked navigation", "blocked navigations"))
+	}
+	if n := len(r.Outline); n > 0 {
+		parts = append(parts, "outline: "+countPhrase(n, "entry", "entries"))
 	}
 	return r.Verdict + " — " + strings.Join(parts, "; ")
 }

@@ -64,6 +64,7 @@ func (opr *OpenPullRequest) Run(parameters map[string]interface{}, logsWriter io
 		agentPRTitle: readAgentPRTitleFromJobOutput(parameters),
 		verifyResult: readVerifyResultFromJobOutput(parameters),
 		review:       readReviewFromJobOutput(parameters),
+		qa:           readQAFromJobOutput(parameters),
 		acceptance:   readAcceptanceCriteria(parameters),
 	}
 	prOutputs, err := opener.openAll(hasChangesByIndex)
@@ -105,6 +106,10 @@ type taskOpenPR struct {
 	// created before the stage existed — in which case the PR body carries no
 	// Review section and looks exactly as it did before.
 	review *reviewOutput
+	// qa is the QA stage's record for this Step run. Nil when the stage did not
+	// run, in which case the body has no QA line or section. It is advisory: it
+	// never touches needsFixes, the title or the draft state.
+	qa *qaOutput
 	// acceptance is the Task's acceptance criteria, read off the ReviewSpec
 	// parameter (see readAcceptanceCriteria). Nil for a Task without a
 	// structured spec, in which case the body has no "What the Task asks for".
@@ -261,10 +266,10 @@ const (
 // first line > generic fallback; see that function for the policy).
 //
 // The body has a fixed layout, every part left out when it has nothing to
-// show: the one-line review tally, the Task's previews, "Before deploying" (the configuration the
+// show: the one-line review tally, the one-line QA status, the Task's previews, "Before deploying" (the configuration the
 // change needs that its environment lacks), the agent's summary, what the Task
-// asks for, how the change was checked, the Review section, the blocked hosts, and
-// the trailer last. What a reviewer reads first is what the review did and
+// asks for, how the change was checked, the Review section, the "QA on a
+// preview" section, the blocked hosts, and the trailer last. What a reviewer reads first is what the review did and
 // what the change is; the reference material sits below it, collapsed.
 //
 // EVERYTHING EXCEPT THE SUMMARY IS BUILT FIRST and the summary is given what
@@ -280,25 +285,45 @@ const (
 // what makes the cap hold. Those parts' own bounds are several, and several
 // bounded parts still add up — plus the trailer carries a Task title of any
 // length. The last cut is the one that guarantees the pull request opens.
+//
+// The QA section is advisory, so it is the first bounded part to go: when the
+// parts around the summary do not fit on their own it is dropped whole, before
+// the last cut can reach the Review section. Its status line stays.
 func (opr *taskOpenPR) buildPRTitleAndBody() (string, string) {
 	subject, leadIn := opr.subjectAndLeadIn()
 	tally := reviewTally(opr.review)
+	qaLine := qaStatusLine(opr.qa)
 	preview := opr.previewSection()
 	deploy := beforeDeployingSection(opr.review, opr.ctx.DashboardURL)
 	asks := acceptanceSection(opr.acceptance)
 	review := strings.Trim(opr.reviewSection(), "\n")
+	qa := strings.Trim(opr.qaSection(), "\n")
 	hosts := opr.blockedHostsSection()
 	trailer := opr.trailer()
 	// "How it was checked" is the one part here with no bound of its own — a
 	// step's output is bounded by boundVerifyTail, but the number of failing
 	// steps follows the Task's repositories — so it is given what the rest of
 	// the body leaves, less the separator in front of it.
-	others := joinBodyParts(tally, preview, deploy, asks, review, hosts, trailer) + "\n"
+	others := joinBodyParts(tally, qaLine, preview, deploy, asks, review, qa, hosts, trailer) + "\n"
+	if qa != "" && overBodyBudget(others) {
+		qa = ""
+		others = joinBodyParts(tally, qaLine, preview, deploy, asks, review, hosts, trailer) + "\n"
+	}
 	checked := opr.howCheckedSection(prBodyMaxRunes - utf8.RuneCountInString(others) - len(bodyPartSeparator))
-	rest := joinBodyParts(tally, preview, deploy, asks, checked, review, hosts, trailer) + "\n"
+	rest := joinBodyParts(tally, qaLine, preview, deploy, asks, checked, review, qa, hosts, trailer) + "\n"
+	if qa != "" && overBodyBudget(rest) {
+		qa = ""
+		rest = joinBodyParts(tally, qaLine, preview, deploy, asks, checked, review, hosts, trailer) + "\n"
+	}
 	leadIn = boundPRSummary(leadIn, prBodyMaxRunes-utf8.RuneCountInString(rest)-len(bodyPartSeparator))
-	body := joinBodyParts(tally, preview, deploy, leadIn, asks, checked, review, hosts, trailer) + "\n"
+	body := joinBodyParts(tally, qaLine, preview, deploy, leadIn, asks, checked, review, qa, hosts, trailer) + "\n"
 	return subject, cutToRuneBudget(body, prBodyMaxRunes, prBodyTruncatedNote)
+}
+
+// overBodyBudget reports whether the parts around the summary leave it no
+// room at all — the point past which the last cut would start eating them.
+func overBodyBudget(parts string) bool {
+	return utf8.RuneCountInString(parts)+len(bodyPartSeparator) > prBodyMaxRunes
 }
 
 // bodyPartSeparator is the blank line between two parts of the body.

@@ -102,6 +102,12 @@ func planRunnerBuiltPreview(deps DeployStaticSitePreviewDeps, repository string,
 	if err != nil {
 		return runnerBuiltPreview{}, false, fmt.Errorf("look up how deployment.io deploys %s: %w", repoDir, err)
 	}
+	return planFromBuildSettings(deps, repoDir, rootDirectory, settings)
+}
+
+// planFromBuildSettings is planRunnerBuiltPreview after the lookup: the deployment's
+// static site when deployment.io deploys one, else the detected settings.
+func planFromBuildSettings(deps DeployStaticSitePreviewDeps, repoDir string, rootDirectory *string, settings task_previews.StaticSiteBuildSettingsReplyV1) (runnerBuiltPreview, bool, error) {
 	if len(settings.Sites) == 0 {
 		return planDetectedPreview(deps, repoDir, rootDirectory, settings)
 	}

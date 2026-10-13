@@ -40,48 +40,57 @@ func reviewContextCopyPattern(workDirHost string) string {
 // pass reads whatever /work/context the Task left, and the deploy requirements
 // resolve to "not found" — no link built from facts nobody fetched.
 func (s *reviewStage) prepareContextCopy() func() {
-	noop := func() {}
-	unavailable := func(reason string) func() {
+	dir, written, cleanup, reason := writeContextCopy(s.ctx, s.workDirHost, reviewContextCopyPattern(s.workDirHost), s.logsWriter)
+	if reason != "" {
 		io.WriteString(s.logsWriter, fmt.Sprintf("Review stage: deployment context unavailable (%s) — the deploy readiness pass reads /work/context as the Task left it, and deploy requirements get no links\n", reason))
-		return noop
-	}
-	if s.workDirHost == "" {
-		return unavailable("no work directory")
-	}
-	// Never a catalog rebuild: the Step's own MaterializeContext already
-	// asked for one when it was due.
-	files, err := getContextClient().MaterializeContext(s.ctx.OrganizationID, nil, false)
-	if err != nil {
-		return unavailable(err.Error())
-	}
-	if len(files) == 0 {
-		return unavailable("no context has been built")
-	}
-	base := strings.TrimRight(s.workDirHost, "/")
-	dir, err := os.MkdirTemp(filepath.Dir(base), reviewContextCopyPattern(base))
-	if err != nil {
-		return unavailable(err.Error())
-	}
-	cleanup := func() {
-		_ = os.RemoveAll(dir)
-		s.contextCopyDir = ""
-	}
-	written, err := writeContextFiles(dir, files, s.logsWriter)
-	if err != nil {
-		cleanup()
-		return unavailable(err.Error())
-	}
-	if written == 0 {
-		cleanup()
-		return unavailable("no context file could be written")
+		return func() {}
 	}
 	if err := ensureContextMountPoint(s.workDirHost, s.logsWriter); err != nil {
 		cleanup()
-		return unavailable(err.Error())
+		io.WriteString(s.logsWriter, fmt.Sprintf("Review stage: deployment context unavailable (%s) — the deploy readiness pass reads /work/context as the Task left it, and deploy requirements get no links\n", err))
+		return func() {}
 	}
 	s.contextCopyDir = dir
 	io.WriteString(s.logsWriter, fmt.Sprintf("Review stage: %d deployment context file(s) mounted read-only at /work/context for every review round\n", written))
-	return cleanup
+	return func() {
+		cleanup()
+		s.contextCopyDir = ""
+	}
+}
+
+// writeContextCopy fetches the org's context and writes it into a fresh
+// temporary directory beside workDirHost named by pattern — the Review and QA
+// stages' read-only copy. It returns the directory, how many files were
+// written and a function removing it, or the reason there is no copy.
+func writeContextCopy(ctx commandUtils.TaskJobContext, workDirHost, pattern string, logsWriter io.Writer) (string, int, func(), string) {
+	if workDirHost == "" {
+		return "", 0, nil, "no work directory"
+	}
+	// Never a catalog rebuild: the Step's own MaterializeContext already
+	// asked for one when it was due.
+	files, err := getContextClient().MaterializeContext(ctx.OrganizationID, nil, false)
+	if err != nil {
+		return "", 0, nil, err.Error()
+	}
+	if len(files) == 0 {
+		return "", 0, nil, "no context has been built"
+	}
+	base := strings.TrimRight(workDirHost, "/")
+	dir, err := os.MkdirTemp(filepath.Dir(base), pattern)
+	if err != nil {
+		return "", 0, nil, err.Error()
+	}
+	cleanup := func() { _ = os.RemoveAll(dir) }
+	written, err := writeContextFiles(dir, files, logsWriter)
+	if err != nil {
+		cleanup()
+		return "", 0, nil, err.Error()
+	}
+	if written == 0 {
+		cleanup()
+		return "", 0, nil, "no context file could be written"
+	}
+	return dir, written, cleanup, ""
 }
 
 // ensureContextMountPoint makes <workDirHost>/context a real directory owned
