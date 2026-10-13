@@ -8,11 +8,11 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/enums/commands_enums"
 )
 
-func TestRunVerifyStageReturnsTheParametersUnchanged(t *testing.T) {
+func TestRunQAStageReturnsTheParametersUnchanged(t *testing.T) {
 	parameters := map[string]interface{}{"1": "a", "2": int64(3)}
 	want := map[string]interface{}{"1": "a", "2": int64(3)}
 	var logs bytes.Buffer
-	got, err := (&RunVerifyStage{}).Run(parameters, &logs)
+	got, err := (&RunQAStage{}).Run(parameters, &logs)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -24,12 +24,12 @@ func TestRunVerifyStageReturnsTheParametersUnchanged(t *testing.T) {
 	}
 }
 
-func TestGetMapsRunVerifyStage(t *testing.T) {
-	cmd, err := Get(commands_enums.RunVerifyStage)
+func TestGetMapsRunQAStage(t *testing.T) {
+	cmd, err := Get(commands_enums.RunQAStage)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := cmd.(*RunVerifyStage); !ok {
-		t.Errorf("Get(RunVerifyStage) = %T, want *RunVerifyStage", cmd)
+	if _, ok := cmd.(*RunQAStage); !ok {
+		t.Errorf("Get(RunQAStage) = %T, want *RunQAStage", cmd)
 	}
 }
