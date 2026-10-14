@@ -12,7 +12,7 @@ func TestPlanModePromptHasSpecSelfCheck(t *testing.T) {
 		"Values are written out.",
 		"Names exist.",
 		"User-facing text is true in every state.",
-		"Every acceptance criterion is decidable.",
+		"4. Every acceptance criterion is an observable outcome.",
 		"Scope is explicit.",
 		"Edge cases are decided.",
 		"It is consistent.",
@@ -33,5 +33,28 @@ func TestPlanModePromptHasSpecSelfCheck(t *testing.T) {
 	}
 	if !(readiness < check && check < suggestion) {
 		t.Errorf("self-check must follow the readiness paragraph and precede the repo-suggestion paragraph: readiness=%d check=%d suggestion=%d", readiness, check, suggestion)
+	}
+}
+
+func TestPlanModePromptKeepsVerificationOutOfCriteria(t *testing.T) {
+	for _, gone := range []string{
+		"note what should be verified in the spec's acceptance criteria",
+		"verified or prepared for retest in the acceptance criteria",
+		"Every acceptance criterion is decidable.",
+		"say that only a person can check it after deploy",
+	} {
+		if strings.Contains(planModePrompt, gone) {
+			t.Errorf("planModePrompt still contains %q", gone)
+		}
+	}
+	for _, want := range []string{
+		`in the context under a line starting "Verification:"`,
+		`Build, test, grep and "file unchanged" checks are not criteria: they go in the context under "Verification:".`,
+		`put how the findings will be verified or prepared for retest in the context under "Verification:"`,
+		"Don't annotate a criterion with who checks it or how.",
+	} {
+		if !strings.Contains(planModePrompt, want) {
+			t.Errorf("planModePrompt missing %q", want)
+		}
 	}
 }
