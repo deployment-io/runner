@@ -251,8 +251,12 @@ func TestVerifyBrowser_RunsTheRequestedImage(t *testing.T) {
 	}
 	req := verifyRequest()
 	req.ImageRef = jobRef
-	if _, err := v.run(context.Background(), req, nil); err != nil {
+	out, err := v.run(context.Background(), req, nil)
+	if err != nil {
 		t.Fatal(err)
+	}
+	if out.ImageRef != jobRef {
+		t.Errorf("outcome image = %q, want %s", out.ImageRef, jobRef)
 	}
 	if len(asked) != 1 || asked[0] != jobRef {
 		t.Errorf("checked %v, want %s", asked, jobRef)

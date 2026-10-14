@@ -69,15 +69,25 @@ type renderedOutlineEntry struct {
 	Href  string `json:"href,omitempty"`
 }
 
+// renderedViewport is the window size the check used (verify-browser 1.2.0+).
+type renderedViewport struct {
+	Width  int    `json:"width"`
+	Height int    `json:"height"`
+	Preset string `json:"preset,omitempty"`
+	Mobile bool   `json:"mobile"`
+}
+
 // renderedResult is the image's result.json as the agent receives it, plus message.
 type renderedResult struct {
-	SchemaVersion      int                       `json:"schema_version"`
-	Status             string                    `json:"status"`
-	Error              string                    `json:"error,omitempty"`
-	Verdict            string                    `json:"verdict"`
-	Message            string                    `json:"message"`
-	HTTPStatus         int                       `json:"http_status"`
-	FinalURL           string                    `json:"final_url"`
+	SchemaVersion int    `json:"schema_version"`
+	Status        string `json:"status"`
+	Error         string `json:"error,omitempty"`
+	Verdict       string `json:"verdict"`
+	Message       string `json:"message"`
+	HTTPStatus    int    `json:"http_status"`
+	FinalURL      string `json:"final_url"`
+	// Viewport is absent from results before 1.2.0, and then from the reply.
+	Viewport           *renderedViewport         `json:"viewport,omitempty"`
 	Steps              []renderedStepResult      `json:"steps"`
 	Assertions         []renderedAssertionResult `json:"assertions"`
 	PageErrors         []string                  `json:"page_errors"`
@@ -94,8 +104,10 @@ type renderedResult struct {
 }
 
 // renderVerifyBrowserOutcome returns the tool's JSON text and the verdict, or an
-// error that says QA couldn't check the page and why.
-func renderVerifyBrowserOutcome(o VerifyBrowserOutcome) (string, string, error) {
+// error that says QA couldn't check the page and why. wantViewport is whether the
+// agent asked for a window size: a completed result without one is from an image
+// that ignored the request, and is not passed off as seen at that size.
+func renderVerifyBrowserOutcome(o VerifyBrowserOutcome, wantViewport bool) (string, string, error) {
 	switch {
 	case o.TimedOut:
 		return "", "", couldntCheck("the browser did not finish in time and was stopped", o.Output)
@@ -117,12 +129,24 @@ func renderVerifyBrowserOutcome(o VerifyBrowserOutcome) (string, string, error) 
 	case r.Status != "completed" || (r.Verdict != "pass" && r.Verdict != "fail"):
 		return "", "", couldntCheck(fmt.Sprintf("the browser's result has status %q and verdict %q", capChars(r.Status, renderedShortChars), capChars(r.Verdict, renderedShortChars)), o.Output)
 	}
+	if wantViewport && r.Viewport == nil {
+		return "", "", olderImageError(o.ImageRef)
+	}
 	capRenderedResult(&r)
 	text, err := fitRenderedResult(&r)
 	if err != nil {
 		return "", "", err
 	}
 	return text, r.Verdict, nil
+}
+
+// olderImageError is the error for a requested viewport the image ignored.
+func olderImageError(imageRef string) error {
+	browser := "this runner's QA browser"
+	if imageRef != "" {
+		browser += " (" + imageRef + ")"
+	}
+	return fmt.Errorf("%s can't set the window size; it needs %s or later", browser, verifyRenderedViewportImage)
 }
 
 // couldntCheck is the error for a check with no usable result; it carries the tail of
@@ -173,6 +197,9 @@ func capStrings(list []string, n, chars int) []string {
 func capRenderedResult(r *renderedResult) {
 	r.Error = ""
 	r.FinalURL = capChars(r.FinalURL, renderedURLChars)
+	if r.Viewport != nil {
+		r.Viewport.Preset = capChars(r.Viewport.Preset, renderedShortChars)
+	}
 	if len(r.Steps) > verifyRenderedMaxSteps {
 		r.Steps = r.Steps[:verifyRenderedMaxSteps]
 	}
@@ -322,7 +349,19 @@ func renderedSummary(r *renderedResult) string {
 	if n := len(r.Outline); n > 0 {
 		parts = append(parts, "outline: "+countPhrase(n, "entry", "entries"))
 	}
-	return r.Verdict + " — " + strings.Join(parts, "; ")
+	return r.Verdict + viewportPhrase(r.Viewport) + " — " + strings.Join(parts, "; ")
+}
+
+// viewportPhrase is " at 412×839 (mobile)", or "" for a result without a viewport.
+func viewportPhrase(v *renderedViewport) string {
+	if v == nil {
+		return ""
+	}
+	phrase := fmt.Sprintf(" at %d×%d", v.Width, v.Height)
+	if v.Preset != "" {
+		phrase += " (" + v.Preset + ")"
+	}
+	return phrase
 }
 
 func stepsSummary(steps []renderedStepResult) string {
