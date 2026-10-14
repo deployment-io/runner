@@ -411,11 +411,33 @@ func (s *reviewStage) openSentBackEnvValue(round int) (string, error) {
 // alone, because inheriting the implementer's secrets is the silent fallback
 // this function exists to prevent.
 func reviewerParameters(parameters map[string]interface{}) (map[string]interface{}, string) {
-	agentType, err := jobs.GetParameterValue[string](parameters, parameters_enums.ReviewAgentType)
+	return agentViewParameters(parameters, agentViewKeys{
+		agentType: parameters_enums.ReviewAgentType,
+		model:     parameters_enums.ReviewModel,
+		provider:  parameters_enums.ReviewAgentProvider,
+		envVars:   parameters_enums.ReviewAgentEnvVars,
+		role:      "reviewer",
+	})
+}
+
+// agentViewKeys names the four parameters a separate agent run (the reviewer,
+// QA) is stamped with, and how its failure reasons name it.
+type agentViewKeys struct {
+	agentType, model, provider, envVars parameters_enums.Key
+	role                                string
+}
+
+// agentViewParameters is reviewerParameters for any separately-stamped agent:
+// the Job's parameters with AgentType, Model, AgentProvider and AgentEnvVars
+// replaced by keys' own, (nil, "") when keys.agentType is absent. See
+// reviewerParameters for why the Job's own credentials never survive into the
+// view and why a missing provider is a failure naming the model.
+func agentViewParameters(parameters map[string]interface{}, keys agentViewKeys) (map[string]interface{}, string) {
+	agentType, err := jobs.GetParameterValue[string](parameters, keys.agentType)
 	if err != nil || agentType == "" {
 		return nil, ""
 	}
-	model, _ := jobs.GetParameterValue[string](parameters, parameters_enums.ReviewModel)
+	model, _ := jobs.GetParameterValue[string](parameters, keys.model)
 	view := make(map[string]interface{}, len(parameters))
 	for k, v := range parameters {
 		view[k] = v
@@ -424,27 +446,27 @@ func reviewerParameters(parameters map[string]interface{}) (map[string]interface
 	jobs.SetParameterValue[string](view, parameters_enums.Model, model)
 	// The implementer's credential pair NEVER survives into the view, on
 	// either path. On the failure path the view still exists — it names the
-	// reviewer in the failed round's record — and a later caller that spawned
-	// from it without checking the failure would otherwise run the reviewer's
-	// agent on the implementer's secrets and provider.
+	// agent in the failed run's record — and a later caller that spawned
+	// from it without checking the failure would otherwise run that agent on
+	// the implementer's secrets and provider.
 	delete(view, parameterKeyString(parameters_enums.AgentProvider))
 	jobs.SetParameterValue[map[string]string](view, parameters_enums.AgentEnvVars, map[string]string{})
-	provider, err := jobs.GetParameterValue[string](parameters, parameters_enums.ReviewAgentProvider)
+	provider, err := jobs.GetParameterValue[string](parameters, keys.provider)
 	if err != nil || provider == "" {
-		// The view is still returned so the failed round's record names the
-		// reviewer that was supposed to run.
-		return view, fmt.Sprintf("no credentials for the reviewer model %s", model)
+		// The view is still returned so the failed run's record names the
+		// agent that was supposed to run.
+		return view, fmt.Sprintf("no credentials for the %s model %s", keys.role, model)
 	}
 	jobs.SetParameterValue[string](view, parameters_enums.AgentProvider, provider)
 	// An ABSENT bundle is legitimate (Bedrock, strict subscription) and stays
 	// the empty map set above. A PRESENT bundle of the wrong type is a
 	// producer bug, and spawning with no secrets because of it would surface
-	// as an unexplained auth failure inside the review round — so it fails the
-	// round by name instead.
-	if _, present := parameters[parameterKeyString(parameters_enums.ReviewAgentEnvVars)]; present {
-		envVars, err := jobs.GetParameterValue[map[string]string](parameters, parameters_enums.ReviewAgentEnvVars)
+	// as an unexplained auth failure inside the run — so it fails the run by
+	// name instead.
+	if _, present := parameters[parameterKeyString(keys.envVars)]; present {
+		envVars, err := jobs.GetParameterValue[map[string]string](parameters, keys.envVars)
 		if err != nil {
-			return view, fmt.Sprintf("the credentials for the reviewer model %s could not be read: %s", model, err)
+			return view, fmt.Sprintf("the credentials for the %s model %s could not be read: %s", keys.role, model, err)
 		}
 		jobs.SetParameterValue[map[string]string](view, parameters_enums.AgentEnvVars, envVars)
 	}
@@ -769,7 +791,7 @@ func (s *reviewStage) runMustFixRound(mustFix []reviewFindingOutput) error {
 	// The description as it stands: the implement run's, or the last kept fix
 	// run's. Read from the Job's real parameter map, where both were merged.
 	description := readAgentSummaryFromJobOutput(s.parameters)
-	env = applyMustFixEnv(env, buildMustFixPrompt(stepPrompt, description, mustFix))
+	env = applyMustFixEnv(env, s.fixRunPrompt(stepPrompt, description, mustFix))
 	// A fix run is an implement run, so it gets the implement run's tool
 	// channel. Without it an agent asked to fix a finding in code that
 	// deploys a preview loses the tools the original run used to do that work
@@ -789,15 +811,17 @@ func (s *reviewStage) runMustFixRound(mustFix []reviewFindingOutput) error {
 		return err
 	}
 
-	// Every finding here was sent back; only the MustFix ones hold the pull
-	// request if they survive the loop, so the count says which is which.
-	holding := 0
-	for _, f := range mustFix {
-		if f.MustFix {
-			holding++
+	if s.fixPrompt == nil {
+		// Every finding here was sent back; only the MustFix ones hold the pull
+		// request if they survive the loop, so the count says which is which.
+		holding := 0
+		for _, f := range mustFix {
+			if f.MustFix {
+				holding++
+			}
 		}
+		io.WriteString(s.logsWriter, fmt.Sprintf("Routing %d finding(s) back to the implementer (%d must-fix)\n", len(mustFix), holding))
 	}
-	io.WriteString(s.logsWriter, fmt.Sprintf("Routing %d finding(s) back to the implementer (%d must-fix)\n", len(mustFix), holding))
 	impl := &RunAgentStep{stopSignal: s.stopSignal, progressSink: s.progressSink}
 	result, err := impl.spawnAgentboxAndWait(s.fixSpawnSpec(imageRef, workDirHost, env, previewDeps), s.logsWriter)
 	if err := recordFailedFixRun(s.parameters, result, err, s.logsWriter); err != nil {
@@ -808,6 +832,15 @@ func (s *reviewStage) runMustFixRound(mustFix []reviewFindingOutput) error {
 	// tell. See keepFixResult and declineFixResult.
 	s.finishedFix = &result
 	return nil
+}
+
+// fixRunPrompt is the fix run's STEP_PROMPT: the stage's own fixPrompt when it
+// set one (the QA stage's), buildMustFixPrompt otherwise.
+func (s *reviewStage) fixRunPrompt(stepPrompt, description string, mustFix []reviewFindingOutput) string {
+	if s.fixPrompt != nil {
+		return s.fixPrompt(stepPrompt, description)
+	}
+	return buildMustFixPrompt(stepPrompt, description, mustFix)
 }
 
 // fixSpawnSpec is a fix run's container configuration. A fix run is an
@@ -890,7 +923,7 @@ func fixRunOutcome(result agentResult, logsWriter io.Writer) error {
 // phase RunAgentStep runs.
 //
 // IT USUALLY DOES NOTHING. RunAgentStep now leaves its cache volume in place for
-// the stage (keepCacheVolumeForReview), and the stage starts with vendored set
+// the rest of the Step (keepCacheVolumeForStep), and the stage starts with vendored set
 // from whether that volume was still there — so the fix run mounts the shelf the
 // implement run built, compiler cache included, and builds incrementally. It is
 // the FALLBACK that vendors: a volume that was gone when the stage started, an

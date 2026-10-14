@@ -308,16 +308,16 @@ func (rs *RunAgentStep) Run(parameters map[string]interface{}, logsWriter io.Wri
 	if err := createCacheVolume(cacheVolume); err != nil {
 		return parameters, fmt.Errorf("error creating cache volume: %s", err)
 	}
-	// IT OUTLIVES THIS RUN WHEN A REVIEW STAGE FOLLOWS IT — see
-	// keepCacheVolumeForReview. The volume holds the vendored dependencies AND
-	// the compiler's own cache (agentbox points GOCACHE at it), so removing it
-	// here made every fix run compile the project from scratch and left the
-	// first review round with nothing vendored at all: a reviewer that ran a
-	// build on a repository with private modules failed on blocked github.com
-	// fetches. The Review stage then owns the removal, on every path out of it.
+	// IT OUTLIVES THIS RUN WHEN THE RUN SUCCEEDS — see keepCacheVolumeForStep.
+	// The volume holds the vendored dependencies AND the compiler's own cache
+	// (agentbox points GOCACHE at it), so removing it here made every fix run
+	// compile the project from scratch and left the first review round with
+	// nothing vendored at all: a reviewer that ran a build on a repository with
+	// private modules failed on blocked github.com fetches. MarkStepDone removes
+	// it when the Step ends, however it ends.
 	defer func() {
-		if keepCacheVolumeForReview(err, parameters) {
-			io.WriteString(logsWriter, "Leaving the Step's dependency cache in place for the Review stage\n")
+		if keepCacheVolumeForStep(err) {
+			io.WriteString(logsWriter, "Leaving the Step's dependency cache in place for the rest of the Step\n")
 			return
 		}
 		removeCacheVolume(cacheVolume)
@@ -1238,6 +1238,9 @@ type agentResult struct {
 	// the Job, because an agent that could assert it could wave its own
 	// findings through.
 	ReviewResult *reviewResult `json:"review_result,omitempty"`
+	// QAResult is what a qa-mode run reported (agentbox 1.9.32+). Nil for any
+	// other run, and for an image that predates QA mode.
+	QAResult *qaResult `json:"qa_result,omitempty"`
 }
 
 // reviewResult mirrors agentbox's result.json review_result object — a
@@ -1789,6 +1792,9 @@ const (
 	usageStageImplement usageStage = "implement"
 	// usageStageReview is every review round and the shadow review.
 	usageStageReview usageStage = "review"
+	// usageStageQA is every QA round. A fix run QA sent back is the
+	// implementer's, and the review round after it the reviewer's.
+	usageStageQA usageStage = "qa"
 )
 
 // accumulateStageUsage adds one run's tokens and resolved cost to its stage.
@@ -1807,6 +1813,8 @@ func accumulateStageUsage(prev *usageOutput, stage usageStage, provider llm_prov
 		slot = &next.Implement
 	case usageStageReview:
 		slot = &next.Review
+	case usageStageQA:
+		slot = &next.QA
 	default:
 		return prev
 	}
@@ -2179,26 +2187,16 @@ func cacheVolumeExists(name string) bool {
 	return err == nil
 }
 
-// keepCacheVolumeForReview reports whether the per-Step cache volume must
-// survive the implement run: only when that run SUCCEEDED and a Review stage
-// follows it in this same Step Job.
+// keepCacheVolumeForStep reports whether the per-Step cache volume must
+// survive the implement run: whenever that run SUCCEEDED, because a later
+// command of the same Step may build against it — a review round, a fix run the
+// review or QA sends back. MarkStepDone removes it when the Step ends, on every
+// path, so keeping it never leaks it.
 //
-// Both halves matter. A run that failed or was stopped is the end of the Step,
-// so nothing later needs the cache and leaving it would leak a volume nothing
-// collects. A Task whose review is Off runs no stage that could remove one —
-// and neither does a Job created before the stage existed, which carries no
-// participation parameter at all and reads as Off. The resolved participation
-// and the Job's command list are stamped together at Job creation, so an On here
-// means the stage really is next in the chain.
-//
-// Participation is read with the log discarded: RunReviewStage reads the same
-// parameter a moment later and logs whatever is wrong with it, and a warning
-// printed twice reads as two problems.
-func keepCacheVolumeForReview(runErr error, parameters map[string]interface{}) bool {
-	if runErr != nil {
-		return false
-	}
-	return readReviewParticipation(parameters, io.Discard) != participationOff
+// A run that failed or was stopped is the end of the Step, so nothing later
+// needs the cache; it is removed at once.
+func keepCacheVolumeForStep(runErr error) bool {
+	return runErr == nil
 }
 
 // removeCacheVolume best-effort deletes the per-Step cache volume. Called

@@ -473,6 +473,11 @@ type jobOutputData struct {
 	// end. Nil when the stage did not run (participation Off, or a runner
 	// older than the stage).
 	Review *reviewOutput `json:"review,omitempty"`
+	// QA is the QA stage's record: the gate's outcome or every QA round, and
+	// the one fix round it may have sent back. Advisory — it never holds the
+	// pull request. Nil when the stage did not run, or found no changed
+	// repository.
+	QA *qaOutput `json:"qa,omitempty"`
 	// Cost is what the run cost, RESOLVED ONCE HERE and never recomputed.
 	//
 	// Deliberately outside Agent: that block is agentbox's result.json passed
@@ -493,6 +498,7 @@ type jobOutputData struct {
 type usageOutput struct {
 	Implement *stageUsageOutput `json:"implement,omitempty"`
 	Review    *stageUsageOutput `json:"review,omitempty"`
+	QA        *stageUsageOutput `json:"qa,omitempty"`
 }
 
 // stageUsageOutput is one stage's tokens and cost. USD is absent while no run

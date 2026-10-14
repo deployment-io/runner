@@ -145,11 +145,6 @@ func (rs *RunReviewStage) Run(parameters map[string]interface{}, logsWriter io.W
 	if err := ensureAgentboxImage(imageRef); err != nil {
 		return parameters, fmt.Errorf("error pulling agentbox image: %s", err)
 	}
-	// Nothing between here and stage.run() returns early, which is what makes the
-	// stage's own defer the single owner of the cache volume below. This parse is
-	// the exception, and it reads the very parameters RunAgentStep parsed a
-	// moment ago from the same map — a Step that fails here never had an
-	// implement run to leave a volume behind.
 	ctx, err := commandUtils.ParseTaskJobContext(parameters)
 	if err != nil {
 		return parameters, err
@@ -207,7 +202,8 @@ func (rs *RunReviewStage) Run(parameters map[string]interface{}, logsWriter io.W
 // (a reviewer on a repository with private modules failed on blocked github.com
 // fetches) and every fix run from compiling the project from scratch (one cold
 // build outlived the fix agent's tool timeout and cost it four minutes). From
-// here the stage owns the volume and removes it on every path out of run().
+// The volume is the Step's, not the stage's: MarkStepDone removes it when the
+// Step ends, so the QA stage after this one can build against it too.
 //
 // A MISSING volume is the fallback: an implement run from an older runner, or one
 // whose volume something else collected. It is created empty and the first fix
@@ -237,8 +233,8 @@ type reviewStage struct {
 	// directories are named after.
 	workDirHost string
 	// cacheVolume is the per-Step dependency cache the implement run left in
-	// place, and the stage's to remove: releaseCacheVolume drops it once, on
-	// every path out of run(). Empty in a test that never mounts one.
+	// place. The Step's, not the stage's: MarkStepDone removes it. Empty in a
+	// test that never mounts one.
 	cacheVolume string
 	// reviewerParams is the parameter view REVIEW rounds run under — see
 	// reviewerParameters. Nil when the Job names no reviewer, which is what
@@ -296,9 +292,6 @@ type reviewStage struct {
 	// See ensureVendoredCache: at most one vendor phase per stage, and none at
 	// all when the implement run's cache survived.
 	vendored bool
-	// cacheReleased guards releaseCacheVolume, so the volume is removed once
-	// however many times the stage's paths out overlap.
-	cacheReleased bool
 	// openSentBack carries the previous round's SENT-BACK findings — must-fix
 	// or not — keyed by finding key, so the next round can be classified as
 	// fixed / still open / new rather than as an undifferentiated list. Each
@@ -352,34 +345,21 @@ type reviewStage struct {
 	fixTreesTmpRoot string
 	fixTreesGit     string
 
-	// The two container runs, the two halves of the fix run's undo and the
-	// cache volume's removal, all injectable so the loop's own decisions can be
+	// The two container runs and the two halves of the fix run's undo, all
+	// injectable so the loop's own decisions can be
 	// tested without a Docker daemon and without root. Nil means the real
 	// thing. runShadow is the shadow review's run, handed the environment it
 	// would be spawned with.
-	runReview   func(round int) (agentResult, error)
-	runFix      func(mustFix []reviewFindingOutput) error
-	runShadow   func(env []string) (agentResult, error)
-	copyTree    copyTreeFunc
-	restoreDir  restoreDirFunc
-	removeCache func(name string)
-}
+	// fixPrompt, when set, builds the fix run's prompt in place of
+	// buildMustFixPrompt — the QA stage's fix run, which sends back failed
+	// acceptance criteria rather than findings. Nil for the Review stage.
+	fixPrompt func(stepPrompt, description string) string
 
-// releaseCacheVolume removes the Step's dependency cache. Deferred at the top
-// of run(), so it happens EXACTLY ONCE on every path out of the stage — a
-// finished loop, a failed or skipped review, a user stop, and a fix round that
-// was rolled back — and never while a later run in the same Step still needs
-// what is on it.
-func (s *reviewStage) releaseCacheVolume() {
-	if s.cacheVolume == "" || s.cacheReleased {
-		return
-	}
-	s.cacheReleased = true
-	remove := s.removeCache
-	if remove == nil {
-		remove = removeCacheVolume
-	}
-	remove(s.cacheVolume)
+	runReview  func(round int) (agentResult, error)
+	runFix     func(mustFix []reviewFindingOutput) error
+	runShadow  func(env []string) (agentResult, error)
+	copyTree   copyTreeFunc
+	restoreDir restoreDirFunc
 }
 
 func (s *reviewStage) reviewRound(round int) (agentResult, error) {
@@ -404,9 +384,6 @@ func (s *reviewStage) fixRound(mustFix []reviewFindingOutput) error {
 // must reach the outer loop's stop path, and a restore that did not work — see
 // attemptFix.
 func (s *reviewStage) run() (map[string]interface{}, error) {
-	// The Step's dependency cache is the stage's to remove, however the stage
-	// ends — see releaseCacheVolume.
-	defer s.releaseCacheVolume()
 	if len(s.baseCommits) == 0 {
 		// No baseline means no diff, and a review of no diff would report a
 		// clean bill of health for work it never saw. Record that and let the
@@ -619,6 +596,10 @@ func (s *reviewStage) attemptFix(round int, mustFix []reviewFindingOutput) (bool
 		return false, fmt.Errorf("error restoring the change after fix round %d failed (%s): %s", round, fixErr, err)
 	}
 	s.fixError = fixErr.Error()
+	if s.fixPrompt != nil {
+		io.WriteString(s.logsWriter, fmt.Sprintf("The change is back to exactly what it was before fix round %d\n", round))
+		return false, nil
+	}
 	io.WriteString(s.logsWriter, fmt.Sprintf("Review stage: the change is back to exactly what it was before fix round %d — %d sent-back finding(s) go to a human on the pull request\n", round, len(mustFix)))
 	return false, nil
 }

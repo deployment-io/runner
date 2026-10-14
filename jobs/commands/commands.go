@@ -105,7 +105,7 @@ func isPreview(parameters map[string]interface{}) bool {
 // RunTaskStep.OnCompletion* hooks in deployment-server (fired from
 // MarkCompleteV1 after the Job result arrives), not from here.
 //
-// Removes /tmp/<orgID>/<taskID>/ — the per-Task base under which all
+// Removes the Step's dependency cache volume, and /tmp/<orgID>/<taskID>/ — the per-Task base under which all
 // per-repo subdirs (<idx>-<name>) for this Step Job live. The whole base
 // is removable per Step Job because each Step Job re-clones via
 // CheckoutRepo from origin; nothing on disk needs to persist between
@@ -125,9 +125,19 @@ func MarkStepDone(parameters map[string]interface{}, err error) <-chan struct{} 
 			return
 		}
 		os.RemoveAll(utils.GetTaskRepositoriesBaseDir(orgID, taskID))
+		// The Step's dependency cache lives until the Step ends — RunAgentStep
+		// leaves it for the review and QA stages — so it goes here, on every
+		// exit. Best-effort: a leaked volume is reclaimed by the startup sweep.
+		if stepIndex, err := jobs.GetParameterValue[int64](parameters, parameters_enums.StepIndex); err == nil {
+			removeStepCacheVolume(cacheVolumeName(utils.TaskJobContext{TaskID: taskID, StepIndex: stepIndex}))
+		}
 	}()
 	return done
 }
+
+// removeStepCacheVolume removes the Step's cache volume when the Step ends. A
+// var so tests can observe it without a Docker daemon.
+var removeStepCacheVolume = removeCacheVolume
 
 func MarkDeploymentDone(parameters map[string]interface{}, err error) <-chan struct{} {
 	done := make(chan struct{})

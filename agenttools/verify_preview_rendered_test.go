@@ -460,3 +460,112 @@ func TestPreviewRecord_Hosts(t *testing.T) {
 		t.Fatal("nil record has hosts")
 	}
 }
+
+// withOutline adds an outline of n entries, each with text and href of the given rune
+// counts, to a result.
+func withOutline(t *testing.T, result []byte, n, textChars, hrefChars int) []byte {
+	t.Helper()
+	var m map[string]any
+	if err := json.Unmarshal(result, &m); err != nil {
+		t.Fatal(err)
+	}
+	outline := make([]map[string]any, n)
+	for i := range outline {
+		outline[i] = map[string]any{"kind": "link", "text": strings.Repeat("x", textChars),
+			"href": "https://d111.cloudfront.net/" + strings.Repeat("h", hrefChars)}
+	}
+	outline[0] = map[string]any{"kind": "heading", "text": strings.Repeat("x", textChars), "level": 1}
+	m["outline"] = outline
+	b, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+func renderOutcome(t *testing.T, result []byte) (string, renderedResult) {
+	t.Helper()
+	text, _, err := renderVerifyBrowserOutcome(VerifyBrowserOutcome{Result: result})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(text) > verifyRenderedMaxResultBytes {
+		t.Fatalf("result is %d bytes, cap %d", len(text), verifyRenderedMaxResultBytes)
+	}
+	var r renderedResult
+	if err := json.Unmarshal([]byte(text), &r); err != nil {
+		t.Fatal(err)
+	}
+	return text, r
+}
+
+func TestRenderVerifyBrowserOutcome_OutlinePassesThroughCapped(t *testing.T) {
+	// Short entries, so the result fits; entry 1 is long and gets cut.
+	res := withOutline(t, passResult(), 61, 10, 10)
+	res = bytes.Replace(res, []byte(`"href":"https://d111.cloudfront.net/hhhhhhhhhh","kind":"link","text":"xxxxxxxxxx"`),
+		[]byte(`"href":"https://d111.cloudfront.net/`+strings.Repeat("h", 1000)+`","kind":"link","text":"`+strings.Repeat("x", 200)+`"`), 1)
+	_, r := renderOutcome(t, res)
+	if len(r.Outline) != 60 {
+		t.Fatalf("outline has %d entries, want 60", len(r.Outline))
+	}
+	h := r.Outline[0]
+	if h.Kind != "heading" || h.Level == nil || *h.Level != 1 || h.Href != "" {
+		t.Errorf("heading entry = %+v", h)
+	}
+	if r.Outline[1].Level != nil {
+		t.Errorf("link entry got a level")
+	}
+	if n := utf8.RuneCountInString(r.Outline[1].Text); n != 120 {
+		t.Errorf("text chars = %d, want 120", n)
+	}
+	if n := utf8.RuneCountInString(r.Outline[1].Href); n != 500 {
+		t.Errorf("href chars = %d, want 500", n)
+	}
+	if r.Truncated {
+		t.Errorf("capped outline needed shortening")
+	}
+	if !strings.HasSuffix(r.Message, "; outline: 60 entries") {
+		t.Errorf("message = %q", r.Message)
+	}
+}
+
+func TestRenderVerifyBrowserOutcome_OutlineHalvedBeforeDOMText(t *testing.T) {
+	var m map[string]any
+	_ = json.Unmarshal(passResult(), &m)
+	m["dom_text_snippet"] = strings.Repeat("t", 1000)
+	res, _ := json.Marshal(m)
+	// 60 entries of ~650 bytes don't fit; 15 do.
+	_, r := renderOutcome(t, withOutline(t, res, 60, 120, 600))
+	if !r.Truncated {
+		t.Errorf("not marked truncated")
+	}
+	if len(r.Outline) == 0 || len(r.Outline) >= 60 {
+		t.Errorf("outline has %d entries, want halved", len(r.Outline))
+	}
+	if n := utf8.RuneCountInString(r.DOMTextSnippet); n != 1000 {
+		t.Errorf("dom_text_snippet cut to %d chars though halving the outline sufficed", n)
+	}
+	if !strings.Contains(r.Message, "outline: 60 entries") {
+		t.Errorf("message = %q", r.Message)
+	}
+}
+
+func TestRenderVerifyBrowserOutcome_OutlineDropped(t *testing.T) {
+	text, r := renderOutcome(t, withOutline(t, bigResult(), 60, 120, 600))
+	if strings.Contains(text, `"outline"`) {
+		t.Errorf("outline kept in an oversized result")
+	}
+	if !r.Truncated {
+		t.Errorf("not marked truncated")
+	}
+}
+
+func TestRenderVerifyBrowserOutcome_NoOutlineFor100(t *testing.T) {
+	text, r := renderOutcome(t, passResult())
+	if strings.Contains(text, `"outline"`) {
+		t.Errorf("1.0.0 result got an outline: %s", text)
+	}
+	if strings.Contains(r.Message, "outline") {
+		t.Errorf("message = %q", r.Message)
+	}
+}

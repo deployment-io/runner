@@ -22,32 +22,40 @@ import (
 // with private modules failed on blocked github.com fetches — and every fix run
 // compiled the project from scratch after the stage vendored again.
 
-// The implement run hands the volume on ONLY when a review will actually use it,
-// and only when the Step got that far. Anything else and the run that created it
-// removes it, or a Step leaks a volume nothing collects.
-func TestTheImplementRunKeepsItsCacheVolumeOnlyForAReviewThatFollows(t *testing.T) {
+// The implement run hands the volume on whenever it succeeded — review On,
+// Advisory or Off alike, since the QA stage may build against it too — and
+// removes it itself only when the Step ends with it.
+func TestTheImplementRunKeepsItsCacheVolumeWheneverItSucceeded(t *testing.T) {
 	for _, tc := range []struct {
-		name          string
-		runErr        error
-		participation int64
-		want          bool
+		name   string
+		runErr error
+		want   bool
 	}{
-		{"review is on and the run succeeded", nil, participationOn, true},
-		{"review is advisory and the run succeeded", nil, participationAdvisory, true},
-		{"review is off", nil, participationOff, false},
-		{"the Job predates the review stage", nil, 0, false},
-		{"the implement run failed", errors.New("agent step did not succeed"), participationOn, false},
-		{"the implement run was stopped", types.ErrJobStoppedByUser, participationOn, false},
+		{"the run succeeded", nil, true},
+		{"the implement run failed", errors.New("agent step did not succeed"), false},
+		{"the implement run was stopped", types.ErrJobStoppedByUser, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			parameters := map[string]interface{}{}
-			if tc.participation != 0 {
-				jobs.SetParameterValue[int64](parameters, parameters_enums.ReviewParticipation, tc.participation)
-			}
-			if got := keepCacheVolumeForReview(tc.runErr, parameters); got != tc.want {
-				t.Errorf("keepCacheVolumeForReview = %t, want %t", got, tc.want)
+			if got := keepCacheVolumeForStep(tc.runErr); got != tc.want {
+				t.Errorf("keepCacheVolumeForStep = %t, want %t", got, tc.want)
 			}
 		})
+	}
+}
+
+// MarkStepDone removes the Step's cache volume on every exit, by the Step's own
+// name.
+func TestMarkStepDoneRemovesTheStepsCacheVolume(t *testing.T) {
+	var removed []string
+	defer func(prev func(string)) { removeStepCacheVolume = prev }(removeStepCacheVolume)
+	removeStepCacheVolume = func(name string) { removed = append(removed, name) }
+	parameters := map[string]interface{}{}
+	jobs.SetParameterValue[string](parameters, parameters_enums.OrganizationIDNamespace, "org-cache-test")
+	jobs.SetParameterValue[string](parameters, parameters_enums.TaskID, "task-1")
+	jobs.SetParameterValue[int64](parameters, parameters_enums.StepIndex, 3)
+	<-MarkStepDone(parameters, nil)
+	if len(removed) != 1 || removed[0] != "agentbox-cache-task-1-3" {
+		t.Errorf("MarkStepDone removed %v, want the Step's cache volume once", removed)
 	}
 }
 
@@ -101,10 +109,9 @@ func TestTheStageAdoptsTheCacheVolumeTheImplementRunLeft(t *testing.T) {
 	}
 }
 
-// The stage owns the volume from the moment it starts, so it removes it EXACTLY
-// ONCE however the stage ends — and never while a later run in the same Step
-// still needs what is on it.
-func TestTheStageRemovesTheCacheVolumeExactlyOnceHoweverItEnds(t *testing.T) {
+// The volume is the Step's, not the stage's: however the review stage ends, it
+// leaves the volume for the QA stage, and MarkStepDone removes it.
+func TestTheStageNeverRemovesTheCacheVolume(t *testing.T) {
 	const volume = "agentbox-cache-task-1-0"
 	for _, tc := range []struct {
 		name    string
@@ -167,7 +174,8 @@ func TestTheStageRemovesTheCacheVolumeExactlyOnceHoweverItEnds(t *testing.T) {
 			stage := fixLoopStage(workDir, io.Discard)
 			var removed []string
 			stage.cacheVolume = volume
-			stage.removeCache = func(name string) { removed = append(removed, name) }
+			defer func(prev func(string)) { removeStepCacheVolume = prev }(removeStepCacheVolume)
+			removeStepCacheVolume = func(name string) { removed = append(removed, name) }
 			tc.arrange(t, stage, repoDir, &removed)
 
 			_, err := stage.run()
@@ -177,8 +185,8 @@ func TestTheStageRemovesTheCacheVolumeExactlyOnceHoweverItEnds(t *testing.T) {
 			if tc.wantErr != nil && !errors.Is(err, tc.wantErr) {
 				t.Fatalf("run returned %v, want %v", err, tc.wantErr)
 			}
-			if len(removed) != 1 || removed[0] != volume {
-				t.Errorf("the stage removed %v, want the Step's cache volume exactly once", removed)
+			if len(removed) != 0 {
+				t.Errorf("the stage removed %v, want the cache volume left for the rest of the Step", removed)
 			}
 		})
 	}
