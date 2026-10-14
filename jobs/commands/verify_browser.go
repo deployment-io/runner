@@ -178,6 +178,7 @@ func (v *verifyBrowser) run(ctx context.Context, req agenttools.VerifyBrowserReq
 		return agenttools.VerifyBrowserOutcome{}, err
 	}
 	return agenttools.VerifyBrowserOutcome{
+		ImageRef:  ref,
 		Result:    readVerifyBrowserResult(filepath.Join(ioDir, "result.json")),
 		Output:    exit.output,
 		ExitCode:  exit.exitCode,

@@ -261,7 +261,7 @@ func TestVerifyRendered_CallLimit(t *testing.T) {
 	}
 	_, err := call(t, tool, `{"url":"`+renderedPreview+`"}`)
 	if err == nil || !strings.Contains(err.Error(), "report what you have found") {
-		t.Fatalf("21st call: err = %v", err)
+		t.Fatalf("call %d: err = %v", verifyRenderedMaxCalls+1, err)
 	}
 	if len(fb.requests) != verifyRenderedMaxCalls-1 {
 		t.Fatalf("browser ran %d times", len(fb.requests))
@@ -396,7 +396,7 @@ func TestRenderVerifyBrowserOutcome_Caps(t *testing.T) {
 }
 
 func TestRenderVerifyBrowserOutcome_SizeCap(t *testing.T) {
-	text, verdict, err := renderVerifyBrowserOutcome(VerifyBrowserOutcome{Result: bigResult()})
+	text, verdict, err := renderVerifyBrowserOutcome(VerifyBrowserOutcome{Result: bigResult()}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -423,7 +423,7 @@ func TestRenderVerifyBrowserOutcome_Summary(t *testing.T) {
 		"steps":[{"index":0,"action":"click","ok":true},{"index":1,"action":"wait_for","ok":false,"error":"Timeout"}],
 		"page_errors":["TypeError: x"],"failed_requests":[{"url":"https://d111.cloudfront.net/a.json","method":"GET","status":404}],
 		"blocked_navigations":["https://evil.example/"]}`
-	text, _, err := renderVerifyBrowserOutcome(VerifyBrowserOutcome{Result: []byte(res)})
+	text, _, err := renderVerifyBrowserOutcome(VerifyBrowserOutcome{Result: []byte(res)}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -485,7 +485,7 @@ func withOutline(t *testing.T, result []byte, n, textChars, hrefChars int) []byt
 
 func renderOutcome(t *testing.T, result []byte) (string, renderedResult) {
 	t.Helper()
-	text, _, err := renderVerifyBrowserOutcome(VerifyBrowserOutcome{Result: result})
+	text, _, err := renderVerifyBrowserOutcome(VerifyBrowserOutcome{Result: result}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -567,5 +567,196 @@ func TestRenderVerifyBrowserOutcome_NoOutlineFor100(t *testing.T) {
 	}
 	if strings.Contains(r.Message, "outline") {
 		t.Errorf("message = %q", r.Message)
+	}
+}
+
+// mobileResult is passResult as a 1.2.0 image reports it for the mobile preset.
+func mobileResult(t *testing.T) []byte {
+	t.Helper()
+	var m map[string]any
+	if err := json.Unmarshal(passResult(), &m); err != nil {
+		t.Fatal(err)
+	}
+	m["viewport"] = map[string]any{"width": 412, "height": 839, "preset": "mobile", "mobile": true}
+	b, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+func TestVerifyRendered_SchemaAndDescriptionMentionViewport(t *testing.T) {
+	var schema struct {
+		Properties map[string]struct {
+			Properties           map[string]json.RawMessage `json:"properties"`
+			AdditionalProperties *bool                      `json:"additionalProperties"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal([]byte(verifyPreviewRenderedInputSchema), &schema); err != nil {
+		t.Fatalf("schema: %v", err)
+	}
+	vp, ok := schema.Properties["viewport"]
+	if !ok {
+		t.Fatal("schema has no viewport")
+	}
+	for _, key := range []string{"preset", "width", "height"} {
+		if _, ok := vp.Properties[key]; !ok {
+			t.Errorf("viewport schema has no %s", key)
+		}
+	}
+	if vp.AdditionalProperties == nil || *vp.AdditionalProperties {
+		t.Error("viewport schema allows other keys")
+	}
+	for _, want := range []string{`"desktop"`, `"tablet"`, `"mobile"`, `"minimum": 320`, `"maximum": 2560`, `"minimum": 480`, `"maximum": 1600`} {
+		if !strings.Contains(verifyPreviewRenderedInputSchema, want) {
+			t.Errorf("schema is missing %s", want)
+		}
+	}
+	for _, want := range []string{"viewport", "1280×720", "712×1138", "412×839", "Galaxy Tab S4", "Pixel 7", "one size", "320–2560", "480–1600", "At most 30 calls"} {
+		if !strings.Contains(verifyPreviewRenderedDescription, want) {
+			t.Errorf("description is missing %q", want)
+		}
+	}
+}
+
+func TestVerifyRendered_ViewportValidation(t *testing.T) {
+	bad := map[string]string{
+		"width 319":      `{"width":319,"height":600}`,
+		"width 2561":     `{"width":2561,"height":600}`,
+		"height 479":     `{"width":800,"height":479}`,
+		"height 1601":    `{"width":800,"height":1601}`,
+		"fractional":     `{"width":800.5,"height":600}`,
+		"string width":   `{"width":"800","height":600}`,
+		"unknown preset": `{"preset":"watch"}`,
+		"preset number":  `{"preset":1}`,
+		"both forms":     `{"preset":"mobile","width":800,"height":600}`,
+		"width alone":    `{"width":800}`,
+		"unknown key":    `{"preset":"mobile","orientation":"landscape"}`,
+		"empty":          `{}`,
+		"not an object":  `"mobile"`,
+		"null":           `null`,
+	}
+	for name, vp := range bad {
+		t.Run(name, func(t *testing.T) {
+			lists := 0
+			record := NewPreviewRecord(func() ([]string, error) { lists++; return nil, nil }, nil)
+			record.AddURL(renderedPreview)
+			fb := &fakeBrowser{}
+			tool, _ := newRenderedTool(record, fb)
+			_, err := call(t, tool, `{"url":"`+renderedPreview+`","viewport":`+vp+`}`)
+			if err == nil || !strings.Contains(err.Error(), "viewport") {
+				t.Fatalf("err = %v, want one naming viewport", err)
+			}
+			if len(fb.requests) != 0 || lists != 0 {
+				t.Fatal("started something before rejecting the viewport")
+			}
+		})
+	}
+	good := map[string]string{
+		`{"preset":"desktop"}`:          `{"preset":"desktop"}`,
+		`{"preset":"tablet"}`:           `{"preset":"tablet"}`,
+		`{"preset":"mobile"}`:           `{"preset":"mobile"}`,
+		`{"width":320,"height":480}`:    `{"width":320,"height":480}`,
+		`{"width":2560,"height":1600}`:  `{"width":2560,"height":1600}`,
+		`{"height":720,"width":1279.0}`: `{"width":1279,"height":720}`,
+	}
+	for vp, want := range good {
+		t.Run(vp, func(t *testing.T) {
+			fb := &fakeBrowser{outcome: VerifyBrowserOutcome{Result: mobileResult(t)}}
+			tool, _ := newRenderedTool(renderedRecord(renderedPreview), fb)
+			if _, err := call(t, tool, `{"url":"`+renderedPreview+`","viewport":`+vp+`}`); err != nil {
+				t.Fatalf("handle: %v", err)
+			}
+			var in map[string]json.RawMessage
+			if err := json.Unmarshal(fb.requests[0].Input, &in); err != nil {
+				t.Fatal(err)
+			}
+			if string(in["viewport"]) != want {
+				t.Fatalf("input.json viewport = %s, want %s", in["viewport"], want)
+			}
+		})
+	}
+}
+
+func TestVerifyRendered_InputHasViewportOnlyWhenGiven(t *testing.T) {
+	for _, args := range []string{`{"url":"` + renderedPreview + `"}`} {
+		fb := &fakeBrowser{outcome: VerifyBrowserOutcome{Result: passResult()}}
+		tool, _ := newRenderedTool(renderedRecord(renderedPreview), fb)
+		if _, err := call(t, tool, args); err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(fb.requests[0].Input), "viewport") {
+			t.Errorf("%s: input.json = %s", args, fb.requests[0].Input)
+		}
+	}
+}
+
+func TestVerifyRendered_ReplyCarriesTheViewport(t *testing.T) {
+	fb := &fakeBrowser{outcome: VerifyBrowserOutcome{Result: mobileResult(t)}}
+	tool, logs := newRenderedTool(renderedRecord(renderedPreview), fb)
+	out, err := call(t, tool, `{"url":"`+renderedPreview+`","viewport":{"preset":"mobile"}}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var res renderedResult
+	if err := json.Unmarshal([]byte(out), &res); err != nil {
+		t.Fatal(err)
+	}
+	if res.Viewport == nil || *res.Viewport != (renderedViewport{Width: 412, Height: 839, Preset: "mobile", Mobile: true}) {
+		t.Errorf("viewport = %+v", res.Viewport)
+	}
+	if res.Message != "pass at 412×839 (mobile) — 1 of 1 assertions passed; no page errors; no failed requests" {
+		t.Errorf("message = %q", res.Message)
+	}
+	if !strings.Contains(logs.String(), "viewport mobile") {
+		t.Errorf("logs = %q", logs.String())
+	}
+}
+
+func TestRenderVerifyBrowserOutcome_CustomAndDefaultViewport(t *testing.T) {
+	custom := bytes.Replace(passResult(), []byte(`"status":"completed",`), []byte(`"status":"completed","viewport":{"width":1279,"height":720,"mobile":false},`), 1)
+	_, r := renderOutcome(t, custom)
+	if !strings.HasPrefix(r.Message, "pass at 1279×720 — ") {
+		t.Errorf("message = %q", r.Message)
+	}
+	// The desktop default, which a 1.2.0 image reports when none was asked for.
+	desktop := bytes.Replace(passResult(), []byte(`"status":"completed",`), []byte(`"status":"completed","viewport":{"width":1280,"height":720,"preset":"desktop","mobile":false},`), 1)
+	text, r := renderOutcome(t, desktop)
+	if !strings.HasPrefix(r.Message, "pass at 1280×720 (desktop) — ") || !strings.Contains(text, `"viewport":{"width":1280,"height":720,"preset":"desktop","mobile":false}`) {
+		t.Errorf("message = %q, reply = %s", r.Message, text)
+	}
+}
+
+func TestVerifyRendered_OlderImageIgnoringTheViewport(t *testing.T) {
+	const ref = "docker.io/deploymenthq/verify-browser:1.1.0"
+	fb := &fakeBrowser{outcome: VerifyBrowserOutcome{ImageRef: ref, Result: passResult()}}
+	tool, _ := newRenderedTool(renderedRecord(renderedPreview), fb)
+	out, err := call(t, tool, `{"url":"`+renderedPreview+`","viewport":{"width":1279,"height":720}}`)
+	want := "this runner's QA browser (" + ref + ") can't set the window size; it needs verify-browser 1.2.0 or later"
+	if err == nil || err.Error() != want {
+		t.Fatalf("out = %q, err = %v\nwant error %q", out, err, want)
+	}
+	// Without a viewport, the same image's result is a normal reply.
+	out, err = call(t, tool, `{"url":"`+renderedPreview+`"}`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var res renderedResult
+	if err := json.Unmarshal([]byte(out), &res); err != nil {
+		t.Fatal(err)
+	}
+	if res.Viewport != nil || strings.Contains(out, "viewport") || res.Message != "pass — 1 of 1 assertions passed; no page errors; no failed requests" {
+		t.Errorf("reply = %s", out)
+	}
+	// An older image's error result is still that error, viewport or not.
+	fb.outcome = VerifyBrowserOutcome{ImageRef: ref, Result: []byte(`{"schema_version":1,"status":"error","error":"the page could not be loaded"}`)}
+	if _, err := call(t, tool, `{"url":"`+renderedPreview+`","viewport":{"preset":"mobile"}}`); err == nil || !strings.Contains(err.Error(), "could not be loaded") {
+		t.Fatalf("err = %v", err)
+	}
+}
+
+func TestVerifyRendered_CallCapAllowsTwoSizesPerPage(t *testing.T) {
+	if verifyRenderedMaxCalls != 30 {
+		t.Fatalf("verifyRenderedMaxCalls = %d, want 30", verifyRenderedMaxCalls)
 	}
 }
