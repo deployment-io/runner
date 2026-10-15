@@ -18,7 +18,7 @@ func (s stubPreviewLister) ListTaskPreviews(string, string) ([]task_previews.Tas
 	return s.previews, s.err
 }
 
-const previewFootnote = "A preview shows the code as of the agent's last deploy to it, which can be earlier than this pull request's final commit. Previews are removed about 72 hours after the Task's last preview deploy, or when the Task is deleted."
+const previewFootnote = "A preview shows the code as of the agent's last deploy to it, which can be earlier than this pull request's final commit. Previews are removed once all of this Task's pull requests are merged or closed, about 72 hours after its last preview deploy, or when the Task is deleted — whichever comes first."
 
 func previewOpener(lister stubPreviewLister) *taskOpenPR {
 	opr := reviewTestOpener(completedReview(false))

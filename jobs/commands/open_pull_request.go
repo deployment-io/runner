@@ -399,7 +399,7 @@ func formatPreviewSection(previews []task_previews.TaskPreviewV1) string {
 		sb.WriteString(fmt.Sprintf("- and %d more under Context → Previews in the dashboard\n", omitted))
 	}
 	sb.WriteString("\nA preview shows the code as of the agent's last deploy to it, which can be earlier than this pull request's final commit. ")
-	sb.WriteString("Previews are removed about 72 hours after the Task's last preview deploy, or when the Task is deleted.\n")
+	sb.WriteString("Previews are removed once all of this Task's pull requests are merged or closed, about 72 hours after its last preview deploy, or when the Task is deleted — whichever comes first.\n")
 	return sb.String()
 }
 
