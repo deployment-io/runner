@@ -228,23 +228,55 @@ type verifyBrowserInput struct {
 	// Viewport is written only when the agent passed one, so an input without it
 	// is exactly what every image before 1.2.0 read.
 	Viewport *verifyRenderedViewport `json:"viewport,omitempty"`
+	// ReadOnly asks the browser to fail every request that isn't GET, HEAD or
+	// OPTIONS and refuse WebSocket, SharedWorker, WebTransport and
+	// RTCPeerConnection, reporting each in blocked_requests
+	// (verify-browser 1.3.0+). Written only for production checks.
+	ReadOnly bool `json:"read_only,omitempty"`
 }
+
+// VerifyBrowserReadOnlyUnsupportedReason is why a production QA run stops when
+// the browser returns a result without blocked_requests: an image older than
+// verify-browser 1.3.0 ignores read_only, so its checks may have changed data.
+const VerifyBrowserReadOnlyUnsupportedReason = "the QA browser doesn't support read-only checks"
 
 // verifyPreviewRendered is the tool's per-agent-run state.
 type verifyPreviewRendered struct {
 	record     *PreviewRecord
 	run        RunVerifyBrowser
 	logsWriter io.Writer
+	// readOnly sends read_only: true on every check; onReadOnlyUnsupported is
+	// told, once, when a result shows the browser ignored it.
+	readOnly              bool
+	onReadOnlyUnsupported func(reason string)
 
 	mu    sync.Mutex
 	calls int
+	// unsupported is set once a read-only check came back without
+	// blocked_requests; every later call is refused.
+	unsupported bool
 }
 
 // RegisterVerifyPreviewRendered registers the verify_preview_rendered tool. record is
 // the agent run's preview record (shared with the other preview tools); run starts the
 // browser container; logsWriter is the Step Job's log writer.
 func RegisterVerifyPreviewRendered(s *agentmcp.Server, record *PreviewRecord, run RunVerifyBrowser, logsWriter io.Writer) {
-	t := &verifyPreviewRendered{record: record, run: run, logsWriter: logsWriter}
+	registerVerifyPreviewRendered(s, &verifyPreviewRendered{record: record, run: run, logsWriter: logsWriter})
+}
+
+// RegisterVerifyPreviewRenderedReadOnly registers verify_preview_rendered for a
+// check of something real (production): every call sends read_only: true to the
+// browser, and a result without blocked_requests — an image that ignored
+// read_only — is refused, reported to onUnsupported (may be nil) with
+// VerifyBrowserReadOnlyUnsupportedReason, and every later call is refused too.
+func RegisterVerifyPreviewRenderedReadOnly(s *agentmcp.Server, record *PreviewRecord, run RunVerifyBrowser, logsWriter io.Writer, onUnsupported func(reason string)) {
+	registerVerifyPreviewRendered(s, &verifyPreviewRendered{
+		record: record, run: run, logsWriter: logsWriter,
+		readOnly: true, onReadOnlyUnsupported: onUnsupported,
+	})
+}
+
+func registerVerifyPreviewRendered(s *agentmcp.Server, t *verifyPreviewRendered) {
 	s.Register(agentmcp.Tool{
 		Name:        "verify_preview_rendered",
 		Description: verifyPreviewRenderedDescription,
@@ -254,6 +286,9 @@ func RegisterVerifyPreviewRendered(s *agentmcp.Server, record *PreviewRecord, ru
 }
 
 func (t *verifyPreviewRendered) handle(ctx context.Context, rawArgs json.RawMessage) (string, error) {
+	if t.isUnsupported() {
+		return "", errors.New("QA couldn't check the page: " + VerifyBrowserReadOnlyUnsupportedReason)
+	}
 	if !t.takeCall() {
 		return "", fmt.Errorf("verify_preview_rendered has already been called %d times in this run, the most allowed — stop checking and report what you have found so far", verifyRenderedMaxCalls)
 	}
@@ -301,6 +336,9 @@ func (t *verifyPreviewRendered) finish(outcome VerifyBrowserOutcome, runErr erro
 		b, _ := json.Marshal(map[string]string{"status": "preparing", "message": verifyRenderedPreparingMessage})
 		return string(b), nil
 	}
+	if t.readOnly && len(outcome.Result) > 0 && !hasBlockedRequests(outcome.Result) {
+		return "", t.readOnlyUnsupported(outcome.ImageRef)
+	}
 	text, verdict, err := renderVerifyBrowserOutcome(outcome, wantViewport)
 	if err != nil {
 		t.logf("verify_preview_rendered: QA couldn't check the page after %.1fs: %s", elapsed.Seconds(), firstLine(err.Error()))
@@ -311,6 +349,42 @@ func (t *verifyPreviewRendered) finish(outcome VerifyBrowserOutcome, runErr erro
 	}
 	t.logf("verify_preview_rendered: %s after %.1fs", verdict, elapsed.Seconds())
 	return text, nil
+}
+
+// hasBlockedRequests reports whether result.json carries blocked_requests,
+// which every verify-browser 1.3.0+ result does. A result that isn't a JSON
+// object is left to renderVerifyBrowserOutcome to report.
+func hasBlockedRequests(result []byte) bool {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(result, &fields); err != nil {
+		return true
+	}
+	raw, ok := fields["blocked_requests"]
+	return ok && string(raw) != "null"
+}
+
+// readOnlyUnsupported records that the browser ignored read_only, tells the
+// run (once) and returns the agent's error.
+func (t *verifyPreviewRendered) readOnlyUnsupported(imageRef string) error {
+	t.mu.Lock()
+	first := !t.unsupported
+	t.unsupported = true
+	t.mu.Unlock()
+	browser := "the QA browser"
+	if imageRef != "" {
+		browser += " (" + imageRef + ")"
+	}
+	t.logf("verify_preview_rendered: %s returned no blocked_requests, so it ignored read_only — stopping the run", browser)
+	if first && t.onReadOnlyUnsupported != nil {
+		t.onReadOnlyUnsupported(VerifyBrowserReadOnlyUnsupportedReason)
+	}
+	return errors.New("QA couldn't check the page: " + VerifyBrowserReadOnlyUnsupportedReason)
+}
+
+func (t *verifyPreviewRendered) isUnsupported() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.unsupported
 }
 
 func (t *verifyPreviewRendered) takeCall() bool {
@@ -550,5 +624,6 @@ func (t *verifyPreviewRendered) buildInput(args verifyRenderedArgs) (verifyBrows
 		Assertions:    assertions,
 		TimeoutMS:     timeout * 1000,
 		Viewport:      args.viewport,
+		ReadOnly:      t.readOnly,
 	}, nil
 }

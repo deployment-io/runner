@@ -335,7 +335,7 @@ func JobMemoryBytes(commandEnums []commands_enums.Type) int64 {
 	}
 	for _, commandEnum := range commandEnums {
 		switch commandEnum {
-		case commands_enums.RunAgentStep:
+		case commands_enums.RunAgentStep, commands_enums.RunProductionQA:
 			bytes, _ := LimitsForAgentContainer()
 			consider(bytes)
 		case commands_enums.RunAssistantSession:

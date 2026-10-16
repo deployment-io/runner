@@ -820,15 +820,8 @@ func (rs *RunAgentStep) spawnAgentboxAndWait(spec agentboxSpawnSpec, logsWriter 
 	// this after the container is removed).
 	if spec.mcpSocketHost != "" {
 		mcpSrv := agentmcp.New("deployment-io-runner", agentMCPServerVersion)
-		agentmcp.RegisterPing(mcpSrv)
-		if spec.previewDeps != nil {
-			// Preview builds still running when the agent run ends are cancelled
-			// and their copies removed.
-			stopPreviewBuilds := agenttools.RegisterDeployStaticSitePreview(mcpSrv, *spec.previewDeps)
-			defer stopPreviewBuilds()
-			agenttools.RegisterVerifyPreviewReachable(mcpSrv, spec.previewDeps.Record, spec.previewDeps.LogsWriter)
-			agenttools.RegisterVerifyPreviewRendered(mcpSrv, spec.previewDeps.Record, spec.previewDeps.VerifyBrowser, spec.previewDeps.LogsWriter)
-		}
+		stopTools := registerAgentTools(mcpSrv, spec)
+		defer stopTools()
 		ln, lerr := mcpSrv.Listen(spec.mcpSocketHost)
 		if lerr != nil {
 			return agentResult{}, fmt.Errorf("error opening agent tool socket: %w", lerr)
@@ -1909,6 +1902,42 @@ type agentboxSpawnSpec struct {
 	// deployment context (see prepareContextCopy). Set by REVIEW spawns only;
 	// a fix run is an implement run and never gets it.
 	readOnlyContextDir string
+	// productionTools, set by a production QA run only, replaces the socket's
+	// tools with its two read-only checks (registerAgentTools); previewDeps is
+	// nil beside it.
+	productionTools *productionQATools
+}
+
+// productionQATools is what a production QA run's tool socket serves: only
+// verify_preview_reachable and verify_preview_rendered, over a record seeded
+// with the production targets, with every rendered check read-only.
+type productionQATools struct {
+	record        *agenttools.PreviewRecord
+	verifyBrowser agenttools.RunVerifyBrowser
+	logsWriter    io.Writer
+	// onReadOnlyUnsupported is told when the browser ignored read_only.
+	onReadOnlyUnsupported func(reason string)
+}
+
+// registerAgentTools registers the tools a spawn's socket serves and returns
+// what stops them. A production QA run gets only its two read-only checks;
+// every other run gets ping and, with previewDeps, the three preview tools.
+func registerAgentTools(mcpSrv *agentmcp.Server, spec agentboxSpawnSpec) func() {
+	if t := spec.productionTools; t != nil {
+		agenttools.RegisterVerifyPreviewReachable(mcpSrv, t.record, t.logsWriter)
+		agenttools.RegisterVerifyPreviewRenderedReadOnly(mcpSrv, t.record, t.verifyBrowser, t.logsWriter, t.onReadOnlyUnsupported)
+		return func() {}
+	}
+	agentmcp.RegisterPing(mcpSrv)
+	if spec.previewDeps == nil {
+		return func() {}
+	}
+	// Preview builds still running when the agent run ends are cancelled
+	// and their copies removed.
+	stopPreviewBuilds := agenttools.RegisterDeployStaticSitePreview(mcpSrv, *spec.previewDeps)
+	agenttools.RegisterVerifyPreviewReachable(mcpSrv, spec.previewDeps.Record, spec.previewDeps.LogsWriter)
+	agenttools.RegisterVerifyPreviewRendered(mcpSrv, spec.previewDeps.Record, spec.previewDeps.VerifyBrowser, spec.previewDeps.LogsWriter)
+	return stopPreviewBuilds
 }
 
 // agentMCPSocketHostPath returns the host path for a task's MCP tool socket: a

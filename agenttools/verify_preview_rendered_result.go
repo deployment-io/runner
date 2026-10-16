@@ -55,6 +55,14 @@ type renderedFailedRequest struct {
 	Failure string `json:"failure"`
 }
 
+// renderedBlockedRequest is one request a read-only check refused
+// (verify-browser 1.3.0+): a method other than GET, HEAD or OPTIONS, or a
+// refused channel (WEBSOCKET, SHAREDWORKER, WEBTRANSPORT, WEBRTC).
+type renderedBlockedRequest struct {
+	URL    string `json:"url"`
+	Method string `json:"method"`
+}
+
 type renderedTimings struct {
 	DOMContentLoaded *int `json:"dom_content_loaded,omitempty"`
 	Load             *int `json:"load,omitempty"`
@@ -94,8 +102,10 @@ type renderedResult struct {
 	ConsoleErrors      []string                  `json:"console_errors"`
 	FailedRequests     []renderedFailedRequest   `json:"failed_requests"`
 	BlockedNavigations []string                  `json:"blocked_navigations"`
-	TimingsMS          renderedTimings           `json:"timings_ms"`
-	DOMTextSnippet     string                    `json:"dom_text_snippet"`
+	// BlockedRequests is present in read-only checks only.
+	BlockedRequests []renderedBlockedRequest `json:"blocked_requests,omitempty"`
+	TimingsMS       renderedTimings          `json:"timings_ms"`
+	DOMTextSnippet  string                   `json:"dom_text_snippet"`
 	// Outline is absent from 1.0.0 results, and then from the reply.
 	Outline []renderedOutlineEntry `json:"outline,omitempty"`
 	// Truncated is set when parts of the result were shortened or dropped to keep
@@ -226,6 +236,14 @@ func capRenderedResult(r *renderedResult) {
 		f.Failure = capChars(f.Failure, renderedDetailChars)
 	}
 	r.BlockedNavigations = capStrings(r.BlockedNavigations, renderedMaxBlocked, renderedURLChars)
+	if len(r.BlockedRequests) > renderedMaxBlocked {
+		r.BlockedRequests = r.BlockedRequests[:renderedMaxBlocked]
+	}
+	for i := range r.BlockedRequests {
+		b := &r.BlockedRequests[i]
+		b.URL = capChars(b.URL, renderedURLChars)
+		b.Method = capChars(b.Method, renderedShortChars)
+	}
 	r.DOMTextSnippet = capChars(r.DOMTextSnippet, renderedDOMTextChars)
 	if len(r.Outline) > renderedMaxOutline {
 		r.Outline = r.Outline[:renderedMaxOutline]
@@ -256,6 +274,9 @@ var renderedShrinks = []func(r *renderedResult){
 	func(r *renderedResult) {
 		r.FinalURL = capChars(r.FinalURL, renderedShrunkURLChars)
 		r.BlockedNavigations = capStrings(r.BlockedNavigations, renderedMaxBlocked, renderedShrunkURLChars)
+		for i := range r.BlockedRequests {
+			r.BlockedRequests[i].URL = capChars(r.BlockedRequests[i].URL, renderedShrunkURLChars)
+		}
 		for i := range r.FailedRequests {
 			r.FailedRequests[i].URL = capChars(r.FailedRequests[i].URL, renderedShrunkURLChars)
 		}
@@ -345,6 +366,9 @@ func renderedSummary(r *renderedResult) string {
 	parts = append(parts, countPhrase(len(r.FailedRequests), "failed request", "failed requests"))
 	if n := len(r.BlockedNavigations); n > 0 {
 		parts = append(parts, countPhrase(n, "blocked navigation", "blocked navigations"))
+	}
+	if n := len(r.BlockedRequests); n > 0 {
+		parts = append(parts, countPhrase(n, "blocked request", "blocked requests"))
 	}
 	if n := len(r.Outline); n > 0 {
 		parts = append(parts, "outline: "+countPhrase(n, "entry", "entries"))
