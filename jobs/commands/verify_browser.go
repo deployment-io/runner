@@ -20,6 +20,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -36,6 +38,16 @@ import (
 // verifyBrowserImage is the verify-browser release this runner uses. Pinned to an
 // exact version; bump it deliberately when a new verify-browser-vX.Y.Z ships.
 const verifyBrowserImage = "docker.io/deploymenthq/verify-browser:1.0.0"
+
+// minReadOnlyVerifyBrowserVersion is the first verify-browser release that
+// honours read_only. A production QA run refuses an older image rather than
+// run it: an older image ignores read_only, so its checks could change data on
+// a real site.
+const minReadOnlyVerifyBrowserVersion = "1.3.0"
+
+// minProductionQAAgentboxVersion is the first agentbox release with the
+// production QA mode (QA_TARGET=production, QA_URLS).
+const minProductionQAAgentboxVersion = "1.9.34"
 
 // verifyBrowserImageEnv overrides both the Job's VerifyBrowserImage and
 // verifyBrowserImage, for developing the image only — it is not a customer
@@ -83,6 +95,60 @@ func verifyBrowserImageRef(jobRef string) string {
 		return jobRef
 	}
 	return verifyBrowserImage
+}
+
+// imageVersionAtLeast reports whether ref's tag is a version (X.Y.Z, an
+// optional leading "v") of at least min. A ref without a tag, or whose tag
+// isn't such a version ("latest", "1.3", "1.3.0-rc1"), is false: a production
+// check can't tell what an unversioned image supports.
+func imageVersionAtLeast(ref, min string) bool {
+	got, ok := imageTagVersion(ref)
+	if !ok {
+		return false
+	}
+	want, ok := parseImageVersion(min)
+	if !ok {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return got[i] > want[i]
+		}
+	}
+	return true
+}
+
+// imageTagVersion parses the version in ref's tag: the text after the last ':'
+// of the last path element, with any @digest removed.
+func imageTagVersion(ref string) ([3]int, bool) {
+	if i := strings.Index(ref, "@"); i >= 0 {
+		ref = ref[:i]
+	}
+	name := ref[strings.LastIndex(ref, "/")+1:]
+	i := strings.LastIndex(name, ":")
+	if i < 0 {
+		return [3]int{}, false
+	}
+	return parseImageVersion(name[i+1:])
+}
+
+func parseImageVersion(tag string) ([3]int, bool) {
+	parts := strings.Split(strings.TrimPrefix(tag, "v"), ".")
+	if len(parts) != 3 {
+		return [3]int{}, false
+	}
+	var v [3]int
+	for i, p := range parts {
+		if p == "" || strings.Trim(p, "0123456789") != "" {
+			return [3]int{}, false
+		}
+		n, err := strconv.Atoi(p)
+		if err != nil {
+			return [3]int{}, false
+		}
+		v[i] = n
+	}
+	return v, true
 }
 
 // verifyBrowserExit is how a verify-browser container ended.

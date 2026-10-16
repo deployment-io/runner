@@ -70,6 +70,11 @@ func (s *Server) Register(t Tool) {
 	s.tools[t.Name] = t
 }
 
+// ToolNames returns the registered tools' names in tools/list order.
+func (s *Server) ToolNames() []string {
+	return append([]string(nil), s.order...)
+}
+
 // Listen creates the Unix socket at socketPath (removing any stale file first)
 // and chmods it 0666 so the container's non-root agent user (UID 1000) can
 // connect through the bind mount — safe because the socket is task-scoped and

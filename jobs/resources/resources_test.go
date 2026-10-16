@@ -232,6 +232,10 @@ func TestJobMemoryBytes(t *testing.T) {
 	if step != agentMem {
 		t.Errorf("task step = %d, want the agent cap %d", step, agentMem)
 	}
+	// A production QA Job runs one agentbox container and nothing else.
+	if got := JobMemoryBytes([]commands_enums.Type{commands_enums.RunProductionQA}); got != agentMem {
+		t.Errorf("production QA = %d, want the agent cap %d", got, agentMem)
+	}
 
 	// A session is sized for analysis, not a build, so it must ask for
 	// materially less than a Step — otherwise one interactive session
