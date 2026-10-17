@@ -37,7 +37,8 @@ import (
 
 // verifyBrowserImage is the verify-browser release this runner uses. Pinned to an
 // exact version; bump it deliberately when a new verify-browser-vX.Y.Z ships.
-const verifyBrowserImage = "docker.io/deploymenthq/verify-browser:1.0.0"
+// 1.3.0 is the first with read_only, which production QA requires.
+const verifyBrowserImage = "docker.io/deploymenthq/verify-browser:1.3.0"
 
 // minReadOnlyVerifyBrowserVersion is the first verify-browser release that
 // honours read_only. A production QA run refuses an older image rather than
