@@ -622,3 +622,245 @@ func TestAFailedCheckoutKeepsLaterBuildsAsBuilt(t *testing.T) {
 		t.Errorf("results = %+v, want one fallback with a reason", results)
 	}
 }
+
+// --- concurrent builds -------------------------------------------------------
+
+// buildSourceIn is buildSource for a goroutine: the error is returned, not
+// fatal, and ctx is the build's own.
+func (f *mergeFixture) buildSourceIn(ctx context.Context, m *qaMergeResults, repoDir string) (string, error) {
+	deps := agenttools.DeployStaticSitePreviewDeps{WorkDirHost: f.workDir, LogsWriter: f.logs, MergeResult: m}
+	return agenttools.PreviewBuildSource(ctx, deps, repoDir)
+}
+
+// fetchCount is how many lookups the fetch source has started.
+func (f *mergeFixture) fetchCount() int {
+	f.fetchMu.Lock()
+	defer f.fetchMu.Unlock()
+	return f.fetches
+}
+
+// gatedFetch is a fetch source that blocks every lookup until released, so
+// the test decides when the merges may proceed.
+func (f *mergeFixture) gatedFetch(m *qaMergeResults, source string, release <-chan struct{}) {
+	m.fetchSource = func(ctx context.Context, _ tasks.RepositoryEntry) (string, string, error) {
+		f.fetchMu.Lock()
+		f.fetches++
+		f.fetchMu.Unlock()
+		select {
+		case <-release:
+			return source, "", nil
+		case <-ctx.Done():
+			return "", "", ctx.Err()
+		}
+	}
+}
+
+// Builds of one repository started together share one merge: it is made
+// once, the others wait for it, and each gets its own directory of it.
+func TestConcurrentBuildsOfARepositoryShareOneMerge(t *testing.T) {
+	f := newMergeFixture(t, nil)
+	f.advanceBase(t, map[string]string{"news.html": "news from main\n"})
+	m := f.provider(f.origin, "")
+	release := make(chan struct{})
+	f.gatedFetch(m, f.origin, release)
+
+	const builds = 4
+	dirs := make([]string, builds)
+	errs := make([]error, builds)
+	var wg sync.WaitGroup
+	for i := 0; i < builds; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			dirs[i], errs[i] = f.buildSourceIn(context.Background(), m, "0-acme/site")
+		}(i)
+	}
+	// Let every build reach the merge before it can finish.
+	time.Sleep(200 * time.Millisecond)
+	close(release)
+	wg.Wait()
+
+	seen := map[string]bool{}
+	for i := 0; i < builds; i++ {
+		if errs[i] != nil {
+			t.Fatalf("build %d: %s", i, errs[i])
+		}
+		defer os.RemoveAll(dirs[i])
+		if seen[dirs[i]] {
+			t.Errorf("two builds shared the directory %s", dirs[i])
+		}
+		seen[dirs[i]] = true
+		if got := readTreeFile(t, dirs[i], "news.html"); got != "news from main\n" {
+			t.Errorf("build %d: news.html = %q, want the merge result", i, got)
+		}
+	}
+	if n := f.fetchCount(); n != 1 {
+		t.Errorf("fetched %d times, want once for the round", n)
+	}
+	m.remove()
+	if got := m.results(); len(got) != 1 || !got[0].Merged {
+		t.Errorf("results = %+v, want one merged entry", got)
+	}
+}
+
+// Two repositories merge independently: neither waits for the other's merge.
+func TestTwoRepositoriesMergeConcurrently(t *testing.T) {
+	f := newMergeFixture(t, nil)
+	f.advanceBase(t, map[string]string{"news.html": "news from main\n"})
+	other := filepath.Join(f.workDir, "1-acme", "other")
+	runGit(t, f.workDir, "clone", "-q", f.origin, "1-acme/other")
+	runGit(t, other, "checkout", "-q", "-b", "tasks/x")
+	writeFile(t, filepath.Join(other, "other.html"), "the other repository\n")
+	m := f.provider(f.origin, "")
+	m.repositories = append(m.repositories, tasks.RepositoryEntry{Name: "acme/other", BaseBranch: "main", CloneURL: "https://example.com/acme/other.git"})
+	// Each lookup waits until both are in flight: merges that ran one at a
+	// time would never both arrive, and would fall back at the timeout.
+	var arrived sync.WaitGroup
+	arrived.Add(2)
+	m.fetchSource = func(ctx context.Context, _ tasks.RepositoryEntry) (string, string, error) {
+		arrived.Done()
+		both := make(chan struct{})
+		go func() { arrived.Wait(); close(both) }()
+		select {
+		case <-both:
+			return f.origin, "", nil
+		case <-ctx.Done():
+			return "", "", ctx.Err()
+		}
+	}
+	m.timeout = 20 * time.Second
+
+	repos := []string{"0-acme/site", "1-acme/other"}
+	dirs := make([]string, len(repos))
+	errs := make([]error, len(repos))
+	var wg sync.WaitGroup
+	for i, repo := range repos {
+		wg.Add(1)
+		go func(i int, repo string) {
+			defer wg.Done()
+			dirs[i], errs[i] = f.buildSourceIn(context.Background(), m, repo)
+		}(i, repo)
+	}
+	wg.Wait()
+	for i := range repos {
+		if errs[i] != nil {
+			t.Fatalf("%s: %s", repos[i], errs[i])
+		}
+		defer os.RemoveAll(dirs[i])
+		if got := readTreeFile(t, dirs[i], "news.html"); got != "news from main\n" {
+			t.Errorf("%s: news.html = %q, want the merge result", repos[i], got)
+		}
+	}
+	if got := readTreeFile(t, dirs[1], "other.html"); got != "the other repository\n" {
+		t.Errorf("other.html = %q, want the other repository's change", got)
+	}
+	m.remove()
+	got := m.results()
+	if len(got) != 2 || got[0].Repository != "acme/site" || got[1].Repository != "acme/other" || !got[0].Merged || !got[1].Merged {
+		t.Errorf("results = %+v, want both merged, in work-dir order", got)
+	}
+}
+
+// The round ending while a build is still merging waits for that build, then
+// removes everything; a build after it falls back.
+func TestTheRoundEndWaitsForABuildInProgress(t *testing.T) {
+	f := newMergeFixture(t, nil)
+	f.advanceBase(t, map[string]string{"news.html": "news from main\n"})
+	m := f.provider(f.origin, "")
+	release := make(chan struct{})
+	f.gatedFetch(m, f.origin, release)
+
+	type build struct {
+		dir string
+		err error
+	}
+	built := make(chan build, 1)
+	go func() {
+		dir, err := f.buildSourceIn(context.Background(), m, "0-acme/site")
+		built <- build{dir, err}
+	}()
+	// Wait for the build to be inside the merge.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if f.fetchCount() > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the build never reached the fetch")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	removed := make(chan struct{})
+	go func() {
+		m.remove()
+		close(removed)
+	}()
+	select {
+	case <-removed:
+		t.Fatal("the round ended under a build in progress")
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(release)
+	b := <-built
+	if b.err != nil {
+		t.Fatal(b.err)
+	}
+	defer os.RemoveAll(b.dir)
+	if got := readTreeFile(t, b.dir, "news.html"); got != "news from main\n" {
+		t.Errorf("news.html = %q, want the merge result", got)
+	}
+	select {
+	case <-removed:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the round's end never finished")
+	}
+	if got := m.results(); len(got) != 1 || !got[0].Merged {
+		t.Errorf("results = %+v, want one merged entry", got)
+	}
+	os.RemoveAll(b.dir)
+	f.assertNoBuildDirsLeft(t)
+
+	late, err := f.buildSourceIn(context.Background(), m, "0-acme/site")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(late)
+	if _, err := os.Stat(filepath.Join(late, "news.html")); !os.IsNotExist(err) {
+		t.Error("a build after the round ended used the merge result")
+	}
+}
+
+// A first build cancelled mid-merge leaves the repository as built for the
+// round, recorded with a reason: the merge isn't retried by a later build.
+func TestACancelledFirstBuildKeepsTheRoundAsBuilt(t *testing.T) {
+	f := newMergeFixture(t, nil)
+	f.advanceBase(t, map[string]string{"news.html": "news from main\n"})
+	m := f.provider(f.origin, "")
+	never := make(chan struct{})
+	f.gatedFetch(m, f.origin, never)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		cancel()
+	}()
+	// The cancelled build's own copy step may refuse; only the record matters.
+	if dir, _ := f.buildSourceIn(ctx, m, "0-acme/site"); dir != "" {
+		os.RemoveAll(dir)
+	}
+	later, err := f.buildSourceIn(context.Background(), m, "0-acme/site")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(later)
+	if _, err := os.Stat(filepath.Join(later, "news.html")); !os.IsNotExist(err) {
+		t.Error("a later build used a merge result after the first was cancelled")
+	}
+	if n := f.fetchCount(); n != 1 {
+		t.Errorf("fetched %d times, want once for the round", n)
+	}
+	m.remove()
+	if got := m.results(); len(got) != 1 || got[0].Merged || got[0].Reason == "" {
+		t.Errorf("results = %+v, want one fallback with a reason", got)
+	}
+}
