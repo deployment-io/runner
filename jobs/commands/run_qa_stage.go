@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -171,6 +172,14 @@ type qaStage struct {
 	// temporary root and git binary; "" means the defaults. Tests only.
 	fixTreesTmpRoot string
 	fixTreesGit     string
+	// mergeFetchSource is where a QA round's merge result fetches the base
+	// branch from, and the secret to scrub; nil means the installation token.
+	// Tests only.
+	mergeFetchSource func(ctx context.Context, entry tasks.RepositoryEntry) (string, string, error)
+
+	// roundMergeResults is what the running QA round's previews were built
+	// from, set when the round ends.
+	roundMergeResults []qaMergeResultOutput
 }
 
 // qaView is the parameter view a QA round runs under.
@@ -297,6 +306,7 @@ func (s *qaStage) qaRound(round int) (qaRoundOutput, error) {
 	io.WriteString(s.logsWriter, fmt.Sprintf("QA round %d: checking the acceptance criteria on a preview of %s\n", round, strings.Join(s.repositories, ", ")))
 	var result agentResult
 	var err error
+	s.roundMergeResults = nil
 	if s.runQA != nil {
 		result, err = s.runQA(round)
 	} else {
@@ -307,6 +317,7 @@ func (s *qaStage) qaRound(round int) (qaRoundOutput, error) {
 		return qaRoundOutput{}, err
 	}
 	out := s.roundOutput(round, result, err)
+	out.MergeResults = s.roundMergeResults
 	s.out.Rounds = append(s.out.Rounds, out)
 	return out, nil
 }

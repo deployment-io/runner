@@ -373,14 +373,15 @@ func previewBuildEnv(c task_previews.StaticSiteBuildSettingsReplyV1) []string {
 	return env
 }
 
-// runRunnerBuiltPreview builds p from a copy of the agent's working tree and deploys
-// its output, removing the copy in every case. Build output streams to the Step log
+// runRunnerBuiltPreview builds p from a copy of the agent's working tree — or, when
+// deps.MergeResult can make it, from the merge result of the repository — and deploys
+// its output, removing that build directory in every case. Build output streams to the Step log
 // only — it can print the configuration's values, so it isn't returned.
 func runRunnerBuiltPreview(ctx context.Context, deps DeployStaticSitePreviewDeps, p runnerBuiltPreview) (string, error) {
 	if deps.BuildSite == nil {
 		return "", fmt.Errorf("deployment.io can't build previews here")
 	}
-	copyDir, err := copyRepositoryForBuild(filepath.Join(deps.WorkDirHost, p.repository), deps.WorkDirHost, deps.LogsWriter)
+	copyDir, err := PreviewBuildSource(ctx, deps, p.repository)
 	if copyDir != "" {
 		defer os.RemoveAll(copyDir)
 	}
@@ -432,6 +433,69 @@ func runRunnerBuiltPreview(ctx context.Context, deps DeployStaticSitePreviewDeps
 	return marshalResult(out)
 }
 
+// PreviewBuildSource is the directory a runner-built preview of repository builds
+// in: the merge result when deps.MergeResult is set and could make it, else
+// copyRepositoryForBuild's copy. Either is a new directory beside the work dir
+// the caller removes (returned also with an error).
+func PreviewBuildSource(ctx context.Context, deps DeployStaticSitePreviewDeps, repository string) (string, error) {
+	if deps.MergeResult != nil {
+		dir, ok, err := mergeResultForBuild(ctx, deps.MergeResult, repository, deps.WorkDirHost, deps.LogsWriter)
+		if ok || err != nil {
+			return dir, err
+		}
+	}
+	return copyRepositoryForBuild(filepath.Join(deps.WorkDirHost, repository), deps.WorkDirHost, deps.LogsWriter)
+}
+
+// mergeResultForBuild checks the merge result of repository out into a new build
+// directory beside workDir, made as copyRepository makes its copy, and applies the
+// copy's rules to it: no .git or node_modules at any depth, and no symlink that
+// leaves it. ok=false (and no directory) when the provider couldn't make it.
+func mergeResultForBuild(ctx context.Context, provider MergeResultProvider, repository, workDir string, logs io.Writer) (string, bool, error) {
+	if logs == nil {
+		logs = io.Discard
+	}
+	dst, err := newBuildDir(workDir)
+	if err != nil {
+		return "", false, nil
+	}
+	if !provider.CheckoutMergeResult(ctx, repository, dst) {
+		_ = os.RemoveAll(dst)
+		return "", false, nil
+	}
+	if err := removeLeftOutEntries(dst); err != nil {
+		return dst, true, err
+	}
+	return dst, true, removeEscapingSymlinks(dst, logs)
+}
+
+// newBuildDir is a new, empty build directory beside workDir — never inside it, so
+// the agent can't see or change it.
+func newBuildDir(workDir string) (string, error) {
+	work := filepath.Clean(workDir)
+	return os.MkdirTemp(filepath.Dir(work), filepath.Base(work)+"-preview-build-")
+}
+
+// removeLeftOutEntries removes every entry named .git or node_modules, at any
+// depth, from the build directory dst — what the copy leaves out.
+func removeLeftOutEntries(dst string) error {
+	return filepath.WalkDir(dst, func(p string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if p == dst || (d.Name() != ".git" && d.Name() != "node_modules") {
+			return nil
+		}
+		if err := os.RemoveAll(p); err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return filepath.SkipDir
+		}
+		return nil
+	})
+}
+
 // copyRepositoryForBuild copies src into a new temporary directory beside workDir —
 // never inside it, so the agent can't see it — leaving out .git and node_modules at
 // any depth, and every symlink whose target leaves the repository (see
@@ -460,7 +524,7 @@ func copyRepository(src, workDir string, logs io.Writer, beforeRead func(rel str
 		beforeRead = func(string) {}
 	}
 	work := filepath.Clean(workDir)
-	dst, err := os.MkdirTemp(filepath.Dir(work), filepath.Base(work)+"-preview-build-")
+	dst, err := newBuildDir(work)
 	if err != nil {
 		return "", err
 	}

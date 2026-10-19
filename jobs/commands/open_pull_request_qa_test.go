@@ -288,3 +288,70 @@ func TestQASectionShowsAPartialRun(t *testing.T) {
 		t.Errorf("a partial run is described as a completed check:\n%s", got)
 	}
 }
+
+// --- what QA's previews were built from --------------------------------------
+
+func TestQASectionSaysWhatEachRepositoryWasBuiltFrom(t *testing.T) {
+	round := qaRoundOutput{
+		Criteria: qaCriteria(tasks.QACriterionPassed),
+		MergeResults: []qaMergeResultOutput{
+			{Repository: "acme/web", BaseBranch: "main", BaseCommit: "0123456789abcdef0123456789abcdef01234567", Merged: true},
+			{Repository: "acme/docs", BaseBranch: "develop", Reason: "the branch doesn't merge cleanly with develop (2 conflicting files)"},
+			{Repository: "acme/@team", BaseBranch: "main", Reason: "main couldn't be fetched"},
+		},
+	}
+	opr := &taskOpenPR{qa: completedQA(round)}
+	section := opr.qaSection()
+	for _, want := range []string{
+		"- QA checked acme/web merged with main at 0123456.\n",
+		"- QA checked acme/docs's branch as built: the branch doesn't merge cleanly with develop (2 conflicting files).\n",
+		"- QA checked acme/@\u200bteam's branch as built: main couldn't be fetched.\n",
+	} {
+		if !strings.Contains(section, want) {
+			t.Errorf("the QA section lacks %q:\n%s", want, section)
+		}
+	}
+
+	// Only the final round's are shown.
+	first := round
+	first.Round = 1
+	first.MergeResults = []qaMergeResultOutput{{Repository: "acme/old", BaseBranch: "main", Reason: "main couldn't be fetched"}}
+	qa := completedQA(qaRoundOutput{Criteria: qaCriteria(tasks.QACriterionPassed)})
+	qa.Rounds = append([]qaRoundOutput{first}, qa.Rounds...)
+	opr = &taskOpenPR{qa: qa}
+	if section := opr.qaSection(); section != "" {
+		t.Errorf("a clean final round without merge results rendered a section:\n%s", section)
+	}
+}
+
+func TestQAMergeResultLinesKeepToTheBudget(t *testing.T) {
+	var results []qaMergeResultOutput
+	for i := 0; i < qaSectionMaxItems+5; i++ {
+		results = append(results, qaMergeResultOutput{Repository: fmt.Sprintf("acme/repo-%d", i), BaseBranch: "main", Reason: strings.Repeat("x", 400)})
+	}
+	opr := &taskOpenPR{qa: completedQA(qaRoundOutput{Criteria: qaCriteria(tasks.QACriterionPassed), MergeResults: results})}
+	section := opr.qaSection()
+	if utf8.RuneCountInString(section) > qaSectionMaxRunes {
+		t.Errorf("the section is %d runes", utf8.RuneCountInString(section))
+	}
+	if !strings.Contains(section, "further QA item(s) are not shown here") {
+		t.Errorf("the section doesn't say what it left out:\n%s", section)
+	}
+}
+
+// A QA run that stopped without reporting anything still says what its
+// previews were built from, and only that.
+func TestQASectionShowsMergeResultsOfARunThatReportedNothing(t *testing.T) {
+	qa := &qaOutput{Status: tasks.QAStatusCouldNotRun, StatusReason: "QA timed out", Rounds: []qaRoundOutput{{
+		Round: 1, Status: tasks.QAStatusCouldNotRun,
+		Criteria:     qaCriteria(tasks.QACriterionNotChecked, tasks.QACriterionNotChecked),
+		MergeResults: []qaMergeResultOutput{{Repository: "acme/web", BaseBranch: "main", Reason: "main couldn't be fetched"}},
+	}}}
+	section := (&taskOpenPR{qa: qa}).qaSection()
+	if !strings.Contains(section, "- QA checked acme/web's branch as built: main couldn't be fetched.\n") {
+		t.Errorf("the QA section lacks the merge result:\n%s", section)
+	}
+	if strings.Contains(section, "Not checked") || strings.Contains(section, "QA checked the change on a preview") {
+		t.Errorf("a run that reported nothing shows more than its merge results:\n%s", section)
+	}
+}

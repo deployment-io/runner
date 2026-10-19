@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -81,10 +82,16 @@ type taskCommitPush struct {
 }
 
 func (tcp *taskCommitPush) getToken(installationID string) (string, error) {
+	return tcp.getTokenContext(context.Background(), installationID)
+}
+
+// getTokenContext is getToken that stops polling a refresh in process once
+// ctx is done.
+func (tcp *taskCommitPush) getTokenContext(ctx context.Context, installationID string) (string, error) {
 	if token, ok := tcp.tokenCache[installationID]; ok {
 		return token, nil
 	}
-	token, err := commandUtils.RefreshGitTokenForInstallation(installationID, tcp.ctx.OrganizationID)
+	token, err := commandUtils.RefreshGitTokenForInstallationContext(ctx, installationID, tcp.ctx.OrganizationID)
 	if err != nil {
 		return "", err
 	}

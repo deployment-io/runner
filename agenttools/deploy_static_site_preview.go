@@ -83,10 +83,26 @@ type DeployStaticSitePreviewDeps struct {
 	// site, or why nothing was detected. It only reads files; nothing is executed.
 	DetectSite func(siteDir string) (DetectedSite, string, bool)
 
+	// MergeResult, when set, gives a runner-built preview the merge result of its
+	// repository to build from — the agent's working tree merged with the base
+	// branch's latest commit — instead of a copy of the working tree. Set by the
+	// QA stage only; nil (implement and fix runs) builds the branch as built.
+	MergeResult MergeResultProvider
+
 	// VerifyBrowser runs one verify_preview_rendered check in a verify-browser
 	// container. Not used by deploy_static_site_preview itself; carried here so the
 	// preview tools of a run are wired from one place.
 	VerifyBrowser RunVerifyBrowser
+}
+
+// MergeResultProvider checks the merge result of a Task repository out for a
+// preview build.
+type MergeResultProvider interface {
+	// CheckoutMergeResult writes the merge result of the repository repoDir
+	// ("<idx>-<name>") into dir, a new empty build directory, and reports whether
+	// it did. false means the merge result couldn't be made (the provider
+	// records why): the preview is then built from the branch as built.
+	CheckoutMergeResult(ctx context.Context, repoDir, dir string) bool
 }
 
 // DetectedSite is how to build a static site, detected from its repository.
@@ -169,6 +185,9 @@ func RegisterDeployStaticSitePreview(s *agentmcp.Server, deps DeployStaticSitePr
 // detection isn't available.
 const errNotDeployedSite = "this repository isn't a site deployment.io deploys, so build it yourself and pass publish_dir"
 
+// errQAPublishDir is the QA stage's answer to publish_dir.
+const errQAPublishDir = "QA previews are built by deployment.io: pass repository, not publish_dir"
+
 // notDetectedError is the agent-built path's error when publish_dir is missing and no
 // build settings could be detected, for reason.
 func notDetectedError(reason string) error {
@@ -219,6 +238,12 @@ func handleDeployStaticSitePreview(ctx context.Context, deps DeployStaticSitePre
 		if strings.TrimSpace(args.PublishDir) == "" {
 			return "", notDetectedError(plan.notDetected)
 		}
+	}
+	if deps.MergeResult != nil {
+		// QA's previews are what deployment.io builds from the repository (the
+		// merge result, or the branch as built and why). Output left in the
+		// Task dir by an earlier run is neither, so QA can't publish it.
+		return "", errors.New(errQAPublishDir)
 	}
 	if strings.TrimSpace(args.PublishDir) == "" {
 		return "", fmt.Errorf("publish_dir is required — or pass repository, and deployment.io builds the site itself when it deploys it or can detect how to build it")

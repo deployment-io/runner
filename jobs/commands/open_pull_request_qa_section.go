@@ -109,25 +109,30 @@ func qaPlainText(s string, n int) string {
 // qaSection renders "QA on a preview": what QA found wrong, in the reader's
 // priority order — the failed criteria with the problems QA found, then,
 // collapsed, the criteria nobody checked, what QA's fix run fixed, and QA's
-// observations.
+// observations — after a line per repository saying what QA's previews were
+// built from: the branch merged with the base branch, or the branch as built.
 //
 // Empty unless there is something to show. A skipped stage is said in full by
-// its status line, and so is one that couldn't run and reported nothing — but a
+// its status line, and so is one that couldn't run and reported nothing (bar
+// what its previews were built from, shown on its own) — but a
 // QA run that stopped part-way (a timeout, a turn cap) can still have reported
 // verdicts, findings and observations, and those are shown under a lead-in
-// that says the run did not finish. A clean pass needs no section. It never
-// holds the pull request, and says so.
+// that says the run did not finish. A clean pass needs no section unless it
+// has those lines. It never holds the pull request, and says so.
 func (opr *taskOpenPR) qaSection() string {
 	qa := opr.qa
 	final := qa.finalRound()
 	if final == nil {
 		return ""
 	}
-	partial := false
+	partial, builtOnly := false, false
 	switch qa.Status {
 	case tasks.QAStatusCompleted:
 	case tasks.QAStatusCouldNotRun:
-		if !qaReportedEvidence(final) {
+		// A run that reported nothing still built previews: what they were
+		// built from is shown on its own.
+		builtOnly = !qaReportedEvidence(final)
+		if builtOnly && len(final.MergeResults) == 0 {
 			return ""
 		}
 		partial = true
@@ -136,29 +141,58 @@ func (opr *taskOpenPR) qaSection() string {
 	}
 	failed, notChecked := splitCriteria(final.Criteria)
 	outcome := qaFixOutcomeLine(qa)
-	if len(failed)+len(final.Findings)+len(notChecked)+len(qa.FixedByQA)+len(final.Observations) == 0 && outcome == "" {
+	built := qaMergeResultItems(final.MergeResults)
+	fixedItems := qa.FixedByQA
+	if builtOnly {
+		failed, notChecked, fixedItems, outcome = nil, nil, nil, ""
+	}
+	if len(built)+len(failed)+len(final.Findings)+len(notChecked)+len(fixedItems)+len(final.Observations) == 0 && outcome == "" {
 		return ""
 	}
 	var sb strings.Builder
 	sb.WriteString("\n---\n")
 	sb.WriteString("**QA on a preview**\n\n")
-	if partial {
+	if builtOnly {
+		sb.WriteString("QA did not finish (see the QA line above) and reported nothing. It is advisory: it does not hold this pull request.\n")
+	} else if partial {
 		sb.WriteString("QA did not finish (see the QA line above); this is what it reported before it stopped. It is advisory: it does not hold this pull request.\n")
 	} else {
 		sb.WriteString("QA checked the change on a preview against the Task's acceptance criteria. It is advisory: it does not hold this pull request.\n")
 	}
 
 	budget := &renderBudget{items: qaSectionMaxItems, runes: qaSectionMaxRunes - utf8.RuneCountInString(sb.String()) - qaSectionReserveRunes - utf8.RuneCountInString(outcome)}
-	total := len(failed) + len(final.Findings) + len(notChecked) + len(qa.FixedByQA) + len(final.Observations)
+	total := len(built) + len(failed) + len(final.Findings) + len(notChecked) + len(fixedItems) + len(final.Observations)
+	if len(built) > 0 {
+		writeQAItems(&sb, "\n", built, budget)
+	}
 	writeFailedCriteria(&sb, failed, final.Findings, budget)
 	sb.WriteString(outcome)
 	sb.WriteString(qaCollapsedList(fmt.Sprintf("Not checked (%d)", len(notChecked)), notCheckedItems(notChecked), budget))
-	sb.WriteString(qaCollapsedList(fmt.Sprintf("Fixed by QA (%d)", len(qa.FixedByQA)), qa.FixedByQA, budget))
+	sb.WriteString(qaCollapsedList(fmt.Sprintf("Fixed by QA (%d)", len(fixedItems)), fixedItems, budget))
 	sb.WriteString(qaCollapsedList(fmt.Sprintf("Observations (%d)", len(final.Observations)), final.Observations, budget))
 	if omitted := total - budget.rendered; omitted > 0 {
 		sb.WriteString(fmt.Sprintf("\n_%d further QA item(s) are not shown here._\n", omitted))
 	}
 	return boundQASection(sb.String())
+}
+
+// qaMergeResultItems says, per repository the final round built a preview of,
+// what QA checked: the branch merged with the base branch at a commit, or the
+// branch as built and why.
+func qaMergeResultItems(results []qaMergeResultOutput) []string {
+	items := make([]string, 0, len(results))
+	for _, r := range results {
+		var line string
+		if r.Merged {
+			line = fmt.Sprintf("QA checked %s merged with %s at %s.", r.Repository, r.BaseBranch, shortCommit(r.BaseCommit))
+		} else {
+			line = fmt.Sprintf("QA checked %s's branch as built: %s.", r.Repository, r.Reason)
+		}
+		if text := qaPlainText(line, reviewDetailMaxRunes); text != "" {
+			items = append(items, "- "+text+"\n")
+		}
+	}
+	return items
 }
 
 // qaReportedEvidence is whether a QA round that couldn't run still reported
