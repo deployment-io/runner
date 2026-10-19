@@ -48,6 +48,14 @@ func (s *qaStage) runQARound(round int) (agentResult, error) {
 	// Previews build from the Task's REAL working tree, which the QA run never
 	// sees: the deploy tool copies <Task dir>/<repository> host-side.
 	previewDeps := buildStaticSitePreviewDeps(s.ctx, s.parameters, s.workDirHost, s.logsWriter)
+	// ...and from the merge result of that tree with the base branch's latest
+	// commit, where it can be made: what ships when the pull request merges.
+	mergeResults := s.newQAMergeResults()
+	defer func() {
+		mergeResults.remove()
+		s.roundMergeResults = mergeResults.results()
+	}()
+	previewDeps.MergeResult = mergeResults
 	label := fmt.Sprintf("QA round %d", round)
 	io.WriteString(s.logsWriter, fmt.Sprintf("%s: turn cap %s model responses\n", label, envValue(env, "MAX_TURNS")))
 	impl := &RunAgentStep{stopSignal: s.stopSignal, progressSink: s.progressSink}

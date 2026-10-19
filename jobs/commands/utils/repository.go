@@ -145,18 +145,41 @@ func RefreshGitToken(parameters map[string]interface{}) (string, error) {
 // parameters-map helper's "single InstallationID" assumption doesn't hold.
 // Polls every 10s on ErrRefreshInProcess (another caller holds the lock).
 func RefreshGitTokenForInstallation(installationID, orgID string) (string, error) {
-	token, err := client.Get().RefreshGitToken(installationID, orgID)
-	if err == nil {
-		return token, nil
+	return RefreshGitTokenForInstallationContext(context.Background(), installationID, orgID)
+}
+
+// refreshGitTokenRPC and refreshGitTokenRetryInterval are the refresh's RPC
+// and its poll interval; tests replace them.
+var (
+	refreshGitTokenRPC = func(installationID, orgID string) (string, error) {
+		return client.Get().RefreshGitToken(installationID, orgID)
 	}
-	for errors.Is(err, oauth.ErrRefreshInProcess) {
-		time.Sleep(10 * time.Second)
-		token, err = client.Get().RefreshGitToken(installationID, orgID)
+	refreshGitTokenRetryInterval = 10 * time.Second
+)
+
+// RefreshGitTokenForInstallationContext is RefreshGitTokenForInstallation
+// that stops polling once ctx is done and returns ctx's error. An RPC already
+// in flight still runs to its end; no new one starts after ctx is done.
+func RefreshGitTokenForInstallationContext(ctx context.Context, installationID, orgID string) (string, error) {
+	for {
+		if err := ctx.Err(); err != nil {
+			return "", err
+		}
+		token, err := refreshGitTokenRPC(installationID, orgID)
 		if err == nil {
 			return token, nil
 		}
+		if !errors.Is(err, oauth.ErrRefreshInProcess) {
+			return "", err
+		}
+		timer := time.NewTimer(refreshGitTokenRetryInterval)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			timer.Stop()
+			return "", ctx.Err()
+		}
 	}
-	return "", err
 }
 
 // UpdateSubmodules initializes and updates all submodules in a given Git repository.

@@ -7,10 +7,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -48,6 +50,8 @@ import (
 const (
 	// fixTreesGitTimeout bounds one git command.
 	fixTreesGitTimeout = 2 * time.Minute
+	// fixTreesGitWaitDelay bounds the wait for a killed git command's output.
+	fixTreesGitWaitDelay = 5 * time.Second
 	// maxFixDiffBytes is the largest fix diff handed to a round. A fix that
 	// rewrote this much is no narrower than the whole change.
 	maxFixDiffBytes = 1 << 20
@@ -72,6 +76,9 @@ type fixTrees struct {
 	failed map[string]string
 	// dirs is every repository directory, in order.
 	dirs []string
+	// ctx, when set, bounds every git command (the QA stage's merge result
+	// runs under one overall timeout); nil for the fix trees.
+	ctx context.Context
 }
 
 // takeFixTrees snapshots every repository directory the stage knows
@@ -254,17 +261,59 @@ func (t *fixTrees) diff(dir, tmp, before, after string) (string, error) {
 // run runs one git command for a repository with the temporary environment.
 // stdout goes to out when given, and is returned otherwise.
 func (t *fixTrees) run(dir, tmp string, out io.Writer, args ...string) (string, error) {
+	return t.runIsolated(dir, tmp, isolatedGit{stdout: out}, args...)
+}
+
+// isolatedGit is what one git command of runIsolated may point elsewhere; ""
+// fields keep the fix trees' defaults.
+type isolatedGit struct {
+	// workTree is the command's work tree and directory; the repository
+	// directory by default.
+	workTree string
+	// index is the command's index file; <tmp>/index by default.
+	index string
+	// env is added to the command's environment.
+	env []string
+	// secret is removed from the error's git output.
+	secret string
+	// stdout receives the command's output, which is returned when it is nil.
+	stdout io.Writer
+}
+
+// runIsolated is run with the work tree, index, environment and output of o,
+// bounded by t.ctx (when set) beside the per-command timeout. The repository's
+// objects stay an ALTERNATE and its config is never read, whatever o says.
+func (t *fixTrees) runIsolated(dir, tmp string, o isolatedGit, args ...string) (string, error) {
 	repo, gitDir, err := t.repositoryPaths(dir)
 	if err != nil {
 		return "", err
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), fixTreesGitTimeout)
+	workTree, index := repo, filepath.Join(tmp, "index")
+	if o.workTree != "" {
+		workTree = o.workTree
+	}
+	if o.index != "" {
+		index = o.index
+	}
+	parent := t.ctx
+	if parent == nil {
+		parent = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(parent, fixTreesGitTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, t.git, append([]string{"-c", "safe.directory=*", "-C", repo}, args...)...)
+	cmd := exec.CommandContext(ctx, t.git, append([]string{"-c", "safe.directory=*", "-C", workTree}, args...)...)
+	// git runs helpers of its own (git-remote-https for a fetch): on timeout
+	// the whole process group is killed, and the wait for its output is
+	// bounded, so a stalled helper can't hold the command past its deadline.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
+	cmd.WaitDelay = fixTreesGitWaitDelay
 	cmd.Env = append(withoutGitEnv(os.Environ()),
 		"GIT_DIR="+filepath.Join(tmp, "gitdir"),
-		"GIT_WORK_TREE="+repo,
-		"GIT_INDEX_FILE="+filepath.Join(tmp, "index"),
+		"GIT_WORK_TREE="+workTree,
+		"GIT_INDEX_FILE="+index,
 		"GIT_OBJECT_DIRECTORY="+filepath.Join(tmp, "gitdir", "objects"),
 		"GIT_ALTERNATE_OBJECT_DIRECTORIES="+filepath.Join(gitDir, "objects"),
 		"GIT_CONFIG_NOSYSTEM=1",
@@ -272,25 +321,60 @@ func (t *fixTrees) run(dir, tmp string, out io.Writer, args ...string) (string, 
 		"GIT_TERMINAL_PROMPT=0",
 		"GIT_OPTIONAL_LOCKS=0",
 	)
+	cmd.Env = append(cmd.Env, o.env...)
 	var stdout bytes.Buffer
-	if out != nil {
-		cmd.Stdout = out
+	if o.stdout != nil {
+		cmd.Stdout = o.stdout
 	} else {
 		cmd.Stdout = &stdout
 	}
 	stderr := &limitedBuffer{limit: 4096}
 	cmd.Stderr = stderr
 	if err := cmd.Run(); err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			return "", fmt.Errorf("git %s timed out after %s", args[0], fixTreesGitTimeout)
-		}
-		msg := strings.TrimSpace(stderr.buf.String())
-		if msg == "" {
-			return "", fmt.Errorf("git %s: %s", args[0], err)
-		}
-		return "", fmt.Errorf("git %s: %s: %s", args[0], err, firstLine(msg))
+		return "", isolatedGitError(parent, ctx, args[0], err, scrubSecret(stderr.buf.String(), o.secret, stderr.overflow))
 	}
 	return stdout.String(), nil
+}
+
+// isolatedGitError says why the git command name failed: cancelled or timed
+// out with parent, timed out on its own (ctx), or git's first line of stderr.
+func isolatedGitError(parent, ctx context.Context, name string, err error, stderr string) error {
+	switch {
+	case errors.Is(parent.Err(), context.Canceled):
+		return fmt.Errorf("git %s was cancelled", name)
+	case parent.Err() != nil:
+		return fmt.Errorf("git %s timed out", name)
+	case errors.Is(ctx.Err(), context.DeadlineExceeded):
+		return fmt.Errorf("git %s timed out after %s", name, fixTreesGitTimeout)
+	}
+	if msg := strings.TrimSpace(stderr); msg != "" {
+		return fmt.Errorf("git %s: %s: %s", name, err, firstLine(msg))
+	}
+	return fmt.Errorf("git %s: %s", name, err)
+}
+
+// scrubSecret removes every occurrence of secret from s, and its URL-escaped
+// forms. When s was cut short (truncated), its last len(secret) bytes are
+// dropped first: they could hold the start of an occurrence the cut split.
+func scrubSecret(s, secret string, truncated bool) string {
+	if secret == "" {
+		return s
+	}
+	if truncated {
+		if len(s) > len(secret) {
+			s = s[:len(s)-len(secret)]
+		} else {
+			s = ""
+		}
+	}
+	s = strings.ReplaceAll(s, secret, "***")
+	if escaped := url.QueryEscape(secret); escaped != secret {
+		s = strings.ReplaceAll(s, escaped, "***")
+	}
+	if escaped := url.PathEscape(secret); escaped != secret {
+		s = strings.ReplaceAll(s, escaped, "***")
+	}
+	return s
 }
 
 // withoutGitEnv drops every inherited GIT_* variable, so nothing in the

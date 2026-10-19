@@ -68,6 +68,10 @@ type qaRoundOutput struct {
 	Turns        int                   `json:"turns,omitempty"`
 	TokenUsage   tokenUsage            `json:"token_usage"`
 	CostUSD      *float64              `json:"cost_usd,omitempty"`
+	// MergeResults is, per repository the round built a preview of, whether
+	// the preview was built from the merge result with the base branch or the
+	// branch as built. Omitted when the round built no preview.
+	MergeResults []qaMergeResultOutput `json:"merge_results,omitempty"`
 }
 
 // finalRound is the round whose result is the stage's, or nil when the gate
