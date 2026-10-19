@@ -599,3 +599,26 @@ func TestTheCheckoutSharesTheMergesTimeout(t *testing.T) {
 	os.RemoveAll(dir)
 	f.assertNoBuildDirsLeft(t)
 }
+
+// Once a checkout of the merge result has failed, the round's later builds of
+// the repository build as built too, so the record matches every preview
+// built after it.
+func TestAFailedCheckoutKeepsLaterBuildsAsBuilt(t *testing.T) {
+	f := newMergeFixture(t, nil)
+	f.advanceBase(t, map[string]string{"news.html": "news from main\n"})
+	m := f.provider(f.origin, "")
+	defer m.remove()
+	// A regular file where the build directory should be: the checkout fails.
+	notADir := filepath.Join(t.TempDir(), "file")
+	writeFile(t, notADir, "x")
+	if m.CheckoutMergeResult(context.Background(), "0-acme/site", notADir) {
+		t.Fatal("a checkout into a file succeeded")
+	}
+	if m.CheckoutMergeResult(context.Background(), "0-acme/site", t.TempDir()) {
+		t.Error("a later build used the merge result after a failed checkout")
+	}
+	results := m.results()
+	if len(results) != 1 || results[0].Merged || results[0].Reason == "" {
+		t.Errorf("results = %+v, want one fallback with a reason", results)
+	}
+}

@@ -139,7 +139,10 @@ func (m *qaMergeResults) CheckoutMergeResult(ctx context.Context, repoDir, dir s
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	r.once.Do(func() { m.make(ctx, r, timeout) })
-	if r.tree == "" {
+	// The record decides, not the tree: once a checkout has failed, the
+	// round's later builds of the repository build as built too, so the
+	// record says what every preview of it after that was built from.
+	if !r.merged() {
 		return false
 	}
 	if err := m.checkout(ctx, r, dir); err != nil {
@@ -154,6 +157,13 @@ func (m *qaMergeResults) CheckoutMergeResult(ctx context.Context, repoDir, dir s
 		return false
 	}
 	return true
+}
+
+// merged reports whether r's previews still build from the merge result.
+func (r *qaMergeRepository) merged() bool {
+	r.recordMu.Lock()
+	defer r.recordMu.Unlock()
+	return r.record.Merged
 }
 
 // repository is repoDir's entry, creating the temporary directory on first use.

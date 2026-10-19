@@ -185,6 +185,9 @@ func RegisterDeployStaticSitePreview(s *agentmcp.Server, deps DeployStaticSitePr
 // detection isn't available.
 const errNotDeployedSite = "this repository isn't a site deployment.io deploys, so build it yourself and pass publish_dir"
 
+// errQAPublishDir is the QA stage's answer to publish_dir.
+const errQAPublishDir = "QA previews are built by deployment.io: pass repository, not publish_dir"
+
 // notDetectedError is the agent-built path's error when publish_dir is missing and no
 // build settings could be detected, for reason.
 func notDetectedError(reason string) error {
@@ -235,6 +238,12 @@ func handleDeployStaticSitePreview(ctx context.Context, deps DeployStaticSitePre
 		if strings.TrimSpace(args.PublishDir) == "" {
 			return "", notDetectedError(plan.notDetected)
 		}
+	}
+	if deps.MergeResult != nil {
+		// QA's previews are what deployment.io builds from the repository (the
+		// merge result, or the branch as built and why). Output left in the
+		// Task dir by an earlier run is neither, so QA can't publish it.
+		return "", errors.New(errQAPublishDir)
 	}
 	if strings.TrimSpace(args.PublishDir) == "" {
 		return "", fmt.Errorf("publish_dir is required — or pass repository, and deployment.io builds the site itself when it deploys it or can detect how to build it")

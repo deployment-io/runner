@@ -2,11 +2,14 @@ package agenttools
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/deployment-io/deployment-runner-kit/task_previews"
 )
 
 // fakeMergeResult is a MergeResultProvider that writes files into the build
@@ -153,5 +156,24 @@ func TestPreviewBuildSourceWithoutAProviderIsTheCopy(t *testing.T) {
 	}
 	if b, err := os.ReadFile(filepath.Join(dir, "apps", "web", "public", "robots.txt")); err != nil || string(b) != "ok" {
 		t.Errorf("the build source isn't a copy of the repository: %q, %v", b, err)
+	}
+}
+
+// In the QA stage (a merge-result provider is set) publish_dir is refused,
+// alone or beside a repository: output an earlier run left in the Task dir is
+// neither the merge result nor a recorded fallback.
+func TestHandlerRefusesPublishDirInQA(t *testing.T) {
+	deps := planDeps(task_previews.StaticSiteBuildSettingsReplyV1{}, nil)
+	deps.MergeResult = &fakeMergeResult{ok: true}
+	builds := newPreviewBuilds()
+	defer builds.stop()
+	for _, args := range []string{
+		`{"publish_dir":"0-acme/web/dist"}`,
+		`{"repository":"0-acme/web","publish_dir":"0-acme/web/dist"}`,
+	} {
+		_, err := handleDeployStaticSitePreview(context.Background(), deps, builds, json.RawMessage(args))
+		if err == nil || err.Error() != errQAPublishDir {
+			t.Errorf("%s: got %v, want %q", args, err, errQAPublishDir)
+		}
 	}
 }
