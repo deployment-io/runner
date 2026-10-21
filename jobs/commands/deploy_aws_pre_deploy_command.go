@@ -48,8 +48,9 @@ var (
 	preDeployPollInterval = 5 * time.Second
 	preDeployNow          = time.Now
 	preDeploySleep        = time.Sleep
-	// Bound a stalled GetLogEvents call or deploy log write, so neither can
-	// hold off the deadline and StopTask.
+	// Bound a stalled AWS call or deploy log write, so none can hold off the
+	// deadline and StopTask, or hold the deploy forever.
+	preDeployEcsCallTimeout  = time.Minute
 	preDeployLogCallTimeout  = time.Minute
 	preDeployLogWriteTimeout = time.Minute
 )
@@ -120,7 +121,7 @@ func runPreDeployCommand(parameters map[string]interface{}, ecsClient preDeployE
 	}
 
 	// Never the command itself: it may carry a secret (DATABASE_URL=… inline).
-	io.WriteString(logsWriter, "Running the pre-deploy command\n")
+	logs.write("Running the pre-deploy command\n")
 	start := preDeployNow()
 	taskArn, failure := startPreDeployTask(ecsClient, runTaskInput)
 	if len(failure) > 0 {
@@ -138,7 +139,7 @@ func runPreDeployCommand(parameters map[string]interface{}, ecsClient preDeployE
 		outcome.stopError = stopErr.Error()
 	}
 	if outcome.exitCode != nil {
-		io.WriteString(logsWriter, fmt.Sprintf("Pre-deploy command finished (exit code %d) in %s\n",
+		logs.write(fmt.Sprintf("Pre-deploy command finished (exit code %d) in %s\n",
 			*outcome.exitCode, preDeployNow().Sub(start).Round(time.Second)))
 	}
 	if message, ok := outcome.message(); !ok {
@@ -150,7 +151,9 @@ func runPreDeployCommand(parameters map[string]interface{}, ecsClient preDeployE
 // startPreDeployTask returns the started task's ARN, or the first sentence of
 // the deploy's error when ECS started none.
 func startPreDeployTask(ecsClient preDeployEcsAPI, runTaskInput *ecs.RunTaskInput) (taskArn string, failure string) {
-	runTaskOutput, err := ecsClient.RunTask(context.TODO(), runTaskInput)
+	ctx, cancel := context.WithTimeout(context.Background(), preDeployEcsCallTimeout)
+	defer cancel()
+	runTaskOutput, err := ecsClient.RunTask(ctx, runTaskInput)
 	if err != nil {
 		return "", fmt.Sprintf("The pre-deploy command couldn't start: %s.", err)
 	}
@@ -172,10 +175,12 @@ func waitForPreDeployTask(ecsClient preDeployEcsAPI, ecsClusterArn, taskArn stri
 	deadline := start.Add(preDeployCommandTimeout)
 	for {
 		logs.read(preDeployLogPagesPerPoll, deadline)
-		describeTasksOutput, err := ecsClient.DescribeTasks(context.TODO(), &ecs.DescribeTasksInput{
+		ctx, cancel := context.WithTimeout(context.Background(), preDeployEcsCallTimeout)
+		describeTasksOutput, err := ecsClient.DescribeTasks(ctx, &ecs.DescribeTasksInput{
 			Cluster: aws.String(ecsClusterArn),
 			Tasks:   []string{taskArn},
 		})
+		cancel()
 		// A failed describe (or a task ECS doesn't return yet) is retried on
 		// the next poll; the deadline bounds how long that can go on.
 		if err == nil && len(describeTasksOutput.Tasks) > 0 &&
@@ -194,11 +199,13 @@ func waitForPreDeployTask(ecsClient preDeployEcsAPI, ecsClusterArn, taskArn stri
 func stopPreDeployTask(ecsClient preDeployEcsAPI, ecsClusterArn, taskArn string) error {
 	var err error
 	for attempt := 1; attempt <= preDeployStopTaskAttempts; attempt++ {
-		_, err = ecsClient.StopTask(context.TODO(), &ecs.StopTaskInput{
+		ctx, cancel := context.WithTimeout(context.Background(), preDeployEcsCallTimeout)
+		_, err = ecsClient.StopTask(ctx, &ecs.StopTaskInput{
 			Cluster: aws.String(ecsClusterArn),
 			Task:    aws.String(taskArn),
 			Reason:  aws.String("The pre-deploy command didn't finish within 30 minutes"),
 		})
+		cancel()
 		if err == nil {
 			return nil
 		}
@@ -310,7 +317,9 @@ func hasPreviousVersion(parameters map[string]interface{}, ecsClient preDeployEc
 	if err != nil {
 		return false
 	}
-	describeServicesOutput, err := ecsClient.DescribeServices(context.TODO(), &ecs.DescribeServicesInput{
+	ctx, cancel := context.WithTimeout(context.Background(), preDeployEcsCallTimeout)
+	defer cancel()
+	describeServicesOutput, err := ecsClient.DescribeServices(ctx, &ecs.DescribeServicesInput{
 		Cluster:  aws.String(ecsClusterArn),
 		Services: []string{ecsServiceName},
 	})

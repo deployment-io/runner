@@ -42,10 +42,22 @@ type fakePreDeployEcs struct {
 	stopTaskInputs []*ecs.StopTaskInput
 	stopTaskErrs   int // StopTask fails this many times before it succeeds
 	services       []ecsTypes.Service
+	stalled        bool // every call blocks until its request is given up
 }
 
-func (f *fakePreDeployEcs) RunTask(_ context.Context, in *ecs.RunTaskInput, _ ...func(*ecs.Options)) (*ecs.RunTaskOutput, error) {
+func (f *fakePreDeployEcs) stall(ctx context.Context) error {
+	if !f.stalled {
+		return nil
+	}
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (f *fakePreDeployEcs) RunTask(ctx context.Context, in *ecs.RunTaskInput, _ ...func(*ecs.Options)) (*ecs.RunTaskOutput, error) {
 	f.runTaskInputs = append(f.runTaskInputs, in)
+	if err := f.stall(ctx); err != nil {
+		return nil, err
+	}
 	if f.runTaskErr != nil {
 		return nil, f.runTaskErr
 	}
@@ -55,7 +67,10 @@ func (f *fakePreDeployEcs) RunTask(_ context.Context, in *ecs.RunTaskInput, _ ..
 	return &ecs.RunTaskOutput{Tasks: []ecsTypes.Task{{TaskArn: aws.String(testTaskArn), LastStatus: aws.String("PROVISIONING")}}}, nil
 }
 
-func (f *fakePreDeployEcs) DescribeTasks(_ context.Context, _ *ecs.DescribeTasksInput, _ ...func(*ecs.Options)) (*ecs.DescribeTasksOutput, error) {
+func (f *fakePreDeployEcs) DescribeTasks(ctx context.Context, _ *ecs.DescribeTasksInput, _ ...func(*ecs.Options)) (*ecs.DescribeTasksOutput, error) {
+	if err := f.stall(ctx); err != nil {
+		return nil, err
+	}
 	i := f.describeCalls
 	if i >= len(f.describeTasks) {
 		i = len(f.describeTasks) - 1
@@ -64,15 +79,21 @@ func (f *fakePreDeployEcs) DescribeTasks(_ context.Context, _ *ecs.DescribeTasks
 	return &ecs.DescribeTasksOutput{Tasks: []ecsTypes.Task{f.describeTasks[i]}}, nil
 }
 
-func (f *fakePreDeployEcs) StopTask(_ context.Context, in *ecs.StopTaskInput, _ ...func(*ecs.Options)) (*ecs.StopTaskOutput, error) {
+func (f *fakePreDeployEcs) StopTask(ctx context.Context, in *ecs.StopTaskInput, _ ...func(*ecs.Options)) (*ecs.StopTaskOutput, error) {
 	f.stopTaskInputs = append(f.stopTaskInputs, in)
+	if err := f.stall(ctx); err != nil {
+		return nil, err
+	}
 	if len(f.stopTaskInputs) <= f.stopTaskErrs {
 		return nil, errors.New("ServerException: try again")
 	}
 	return &ecs.StopTaskOutput{}, nil
 }
 
-func (f *fakePreDeployEcs) DescribeServices(_ context.Context, _ *ecs.DescribeServicesInput, _ ...func(*ecs.Options)) (*ecs.DescribeServicesOutput, error) {
+func (f *fakePreDeployEcs) DescribeServices(ctx context.Context, _ *ecs.DescribeServicesInput, _ ...func(*ecs.Options)) (*ecs.DescribeServicesOutput, error) {
+	if err := f.stall(ctx); err != nil {
+		return nil, err
+	}
 	return &ecs.DescribeServicesOutput{Services: f.services}, nil
 }
 
@@ -663,6 +684,63 @@ func TestPreDeployTimeoutNotHeldOffByStalledLogs(t *testing.T) {
 		t.Errorf("a blocked deploy log: error = %v after %d StopTask calls; want the timeout after 1", err,
 			len(ecsClient.stopTaskInputs))
 	}
+}
+
+func TestPreDeployFinishLineNotHeldByBlockedLogs(t *testing.T) {
+	fakePreDeployClock(t, time.Second)
+	original := preDeployLogWriteTimeout
+	t.Cleanup(func() { preDeployLogWriteTimeout = original })
+	preDeployLogWriteTimeout = 10 * time.Millisecond
+
+	// The output blocks the deploy logs; the command still succeeds and the
+	// deploy goes on.
+	ecsClient := &fakePreDeployEcs{describeTasks: []ecsTypes.Task{stoppedTask(aws.Int32(0), "")}}
+	writer := &blockedWriter{release: make(chan struct{})}
+	defer close(writer.release)
+	err := runPreDeployCommand(preDeployParameters(testCommand), ecsClient,
+		&fakePreDeployLogs{pages: [][]string{{"migrated"}}}, testClusterArn, testTaskDefinitionArn, writer)
+	if err != nil {
+		t.Errorf("exit 0 behind a blocked deploy log: error = %v; want nil", err)
+	}
+}
+
+func TestPreDeployNotHeldByStalledEcsCalls(t *testing.T) {
+	fakePreDeployClock(t, 4*time.Minute)
+	original := preDeployEcsCallTimeout
+	t.Cleanup(func() { preDeployEcsCallTimeout = original })
+	preDeployEcsCallTimeout = 10 * time.Millisecond
+
+	// DescribeTasks and StopTask never answer: the deadline still comes, and
+	// each StopTask attempt is given up.
+	ecsClient := &fakePreDeployEcs{describeTasks: []ecsTypes.Task{runningTask()}}
+	parameters := preDeployParameters(testCommand)
+	stalledAfterStart := &stalledAfterRunTask{fakePreDeployEcs: ecsClient}
+	var logs bytes.Buffer
+	err := runPreDeployCommand(parameters, stalledAfterStart, &fakePreDeployLogs{}, testClusterArn,
+		testTaskDefinitionArn, &logs)
+	if err == nil || !strings.HasPrefix(err.Error(), "The pre-deploy command didn't finish within 30 minutes and couldn't be stopped: ") ||
+		len(ecsClient.stopTaskInputs) != preDeployStopTaskAttempts {
+		t.Errorf("stalled ECS calls: error = %v after %d StopTask calls; want it couldn't be stopped after %d",
+			err, len(ecsClient.stopTaskInputs), preDeployStopTaskAttempts)
+	}
+
+	// RunTask never answers: the deploy fails instead of waiting forever.
+	ecsClient = &fakePreDeployEcs{stalled: true}
+	_, err = runPreDeploy(t, preDeployParameters(testCommand), ecsClient, &fakePreDeployLogs{})
+	if err == nil || !strings.HasPrefix(err.Error(), "The pre-deploy command couldn't start: ") {
+		t.Errorf("a stalled RunTask: error = %v; want it couldn't start", err)
+	}
+}
+
+// stalledAfterRunTask starts the task, then stalls every other ECS call.
+type stalledAfterRunTask struct {
+	*fakePreDeployEcs
+}
+
+func (f *stalledAfterRunTask) RunTask(ctx context.Context, in *ecs.RunTaskInput, optFns ...func(*ecs.Options)) (*ecs.RunTaskOutput, error) {
+	output, err := f.fakePreDeployEcs.RunTask(ctx, in, optFns...)
+	f.stalled = true
+	return output, err
 }
 
 func TestSplitLongLogLines(t *testing.T) {
