@@ -1166,6 +1166,26 @@ func getInternalDnsName(parameters map[string]interface{}) (string, error) {
 	return dnsName, nil
 }
 
+// getEcsServiceNetworkConfiguration is the network a deployment's tasks run in:
+// the private subnets, no security groups of their own and no public IP. The
+// service and the pre-deploy command's one-off task both use it, so the
+// pre-deploy command reaches exactly what the service reaches.
+func getEcsServiceNetworkConfiguration(parameters map[string]interface{}) (*ecsTypes.NetworkConfiguration, error) {
+	privateSubnets, err := jobs.GetParameterValue[primitive.A](parameters, parameters_enums.PrivateSubnets)
+	if err != nil {
+		return nil, err
+	}
+	privateSubnetsSlice, err := commandUtils.ConvertPrimitiveAToStringSlice(privateSubnets)
+	if err != nil {
+		return nil, err
+	}
+	return &ecsTypes.NetworkConfiguration{
+		AwsvpcConfiguration: &ecsTypes.AwsVpcConfiguration{
+			Subnets: privateSubnetsSlice,
+		},
+	}, nil
+}
+
 func createEcsServiceIfNeeded(parameters map[string]interface{}, ecsClient *ecs.Client,
 	ecsClusterArn, targetGroupArn, taskDefinitionArn string, logsWriter io.Writer) (ecsServiceArn string, shouldUpdateService bool, err error) {
 
@@ -1203,20 +1223,9 @@ func createEcsServiceIfNeeded(parameters map[string]interface{}, ecsClient *ecs.
 		if err != nil {
 			return "", false, err
 		}
-		privateSubnets, err := jobs.GetParameterValue[primitive.A](parameters, parameters_enums.PrivateSubnets)
+		networkConfiguration, err := getEcsServiceNetworkConfiguration(parameters)
 		if err != nil {
 			return "", false, err
-		}
-		privateSubnetsSlice, err := commandUtils.ConvertPrimitiveAToStringSlice(privateSubnets)
-		if err != nil {
-			return "", false, err
-		}
-		awsVpcConfiguration := &ecsTypes.AwsVpcConfiguration{
-			Subnets: privateSubnetsSlice,
-		}
-
-		networkConfiguration := &ecsTypes.NetworkConfiguration{
-			AwsvpcConfiguration: awsVpcConfiguration,
 		}
 
 		containerName, err := getContainerName(parameters)
@@ -1445,15 +1454,13 @@ func (d *DeployAwsWebService) Run(parameters map[string]interface{}, logsWriter 
 	if err != nil {
 		return parameters, err
 	}
-	_, shouldUpdateService, err := createEcsServiceIfNeeded(parameters, ecsClient, ecsClusterArn, targetGroupArn, taskDefinitionArn, logsWriter)
+	logsClient, err := cloud_api_clients.GetCloudwatchLogsClient(parameters)
 	if err != nil {
 		return parameters, err
 	}
-	if shouldUpdateService {
-		err = updateEcsService(parameters, ecsClient, ecsClusterArn, taskDefinitionArn, logsWriter)
-		if err != nil {
-			return parameters, err
-		}
+	err = deployEcsServiceAfterPreDeploy(parameters, ecsClient, logsClient, ecsClusterArn, targetGroupArn, taskDefinitionArn, logsWriter)
+	if err != nil {
+		return parameters, err
 	}
 
 	buildID, err := jobs.GetParameterValue[string](parameters, parameters_enums.BuildID)

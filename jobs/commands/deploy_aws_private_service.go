@@ -56,15 +56,13 @@ func (d *DeployAwsPrivateService) Run(parameters map[string]interface{}, logsWri
 	if err != nil {
 		return parameters, err
 	}
-	_, shouldUpdateService, err := createEcsServiceIfNeeded(parameters, ecsClient, ecsClusterArn, "", taskDefinitionArn, logsWriter)
+	logsClient, err := cloud_api_clients.GetCloudwatchLogsClient(parameters)
 	if err != nil {
 		return parameters, err
 	}
-	if shouldUpdateService {
-		err = updateEcsService(parameters, ecsClient, ecsClusterArn, taskDefinitionArn, logsWriter)
-		if err != nil {
-			return parameters, err
-		}
+	err = deployEcsServiceAfterPreDeploy(parameters, ecsClient, logsClient, ecsClusterArn, "", taskDefinitionArn, logsWriter)
+	if err != nil {
+		return parameters, err
 	}
 
 	buildID, err := jobs.GetParameterValue[string](parameters, parameters_enums.BuildID)
