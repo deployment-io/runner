@@ -77,42 +77,9 @@ func (d *DeleteAwsPrivateService) Run(parameters map[string]interface{}, logsWri
 		return parameters, err
 	}
 
-	//delete task definition if needed
-	taskDefinitionFamilyName, err := getTaskDefinitionFamilyName(parameters)
+	err = deleteTaskDefinitions(parameters, ecsClient, logsWriter)
 	if err != nil {
 		return parameters, err
-	}
-	listTaskDefinitionsOutput, err := ecsClient.ListTaskDefinitions(context.TODO(), &ecs.ListTaskDefinitionsInput{
-		FamilyPrefix: aws.String(taskDefinitionFamilyName),
-	})
-	if err != nil {
-		return parameters, err
-	}
-	taskDefinitionArns := listTaskDefinitionsOutput.TaskDefinitionArns
-	for _, taskDefinitionArn := range taskDefinitionArns {
-		io.WriteString(logsWriter, fmt.Sprintf("Deleting task definition: %s\n", taskDefinitionArn))
-		_, err = ecsClient.DeregisterTaskDefinition(context.TODO(), &ecs.DeregisterTaskDefinitionInput{TaskDefinition: aws.String(taskDefinitionArn)})
-		if err != nil {
-			return parameters, err
-		}
-		time.Sleep(time.Second)
-	}
-	var taskDefinitionArnsSet []string
-	for _, taskDefinitionArn := range taskDefinitionArns {
-		taskDefinitionArnsSet = append(taskDefinitionArnsSet, taskDefinitionArn)
-		if len(taskDefinitionArnsSet) == 8 {
-			_, err = ecsClient.DeleteTaskDefinitions(context.TODO(), &ecs.DeleteTaskDefinitionsInput{TaskDefinitions: taskDefinitionArnsSet})
-			if err != nil {
-				return parameters, err
-			}
-			taskDefinitionArnsSet = nil
-		}
-	}
-	if len(taskDefinitionArnsSet) > 0 {
-		_, err = ecsClient.DeleteTaskDefinitions(context.TODO(), &ecs.DeleteTaskDefinitionsInput{TaskDefinitions: taskDefinitionArnsSet})
-		if err != nil {
-			return parameters, err
-		}
 	}
 
 	deployedFromImage, _ := jobs.GetParameterValue[bool](parameters, parameters_enums.DeployedFromImage)

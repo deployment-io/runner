@@ -22,10 +22,13 @@ import (
 )
 
 // The pre-deploy command (e.g. database migrations) runs once per deploy of
-// new code, as a one-off Fargate task from the newly registered task
-// definition, before the service is created or updated. Its output is copied
-// into the deploy logs; anything but exit code 0 fails the deploy, so the
-// service is never moved to the new task definition.
+// new code, as a one-off Fargate task, before the service is created or
+// updated. The task runs from a sibling of the newly registered task
+// definition whose container's entrypoint is sh -c, so the command runs
+// whatever the image's ENTRYPOINT is; the sibling is deregistered once the
+// task ends. Its output is copied into the deploy logs; anything but exit code
+// 0 fails the deploy, so the service is never moved to the new task
+// definition.
 
 const preDeployCommandTimeout = 30 * time.Minute
 
@@ -68,6 +71,9 @@ type preDeployEcsAPI interface {
 	DescribeTasks(ctx context.Context, params *ecs.DescribeTasksInput, optFns ...func(*ecs.Options)) (*ecs.DescribeTasksOutput, error)
 	StopTask(ctx context.Context, params *ecs.StopTaskInput, optFns ...func(*ecs.Options)) (*ecs.StopTaskOutput, error)
 	DescribeServices(ctx context.Context, params *ecs.DescribeServicesInput, optFns ...func(*ecs.Options)) (*ecs.DescribeServicesOutput, error)
+	DescribeTaskDefinition(ctx context.Context, params *ecs.DescribeTaskDefinitionInput, optFns ...func(*ecs.Options)) (*ecs.DescribeTaskDefinitionOutput, error)
+	RegisterTaskDefinition(ctx context.Context, params *ecs.RegisterTaskDefinitionInput, optFns ...func(*ecs.Options)) (*ecs.RegisterTaskDefinitionOutput, error)
+	DeregisterTaskDefinition(ctx context.Context, params *ecs.DeregisterTaskDefinitionInput, optFns ...func(*ecs.Options)) (*ecs.DeregisterTaskDefinitionOutput, error)
 }
 
 // preDeployLogsAPI is the part of *cloudwatchlogs.Client the pre-deploy command uses.
@@ -111,7 +117,7 @@ func runPreDeployCommand(parameters map[string]interface{}, ecsClient preDeployE
 	if err != nil {
 		return err
 	}
-	runTaskInput, err := getPreDeployRunTaskInput(parameters, ecsClusterArn, taskDefinitionArn, containerName, command)
+	runTaskInput, err := getPreDeployRunTaskInput(parameters, ecsClusterArn, containerName, command)
 	if err != nil {
 		return err
 	}
@@ -122,6 +128,14 @@ func runPreDeployCommand(parameters map[string]interface{}, ecsClient preDeployE
 
 	// Never the command itself: it may carry a secret (DATABASE_URL=… inline).
 	logs.write("Running the pre-deploy command\n")
+	preDeployTaskDefinitionArn, err := registerPreDeployTaskDefinition(parameters, ecsClient, taskDefinitionArn, containerName)
+	if err != nil {
+		return preDeployFailure(parameters, ecsClient, ecsClusterArn,
+			fmt.Sprintf("The pre-deploy command couldn't start: %s.", err))
+	}
+	defer deregisterPreDeployTaskDefinition(ecsClient, preDeployTaskDefinitionArn, logs)
+	runTaskInput.TaskDefinition = aws.String(preDeployTaskDefinitionArn)
+
 	start := preDeployNow()
 	taskArn, failure := startPreDeployTask(ecsClient, runTaskInput)
 	if len(failure) > 0 {
@@ -216,10 +230,101 @@ func stopPreDeployTask(ecsClient preDeployEcsAPI, ecsClusterArn, taskArn string)
 	return err
 }
 
-// getPreDeployRunTaskInput runs the new task definition once, in the network
-// the service uses, with the deployment's container running the command
-// through sh -c. The image's ENTRYPOINT still applies.
-func getPreDeployRunTaskInput(parameters map[string]interface{}, ecsClusterArn, taskDefinitionArn, containerName,
+// registerPreDeployTaskDefinition registers the pre-deploy sibling of the
+// task definition the deploy rolls out and returns its ARN.
+func registerPreDeployTaskDefinition(parameters map[string]interface{}, ecsClient preDeployEcsAPI,
+	taskDefinitionArn, containerName string) (string, error) {
+	family, err := getTaskDefinitionFamilyName(parameters)
+	if err != nil {
+		return "", err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), preDeployEcsCallTimeout)
+	described, err := ecsClient.DescribeTaskDefinition(ctx, &ecs.DescribeTaskDefinitionInput{
+		TaskDefinition: aws.String(taskDefinitionArn),
+		Include:        []ecsTypes.TaskDefinitionField{ecsTypes.TaskDefinitionFieldTags},
+	})
+	cancel()
+	if err != nil {
+		return "", err
+	}
+	if described.TaskDefinition == nil {
+		return "", errors.New("ECS returned no task definition")
+	}
+	ctx, cancel = context.WithTimeout(context.Background(), preDeployEcsCallTimeout)
+	defer cancel()
+	registered, err := ecsClient.RegisterTaskDefinition(ctx,
+		getPreDeployTaskDefinitionInput(described, family+"-pre-deploy", containerName))
+	if err != nil {
+		return "", err
+	}
+	if registered.TaskDefinition == nil {
+		return "", errors.New("ECS returned no task definition")
+	}
+	return aws.ToString(registered.TaskDefinition.TaskDefinitionArn), nil
+}
+
+// getPreDeployTaskDefinitionInput copies the described task definition into
+// the family named family, with the deployment's container's entrypoint
+// replaced by sh -c and no command, so the command given to RunTask runs as
+// is. The command itself is never stored in a task definition: it may carry a
+// secret.
+func getPreDeployTaskDefinitionInput(described *ecs.DescribeTaskDefinitionOutput, family,
+	containerName string) *ecs.RegisterTaskDefinitionInput {
+	source := described.TaskDefinition
+	containerDefinitions := make([]ecsTypes.ContainerDefinition, len(source.ContainerDefinitions))
+	copy(containerDefinitions, source.ContainerDefinitions)
+	for i := range containerDefinitions {
+		if aws.ToString(containerDefinitions[i].Name) == containerName {
+			containerDefinitions[i].EntryPoint = []string{"sh", "-c"}
+			containerDefinitions[i].Command = nil
+		}
+	}
+	tags := make([]ecsTypes.Tag, len(described.Tags))
+	copy(tags, described.Tags)
+	for i := range tags {
+		if aws.ToString(tags[i].Key) == "Name" {
+			tags[i].Value = aws.String(family)
+		}
+	}
+	return &ecs.RegisterTaskDefinitionInput{
+		ContainerDefinitions:    containerDefinitions,
+		Family:                  aws.String(family),
+		Cpu:                     source.Cpu,
+		EphemeralStorage:        source.EphemeralStorage,
+		ExecutionRoleArn:        source.ExecutionRoleArn,
+		InferenceAccelerators:   source.InferenceAccelerators,
+		IpcMode:                 source.IpcMode,
+		Memory:                  source.Memory,
+		NetworkMode:             source.NetworkMode,
+		PidMode:                 source.PidMode,
+		PlacementConstraints:    source.PlacementConstraints,
+		ProxyConfiguration:      source.ProxyConfiguration,
+		RequiresCompatibilities: source.RequiresCompatibilities,
+		RuntimePlatform:         source.RuntimePlatform,
+		Tags:                    tags,
+		TaskRoleArn:             source.TaskRoleArn,
+		Volumes:                 source.Volumes,
+	}
+}
+
+// deregisterPreDeployTaskDefinition removes the pre-deploy task definition
+// once its task has ended (a running task isn't affected). It's best-effort:
+// a failure is only noted in the deploy logs.
+func deregisterPreDeployTaskDefinition(ecsClient preDeployEcsAPI, taskDefinitionArn string, logs *preDeployLogReader) {
+	ctx, cancel := context.WithTimeout(context.Background(), preDeployEcsCallTimeout)
+	defer cancel()
+	_, err := ecsClient.DeregisterTaskDefinition(ctx, &ecs.DeregisterTaskDefinitionInput{
+		TaskDefinition: aws.String(taskDefinitionArn),
+	})
+	if err != nil {
+		logs.write(fmt.Sprintf("Couldn't remove the pre-deploy task definition: %s\n", err))
+	}
+}
+
+// getPreDeployRunTaskInput runs a task once, in the network the service uses,
+// with the deployment's container running the command. The caller sets the
+// task definition: the pre-deploy one, whose entrypoint is sh -c.
+func getPreDeployRunTaskInput(parameters map[string]interface{}, ecsClusterArn, containerName,
 	command string) (*ecs.RunTaskInput, error) {
 	networkConfiguration, err := getEcsServiceNetworkConfiguration(parameters)
 	if err != nil {
@@ -233,11 +338,10 @@ func getPreDeployRunTaskInput(parameters map[string]interface{}, ecsClusterArn, 
 		Overrides: &ecsTypes.TaskOverride{
 			ContainerOverrides: []ecsTypes.ContainerOverride{{
 				Name:    aws.String(containerName),
-				Command: []string{"sh", "-c", command},
+				Command: []string{command},
 			}},
 		},
-		StartedBy:      aws.String("deployment-io-pre-deploy"),
-		TaskDefinition: aws.String(taskDefinitionArn),
+		StartedBy: aws.String("deployment-io-pre-deploy"),
 	}, nil
 }
 
