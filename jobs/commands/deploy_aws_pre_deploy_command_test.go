@@ -3,6 +3,7 @@ package commands
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"go/ast"
@@ -29,6 +30,8 @@ const (
 	testClusterArn        = "arn:aws:ecs:eu-west-1:123456789012:cluster/c"
 	testTaskDefinitionArn = "arn:aws:ecs:eu-west-1:123456789012:task-definition/td-deployment-1:8"
 	testTaskArn           = "arn:aws:ecs:eu-west-1:123456789012:task/c/0123456789abcdef"
+	// The sibling task definition the pre-deploy command runs from.
+	testPreDeployTaskDefinitionArn = "arn:aws:ecs:eu-west-1:123456789012:task-definition/td-deployment-1-pre-deploy:3"
 	// Carries a secret inline, as a customer's command may.
 	testCommand = "DATABASE_URL=postgres://u:hunter2@db/app npm run migrate"
 )
@@ -42,20 +45,125 @@ type fakePreDeployEcs struct {
 	stopTaskInputs []*ecs.StopTaskInput
 	stopTaskErrs   int // StopTask fails this many times before it succeeds
 	services       []ecsTypes.Service
-	stalled        bool // every call blocks until its request is given up
+	stalled        bool   // every call blocks until its request is given up
+	stalledCall    string // only the call of this name blocks
+
+	describeTaskDefinitionInputs []*ecs.DescribeTaskDefinitionInput
+	describeTaskDefinitionErr    error
+	registerInputs               []*ecs.RegisterTaskDefinitionInput
+	registerErr                  error
+	deregisterInputs             []*ecs.DeregisterTaskDefinitionInput
+	deregisterErr                error
 }
 
 func (f *fakePreDeployEcs) stall(ctx context.Context) error {
-	if !f.stalled {
+	return f.stallCall(ctx, "")
+}
+
+func (f *fakePreDeployEcs) stallCall(ctx context.Context, name string) error {
+	if !f.stalled && (len(name) == 0 || f.stalledCall != name) {
 		return nil
 	}
 	<-ctx.Done()
 	return ctx.Err()
 }
 
+func (f *fakePreDeployEcs) DescribeTaskDefinition(ctx context.Context, in *ecs.DescribeTaskDefinitionInput, _ ...func(*ecs.Options)) (*ecs.DescribeTaskDefinitionOutput, error) {
+	f.describeTaskDefinitionInputs = append(f.describeTaskDefinitionInputs, in)
+	if err := f.stallCall(ctx, "DescribeTaskDefinition"); err != nil {
+		return nil, err
+	}
+	if f.describeTaskDefinitionErr != nil {
+		return nil, f.describeTaskDefinitionErr
+	}
+	return testTaskDefinitionDescription(), nil
+}
+
+func (f *fakePreDeployEcs) RegisterTaskDefinition(ctx context.Context, in *ecs.RegisterTaskDefinitionInput, _ ...func(*ecs.Options)) (*ecs.RegisterTaskDefinitionOutput, error) {
+	f.registerInputs = append(f.registerInputs, in)
+	if err := f.stallCall(ctx, "RegisterTaskDefinition"); err != nil {
+		return nil, err
+	}
+	if f.registerErr != nil {
+		return nil, f.registerErr
+	}
+	return &ecs.RegisterTaskDefinitionOutput{TaskDefinition: &ecsTypes.TaskDefinition{
+		TaskDefinitionArn: aws.String(testPreDeployTaskDefinitionArn),
+	}}, nil
+}
+
+func (f *fakePreDeployEcs) DeregisterTaskDefinition(ctx context.Context, in *ecs.DeregisterTaskDefinitionInput, _ ...func(*ecs.Options)) (*ecs.DeregisterTaskDefinitionOutput, error) {
+	f.deregisterInputs = append(f.deregisterInputs, in)
+	if err := f.stallCall(ctx, "DeregisterTaskDefinition"); err != nil {
+		return nil, err
+	}
+	if f.deregisterErr != nil {
+		return nil, f.deregisterErr
+	}
+	return &ecs.DeregisterTaskDefinitionOutput{}, nil
+}
+
+// testTaskDefinitionDescription is the task definition registerTaskDefinition
+// registers, as DescribeTaskDefinition returns it, with every field the
+// pre-deploy copy takes set.
+func testTaskDefinitionDescription() *ecs.DescribeTaskDefinitionOutput {
+	return &ecs.DescribeTaskDefinitionOutput{
+		TaskDefinition: &ecsTypes.TaskDefinition{
+			TaskDefinitionArn:  aws.String(testTaskDefinitionArn),
+			Family:             aws.String("td-deployment-1"),
+			Revision:           8,
+			Status:             ecsTypes.TaskDefinitionStatusActive,
+			Compatibilities:    []ecsTypes.Compatibility{ecsTypes.CompatibilityEc2, ecsTypes.CompatibilityFargate},
+			RequiresAttributes: []ecsTypes.Attribute{{Name: aws.String("com.amazonaws.ecs.capability.logging-driver.awslogs")}},
+			ContainerDefinitions: []ecsTypes.ContainerDefinition{
+				{
+					Name:        aws.String("c-deployment-1"),
+					Image:       aws.String("123456789012.dkr.ecr.eu-west-1.amazonaws.com/app:build-1"),
+					Essential:   aws.Bool(true),
+					Environment: []ecsTypes.KeyValuePair{{Name: aws.String("PORT"), Value: aws.String("3000")}},
+					LogConfiguration: &ecsTypes.LogConfiguration{
+						LogDriver: ecsTypes.LogDriverAwslogs,
+						Options:   map[string]string{"awslogs-group": "org-1/deployment-1", "awslogs-stream-prefix": "application/build-1"},
+					},
+				},
+				{
+					Name:       aws.String("sidecar"),
+					Image:      aws.String("sidecar:1"),
+					EntryPoint: []string{"/sidecar"},
+					Command:    []string{"--serve"},
+				},
+			},
+			Cpu:                     aws.String("256"),
+			Memory:                  aws.String("512"),
+			ExecutionRoleArn:        aws.String("arn:aws:iam::123456789012:role/execution"),
+			TaskRoleArn:             aws.String("arn:aws:iam::123456789012:role/task"),
+			NetworkMode:             ecsTypes.NetworkModeAwsvpc,
+			RequiresCompatibilities: []ecsTypes.Compatibility{ecsTypes.CompatibilityFargate},
+			RuntimePlatform: &ecsTypes.RuntimePlatform{
+				CpuArchitecture:       ecsTypes.CPUArchitectureArm64,
+				OperatingSystemFamily: ecsTypes.OSFamilyLinux,
+			},
+			EphemeralStorage:      &ecsTypes.EphemeralStorage{SizeInGiB: 30},
+			InferenceAccelerators: []ecsTypes.InferenceAccelerator{{DeviceName: aws.String("d"), DeviceType: aws.String("t")}},
+			Volumes:               []ecsTypes.Volume{{Name: aws.String("scratch")}},
+			PlacementConstraints: []ecsTypes.TaskDefinitionPlacementConstraint{{
+				Type:       ecsTypes.TaskDefinitionPlacementConstraintTypeMemberOf,
+				Expression: aws.String("attribute:ecs.os-type == linux"),
+			}},
+			PidMode:            ecsTypes.PidModeTask,
+			IpcMode:            ecsTypes.IpcModeTask,
+			ProxyConfiguration: &ecsTypes.ProxyConfiguration{ContainerName: aws.String("sidecar")},
+		},
+		Tags: []ecsTypes.Tag{
+			{Key: aws.String("Name"), Value: aws.String("td-deployment-1")},
+			{Key: aws.String("created by"), Value: aws.String("deployment.io")},
+		},
+	}
+}
+
 func (f *fakePreDeployEcs) RunTask(ctx context.Context, in *ecs.RunTaskInput, _ ...func(*ecs.Options)) (*ecs.RunTaskOutput, error) {
 	f.runTaskInputs = append(f.runTaskInputs, in)
-	if err := f.stall(ctx); err != nil {
+	if err := f.stallCall(ctx, "RunTask"); err != nil {
 		return nil, err
 	}
 	if f.runTaskErr != nil {
@@ -176,20 +284,22 @@ func runPreDeploy(t *testing.T, parameters map[string]interface{}, ecsClient *fa
 	if err != nil && strings.Contains(err.Error(), "hunter2") {
 		t.Errorf("the error carries the command itself: %v", err)
 	}
+	for _, in := range ecsClient.registerInputs {
+		if registered, _ := json.Marshal(in); strings.Contains(string(registered), "hunter2") {
+			t.Errorf("a registered task definition carries the command itself: %s", registered)
+		}
+	}
 	return logs.String(), err
 }
 
 func TestPreDeployRunTaskInput(t *testing.T) {
 	parameters := preDeployParameters(testCommand)
-	input, err := getPreDeployRunTaskInput(parameters, testClusterArn, testTaskDefinitionArn, "c-deployment-1", testCommand)
+	input, err := getPreDeployRunTaskInput(parameters, testClusterArn, "c-deployment-1", testCommand)
 	if err != nil {
 		t.Fatalf("getPreDeployRunTaskInput: %v", err)
 	}
 	if aws.ToString(input.Cluster) != testClusterArn {
 		t.Errorf("Cluster = %q; want %q", aws.ToString(input.Cluster), testClusterArn)
-	}
-	if aws.ToString(input.TaskDefinition) != testTaskDefinitionArn {
-		t.Errorf("TaskDefinition = %q; want the newly registered %q", aws.ToString(input.TaskDefinition), testTaskDefinitionArn)
 	}
 	if input.LaunchType != ecsTypes.LaunchTypeFargate {
 		t.Errorf("LaunchType = %q; want FARGATE", input.LaunchType)
@@ -212,7 +322,8 @@ func TestPreDeployRunTaskInput(t *testing.T) {
 	if len(overrides) != 1 || aws.ToString(overrides[0].Name) != "c-deployment-1" {
 		t.Fatalf("ContainerOverrides = %+v; want one for c-deployment-1", overrides)
 	}
-	if want := []string{"sh", "-c", testCommand}; !reflect.DeepEqual(overrides[0].Command, want) {
+	// The pre-deploy task definition's entrypoint, sh -c, takes it as one word.
+	if want := []string{testCommand}; !reflect.DeepEqual(overrides[0].Command, want) {
 		t.Errorf("Command = %q; want %q", overrides[0].Command, want)
 	}
 }
@@ -233,11 +344,30 @@ func TestPreDeployExitZeroContinues(t *testing.T) {
 		t.Fatalf("exit code 0 must continue the deploy: %v", err)
 	}
 	if len(ecsClient.runTaskInputs) != 1 {
-		t.Errorf("RunTask called %d times; want 1", len(ecsClient.runTaskInputs))
+		t.Fatalf("RunTask called %d times; want 1", len(ecsClient.runTaskInputs))
 	}
 	if len(ecsClient.stopTaskInputs) != 0 {
 		t.Error("a finished task must not be stopped")
 	}
+	if len(ecsClient.describeTaskDefinitionInputs) != 1 || len(ecsClient.registerInputs) != 1 {
+		t.Fatalf("DescribeTaskDefinition called %d times, RegisterTaskDefinition %d; want 1 each",
+			len(ecsClient.describeTaskDefinitionInputs), len(ecsClient.registerInputs))
+	}
+	described := ecsClient.describeTaskDefinitionInputs[0]
+	if aws.ToString(described.TaskDefinition) != testTaskDefinitionArn ||
+		!reflect.DeepEqual(described.Include, []ecsTypes.TaskDefinitionField{ecsTypes.TaskDefinitionFieldTags}) {
+		t.Errorf("described %q including %v; want %q with its tags", aws.ToString(described.TaskDefinition), described.Include,
+			testTaskDefinitionArn)
+	}
+	runTask := ecsClient.runTaskInputs[0]
+	if aws.ToString(runTask.TaskDefinition) != testPreDeployTaskDefinitionArn {
+		t.Errorf("RunTask TaskDefinition = %q; want the pre-deploy %q", aws.ToString(runTask.TaskDefinition),
+			testPreDeployTaskDefinitionArn)
+	}
+	if got := runTask.Overrides.ContainerOverrides[0].Command; !reflect.DeepEqual(got, []string{testCommand}) {
+		t.Errorf("RunTask Command = %q; want [the command]", got)
+	}
+	assertPreDeployTaskDefinitionDeregistered(t, ecsClient)
 	want := "Running the pre-deploy command\nmigrating 001\nmigrating 002\ndone\nPre-deploy command finished (exit code 0) in "
 	if !strings.HasPrefix(logs, want) {
 		t.Errorf("deploy logs =\n%s\nwant them to start with\n%s", logs, want)
@@ -339,6 +469,7 @@ func TestPreDeployFailures(t *testing.T) {
 			if finished := strings.Contains(logs, "Pre-deploy command finished (exit code"); finished != tt.wantFinishLog {
 				t.Errorf("finish line in logs = %v; want %v:\n%s", finished, tt.wantFinishLog, logs)
 			}
+			assertPreDeployTaskDefinitionDeregistered(t, tt.ecsClient)
 		})
 	}
 }
@@ -725,11 +856,12 @@ func TestPreDeployNotHeldByStalledEcsCalls(t *testing.T) {
 	}
 
 	// RunTask never answers: the deploy fails instead of waiting forever.
-	ecsClient = &fakePreDeployEcs{stalled: true}
+	ecsClient = &fakePreDeployEcs{stalledCall: "RunTask"}
 	_, err = runPreDeploy(t, preDeployParameters(testCommand), ecsClient, &fakePreDeployLogs{})
 	if err == nil || !strings.HasPrefix(err.Error(), "The pre-deploy command couldn't start: ") {
 		t.Errorf("a stalled RunTask: error = %v; want it couldn't start", err)
 	}
+	assertPreDeployTaskDefinitionDeregistered(t, ecsClient)
 }
 
 // stalledAfterRunTask starts the task, then stalls every other ECS call.
@@ -783,5 +915,181 @@ func TestPreDeployLogsStopCopyingWhenTheDeployLogsClose(t *testing.T) {
 	}
 	if logsClient.calls != 1 {
 		t.Errorf("read %d pages after the deploy logs closed; want to stop after 1", logsClient.calls)
+	}
+}
+
+func assertPreDeployTaskDefinitionDeregistered(t *testing.T, ecsClient *fakePreDeployEcs) {
+	t.Helper()
+	if len(ecsClient.deregisterInputs) != 1 ||
+		aws.ToString(ecsClient.deregisterInputs[0].TaskDefinition) != testPreDeployTaskDefinitionArn {
+		var got []string
+		for _, in := range ecsClient.deregisterInputs {
+			got = append(got, aws.ToString(in.TaskDefinition))
+		}
+		t.Errorf("deregistered %q; want the pre-deploy %q once", got, testPreDeployTaskDefinitionArn)
+	}
+}
+
+func TestPreDeployTaskDefinitionInput(t *testing.T) {
+	described := testTaskDefinitionDescription()
+	source := described.TaskDefinition
+	input := getPreDeployTaskDefinitionInput(described, "td-deployment-1-pre-deploy", "c-deployment-1")
+	if !reflect.DeepEqual(described, testTaskDefinitionDescription()) {
+		t.Error("the described task definition was changed")
+	}
+
+	if got := aws.ToString(input.Family); got != "td-deployment-1-pre-deploy" {
+		t.Errorf("Family = %q; want td-deployment-1-pre-deploy", got)
+	}
+	wantTags := []ecsTypes.Tag{
+		{Key: aws.String("Name"), Value: aws.String("td-deployment-1-pre-deploy")},
+		{Key: aws.String("created by"), Value: aws.String("deployment.io")},
+	}
+	if !reflect.DeepEqual(input.Tags, wantTags) {
+		t.Errorf("Tags = %+v; want %+v", input.Tags, wantTags)
+	}
+	if len(input.ContainerDefinitions) != 2 {
+		t.Fatalf("%d container definitions; want 2", len(input.ContainerDefinitions))
+	}
+	container := input.ContainerDefinitions[0]
+	if !reflect.DeepEqual(container.EntryPoint, []string{"sh", "-c"}) || container.Command != nil {
+		t.Errorf("c-deployment-1: EntryPoint = %q, Command = %q; want [sh -c] and none", container.EntryPoint, container.Command)
+	}
+	container.EntryPoint = nil
+	if !reflect.DeepEqual(container, source.ContainerDefinitions[0]) {
+		t.Errorf("c-deployment-1 = %+v; want %+v but for the entrypoint", container, source.ContainerDefinitions[0])
+	}
+	if !reflect.DeepEqual(input.ContainerDefinitions[1], source.ContainerDefinitions[1]) {
+		t.Errorf("sidecar = %+v; want it as is", input.ContainerDefinitions[1])
+	}
+
+	// Every other input the task definition has is copied as is; the source
+	// sets them all, so a field missed here shows up.
+	inputValue, sourceValue := reflect.ValueOf(input).Elem(), reflect.ValueOf(source).Elem()
+	for i := 0; i < inputValue.NumField(); i++ {
+		name := inputValue.Type().Field(i).Name
+		switch name {
+		case "Family", "Tags", "ContainerDefinitions":
+			continue
+		}
+		sourceField := sourceValue.FieldByName(name)
+		if !sourceField.IsValid() || !inputValue.Type().Field(i).IsExported() {
+			continue
+		}
+		if sourceField.IsZero() {
+			t.Errorf("the test's source task definition doesn't set %s", name)
+		}
+		if !reflect.DeepEqual(inputValue.Field(i).Interface(), sourceField.Interface()) {
+			t.Errorf("%s = %+v; want the source's %+v", name, inputValue.Field(i).Interface(), sourceField.Interface())
+		}
+	}
+
+	// The source sets no requiresCompatibilities: none is added.
+	described = testTaskDefinitionDescription()
+	described.TaskDefinition.RequiresCompatibilities = nil
+	input = getPreDeployTaskDefinitionInput(described, "td-deployment-1-pre-deploy", "c-deployment-1")
+	if input.RequiresCompatibilities != nil {
+		t.Errorf("RequiresCompatibilities = %v; want none, as the source", input.RequiresCompatibilities)
+	}
+}
+
+func TestPreDeployTaskDefinitionNeverCarriesTheCommand(t *testing.T) {
+	fakePreDeployClock(t, time.Second)
+	ecsClient := &fakePreDeployEcs{describeTasks: []ecsTypes.Task{stoppedTask(aws.Int32(0), "")}}
+	if _, err := runPreDeploy(t, preDeployParameters(testCommand), ecsClient, &fakePreDeployLogs{}); err != nil {
+		t.Fatalf("exit 0: %v", err)
+	}
+	if len(ecsClient.registerInputs) != 1 {
+		t.Fatalf("RegisterTaskDefinition called %d times; want 1", len(ecsClient.registerInputs))
+	}
+	registered, err := json.Marshal(ecsClient.registerInputs[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(registered), "migrate") || strings.Contains(string(registered), "hunter2") {
+		t.Errorf("the registered task definition carries the command: %s", registered)
+	}
+}
+
+func TestPreDeployTaskDefinitionDeregisteredAfterRunTaskError(t *testing.T) {
+	fakePreDeployClock(t, time.Second)
+	ecsClient := &fakePreDeployEcs{runTaskErr: errors.New("AccessDeniedException: not authorized")}
+	runPreDeploy(t, preDeployParameters(testCommand), ecsClient, &fakePreDeployLogs{})
+	assertPreDeployTaskDefinitionDeregistered(t, ecsClient)
+}
+
+func TestPreDeployDeregisterFailureOnlyNoted(t *testing.T) {
+	const line = "Couldn't remove the pre-deploy task definition: ClientException: throttled\n"
+	for _, tt := range []struct {
+		name    string
+		task    ecsTypes.Task
+		wantErr string
+	}{
+		{name: "exit 0", task: stoppedTask(aws.Int32(0), "")},
+		{name: "non-zero exit", task: stoppedTask(aws.Int32(3), ""),
+			wantErr: "The pre-deploy command failed with exit code 3. The deploy was stopped; the previous version keeps running."},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			fakePreDeployClock(t, time.Second)
+			ecsClient := &fakePreDeployEcs{describeTasks: []ecsTypes.Task{tt.task},
+				deregisterErr: errors.New("ClientException: throttled")}
+			logs, err := runPreDeploy(t, preDeployParameters(testCommand), ecsClient, &fakePreDeployLogs{})
+			if gotErr := fmt.Sprint(err); (err == nil) != (len(tt.wantErr) == 0) || (err != nil && gotErr != tt.wantErr) {
+				t.Errorf("error = %v; want %q", err, tt.wantErr)
+			}
+			if strings.Count(logs, line) != 1 {
+				t.Errorf("deploy logs =\n%s\nwant the line %q once", logs, line)
+			}
+			assertPreDeployTaskDefinitionDeregistered(t, ecsClient)
+		})
+	}
+}
+
+func TestPreDeployTaskDefinitionErrorsFailToStart(t *testing.T) {
+	original := preDeployEcsCallTimeout
+	t.Cleanup(func() { preDeployEcsCallTimeout = original })
+	preDeployEcsCallTimeout = 10 * time.Millisecond
+	const second = " The deploy was stopped; the previous version keeps running."
+	for _, tt := range []struct {
+		name      string
+		ecsClient *fakePreDeployEcs
+		want      string
+	}{
+		{name: "DescribeTaskDefinition error",
+			ecsClient: &fakePreDeployEcs{describeTaskDefinitionErr: errors.New("ClientException: unable to describe")},
+			want:      "The pre-deploy command couldn't start: ClientException: unable to describe." + second},
+		{name: "RegisterTaskDefinition error",
+			ecsClient: &fakePreDeployEcs{registerErr: errors.New("ClientException: too many revisions")},
+			want:      "The pre-deploy command couldn't start: ClientException: too many revisions." + second},
+		{name: "DescribeTaskDefinition stalled",
+			ecsClient: &fakePreDeployEcs{stalledCall: "DescribeTaskDefinition"},
+			want:      "The pre-deploy command couldn't start: context deadline exceeded." + second},
+		{name: "RegisterTaskDefinition stalled",
+			ecsClient: &fakePreDeployEcs{stalledCall: "RegisterTaskDefinition"},
+			want:      "The pre-deploy command couldn't start: context deadline exceeded." + second},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			fakePreDeployClock(t, time.Second)
+			done := make(chan struct{})
+			var err error
+			go func() {
+				defer close(done)
+				_, err = runPreDeploy(t, preDeployParameters(testCommand), tt.ecsClient, &fakePreDeployLogs{})
+			}()
+			select {
+			case <-done:
+			case <-time.After(5 * time.Second):
+				t.Fatal("the pre-deploy command hangs on a stalled task definition call")
+			}
+			if err == nil || err.Error() != tt.want {
+				t.Errorf("error = %v; want %q", err, tt.want)
+			}
+			if len(tt.ecsClient.runTaskInputs) != 0 {
+				t.Error("RunTask was called without a pre-deploy task definition")
+			}
+			if len(tt.ecsClient.deregisterInputs) != 0 {
+				t.Errorf("deregistered %d task definitions; none was registered", len(tt.ecsClient.deregisterInputs))
+			}
+		})
 	}
 }
