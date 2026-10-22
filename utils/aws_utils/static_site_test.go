@@ -145,15 +145,14 @@ func TestWithStaleLifecycleRule_AppendsATagScopedSevenDayRule(t *testing.T) {
 	// ⚠️ The filter MUST be the tag. Scoped to a prefix or to nothing, the rule
 	// expires by age alone — and a site deployed once and then left running
 	// refreshes no LastModified, so on day 7 it deletes itself.
-	tagFilter, ok := rule.Filter.(*s3Types.LifecycleRuleFilterMemberTag)
-	if !ok {
-		t.Fatalf("rule filter is %T, want a tag filter; anything else expires "+
+	if rule.Filter == nil || rule.Filter.Tag == nil || rule.Filter.Prefix != nil || rule.Filter.And != nil {
+		t.Fatalf("rule filter is %#v, want a tag filter; anything else expires "+
 			"objects the current build still serves", rule.Filter)
 	}
-	if aws.ToString(tagFilter.Value.Key) != staleObjectTagKey || aws.ToString(tagFilter.Value.Value) != staleObjectTagValue {
+	if aws.ToString(rule.Filter.Tag.Key) != staleObjectTagKey || aws.ToString(rule.Filter.Tag.Value) != staleObjectTagValue {
 		t.Errorf("rule filters on %s=%s, want %s=%s — the marking pass writes the "+
 			"latter, and a rule watching anything else never fires",
-			aws.ToString(tagFilter.Value.Key), aws.ToString(tagFilter.Value.Value),
+			aws.ToString(rule.Filter.Tag.Key), aws.ToString(rule.Filter.Tag.Value),
 			staleObjectTagKey, staleObjectTagValue)
 	}
 }
@@ -185,8 +184,8 @@ func TestWithStaleLifecycleRule_AddsWholeBucketIncompleteMPUCleanup(t *testing.T
 		t.Errorf("AbortIncompleteMultipartUpload = %v, want DaysAfterInitiation=%d",
 			rule.AbortIncompleteMultipartUpload, abortIncompleteMPUDays)
 	}
-	prefix, ok := rule.Filter.(*s3Types.LifecycleRuleFilterMemberPrefix)
-	if !ok || prefix.Value != "" {
+	if rule.Filter == nil || rule.Filter.Prefix == nil || aws.ToString(rule.Filter.Prefix) != "" ||
+		rule.Filter.Tag != nil || rule.Filter.And != nil {
 		t.Errorf("filter = %#v, want an empty-prefix (whole bucket) filter — "+
 			"stranded parts belong to no tag and no prefix", rule.Filter)
 	}
@@ -248,7 +247,7 @@ func TestWithStaleLifecycleRule_PreservesUnrelatedRules(t *testing.T) {
 	existing := []s3Types.LifecycleRule{{
 		ID:         aws.String("customers-own-rule"),
 		Status:     s3Types.ExpirationStatusEnabled,
-		Filter:     &s3Types.LifecycleRuleFilterMemberPrefix{Value: "logs/"},
+		Filter:     &s3Types.LifecycleRuleFilter{Prefix: aws.String("logs/")},
 		Expiration: &s3Types.LifecycleExpiration{Days: aws.Int32(30)},
 	}}
 

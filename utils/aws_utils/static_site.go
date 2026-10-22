@@ -384,8 +384,8 @@ func ownedLifecycleRules() []s3Types.LifecycleRule {
 		{
 			ID:     aws.String(staleLifecycleRuleID),
 			Status: s3Types.ExpirationStatusEnabled,
-			Filter: &s3Types.LifecycleRuleFilterMemberTag{
-				Value: s3Types.Tag{
+			Filter: &s3Types.LifecycleRuleFilter{
+				Tag: &s3Types.Tag{
 					Key:   aws.String(staleObjectTagKey),
 					Value: aws.String(staleObjectTagValue),
 				},
@@ -407,7 +407,7 @@ func ownedLifecycleRules() []s3Types.LifecycleRule {
 		{
 			ID:     aws.String(abortIncompleteMPURuleID),
 			Status: s3Types.ExpirationStatusEnabled,
-			Filter: &s3Types.LifecycleRuleFilterMemberPrefix{Value: ""},
+			Filter: &s3Types.LifecycleRuleFilter{Prefix: aws.String("")},
 			AbortIncompleteMultipartUpload: &s3Types.AbortIncompleteMultipartUpload{
 				DaysAfterInitiation: aws.Int32(abortIncompleteMPUDays),
 			},
