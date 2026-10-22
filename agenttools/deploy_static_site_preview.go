@@ -336,7 +336,7 @@ func deployPreviewDirectory(ctx context.Context, deps DeployStaticSitePreviewDep
 	}
 
 	previewURL := "https://" + domain
-	deps.Record.AddURL(previewURL)
+	recordPreviewDeploy(deps.Record, previewURL, res)
 	return deployStaticSitePreviewResult{
 		URL:            previewURL,
 		Status:         "deployed",
@@ -344,6 +344,14 @@ func deployPreviewDirectory(ctx context.Context, deps DeployStaticSitePreviewDep
 		Note:           "CDN propagation may take a few minutes before the URL serves the latest content.",
 		LogTail:        tailString(tail.Bytes(), logTailMaxBytes),
 	}, nil
+}
+
+// recordPreviewDeploy records previewURL's host and, for a deploy that created its
+// distribution (res.DomainName set) or a later one in this run to that host, the
+// file from this upload verify_preview_reachable also waits for.
+func recordPreviewDeploy(record *PreviewRecord, previewURL string, res StaticPreviewDeployResult) {
+	record.AddURL(previewURL)
+	record.SetDeployProbe(previewURL, res.DomainName != "", pickProbeKey(res.UploadedKeys))
 }
 
 // ensurePreview is Store.EnsurePreview, given up when ctx is cancelled. The RPC takes
