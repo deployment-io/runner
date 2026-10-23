@@ -78,13 +78,6 @@ func GetRepositoryDirectoryPath(parameters map[string]interface{}) (string, erro
 	if err != nil {
 		return "", err
 	}
-	automationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.AutomationID)
-	if err == nil && len(automationID) > 0 {
-		jobID, err := jobs.GetParameterValue[string](parameters, parameters_enums.JobID)
-		if err == nil && len(jobID) > 0 {
-			return fmt.Sprintf("/tmp/%s/%s/%s", organizationID, automationID, jobID), nil
-		}
-	}
 	buildID, err := jobs.GetParameterValue[string](parameters, parameters_enums.BuildID)
 	if err != nil {
 		return "", err
