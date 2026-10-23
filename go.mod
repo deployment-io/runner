@@ -41,7 +41,7 @@ require (
 	github.com/moby/moby v27.3.0+incompatible
 	github.com/tree-sitter/go-tree-sitter v0.25.0
 	github.com/tree-sitter/tree-sitter-go v0.23.4
-	go.mongodb.org/mongo-driver v1.17.7
+	go.mongodb.org/mongo-driver v1.17.10
 	golang.org/x/net v0.57.0
 	gonum.org/v1/gonum v0.16.0
 )
