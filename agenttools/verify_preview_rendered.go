@@ -102,7 +102,7 @@ const verifyPreviewRenderedInputSchema = `{
   "properties": {
     "url": {
       "type": "string",
-      "description": "The page to open first: a preview URL this Task deployed (what deploy_static_site_preview returned), optionally with a path."
+      "description": "The page to open first: a preview URL this Task deployed (what deploy_static_site_preview or deploy_web_service_preview returned), optionally with a path."
     },
     "steps": {
       "type": "array",
@@ -169,7 +169,7 @@ const verifyPreviewRenderedDescription = "Load a preview in a real browser (head
 	"emulated Pixel 7 with touch and a mobile user agent), or {\"width\": W, \"height\": H} (integers, width 320–2560, " +
 	"height 480–1600, no device emulation) — e.g. 1279 and 1280 wide for the two sides of a 1280px breakpoint. The " +
 	"result's viewport says the size the page was seen at.\n\n" +
-	"The url (and every goto) must be a preview this Task deployed: call deploy_static_site_preview and verify_preview_reachable " +
+	"The url (and every goto) must be a preview this Task deployed: call deploy_static_site_preview or deploy_web_service_preview, and verify_preview_reachable " +
 	"first. Navigation to any other host — a link, a redirect, a new window — is blocked, recorded in blocked_navigations and " +
 	"fails the step that caused it.\n\n" +
 	"Example: {\"url\": \"https://d123.cloudfront.net/\", \"steps\": [{\"action\": \"click\", \"selector\": \"text=Pricing\"}, " +
@@ -595,14 +595,14 @@ func checkRenderedString(name, v string, allowEmpty bool) error {
 func (t *verifyPreviewRendered) buildInput(args verifyRenderedArgs) (verifyBrowserInput, error) {
 	check := newPreviewURLCheck(t.record)
 	if !check.allowedRaw(args.URL) {
-		return verifyBrowserInput{}, fmt.Errorf("url must be a preview URL this Task deployed (the URL deploy_static_site_preview returned) — got %q", args.URL)
+		return verifyBrowserInput{}, fmt.Errorf("url must be a preview URL this Task deployed (the URL deploy_static_site_preview or deploy_web_service_preview returned) — got %q", args.URL)
 	}
 	for i, s := range args.Steps {
 		if s.Action != "goto" {
 			continue
 		}
 		if !check.allowedRaw(s.URL) {
-			return verifyBrowserInput{}, fmt.Errorf("steps[%d]: goto url must be a preview URL this Task deployed (the URL deploy_static_site_preview returned) — got %q", i, s.URL)
+			return verifyBrowserInput{}, fmt.Errorf("steps[%d]: goto url must be a preview URL this Task deployed (the URL deploy_static_site_preview or deploy_web_service_preview returned) — got %q", i, s.URL)
 		}
 	}
 	timeout := verifyRenderedDefaultTimeoutSeconds

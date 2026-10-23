@@ -13,10 +13,12 @@ import (
 // the ids the runner deploys into. Idempotent — safe to call on every deploy. The
 // runner's identity (cloud account, region, arch, os) is sent the same way as the
 // job poll so the server pins the ephemeral env to this runner. serviceType is a
-// task_previews.ServiceType* token.
-func (r *RunnerClient) EnsureTaskPreview(organizationID, taskID, serviceName, serviceType string) (previewID, existingDistID, existingDomain string, err error) {
+// task_previews.ServiceType* token. The reply carries the preview's id, its
+// persisted CloudFront distribution and, for a web service, its name and the AWS
+// resources a prior deploy persisted.
+func (r *RunnerClient) EnsureTaskPreview(organizationID, taskID, serviceName, serviceType string) (task_previews.EnsureTaskPreviewReplyV1, error) {
 	if !r.isConnected {
-		return "", "", "", ErrConnection
+		return task_previews.EnsureTaskPreviewReplyV1{}, ErrConnection
 	}
 	args := task_previews.EnsureTaskPreviewArgsV1{}
 	args.OrganizationID = r.GetComputedOrganizationID(organizationID)
@@ -29,10 +31,10 @@ func (r *RunnerClient) EnsureTaskPreview(organizationID, taskID, serviceName, se
 	args.ServiceName = serviceName
 	args.ServiceType = serviceType
 	var reply task_previews.EnsureTaskPreviewReplyV1
-	if err = r.c.Call("TaskPreviews.EnsureV1", args, &reply); err != nil {
-		return "", "", "", err
+	if err := r.c.Call("TaskPreviews.EnsureV1", args, &reply); err != nil {
+		return task_previews.EnsureTaskPreviewReplyV1{}, err
 	}
-	return reply.PreviewID, reply.ExistingDistID, reply.ExistingDomain, nil
+	return reply, nil
 }
 
 // ListTaskPreviews returns the previews of the task's active ephemeral preview
@@ -84,6 +86,43 @@ func (r *RunnerClient) StaticSiteBuildSettings(organizationID, taskID, cloneURL 
 	var reply task_previews.StaticSiteBuildSettingsReplyV1
 	if err := c.Call("TaskPreviews.StaticSiteBuildSettingsV1", args, &reply); err != nil {
 		return task_previews.StaticSiteBuildSettingsReplyV1{}, err
+	}
+	return reply, nil
+}
+
+// WebServicePreviewSettings returns how the org deploys the repository at cloneURL as
+// a web service (empty Services when deployment.io deploys none built from a
+// Dockerfile), the org's preview configuration and deployment.io's network in this
+// runner's cloud account and region. The reply carries the configuration's values:
+// never log it.
+//
+// Like StaticSiteBuildSettings, the call runs over its own connection whose deadline
+// is timeout from now.
+func (r *RunnerClient) WebServicePreviewSettings(organizationID, taskID, cloneURL string, timeout time.Duration) (task_previews.WebServicePreviewSettingsReplyV1, error) {
+	if !r.isConnected || r.dial == nil {
+		return task_previews.WebServicePreviewSettingsReplyV1{}, ErrConnection
+	}
+	deadline := time.Now().Add(timeout)
+	conn, err := r.dial(timeout)
+	if err != nil {
+		return task_previews.WebServicePreviewSettingsReplyV1{}, err
+	}
+	if err := conn.SetDeadline(deadline); err != nil {
+		conn.Close()
+		return task_previews.WebServicePreviewSettingsReplyV1{}, err
+	}
+	c := rpc.NewClient(conn)
+	defer c.Close()
+	args := task_previews.WebServicePreviewSettingsArgsV1{}
+	args.OrganizationID = r.GetComputedOrganizationID(organizationID)
+	args.Token = r.token
+	args.TaskID = taskID
+	args.CloneURL = cloneURL
+	args.CloudAccountID = r.cloudAccountID
+	args.Region = r.runnerRegion
+	var reply task_previews.WebServicePreviewSettingsReplyV1
+	if err := c.Call("TaskPreviews.WebServicePreviewSettingsV1", args, &reply); err != nil {
+		return task_previews.WebServicePreviewSettingsReplyV1{}, err
 	}
 	return reply, nil
 }

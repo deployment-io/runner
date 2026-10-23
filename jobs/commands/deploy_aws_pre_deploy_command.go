@@ -86,17 +86,17 @@ type preDeployLogsAPI interface {
 // the service with it. Both deploy commands call it right after
 // registerTaskDefinition.
 func deployEcsServiceAfterPreDeploy(parameters map[string]interface{}, ecsClient *ecs.Client, logsClient preDeployLogsAPI,
-	ecsClusterArn, targetGroupArn, taskDefinitionArn string, logsWriter io.Writer) error {
+	ecsClusterArn, targetGroupArn, taskDefinitionArn string, logsWriter io.Writer, opts ecsServiceDeployOptions) error {
 	err := runPreDeployCommand(parameters, preDeployEcsClient(ecsClient), logsClient, ecsClusterArn, taskDefinitionArn, logsWriter)
 	if err != nil {
 		return err
 	}
-	_, shouldUpdateService, err := createEcsServiceStep(parameters, ecsClient, ecsClusterArn, targetGroupArn, taskDefinitionArn, logsWriter)
+	_, shouldUpdateService, err := createEcsServiceStep(parameters, ecsClient, ecsClusterArn, targetGroupArn, taskDefinitionArn, logsWriter, opts)
 	if err != nil {
 		return err
 	}
 	if shouldUpdateService {
-		return updateEcsServiceStep(parameters, ecsClient, ecsClusterArn, taskDefinitionArn, logsWriter)
+		return updateEcsServiceStep(parameters, ecsClient, ecsClusterArn, taskDefinitionArn, logsWriter, opts)
 	}
 	return nil
 }

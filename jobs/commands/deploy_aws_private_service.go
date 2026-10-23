@@ -60,7 +60,7 @@ func (d *DeployAwsPrivateService) Run(parameters map[string]interface{}, logsWri
 	if err != nil {
 		return parameters, err
 	}
-	err = deployEcsServiceAfterPreDeploy(parameters, ecsClient, logsClient, ecsClusterArn, "", taskDefinitionArn, logsWriter)
+	err = deployEcsServiceAfterPreDeploy(parameters, ecsClient, logsClient, ecsClusterArn, "", taskDefinitionArn, logsWriter, ecsServiceDeployOptions{})
 	if err != nil {
 		return parameters, err
 	}

@@ -12,8 +12,8 @@ package agenttools
 // result. So verify_preview_reachable validates every URL against the record of
 // previews this Task deployed (PreviewRecord): it fetches a URL only when it is https
 // on the default port, carries no user info, and its host is a preview host this
-// Task deployed — one deploy_static_site_preview returned in this run, or one the
-// control plane lists for the Task. Redirects are followed only when their target
+// Task deployed — one deploy_static_site_preview or deploy_web_service_preview
+// returned in this run, or one the control plane lists for the Task. Redirects are followed only when their target
 // passes the same check. That record is the whole SSRF defense.
 
 import (
@@ -50,7 +50,7 @@ const verifyPreviewReachableInputSchema = `{
   "properties": {
     "url": {
       "type": "string",
-      "description": "The preview URL returned by deploy_static_site_preview. Only previews this Task deployed are accepted; redirects are followed only when they stay on such a preview."
+      "description": "The preview URL returned by deploy_static_site_preview, or the health_url deploy_web_service_preview returned. Only previews this Task deployed are accepted; redirects are followed only when they stay on such a preview."
     },
     "contains": {
       "type": "string",
@@ -76,7 +76,7 @@ type verifyPreviewReachableResult struct {
 }
 
 // RegisterVerifyPreviewReachable registers the verify_preview_reachable tool. record is the
-// agent run's preview record (shared with deploy_static_site_preview) that every URL is
+// agent run's preview record (shared with the preview deploy tools) that every URL is
 // validated against. logsWriter is the Step Job's log writer; poll progress streams there.
 func RegisterVerifyPreviewReachable(s *agentmcp.Server, record *PreviewRecord, logsWriter io.Writer) {
 	s.Register(agentmcp.Tool{
@@ -84,7 +84,7 @@ func RegisterVerifyPreviewReachable(s *agentmcp.Server, record *PreviewRecord, l
 		Description: "Confirm a deployed preview URL is live. Polls it until it returns HTTP 200 (a first-time " +
 			"distribution can take a few minutes to propagate), and returns live=true as soon as it does — that 200 is " +
 			"your success signal. Runs on the runner, so it works even though your sandbox can't reach the URL directly. " +
-			"Only a preview URL this Task deployed (the URL deploy_static_site_preview returned) is accepted, and " +
+			"Only a preview URL this Task deployed (the URL deploy_static_site_preview or deploy_web_service_preview returned) is accepted, and " +
 			"redirects are followed only when they stay on such a preview. Do NOT pass `contains` expecting rendered SPA text — an " +
 			"SPA's body is the HTML shell, so verify the change in the built bundle instead.",
 		InputSchema: json.RawMessage(verifyPreviewReachableInputSchema),
@@ -111,7 +111,7 @@ func handleVerifyPreviewReachable(ctx context.Context, record *PreviewRecord, lo
 	}
 	check := newPreviewURLCheck(record)
 	if !check.allowedRaw(target) {
-		return "", fmt.Errorf("url must be a preview URL this Task deployed (the URL deploy_static_site_preview returned) — got %q", target)
+		return "", fmt.Errorf("url must be a preview URL this Task deployed (the URL deploy_static_site_preview or deploy_web_service_preview returned) — got %q", target)
 	}
 
 	maxWait := verifyPreviewReachableDefaultMaxWait

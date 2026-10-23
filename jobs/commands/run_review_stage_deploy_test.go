@@ -81,7 +81,7 @@ func TestTheReviewSpawnMountsTheContextCopyReadOnlyAndAFixRunDoesNot(t *testing.
 	if !m.ReadOnly || m.Source != copyDir {
 		t.Errorf("/work/context = %+v, want a read-only bind of the copy %s", m, copyDir)
 	}
-	for _, m := range agentboxMounts(stage.fixSpawnSpec("img", workDir, nil, nil)) {
+	for _, m := range agentboxMounts(stage.fixSpawnSpec("img", workDir, nil, implementPreviewTools{})) {
 		if m.Target == "/work/context" {
 			t.Errorf("a fix run mounts the review's context copy: %+v", m)
 		}

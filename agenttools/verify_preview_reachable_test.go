@@ -196,7 +196,7 @@ func TestHandleVerifyPreviewReachable_RefusesUnrecordedURL(t *testing.T) {
 	record, _ := recordWith([]string{"https://dthisrun.cloudfront.net"}, nil, nil)
 	args, _ := json.Marshal(map[string]string{"url": "https://dother.cloudfront.net/"})
 	_, err := handleVerifyPreviewReachable(context.Background(), record, io.Discard, args)
-	want := `url must be a preview URL this Task deployed (the URL deploy_static_site_preview returned) — got "https://dother.cloudfront.net/"`
+	want := `url must be a preview URL this Task deployed (the URL deploy_static_site_preview or deploy_web_service_preview returned) — got "https://dother.cloudfront.net/"`
 	if err == nil || err.Error() != want {
 		t.Fatalf("got %v, want %q", err, want)
 	}
