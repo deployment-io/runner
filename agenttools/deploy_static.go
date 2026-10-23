@@ -11,6 +11,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -65,6 +67,46 @@ type StaticPreviewDeployResult struct {
 	DistributionID  string
 	DistributionArn string
 	DomainName      string // CloudFront domain (e.g. d123.cloudfront.net); the preview URL host
+	// UploadedKeys are the S3 keys this deploy uploaded (paths relative to the
+	// upload root, "/"-separated), sorted.
+	UploadedKeys []string
+}
+
+// sortedUploadedKeys returns the keys of uploaded, sorted.
+func sortedUploadedKeys(uploaded map[string]bool) []string {
+	keys := make([]string, 0, len(uploaded))
+	for k := range uploaded {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// pickProbeKey picks the file verify_preview_reachable waits for after a new
+// distribution's front page answers: the lexically first of keys (S3 keys from an
+// upload) that isn't an HTML page and has no path segment starting with ".". It
+// returns "" when there is none.
+func pickProbeKey(keys []string) string {
+	best := ""
+	for _, k := range keys {
+		if k == "" || strings.HasSuffix(strings.ToLower(k), ".html") {
+			continue
+		}
+		hidden := false
+		for _, seg := range strings.Split(k, "/") {
+			if strings.HasPrefix(seg, ".") {
+				hidden = true
+				break
+			}
+		}
+		if hidden {
+			continue
+		}
+		if best == "" || k < best {
+			best = k
+		}
+	}
+	return best
 }
 
 // DeployStaticSitePreview deploys an already-built static site into an ephemeral,
@@ -126,7 +168,7 @@ func DeployStaticSitePreview(in StaticPreviewDeployInput, logsWriter io.Writer) 
 		return StaticPreviewDeployResult{}, err
 	}
 	if dist == nil {
-		return StaticPreviewDeployResult{DistributionID: in.ExistingDistID}, nil
+		return StaticPreviewDeployResult{DistributionID: in.ExistingDistID, UploadedKeys: sortedUploadedKeys(uploadedKeys)}, nil
 	}
 	cf := in.CloudfrontClient
 
@@ -149,6 +191,7 @@ func DeployStaticSitePreview(in StaticPreviewDeployInput, logsWriter io.Writer) 
 		DistributionID:  aws.ToString(dist.Id),
 		DistributionArn: aws.ToString(dist.ARN),
 		DomainName:      aws.ToString(dist.DomainName),
+		UploadedKeys:    sortedUploadedKeys(uploadedKeys),
 	}, nil
 }
 

@@ -122,13 +122,48 @@ func handleVerifyPreviewReachable(ctx context.Context, record *PreviewRecord, lo
 		}
 	}
 
-	res := pollURL(ctx, target, args.Contains, maxWait, verifyPreviewReachablePollInterval, check.allowed, logsWriter)
+	// After a deploy that created the host's distribution, "live" also needs one
+	// other file of that upload served: a new distribution's edges don't all get
+	// to read the bucket at once, so the front page can answer while the rest of
+	// the site still returns 403.
+	host := urlHost(target)
+	probePath, probeToken := record.pendingProbe(host)
+	probe := ""
+	if probePath != "" {
+		if p, ok := previewProbeURL(host, probePath); ok && check.allowedRaw(p) {
+			probe = p
+		}
+	}
+	res, probeServed := pollPreview(ctx, target, args.Contains, probe, probePath, maxWait, verifyPreviewReachablePollInterval, check.allowed, logsWriter)
+	if probeServed {
+		record.probeServed(host, probeToken)
+	}
 	b, err := json.Marshal(res)
 	if err != nil {
 		return "", err
 	}
 	return string(b), nil
 }
+
+// previewProbeURL is https://<host>/<probePath> with each path segment escaped. ok
+// is false unless the result parses back to host, so a probe path can never point
+// the request elsewhere.
+func previewProbeURL(host, probePath string) (string, bool) {
+	segs := strings.Split(probePath, "/")
+	for i, seg := range segs {
+		segs[i] = url.PathEscape(seg)
+	}
+	raw := "https://" + host + "/" + strings.Join(segs, "/")
+	u, err := url.Parse(raw)
+	if err != nil || u.User != nil || !strings.EqualFold(u.Host, host) {
+		return "", false
+	}
+	return raw, true
+}
+
+// previewHTTPTransport is the transport preview polling uses; nil is
+// http.DefaultTransport. Tests point it at a local server.
+var previewHTTPTransport http.RoundTripper
 
 // redirectBlockedError is returned by the redirect policy when a redirect target
 // isn't a preview this Task deployed.
@@ -165,6 +200,18 @@ func previewRedirectPolicy(allow func(*url.URL) bool, onBlocked func(*redirectBl
 // target before calling this; allowRedirect validates each redirect target, and a
 // redirect it refuses ends the poll with live=false.
 func pollURL(ctx context.Context, target, contains string, maxWait, interval time.Duration, allowRedirect func(*url.URL) bool, logsWriter io.Writer) verifyPreviewReachableResult {
+	res, _ := pollPreview(ctx, target, contains, "", "", maxWait, interval, allowRedirect, logsWriter)
+	return res
+}
+
+// verifyPreviewProbePendingMessage is the result message when the front page
+// answered but the probe file didn't within the call.
+const verifyPreviewProbePendingMessage = "The front page answers, but the rest of the site isn't served everywhere yet (a new distribution is still propagating). Call verify_preview_reachable again — it returns as soon as it is."
+
+// pollPreview is pollURL with a probe: when probe (the URL of probePath on the
+// same preview) is set, a 200 from target is live only once probe has also returned
+// 200 within the same maxWait. probeServed reports that it did.
+func pollPreview(ctx context.Context, target, contains, probe, probePath string, maxWait, interval time.Duration, allowRedirect func(*url.URL) bool, logsWriter io.Writer) (res verifyPreviewReachableResult, probeServed bool) {
 	// Floor the interval. The guaranteed sleep between attempts is what caps the
 	// attempt count (together with the maxWait deadline); a non-positive interval
 	// would turn the loop into a tight spin, so never allow that regardless of caller.
@@ -175,6 +222,7 @@ func pollURL(ctx context.Context, target, contains string, maxWait, interval tim
 	defer cancel()
 	var blocked *redirectBlockedError
 	client := &http.Client{
+		Transport:     previewHTTPTransport,
 		Timeout:       verifyPreviewReachablePerRequestTO,
 		CheckRedirect: previewRedirectPolicy(allowRedirect, func(e *redirectBlockedError) { blocked = e }),
 	}
@@ -204,7 +252,7 @@ func pollURL(ctx context.Context, target, contains string, maxWait, interval tim
 				ElapsedSeconds: int(time.Since(start).Seconds()),
 				BodySnippet:    lastSnippet,
 				Message:        blocked.Error(),
-			}
+			}, false
 		}
 		// A 200 means the URL is reachable → LIVE. `contains` is a separate content
 		// assertion, reported but NOT a gate: we do NOT keep polling a live URL hoping
@@ -226,7 +274,10 @@ func pollURL(ctx context.Context, target, contains string, maxWait, interval tim
 					res.Message = "preview is LIVE (HTTP 200), but the expected substring was not found in the response body. For an SPA this is expected — the page text is client-rendered, not in the HTML shell — so treat the 200 as success and confirm the change in the built bundle."
 				}
 			}
-			return res
+			if probe == "" {
+				return res, false
+			}
+			return waitForProbe(ctx, client, probe, probePath, res, start, interval, func() *redirectBlockedError { return blocked }, logsWriter)
 		}
 		// Not reachable yet (status 0 / non-200). Log periodically, not every tick.
 		if logsWriter != nil && (attempts == 1 || attempts%6 == 0) {
@@ -241,7 +292,42 @@ func pollURL(ctx context.Context, target, contains string, maxWait, interval tim
 				ElapsedSeconds: int(time.Since(start).Seconds()),
 				BodySnippet:    lastSnippet,
 				Message:        "not reachable yet — a first-time CloudFront distribution takes a couple of minutes to start serving. This is normal; call verify_preview_reachable again to keep waiting (it returns as soon as it's live).",
+			}, false
+		case <-time.After(interval):
+		}
+	}
+}
+
+// waitForProbe polls probe (through pollPreview's client, so the same timeouts and
+// redirect policy, until ctx's deadline) until it returns 200. live is the front
+// page's live result; it stays live only if the probe is served.
+func waitForProbe(ctx context.Context, client *http.Client, probe, probePath string, live verifyPreviewReachableResult,
+	start time.Time, interval time.Duration, blocked func() *redirectBlockedError, logsWriter io.Writer) (verifyPreviewReachableResult, bool) {
+	if logsWriter != nil {
+		io.WriteString(logsWriter, fmt.Sprintf("verify_preview_reachable: the front page answers; waiting for %s to be served too\n", probePath))
+	}
+	notLive := func(message string) (verifyPreviewReachableResult, bool) {
+		res := live
+		res.Live = false
+		res.ElapsedSeconds = int(time.Since(start).Seconds())
+		res.Message = message
+		return res, false
+	}
+	for {
+		status, _, _ := fetchOnce(ctx, client, probe)
+		if b := blocked(); b != nil {
+			if logsWriter != nil {
+				io.WriteString(logsWriter, fmt.Sprintf("verify_preview_reachable: %s — not following it\n", b.Error()))
 			}
+			return notLive(b.Error())
+		}
+		if status == http.StatusOK {
+			live.ElapsedSeconds = int(time.Since(start).Seconds())
+			return live, true
+		}
+		select {
+		case <-ctx.Done():
+			return notLive(verifyPreviewProbePendingMessage)
 		case <-time.After(interval):
 		}
 	}
