@@ -17,7 +17,6 @@ import (
 	"github.com/deployment-io/deployment-runner/utils/aws_utils"
 
 	"io"
-	"time"
 )
 
 type DeleteAwsStaticSite struct {
@@ -57,38 +56,7 @@ func (d *DeleteAwsStaticSite) Run(parameters map[string]interface{}, logsWriter 
 	if err != nil {
 		return parameters, err
 	}
-	distributionConfigOutput, err := cloudfrontClient.GetDistributionConfig(context.TODO(), &cloudfront.GetDistributionConfigInput{
-		Id: aws.String(cloudfrontDistributionId),
-	})
-
-	if err != nil {
-		return parameters, err
-	}
-	if distributionConfigOutput == nil {
-		return parameters, fmt.Errorf("distribution doesn't exists")
-	}
-	distributionConfig := distributionConfigOutput.DistributionConfig
-	distributionConfig.Enabled = aws.Bool(false)
-	//disable distribution
-	io.WriteString(logsWriter, fmt.Sprintf("Disabling cloudfront distribution: %s\n", cloudfrontDistributionId))
-	updateDistributionOutput, err := cloudfrontClient.UpdateDistribution(context.TODO(), &cloudfront.UpdateDistributionInput{
-		DistributionConfig: distributionConfig,
-		Id:                 aws.String(cloudfrontDistributionId),
-		IfMatch:            distributionConfigOutput.ETag,
-	})
-	if err != nil {
-		return parameters, err
-	}
-	waiter := cloudfront.NewDistributionDeployedWaiter(cloudfrontClient)
-	err = waiter.Wait(context.TODO(), &cloudfront.GetDistributionInput{Id: aws.String(cloudfrontDistributionId)}, 20*time.Minute)
-	if err != nil {
-		return parameters, err
-	}
-	io.WriteString(logsWriter, fmt.Sprintf("Deleting cloudfront distribution: %s\n", cloudfrontDistributionId))
-	_, err = cloudfrontClient.DeleteDistribution(context.TODO(), &cloudfront.DeleteDistributionInput{
-		Id:      aws.String(cloudfrontDistributionId),
-		IfMatch: updateDistributionOutput.ETag,
-	})
+	distributionConfig, err := deleteCloudfrontDistribution(cloudfrontClient, cloudfrontDistributionId, logsWriter)
 	if err != nil {
 		return parameters, err
 	}
