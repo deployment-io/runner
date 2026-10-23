@@ -19,10 +19,21 @@ type PreviewState struct {
 	CloudFrontDistributionArn string
 	CloudFrontDomainName      string
 
-	// Web service (ALB + ECS) and database (RDS) resources land here as those tools
-	// arrive — e.g. LoadBalancerDNS / TargetGroupArn / EcsServiceArn / Port, or
-	// RdsDatabaseArn / RdsEndpoint. Adding a field (not a method) keeps PreviewStore
-	// fixed and every existing deploy tool untouched.
+	// Web service (ECR + ALB + ECS; CloudFront in front, in the fields above).
+	// DeploymentName is the preview Deployment's name; the rest are the handles a
+	// prior deploy persisted, empty on the first.
+	DeploymentName     string
+	EcrRepositoryUri   string
+	AlbSecurityGroupId string
+	TargetGroupArn     string
+	ListenerArnPort80  string
+	LoadBalancerArn    string
+	LoadBalancerDns    string
+	EcsServiceArn      string
+
+	// Database (RDS) resources land here as that tool arrives — e.g. RdsDatabaseArn /
+	// RdsEndpoint. Adding a field (not a method) keeps PreviewStore fixed and every
+	// existing deploy tool untouched.
 }
 
 // PreviewStore is the find-or-create + persist seam for a task's preview services. An

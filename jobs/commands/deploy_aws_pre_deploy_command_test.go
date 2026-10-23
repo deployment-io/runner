@@ -511,11 +511,12 @@ func mustKey(t *testing.T, k parameters_enums.Key) string {
 // Both deploy commands hand the newly registered task definition to
 // deployEcsServiceAfterPreDeploy (tested above with fakes) and return on its
 // error, and don't create or update the service themselves. The rest of Run
-// needs live AWS, so this pins it in the source.
+// needs live AWS, so this pins it in the source. The web service's steps are
+// deployAwsWebService, which its Run and the backend preview both run.
 func TestDeployCommandsDeployTheServiceAfterThePreDeployCommand(t *testing.T) {
-	for file, receiver := range map[string]string{
-		"deploy_aws_web_service.go":     "DeployAwsWebService",
-		"deploy_aws_private_service.go": "DeployAwsPrivateService",
+	for file, steps := range map[string]struct{ receiver, name string }{
+		"deploy_aws_web_service.go":     {name: "deployAwsWebService"},
+		"deploy_aws_private_service.go": {receiver: "DeployAwsPrivateService", name: "Run"},
 	} {
 		fset := token.NewFileSet()
 		f, err := parser.ParseFile(fset, file, nil, 0)
@@ -524,13 +525,17 @@ func TestDeployCommandsDeployTheServiceAfterThePreDeployCommand(t *testing.T) {
 		}
 		var run *ast.FuncDecl
 		for _, decl := range f.Decls {
-			if fn, ok := decl.(*ast.FuncDecl); ok && fn.Name.Name == "Run" && fn.Recv != nil &&
-				strings.Contains(receiverTypeName(fn.Recv.List[0].Type), receiver) {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok || fn.Name.Name != steps.name {
+				continue
+			}
+			if steps.receiver == "" && fn.Recv == nil ||
+				fn.Recv != nil && strings.Contains(receiverTypeName(fn.Recv.List[0].Type), steps.receiver) && steps.receiver != "" {
 				run = fn
 			}
 		}
 		if run == nil {
-			t.Fatalf("%s: no Run on %s", file, receiver)
+			t.Fatalf("%s: no %s %s", file, steps.receiver, steps.name)
 		}
 
 		position := map[string]int{}
@@ -600,6 +605,7 @@ type fakeServiceSteps struct {
 	created, updated   []string // task definition ARNs
 	shouldUpdate       bool
 	preDeployEcsClient *fakePreDeployEcs
+	opts               []ecsServiceDeployOptions // what each step was called with
 }
 
 func stubServiceSteps(t *testing.T, steps *fakeServiceSteps) {
@@ -610,12 +616,14 @@ func stubServiceSteps(t *testing.T, steps *fakeServiceSteps) {
 	})
 	preDeployEcsClient = func(*ecs.Client) preDeployEcsAPI { return steps.preDeployEcsClient }
 	createEcsServiceStep = func(_ map[string]interface{}, _ *ecs.Client, _, _, taskDefinitionArn string,
-		_ io.Writer) (string, bool, error) {
+		_ io.Writer, opts ecsServiceDeployOptions) (string, bool, error) {
 		steps.created = append(steps.created, taskDefinitionArn)
+		steps.opts = append(steps.opts, opts)
 		return "", steps.shouldUpdate, nil
 	}
-	updateEcsServiceStep = func(_ map[string]interface{}, _ *ecs.Client, _, taskDefinitionArn string, _ io.Writer) error {
+	updateEcsServiceStep = func(_ map[string]interface{}, _ *ecs.Client, _, taskDefinitionArn string, _ io.Writer, opts ecsServiceDeployOptions) error {
 		steps.updated = append(steps.updated, taskDefinitionArn)
+		steps.opts = append(steps.opts, opts)
 		return nil
 	}
 }
@@ -650,7 +658,7 @@ func TestDeployEcsServiceAfterPreDeploy(t *testing.T) {
 				stubServiceSteps(t, steps)
 				var logs bytes.Buffer
 				err := deployEcsServiceAfterPreDeploy(preDeployParameters(tt.command), nil, &fakePreDeployLogs{},
-					testClusterArn, targetGroupArn, testTaskDefinitionArn, &logs)
+					testClusterArn, targetGroupArn, testTaskDefinitionArn, &logs, ecsServiceDeployOptions{})
 				if (err != nil) != tt.wantErr {
 					t.Fatalf("error = %v; want error = %v", err, tt.wantErr)
 				}

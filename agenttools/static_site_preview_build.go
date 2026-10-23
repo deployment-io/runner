@@ -212,23 +212,7 @@ func planDetectedPreview(deps DeployStaticSitePreviewDeps, repoDir string, rootD
 // stalled request never holds the tool call past the agent CLI's timeout. (The
 // runner's client also puts that deadline on the request itself.)
 func lookupBuildSettings(lookup func(string) (task_previews.StaticSiteBuildSettingsReplyV1, error), cloneURL string) (task_previews.StaticSiteBuildSettingsReplyV1, error) {
-	type answer struct {
-		reply task_previews.StaticSiteBuildSettingsReplyV1
-		err   error
-	}
-	ch := make(chan answer, 1)
-	go func() {
-		reply, err := lookup(cloneURL)
-		ch <- answer{reply, err}
-	}()
-	timer := time.NewTimer(PreviewBuildSettingsTimeout)
-	defer timer.Stop()
-	select {
-	case a := <-ch:
-		return a.reply, a.err
-	case <-timer.C:
-		return task_previews.StaticSiteBuildSettingsReplyV1{}, errors.New("deployment.io didn't answer in time; call deploy_static_site_preview again")
-	}
+	return lookupWithin(lookup, cloneURL, "deployment.io didn't answer in time; call deploy_static_site_preview again")
 }
 
 // resolveTaskRepository matches repository (its directory under /work, with or
@@ -872,6 +856,9 @@ type previewBuilds struct {
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
+	// pending is a call's answer while its service's build is still running.
+	pending previewBuildingResult
+
 	mu        sync.Mutex
 	byService map[string]*previewBuild
 	// byRequest maps a call's arguments to the service its build runs as, so a call
@@ -885,9 +872,18 @@ type previewBuild struct {
 	err    error
 }
 
+// newPreviewBuilds is deploy_static_site_preview's previewBuilds: a call still
+// waiting answers status "building".
 func newPreviewBuilds() *previewBuilds {
+	return newPreviewBuildsPending("building", previewBuildingMessage)
+}
+
+// newPreviewBuildsPending is a previewBuilds whose calls answer status and message
+// while their build is still running.
+func newPreviewBuildsPending(status, message string) *previewBuilds {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &previewBuilds{ctx: ctx, cancel: cancel, byService: map[string]*previewBuild{}, byRequest: map[string]string{}}
+	return &previewBuilds{ctx: ctx, cancel: cancel, pending: previewBuildingResult{Status: status, Message: message},
+		byService: map[string]*previewBuild{}, byRequest: map[string]string{}}
 }
 
 // call starts or attaches to service's build (run, given a context cancelled when the
@@ -945,7 +941,7 @@ func (b *previewBuilds) attach(ctx context.Context, request string, wait time.Du
 }
 
 // wait returns pb's result once it finishes within wait, forgetting it, or the
-// "building" result.
+// pending result.
 func (b *previewBuilds) wait(ctx context.Context, service string, pb *previewBuild, wait time.Duration) (string, error) {
 	timer := time.NewTimer(wait)
 	defer timer.Stop()
@@ -958,7 +954,7 @@ func (b *previewBuilds) wait(ctx context.Context, service string, pb *previewBui
 		b.mu.Unlock()
 		return pb.result, pb.err
 	case <-timer.C:
-		return marshalResult(previewBuildingResult{Status: "building", Message: previewBuildingMessage})
+		return marshalResult(b.pending)
 	case <-ctx.Done():
 		return "", ctx.Err()
 	}

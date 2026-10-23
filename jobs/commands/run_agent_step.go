@@ -335,18 +335,12 @@ func (rs *RunAgentStep) Run(parameters map[string]interface{}, logsWriter io.Wri
 	}
 	// Per-task MCP tool socket: the runner serves runner-executed tools on a
 	// host socket (sibling of the work dir, so it never lands in /work or a
-	// commit diff) bind-mounted into the agent container. Tools: ping (C0) +
-	// deploy_static_site_preview (C2).
+	// commit diff) bind-mounted into the agent container. Tools: ping (C0),
+	// deploy_static_site_preview (C2), deploy_web_service_preview and the
+	// verify tools.
 	envVars = append(envVars, agentMCPSocketEnvVar+"="+agentboxMCPSocketInContainer)
-	previewDeps := buildStaticSitePreviewDeps(ctx, parameters, workDirHost, logsWriter)
-	result, err := rs.spawnAgentboxAndWait(agentboxSpawnSpec{
-		imageRef:      imageRef,
-		workDirHost:   workDirHost,
-		cacheVolume:   cacheVolume,
-		env:           envVars,
-		mcpSocketHost: agentMCPSocketHostPath(workDirHost),
-		previewDeps:   previewDeps,
-	}, logsWriter)
+	previewTools := buildImplementPreviewTools(ctx, parameters, workDirHost, logsWriter)
+	result, err := rs.spawnAgentboxAndWait(implementSpawnSpec(imageRef, workDirHost, cacheVolume, envVars, previewTools), logsWriter)
 	// User-stop path: agentbox SIGTERM-handled and wrote a partial
 	// /result.json (status="cancelled" with whatever progress it had).
 	// Merge that partial into JobOutput so token usage / denied hosts /
@@ -1877,6 +1871,11 @@ type agentboxSpawnSpec struct {
 	// previewDeps, set for the agent phase only, is the task-scoped context the
 	// deploy_static_site_preview MCP tool closes over. Nil for the vendor phase.
 	previewDeps *agenttools.DeployStaticSitePreviewDeps
+	// webPreviewDeps, set beside previewDeps for implement and fix runs only, is
+	// what the deploy_web_service_preview tool closes over; it shares previewDeps'
+	// Record. Nil for QA rounds (they would need the agentbox allowlist to reach
+	// a backend preview) and every other spawn.
+	webPreviewDeps *agenttools.DeployWebServicePreviewDeps
 	// waitTimeout overrides how long the container may run. Zero means
 	// defaultWallClockTimeout, which is what an implement run gets. The
 	// Review stage sets it per round, because a review and a bounded fix run
@@ -1921,7 +1920,9 @@ type productionQATools struct {
 
 // registerAgentTools registers the tools a spawn's socket serves and returns
 // what stops them. A production QA run gets only its two read-only checks;
-// every other run gets ping and, with previewDeps, the three preview tools.
+// every other run gets ping and, with previewDeps, the three preview tools —
+// and deploy_web_service_preview when webPreviewDeps is set too (implement and
+// fix runs). The returned stop stops both deploy tools.
 func registerAgentTools(mcpSrv *agentmcp.Server, spec agentboxSpawnSpec) func() {
 	if t := spec.productionTools; t != nil {
 		agenttools.RegisterVerifyPreviewReachable(mcpSrv, t.record, t.logsWriter)
@@ -1935,9 +1936,16 @@ func registerAgentTools(mcpSrv *agentmcp.Server, spec agentboxSpawnSpec) func() 
 	// Preview builds still running when the agent run ends are cancelled
 	// and their copies removed.
 	stopPreviewBuilds := agenttools.RegisterDeployStaticSitePreview(mcpSrv, *spec.previewDeps)
+	stopWebPreviews := func() {}
+	if spec.webPreviewDeps != nil {
+		stopWebPreviews = agenttools.RegisterDeployWebServicePreview(mcpSrv, *spec.webPreviewDeps)
+	}
 	agenttools.RegisterVerifyPreviewReachable(mcpSrv, spec.previewDeps.Record, spec.previewDeps.LogsWriter)
 	agenttools.RegisterVerifyPreviewRendered(mcpSrv, spec.previewDeps.Record, spec.previewDeps.VerifyBrowser, spec.previewDeps.LogsWriter)
-	return stopPreviewBuilds
+	return func() {
+		stopPreviewBuilds()
+		stopWebPreviews()
+	}
 }
 
 // agentMCPSocketHostPath returns the host path for a task's MCP tool socket: a
@@ -1965,24 +1973,52 @@ type taskPreviewStore struct {
 }
 
 func (s taskPreviewStore) EnsurePreview(serviceName string) (string, agenttools.PreviewState, error) {
-	previewID, existingDistID, existingDomain, err := runnerclient.Get().EnsureTaskPreview(s.orgID, s.taskID, serviceName, s.serviceType)
+	reply, err := runnerclient.Get().EnsureTaskPreview(s.orgID, s.taskID, serviceName, s.serviceType)
 	if err != nil {
 		return "", agenttools.PreviewState{}, err
 	}
-	return previewID, agenttools.PreviewState{
-		CloudFrontDistributionID: existingDistID,
-		CloudFrontDomainName:     existingDomain,
-	}, nil
+	return reply.PreviewID, previewStateFromReply(reply), nil
 }
 
 func (s taskPreviewStore) SavePreview(previewID string, r agenttools.PreviewState) {
-	commandUtils.UpdateDeploymentsPipeline.Add(s.orgID, deployments.UpdateDeploymentDtoV1{
+	commandUtils.UpdateDeploymentsPipeline.Add(s.orgID, previewUpdateDto(previewID, r))
+}
+
+// previewStateFromReply maps EnsureV1's reply onto PreviewState: the CloudFront
+// distribution of any preview and, for a web service, its name and handles (empty
+// for other types).
+func previewStateFromReply(reply task_previews.EnsureTaskPreviewReplyV1) agenttools.PreviewState {
+	return agenttools.PreviewState{
+		CloudFrontDistributionID: reply.ExistingDistID,
+		CloudFrontDomainName:     reply.ExistingDomain,
+		DeploymentName:           reply.DeploymentName,
+		EcrRepositoryUri:         reply.EcrRepositoryUri,
+		AlbSecurityGroupId:       reply.AlbSecurityGroupId,
+		TargetGroupArn:           reply.TargetGroupArn,
+		ListenerArnPort80:        reply.ListenerArnPort80,
+		LoadBalancerArn:          reply.LoadBalancerArn,
+		LoadBalancerDns:          reply.LoadBalancerDns,
+		EcsServiceArn:            reply.EcsServiceArn,
+	}
+}
+
+// previewUpdateDto is the update that saves r onto the preview previewID. Fields r
+// leaves empty are left as they are.
+func previewUpdateDto(previewID string, r agenttools.PreviewState) deployments.UpdateDeploymentDtoV1 {
+	return deployments.UpdateDeploymentDtoV1{
 		ID:                               previewID,
 		CloudfrontDistributionID:         r.CloudFrontDistributionID,
 		CloudfrontDistributionArn:        r.CloudFrontDistributionArn,
 		CloudfrontDistributionDomainName: r.CloudFrontDomainName,
+		EcrRepositoryUri:                 r.EcrRepositoryUri,
+		AlbSecurityGroupId:               r.AlbSecurityGroupId,
+		TargetGroupArn:                   r.TargetGroupArn,
+		ListenerArnPort80:                r.ListenerArnPort80,
+		LoadBalancerArn:                  r.LoadBalancerArn,
+		LoadBalancerDns:                  r.LoadBalancerDns,
+		EcsServiceArn:                    r.EcsServiceArn,
 		Status:                           build_enums.Success,
-	})
+	}
 }
 
 // grantPreviewDeployAccess self-grants this runner the static-site policy
@@ -2077,6 +2113,77 @@ func buildStaticSitePreviewDeps(ctx commandUtils.TaskJobContext, parameters map[
 		// shared by every Step on this runner (one image download, two at once).
 		// Each check carries this Job's pinned image.
 		VerifyBrowser: verifyBrowserForJob(runnerVerifyBrowser.run, parameters),
+	}
+}
+
+// implementPreviewTools are the preview tools' deps of an implement or fix run:
+// the static tool's and, sharing its Record, the backend preview tool's.
+type implementPreviewTools struct {
+	static *agenttools.DeployStaticSitePreviewDeps
+	web    *agenttools.DeployWebServicePreviewDeps
+}
+
+// buildImplementPreviewTools builds an implement or fix run's preview tools' deps.
+func buildImplementPreviewTools(ctx commandUtils.TaskJobContext, parameters map[string]interface{}, workDirHost string, logsWriter io.Writer) implementPreviewTools {
+	static := buildStaticSitePreviewDeps(ctx, parameters, workDirHost, logsWriter)
+	return implementPreviewTools{
+		static: static,
+		web:    buildWebServicePreviewDeps(ctx, parameters, workDirHost, logsWriter, static.Record),
+	}
+}
+
+// implementSpawnSpec is an implement run's container configuration.
+func implementSpawnSpec(imageRef, workDirHost, cacheVolume string, env []string, tools implementPreviewTools) agentboxSpawnSpec {
+	return agentboxSpawnSpec{
+		imageRef:       imageRef,
+		workDirHost:    workDirHost,
+		cacheVolume:    cacheVolume,
+		env:            env,
+		mcpSocketHost:  agentMCPSocketHostPath(workDirHost),
+		previewDeps:    tools.static,
+		webPreviewDeps: tools.web,
+	}
+}
+
+// buildWebServicePreviewDeps assembles what the deploy_web_service_preview tool
+// closes over. The deploy runs production's web-service commands on a parameters
+// map of its own (webPreviewDeployer), in the runner's region; record is the run's
+// preview record, shared with the static tool and the verify tools.
+func buildWebServicePreviewDeps(ctx commandUtils.TaskJobContext, parameters map[string]interface{}, workDirHost string, logsWriter io.Writer, record *agenttools.PreviewRecord) *agenttools.DeployWebServicePreviewDeps {
+	runnerRegion := utils.RunnerData.Get().RunnerRegion
+	orgNamespace, _ := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIDNamespace)
+	orgFromJob, _ := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIdFromJob)
+	deployer := webPreviewDeployer{
+		organizationIDNamespace: orgNamespace,
+		organizationIdFromJob:   orgFromJob,
+		steps:                   productionWebPreviewSteps(),
+	}
+	if rt, err := region_enums.GetType(runnerRegion); err == nil {
+		deployer.region = int64(rt)
+	}
+	orgID := ctx.OrganizationID
+	taskID := ctx.TaskID
+	return &agenttools.DeployWebServicePreviewDeps{
+		Region:      runnerRegion,
+		WorkDirHost: workDirHost,
+		LogsWriter:  logsWriter,
+		Store: taskPreviewStore{
+			orgID:       orgID,
+			taskID:      taskID,
+			serviceType: task_previews.ServiceTypeWebService,
+		},
+		Record:       record,
+		Repositories: ctx.Entries,
+		Settings: func(cloneURL string) (task_previews.WebServicePreviewSettingsReplyV1, error) {
+			return runnerclient.Get().WebServicePreviewSettings(orgID, taskID, cloneURL, agenttools.PreviewBuildSettingsTimeout)
+		},
+		Deploy: deployer.deploy,
+		BuildCloudFront: func() (agenttools.WebPreviewCloudFront, error) {
+			// CloudFront is the static-site policy's; the deploy's commands
+			// grant themselves the rest.
+			ensurePreviewDeployAccess(parameters, logsWriter)
+			return cloud_api_clients.GetCloudfrontClient(parameters, cloudfrontRegion)
+		},
 	}
 }
 

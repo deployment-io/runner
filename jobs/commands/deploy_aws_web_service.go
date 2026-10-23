@@ -1186,8 +1186,23 @@ func getEcsServiceNetworkConfiguration(parameters map[string]interface{}) (*ecsT
 	}, nil
 }
 
+// ecsServiceDeployOptions changes how a deploy creates or updates its ECS
+// service. The zero value is what every production deploy does.
+type ecsServiceDeployOptions struct {
+	// skipServiceStableWait returns once the service is created or updated,
+	// without waiting for it to settle. A Task's backend preview sets it: its
+	// readiness is checked by verify_preview_reachable on its health URL.
+	skipServiceStableWait bool
+}
+
+// waitForEcsServiceStable waits until the service settles. Swapped by tests
+// so they see whether a deploy waits, without AWS.
+var waitForEcsServiceStable = func(ecsClient *ecs.Client, describeServicesInput *ecs.DescribeServicesInput) error {
+	return ecs.NewServicesStableWaiter(ecsClient).Wait(context.TODO(), describeServicesInput, time.Minute*20)
+}
+
 func createEcsServiceIfNeeded(parameters map[string]interface{}, ecsClient *ecs.Client,
-	ecsClusterArn, targetGroupArn, taskDefinitionArn string, logsWriter io.Writer) (ecsServiceArn string, shouldUpdateService bool, err error) {
+	ecsClusterArn, targetGroupArn, taskDefinitionArn string, logsWriter io.Writer, opts ecsServiceDeployOptions) (ecsServiceArn string, shouldUpdateService bool, err error) {
 
 	ecsServiceArnFromParams, err := jobs.GetParameterValue[string](parameters, parameters_enums.EcsServiceArn)
 	if err == nil && len(ecsServiceArnFromParams) > 0 {
@@ -1310,14 +1325,14 @@ func createEcsServiceIfNeeded(parameters map[string]interface{}, ecsClient *ecs.
 
 		ecsServiceArn = aws.ToString(createServiceOutput.Service.ServiceArn)
 
-		newServicesStableWaiter := ecs.NewServicesStableWaiter(ecsClient)
+		if !opts.skipServiceStableWait {
+			io.WriteString(logsWriter, fmt.Sprintf("Waiting for ECS service to be stable: %s\n", ecsServiceArn))
 
-		io.WriteString(logsWriter, fmt.Sprintf("Waiting for ECS service to be stable: %s\n", ecsServiceArn))
+			err = waitForEcsServiceStable(ecsClient, describeServicesInput)
 
-		err = newServicesStableWaiter.Wait(context.TODO(), describeServicesInput, time.Minute*20)
-
-		if err != nil {
-			return "", false, err
+			if err != nil {
+				return "", false, err
+			}
 		}
 	}
 
@@ -1353,7 +1368,7 @@ func createEcsServiceIfNeeded(parameters map[string]interface{}, ecsClient *ecs.
 }
 
 func updateEcsService(parameters map[string]interface{}, ecsClient *ecs.Client, ecsClusterArn string,
-	taskDefinitionArn string, logsWriter io.Writer) error {
+	taskDefinitionArn string, logsWriter io.Writer, opts ecsServiceDeployOptions) error {
 	//TODO desired count is 1 for now.
 	ecsServiceName, err := aws_utils.GetEcsServiceName(parameters)
 	if err != nil {
@@ -1386,11 +1401,14 @@ func updateEcsService(parameters map[string]interface{}, ecsClient *ecs.Client, 
 
 	ecsServiceArn := aws.ToString(describeServicesOutput.Services[0].ServiceArn)
 
-	newServicesStableWaiter := ecs.NewServicesStableWaiter(ecsClient)
+	if opts.skipServiceStableWait {
+		io.WriteString(logsWriter, fmt.Sprintf("Updated ECS service: %s\n", ecsServiceArn))
+		return nil
+	}
 
 	io.WriteString(logsWriter, fmt.Sprintf("Waiting for ECS service to be stable: %s\n", ecsServiceArn))
 
-	err = newServicesStableWaiter.Wait(context.TODO(), describeServicesInput, time.Minute*20)
+	err = waitForEcsServiceStable(ecsClient, describeServicesInput)
 
 	if err != nil {
 		return err
@@ -1403,6 +1421,22 @@ func updateEcsService(parameters map[string]interface{}, ecsClient *ecs.Client, 
 //1. add another ingress security rule for ALB security group  - port 80
 
 func (d *DeployAwsWebService) Run(parameters map[string]interface{}, logsWriter io.Writer) (newParameters map[string]interface{}, err error) {
+	return runAwsWebServiceDeploy(parameters, logsWriter, ecsServiceDeployOptions{})
+}
+
+// deployAwsWebServicePreview is DeployAwsWebService's steps for a Task's
+// backend preview: the same deploy, without waiting for the ECS service to
+// settle.
+func deployAwsWebServicePreview(parameters map[string]interface{}, logsWriter io.Writer) (map[string]interface{}, error) {
+	return runAwsWebServiceDeploy(parameters, logsWriter, ecsServiceDeployOptions{skipServiceStableWait: true})
+}
+
+// runAwsWebServiceDeploy is deployAwsWebService; tests replace it to see the
+// options each entry point deploys with.
+var runAwsWebServiceDeploy = deployAwsWebService
+
+// deployAwsWebService runs the web-service deploy's steps with opts.
+func deployAwsWebService(parameters map[string]interface{}, logsWriter io.Writer, opts ecsServiceDeployOptions) (newParameters map[string]interface{}, err error) {
 	defer func() {
 		if err != nil {
 			<-MarkDeploymentDone(parameters, err)
@@ -1458,7 +1492,7 @@ func (d *DeployAwsWebService) Run(parameters map[string]interface{}, logsWriter 
 	if err != nil {
 		return parameters, err
 	}
-	err = deployEcsServiceAfterPreDeploy(parameters, ecsClient, logsClient, ecsClusterArn, targetGroupArn, taskDefinitionArn, logsWriter)
+	err = deployEcsServiceAfterPreDeploy(parameters, ecsClient, logsClient, ecsClusterArn, targetGroupArn, taskDefinitionArn, logsWriter, opts)
 	if err != nil {
 		return parameters, err
 	}

@@ -12,7 +12,6 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/enums/llm_provider_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
-	"github.com/deployment-io/deployment-runner/agenttools"
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
 )
 
@@ -798,7 +797,7 @@ func (s *reviewStage) runMustFixRound(mustFix []reviewFindingOutput) error {
 	// — and fails, or silently does something else, for a reason that has
 	// nothing to do with the finding.
 	env = append(env, agentMCPSocketEnvVar+"="+agentboxMCPSocketInContainer)
-	previewDeps := buildStaticSitePreviewDeps(s.ctx, s.parameters, workDirHost, s.logsWriter)
+	previewTools := buildImplementPreviewTools(s.ctx, s.parameters, workDirHost, s.logsWriter)
 
 	// A fix run BUILDS, and it builds offline: the agent container has no
 	// credentials and the proxy allows only the agent's own hosts. Ordinarily
@@ -823,7 +822,7 @@ func (s *reviewStage) runMustFixRound(mustFix []reviewFindingOutput) error {
 		io.WriteString(s.logsWriter, fmt.Sprintf("Routing %d finding(s) back to the implementer (%d must-fix)\n", len(mustFix), holding))
 	}
 	impl := &RunAgentStep{stopSignal: s.stopSignal, progressSink: s.progressSink}
-	result, err := impl.spawnAgentboxAndWait(s.fixSpawnSpec(imageRef, workDirHost, env, previewDeps), s.logsWriter)
+	result, err := impl.spawnAgentboxAndWait(s.fixSpawnSpec(imageRef, workDirHost, env, previewTools), s.logsWriter)
 	if err := recordFailedFixRun(s.parameters, result, err, s.logsWriter); err != nil {
 		return err
 	}
@@ -845,16 +844,10 @@ func (s *reviewStage) fixRunPrompt(stepPrompt, description string, mustFix []rev
 
 // fixSpawnSpec is a fix run's container configuration. A fix run is an
 // implement run: no read-only repositories and no read-only context copy.
-func (s *reviewStage) fixSpawnSpec(imageRef, workDirHost string, env []string, previewDeps *agenttools.DeployStaticSitePreviewDeps) agentboxSpawnSpec {
-	return agentboxSpawnSpec{
-		imageRef:      imageRef,
-		workDirHost:   workDirHost,
-		cacheVolume:   cacheVolumeName(s.ctx),
-		env:           env,
-		mcpSocketHost: agentMCPSocketHostPath(workDirHost),
-		previewDeps:   previewDeps,
-		waitTimeout:   mustFixRunTimeout,
-	}
+func (s *reviewStage) fixSpawnSpec(imageRef, workDirHost string, env []string, tools implementPreviewTools) agentboxSpawnSpec {
+	spec := implementSpawnSpec(imageRef, workDirHost, cacheVolumeName(s.ctx), env, tools)
+	spec.waitTimeout = mustFixRunTimeout
+	return spec
 }
 
 // recordFixRunResult attributes a finished fix run to the Step and says what
