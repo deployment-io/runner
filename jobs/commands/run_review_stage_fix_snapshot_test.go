@@ -625,8 +625,10 @@ func commitEverything(t *testing.T, repoDir, message string) string {
 	if err := worktree.AddWithOptions(&git.AddOptions{All: true}); err != nil {
 		t.Fatal(err)
 	}
+	// go-git >= 5.13 refuses an empty commit by default, and this helper is used to make one.
 	hash, err := worktree.Commit(message, &git.CommitOptions{
-		Author: &object.Signature{Name: "agent", Email: "agent@example.com", When: time.Unix(1700000000, 0).UTC()},
+		Author:            &object.Signature{Name: "agent", Email: "agent@example.com", When: time.Unix(1700000000, 0).UTC()},
+		AllowEmptyCommits: true,
 	})
 	if err != nil {
 		t.Fatal(err)
