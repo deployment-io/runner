@@ -399,8 +399,23 @@ func formatPreviewSection(previews []task_previews.TaskPreviewV1) string {
 		sb.WriteString(fmt.Sprintf("- and %d more under Context → Previews in the dashboard\n", omitted))
 	}
 	sb.WriteString("\nA preview shows the code as of the agent's last deploy to it, which can be earlier than this pull request's final commit. ")
-	sb.WriteString("Previews are removed once all of this Task's pull requests are merged or closed, about 72 hours after its last preview deploy, or when the Task is deleted — whichever comes first.\n")
+	sb.WriteString("Previews are removed once all of this Task's pull requests are merged or closed, about 72 hours after its last preview deploy, or when the Task is deleted — whichever comes first.")
+	if hasBackendPreview(previews) {
+		sb.WriteString(" Backend previews are removed sooner, about 4 hours after the Task's last preview deploy.")
+	}
+	sb.WriteString("\n")
 	return sb.String()
+}
+
+// hasBackendPreview reports whether any preview is a backend service, which is
+// removed after 4 idle hours rather than with the Task's other previews.
+func hasBackendPreview(previews []task_previews.TaskPreviewV1) bool {
+	for _, p := range previews {
+		if p.ServiceType == task_previews.ServiceTypeWebService || p.ServiceType == task_previews.ServiceTypePrivateService {
+			return true
+		}
+	}
+	return false
 }
 
 // blockedHostsSection lists the hostnames the agentbox proxy denied during

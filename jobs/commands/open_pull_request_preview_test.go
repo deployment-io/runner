@@ -91,3 +91,33 @@ func TestPreviewSection_AbsentWithoutPreviews(t *testing.T) {
 		})
 	}
 }
+
+const backendPreviewFootnote = " Backend previews are removed sooner, about 4 hours after the Task's last preview deploy."
+
+// A web or private service preview is removed after 4 idle hours; the
+// description says so after the removal sentence. Static previews alone don't.
+func TestPreviewSection_BackendSentence(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		serviceType string
+		want        bool
+	}{
+		{"web service", task_previews.ServiceTypeWebService, true},
+		{"private service", task_previews.ServiceTypePrivateService, true},
+		{"static site only", task_previews.ServiceTypeStaticSite, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := formatPreviewSection([]task_previews.TaskPreviewV1{
+				{ServiceName: "web", ServiceType: task_previews.ServiceTypeStaticSite, URL: "https://d1.cloudfront.net"},
+				{ServiceName: "svc", ServiceType: tc.serviceType, URL: "https://d2.cloudfront.net"},
+			})
+			withSentence := strings.HasSuffix(got, previewFootnote+backendPreviewFootnote+"\n")
+			if withSentence != tc.want {
+				t.Fatalf("backend sentence present = %v, want %v:\n%s", withSentence, tc.want, got)
+			}
+			if !tc.want && !strings.HasSuffix(got, previewFootnote+"\n") {
+				t.Fatalf("removal sentence changed:\n%s", got)
+			}
+		})
+	}
+}
