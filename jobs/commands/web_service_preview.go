@@ -71,8 +71,8 @@ func buildWebPreviewParameters(in webPreviewParametersInput) (map[string]interfa
 	jobs.SetParameterValue(p, parameters_enums.RepoDirectoryPath, filepath.Join(d.BuildDir, d.RootDirectory))
 	jobs.SetParameterValue(p, parameters_enums.CommitHash, fmt.Sprintf("preview-%d", in.Now.Unix()))
 	jobs.SetParameterValue(p, parameters_enums.DockerFilePath, webPreviewDockerFile(d.Service.DockerFilePath))
-	if len(d.Service.DockerBuildArgs) > 0 {
-		jobs.SetParameterValue(p, parameters_enums.DockerBuildArgs, stringsToPrimitiveA(d.Service.DockerBuildArgs))
+	if buildArgs, _ := webPreviewBuildArgs(d.Service.DockerBuildArgs, d.Settings.Variables); len(buildArgs) > 0 {
+		jobs.SetParameterValue(p, parameters_enums.DockerBuildArgs, stringsToPrimitiveA(buildArgs))
 	}
 	jobs.SetParameterValue(p, parameters_enums.Region, in.Region)
 	jobs.SetParameterValue(p, parameters_enums.Port, d.Service.Port)
@@ -140,6 +140,32 @@ func webPreviewDockerFile(path string) string {
 		return "Dockerfile"
 	}
 	return path
+}
+
+// webPreviewBuildArgs is a preview's Docker build args: the NAMES of the production
+// service's build args, each with the preview configuration variable of that name as
+// its value. Production's values never reach a preview build: the agent writes the
+// Dockerfile, so it could serve whatever the image is built with. A name with no such
+// variable, or whose variable's value has an "=" (GetDockerBuildArgs reads "K=V" with
+// exactly one "=", as production does), is left out so the Dockerfile's own ARG
+// default applies; left lists those names, never a value.
+func webPreviewBuildArgs(productionArgs []string, variables map[string]string) (args, left []string) {
+	seen := map[string]bool{}
+	for _, arg := range productionArgs {
+		name, _, _ := strings.Cut(arg, "=")
+		name = strings.TrimSpace(name)
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		value, ok := variables[name]
+		if !ok || strings.Contains(value, "=") {
+			left = append(left, name)
+			continue
+		}
+		args = append(args, name+"="+value)
+	}
+	return args, left
 }
 
 // webPreviewEnvironmentVariables is the preview configuration's variables as the task
@@ -244,6 +270,10 @@ func (d webPreviewDeployer) deploy(ctx context.Context, in agenttools.WebService
 	dockerFilePath := filepath.Join(repoDir, dockerFile)
 	if info, err := os.Stat(dockerFilePath); err != nil || info.IsDir() || agenttools.CheckInside(repoDir, dockerFilePath) != nil {
 		return agenttools.WebServicePreviewDeployOutput{}, fmt.Errorf("%s's Dockerfile %s isn't in its root directory %q, so its backend preview can't be built", in.Service.DeploymentName, dockerFile, in.RootDirectory)
+	}
+	// The Step log only (BuildLogs never reaches the agent), and names only.
+	if _, left := webPreviewBuildArgs(in.Service.DockerBuildArgs, in.Settings.Variables); len(left) > 0 && in.BuildLogs != nil {
+		io.WriteString(in.BuildLogs, fmt.Sprintf("Backend preview: build args left out, with no usable Preview configuration variable of the same name: %s\n", strings.Join(left, ", ")))
 	}
 	if in.Settings.ConfigurationSet {
 		if err := agenttools.WritePreviewFiles(repoDir, in.Settings.Files); err != nil {

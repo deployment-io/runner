@@ -40,7 +40,7 @@ func testWebPreviewInput(buildDir string) agenttools.WebServicePreviewDeployInpu
 		RootDirectory: "services/api",
 		Service: task_previews.WebServicePreviewSettingsV1{
 			DeploymentName: "api", EnvironmentName: "production", Region: "us-east-1", RootDirectory: "services/api",
-			DockerFilePath: "docker/Dockerfile.prod", DockerBuildArgs: []string{"A=1", "B=2"},
+			DockerFilePath: "docker/Dockerfile.prod", DockerBuildArgs: []string{"A=prod-a", "API_KEY=prod-key", "URL=prod-url"},
 			Port: 8080, HealthCheckPath: "/healthz", Cpu: "256", Memory: "512",
 			PreDeployCommand: "./migrate", StartCommand: "./server",
 		},
@@ -96,7 +96,7 @@ func TestBuildWebPreviewParametersKeysAndTypes(t *testing.T) {
 		parameters_enums.RepoDirectoryPath:       "/tmp/orgns/task-preview-build-123/services/api",
 		parameters_enums.CommitHash:              "preview-1700000000",
 		parameters_enums.DockerFilePath:          "docker/Dockerfile.prod",
-		parameters_enums.DockerBuildArgs:         primitive.A{"A=1", "B=2"},
+		parameters_enums.DockerBuildArgs:         primitive.A{"API_KEY=s3cret"},
 		parameters_enums.Region:                  int64(1),
 		parameters_enums.Port:                    int64(8080),
 		parameters_enums.HealthCheckPath:         "/healthz",
@@ -167,6 +167,40 @@ func TestBuildWebPreviewParametersOptionalValues(t *testing.T) {
 	}
 }
 
+// A preview is built with the preview configuration's values under the production
+// build args' names, never with production's values: the agent writes the Dockerfile.
+func TestWebPreviewBuildArgs(t *testing.T) {
+	variables := map[string]string{"API_KEY": "preview-key", "EMPTY": "", "URL": "https://x/?a=b"}
+	for _, tt := range []struct {
+		name       string
+		production []string
+		args, left []string
+	}{
+		{name: "none", production: nil},
+		{name: "value from the preview configuration", production: []string{"API_KEY=prod-key"}, args: []string{"API_KEY=preview-key"}},
+		{name: "empty preview value", production: []string{"EMPTY=prod"}, args: []string{"EMPTY="}},
+		{name: "no preview variable", production: []string{"NPM_TOKEN=prod-token"}, left: []string{"NPM_TOKEN"}},
+		{name: "preview value with =", production: []string{"URL=prod"}, left: []string{"URL"}},
+		{name: "name only", production: []string{"API_KEY"}, args: []string{"API_KEY=preview-key"}},
+		{name: "duplicates and blanks", production: []string{"API_KEY=a", " API_KEY =b", "=c", ""}, args: []string{"API_KEY=preview-key"}},
+		{name: "order kept", production: []string{"NPM_TOKEN=t", "EMPTY=e", "API_KEY=k"}, args: []string{"EMPTY=", "API_KEY=preview-key"}, left: []string{"NPM_TOKEN"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			args, left := webPreviewBuildArgs(tt.production, variables)
+			if !reflect.DeepEqual(args, tt.args) || !reflect.DeepEqual(left, tt.left) {
+				t.Errorf("args %q, left %q; want %q, %q", args, left, tt.args, tt.left)
+			}
+			for _, a := range append(args, left...) {
+				for _, prod := range []string{"prod-key", "prod-token", "prod"} {
+					if strings.HasSuffix(a, "="+prod) || a == prod {
+						t.Errorf("production value %q reached the preview: %q", prod, a)
+					}
+				}
+			}
+		})
+	}
+}
+
 func TestBuildWebPreviewParametersReuseHandles(t *testing.T) {
 	for _, tt := range []struct {
 		name     string
@@ -218,7 +252,7 @@ func TestBuildWebPreviewParametersFreshMapEachTime(t *testing.T) {
 	if _, ok := b[mustKey(t, parameters_enums.EcrRepositoryUri)]; ok {
 		t.Error("a second map carries what a command wrote into the first")
 	}
-	if len(in.Deploy.Service.DockerBuildArgs) != 2 || in.Deploy.Settings.Variables["API_KEY"] != "s3cret" {
+	if len(in.Deploy.Service.DockerBuildArgs) != 3 || in.Deploy.Settings.Variables["API_KEY"] != "s3cret" {
 		t.Error("building the map changed its input")
 	}
 }
@@ -364,6 +398,35 @@ func TestWebPreviewDeployRunsProductionStepsInOrder(t *testing.T) {
 	}
 	if b, err := os.ReadFile(filepath.Join(buildDir, "services/api/.env")); err != nil || string(b) != "A=b" {
 		t.Errorf("secret file = %q, %v", b, err)
+	}
+}
+
+// The names of build args left out go to the Step log only (BuildLogs), never a
+// value and never the deploy log the agent's log tail is cut from.
+func TestWebPreviewDeployLogsLeftOutBuildArgNames(t *testing.T) {
+	buildDir, org := webPreviewBuildDir(t)
+	fake := &fakeWebPreviewSteps{}
+	in := testWebPreviewInput(buildDir)
+	var buildLogs, logs bytes.Buffer
+	in.BuildLogs, in.Logs = &buildLogs, &logs
+	if _, err := testWebPreviewDeployer(org, fake.steps()).deploy(context.Background(), in); err != nil {
+		t.Fatal(err)
+	}
+	want := "Backend preview: build args left out, with no usable Preview configuration variable of the same name: A, URL\n"
+	if !strings.Contains(buildLogs.String(), want) {
+		t.Errorf("build log %q, want it to contain %q", buildLogs.String(), want)
+	}
+	for _, out := range []string{buildLogs.String(), logs.String()} {
+		if strings.Contains(out, "prod-") {
+			t.Errorf("a production value was logged: %q", out)
+		}
+	}
+	if strings.Contains(logs.String(), "build args left out") {
+		t.Error("the left-out names reached the deploy log")
+	}
+	args, err := commandUtils.GetDockerBuildArgs(fake.seen[0])
+	if err != nil || len(args) != 1 || args["API_KEY"] == nil || *args["API_KEY"] != "s3cret" {
+		t.Errorf("the build got %v (%v), want only API_KEY from the preview configuration", args, err)
 	}
 }
 
