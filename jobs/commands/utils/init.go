@@ -6,8 +6,6 @@ import (
 
 	goPipeline "github.com/ankit-arora/go-utils/go-concurrent-pipeline/go-pipeline"
 	goShutdownHook "github.com/ankit-arora/go-utils/go-shutdown-hook"
-	agentTypes "github.com/deployment-io/deployment-runner-kit/agents"
-	"github.com/deployment-io/deployment-runner-kit/automations"
 	"github.com/deployment-io/deployment-runner-kit/builds"
 	"github.com/deployment-io/deployment-runner-kit/certificates"
 	"github.com/deployment-io/deployment-runner-kit/clusters"
@@ -29,8 +27,6 @@ var UpsertVpcsPipeline *goPipeline.Pipeline[string, vpcs.UpsertVpcDtoV1]
 var UpsertClustersPipeline *goPipeline.Pipeline[string, clusters.UpsertClusterDtoV1]
 var UpdateCertificatesPipeline *goPipeline.Pipeline[string, certificates.UpdateCertificateDtoV1]
 var UpdateJobOutputPipeline *goPipeline.Pipeline[string, jobs.UpdateJobOutputDtoV1]
-var UpdateAutomationOutputPipeline *goPipeline.Pipeline[string, automations.UpdateResponseDtoV1]
-var UpdateAgentOutputPipeline *goPipeline.Pipeline[string, agentTypes.UpdateResponseDtoV1]
 
 func Shutdown() {
 	UpdateTasksPipeline.Shutdown()
@@ -42,8 +38,6 @@ func Shutdown() {
 	UpdateCertificatesPipeline.Shutdown()
 	SendNotificationPipeline.Shutdown()
 	UpdateJobOutputPipeline.Shutdown()
-	UpdateAutomationOutputPipeline.Shutdown()
-	UpdateAgentOutputPipeline.Shutdown()
 }
 
 func Init() {
@@ -204,37 +198,6 @@ func Init() {
 			e := true
 			for e {
 				err := c.UpdateJobOutputs(jobOutputs, organizationId)
-				//TODO we can handle for ErrConnection
-				//will block till error
-				if err != nil {
-					fmt.Println(err)
-					time.Sleep(2 * time.Second)
-					continue
-				}
-				e = false
-			}
-		})
-	UpdateAutomationOutputPipeline, _ = goPipeline.NewPipeline(5, 1*time.Second,
-		func(organizationId string, automationResponses []automations.UpdateResponseDtoV1) {
-			e := true
-			for e {
-				err := c.UpdateAutomationResponses(automationResponses, organizationId)
-				//TODO we can handle for ErrConnection
-				//will block till error
-				if err != nil {
-					fmt.Println(err)
-					time.Sleep(2 * time.Second)
-					continue
-				}
-				e = false
-			}
-		})
-
-	UpdateAgentOutputPipeline, _ = goPipeline.NewPipeline(5, 1*time.Second,
-		func(organizationId string, agentResponses []agentTypes.UpdateResponseDtoV1) {
-			e := true
-			for e {
-				err := c.UpdateAgentResponses(agentResponses, organizationId)
 				//TODO we can handle for ErrConnection
 				//will block till error
 				if err != nil {

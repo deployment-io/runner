@@ -7,6 +7,9 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
+	"github.com/deployment-io/deployment-runner-kit/jobs"
 )
 
 // The mid-session repository add bounds its checkout with a 5-minute deadline
@@ -59,5 +62,75 @@ func TestSessionRepositoryDirMatchesTheSessionStartLayout(t *testing.T) {
 	// Sanity: the base dir is not something a test could clobber.
 	if _, err := os.Stat(base); err == nil {
 		t.Skipf("%s exists on this host", base)
+	}
+}
+
+// A build job's repository lives under /tmp/<orgID>/<buildID>. The removed
+// automations feature used /tmp/<orgID>/<automationID>/<jobID>; a leftover
+// AutomationID parameter no longer changes the path.
+func TestGetRepositoryDirectoryPath(t *testing.T) {
+	tests := []struct {
+		name       string
+		parameters map[parameters_enums.Key]string
+		want       string
+		wantErr    bool
+	}{
+		{
+			name: "organization and build",
+			parameters: map[parameters_enums.Key]string{
+				parameters_enums.OrganizationIDNamespace: "org-1",
+				parameters_enums.BuildID:                 "build-1",
+			},
+			want: "/tmp/org-1/build-1",
+		},
+		{
+			name: "automation id is ignored",
+			parameters: map[parameters_enums.Key]string{
+				parameters_enums.OrganizationIDNamespace: "org-1",
+				parameters_enums.BuildID:                 "build-1",
+				parameters_enums.AutomationID:            "automation-1",
+				parameters_enums.JobID:                   "job-1",
+			},
+			want: "/tmp/org-1/build-1",
+		},
+		{
+			name: "automation id without a build is an error",
+			parameters: map[parameters_enums.Key]string{
+				parameters_enums.OrganizationIDNamespace: "org-1",
+				parameters_enums.AutomationID:            "automation-1",
+				parameters_enums.JobID:                   "job-1",
+			},
+			wantErr: true,
+		},
+		{
+			name: "missing organization is an error",
+			parameters: map[parameters_enums.Key]string{
+				parameters_enums.BuildID: "build-1",
+			},
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			parameters := map[string]interface{}{}
+			for k, v := range tt.parameters {
+				if err := jobs.SetParameterValue(parameters, k, v); err != nil {
+					t.Fatalf("SetParameterValue(%s): %v", k.String(), err)
+				}
+			}
+			got, err := GetRepositoryDirectoryPath(parameters)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("GetRepositoryDirectoryPath() = %q, want an error", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("GetRepositoryDirectoryPath() error = %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("GetRepositoryDirectoryPath() = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }

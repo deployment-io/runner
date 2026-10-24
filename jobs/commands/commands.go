@@ -12,7 +12,6 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner-kit/previews"
-	"github.com/deployment-io/deployment-runner/jobs/commands/agents"
 	"github.com/deployment-io/deployment-runner/jobs/commands/utils"
 )
 
@@ -66,10 +65,6 @@ func Get(p commands_enums.Type) (jobs.Command, error) {
 		return &ListCloudWatchMetricsAwsEcsWebService{}, nil
 	case commands_enums.CreateSecretAwsSecretManager:
 		return &CreateSecretAwsSecretManager{}, nil
-	case commands_enums.RunNewAutomation:
-		return &RunNewAutomation{}, nil
-	case commands_enums.RunNewAgent:
-		return &agents.RunNewAgent{}, nil
 	case commands_enums.GetDeploymentLogsAws:
 		return &GetDeploymentLogsAws{}, nil
 	case commands_enums.RunAgentStep:
