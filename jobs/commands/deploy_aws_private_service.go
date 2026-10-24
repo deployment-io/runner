@@ -60,7 +60,11 @@ func (d *DeployAwsPrivateService) Run(parameters map[string]interface{}, logsWri
 	if err != nil {
 		return parameters, err
 	}
-	err = deployEcsServiceAfterPreDeploy(parameters, ecsClient, logsClient, ecsClusterArn, "", taskDefinitionArn, logsWriter, ecsServiceDeployOptions{})
+	// Its DNS name (registered below) resolves only once the VPC's DNS
+	// attributes are on.
+	ensurePrivateServiceVpcDns(parameters, ec2Client, logsWriter)
+	err = deployEcsServiceAfterPreDeploy(parameters, ecsClient, logsClient, ecsClusterArn, "", taskDefinitionArn, logsWriter,
+		ecsServiceDeployOptions{registerDnsName: true})
 	if err != nil {
 		return parameters, err
 	}

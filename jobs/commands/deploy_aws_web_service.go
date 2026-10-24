@@ -1083,7 +1083,7 @@ func createNamespaceIfNeeded(parameters map[string]interface{}, logsWriter io.Wr
 	if err != nil {
 		return "", err
 	}
-	serviceDiscoveryClient, err := cloud_api_clients.GetServiceDiscoveryClient(parameters)
+	serviceDiscoveryClient, err := getServiceDiscoveryClient(parameters)
 	if err != nil {
 		return "", err
 	}
@@ -1193,6 +1193,10 @@ type ecsServiceDeployOptions struct {
 	// without waiting for it to settle. A Task's backend preview sets it: its
 	// readiness is checked by verify_preview_reachable on its health URL.
 	skipServiceStableWait bool
+	// registerDnsName registers the service's Service Connect alias as a DNS
+	// name in its namespace (private_service_dns.go). Only DeployAwsPrivateService
+	// sets it.
+	registerDnsName bool
 }
 
 // waitForEcsServiceStable waits until the service settles. Swapped by tests
@@ -1208,6 +1212,7 @@ func createEcsServiceIfNeeded(parameters map[string]interface{}, ecsClient *ecs.
 	if err == nil && len(ecsServiceArnFromParams) > 0 {
 		return ecsServiceArnFromParams, true, nil
 	}
+	ecsServiceAPIClient := ecsServiceClient(ecsClient)
 
 	ecsServiceName, err := aws_utils.GetEcsServiceName(parameters)
 	if err != nil {
@@ -1223,7 +1228,7 @@ func createEcsServiceIfNeeded(parameters map[string]interface{}, ecsClient *ecs.
 		Cluster: aws.String(ecsClusterArn),
 	}
 
-	describeServicesOutput, err := ecsClient.DescribeServices(context.TODO(), describeServicesInput)
+	describeServicesOutput, err := ecsServiceAPIClient.DescribeServices(context.TODO(), describeServicesInput)
 	if err != nil {
 		return "", false, err
 	}
@@ -1318,7 +1323,11 @@ func createEcsServiceIfNeeded(parameters map[string]interface{}, ecsClient *ecs.
 			},
 		}
 
-		createServiceOutput, err := ecsClient.CreateService(context.TODO(), createServiceInput)
+		if opts.registerDnsName {
+			createServiceInput.ServiceRegistries = dnsServiceRegistries(parameters, namespaceName, dnsName, logsWriter)
+		}
+
+		createServiceOutput, err := ecsServiceAPIClient.CreateService(context.TODO(), createServiceInput)
 		if err != nil {
 			return "", false, err
 		}
@@ -1374,19 +1383,6 @@ func updateEcsService(parameters map[string]interface{}, ecsClient *ecs.Client, 
 	if err != nil {
 		return err
 	}
-	updateServiceInput := &ecs.UpdateServiceInput{
-		Service:        aws.String(ecsServiceName),
-		Cluster:        aws.String(ecsClusterArn),
-		DesiredCount:   aws.Int32(1),
-		TaskDefinition: aws.String(taskDefinitionArn),
-		PropagateTags:  ecsTypes.PropagateTagsTaskDefinition,
-	}
-	_, err = ecsClient.UpdateService(context.TODO(), updateServiceInput)
-
-	if err != nil {
-		return err
-	}
-
 	describeServicesInput := &ecs.DescribeServicesInput{
 		Services: []string{
 			ecsServiceName,
@@ -1394,7 +1390,26 @@ func updateEcsService(parameters map[string]interface{}, ecsClient *ecs.Client, 
 		Cluster: aws.String(ecsClusterArn),
 	}
 
-	describeServicesOutput, err := ecsClient.DescribeServices(context.TODO(), describeServicesInput)
+	ecsServiceAPIClient := ecsServiceClient(ecsClient)
+	updateServiceInput := &ecs.UpdateServiceInput{
+		Service:        aws.String(ecsServiceName),
+		Cluster:        aws.String(ecsClusterArn),
+		DesiredCount:   aws.Int32(1),
+		TaskDefinition: aws.String(taskDefinitionArn),
+		PropagateTags:  ecsTypes.PropagateTagsTaskDefinition,
+	}
+	if opts.registerDnsName {
+		// In the same call as the new task definition, so it is one ECS
+		// deployment. Nil leaves a registry the service already has as is.
+		updateServiceInput.ServiceRegistries = missingDnsServiceRegistries(parameters, ecsServiceAPIClient, describeServicesInput, logsWriter)
+	}
+	_, err = ecsServiceAPIClient.UpdateService(context.TODO(), updateServiceInput)
+
+	if err != nil {
+		return err
+	}
+
+	describeServicesOutput, err := ecsServiceAPIClient.DescribeServices(context.TODO(), describeServicesInput)
 	if err != nil {
 		return err
 	}
