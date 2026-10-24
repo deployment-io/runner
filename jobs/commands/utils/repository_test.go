@@ -65,9 +65,7 @@ func TestSessionRepositoryDirMatchesTheSessionStartLayout(t *testing.T) {
 	}
 }
 
-// A build job's repository lives under /tmp/<orgID>/<buildID>. The removed
-// automations feature used /tmp/<orgID>/<automationID>/<jobID>; a leftover
-// AutomationID parameter no longer changes the path.
+// A build job's repository lives under /tmp/<orgID>/<buildID>.
 func TestGetRepositoryDirectoryPath(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -82,25 +80,6 @@ func TestGetRepositoryDirectoryPath(t *testing.T) {
 				parameters_enums.BuildID:                 "build-1",
 			},
 			want: "/tmp/org-1/build-1",
-		},
-		{
-			name: "automation id is ignored",
-			parameters: map[parameters_enums.Key]string{
-				parameters_enums.OrganizationIDNamespace: "org-1",
-				parameters_enums.BuildID:                 "build-1",
-				parameters_enums.AutomationID:            "automation-1",
-				parameters_enums.JobID:                   "job-1",
-			},
-			want: "/tmp/org-1/build-1",
-		},
-		{
-			name: "automation id without a build is an error",
-			parameters: map[parameters_enums.Key]string{
-				parameters_enums.OrganizationIDNamespace: "org-1",
-				parameters_enums.AutomationID:            "automation-1",
-				parameters_enums.JobID:                   "job-1",
-			},
-			wantErr: true,
 		},
 		{
 			name: "missing organization is an error",
