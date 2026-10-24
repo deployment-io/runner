@@ -96,8 +96,8 @@ github.com/cyphar/filepath-securejoin v0.6.1/go.mod h1:A8hd4EnAeyujCJRrICiOWqjS1
 github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
-github.com/deployment-io/deployment-runner-kit v0.0.0-20261023062427-88cbedca9de4 h1:gWQ3pWBgtbTqWI8g/RvZC6ND0M8DPAZfxtEL6Cr2uwQ=
-github.com/deployment-io/deployment-runner-kit v0.0.0-20261023062427-88cbedca9de4/go.mod h1:8Tac8gdT2ADMFefU552PTUJ+M7geOUtGvmmwaBzyihs=
+github.com/deployment-io/deployment-runner-kit v0.0.0-20261024103631-16f356ef30fe h1:LF/Xvs0SjAs3sDAjgz9imbFfj2qSbIKA348kuvswLA0=
+github.com/deployment-io/deployment-runner-kit v0.0.0-20261024103631-16f356ef30fe/go.mod h1:NqnNGZgTJGDpxTGxBU47fVBpUG8U73tW40enuja5S+E=
 github.com/distribution/reference v0.6.0 h1:0IXCQ5g4/QMHHkarYzh5l+u8T3t73zM5QvfrDyIgxBk=
 github.com/distribution/reference v0.6.0/go.mod h1:BbU0aIcezP1/5jX/8MP0YiH4SdvB5Y4f/wlDRiLyi3E=
 github.com/docker/docker v27.3.0+incompatible h1:BNb1QY6o4JdKpqwi9IB+HUYcRRrVN4aGFUTvDmWYK1A=
