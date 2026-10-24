@@ -569,7 +569,7 @@ func TestWebServiceDeployEntryPointsOptions(t *testing.T) {
 		testClusterArn, "", testTaskDefinitionArn, io.Discard, ecsServiceDeployOptions{skipServiceStableWait: true}); err != nil {
 		t.Fatal(err)
 	}
-	if !reflect.DeepEqual(steps.opts, []ecsServiceDeployOptions{{true}, {true}}) {
+	if !reflect.DeepEqual(steps.opts, []ecsServiceDeployOptions{{skipServiceStableWait: true}, {skipServiceStableWait: true}}) {
 		t.Errorf("service steps got %+v", steps.opts)
 	}
 }
