@@ -138,7 +138,7 @@ func TestBuildWebPreviewParametersKeysAndTypes(t *testing.T) {
 	}
 	for _, never := range []parameters_enums.Key{
 		parameters_enums.TaskDefinitionArn, parameters_enums.IsPreview, parameters_enums.RestartOnly,
-		parameters_enums.AutomationID, parameters_enums.JobID, parameters_enums.PreDeployCommand,
+		parameters_enums.JobID, parameters_enums.PreDeployCommand,
 		parameters_enums.IsPrivateRegistry, parameters_enums.SecretName, parameters_enums.RepoProviderToken,
 		parameters_enums.IsPrivateService, parameters_enums.EcrRepositoryUri, parameters_enums.AlbSecurityGroupId,
 		parameters_enums.LoadBalancerArn, parameters_enums.TargetGroupArn, parameters_enums.EcsServiceArn,
