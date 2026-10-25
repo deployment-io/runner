@@ -189,7 +189,7 @@ func getPrivateCidrBlocks() []string {
 	}
 }
 
-func createVpcIfNeeded(parameters map[string]interface{}, ec2Client *ec2.Client, cidrBlock string) (string, error) {
+func createVpcIfNeeded(parameters map[string]interface{}, ec2Client *ec2.Client, cidrBlock string, logsWriter io.Writer) (string, error) {
 	vpcIdFromParams, err := jobs.GetParameterValue[string](parameters, parameters_enums.VpcID)
 	if err == nil && len(vpcIdFromParams) > 0 {
 		return vpcIdFromParams, nil
@@ -257,6 +257,9 @@ func createVpcIfNeeded(parameters map[string]interface{}, ec2Client *ec2.Client,
 			return "", err
 		}
 	}
+
+	// So private services' DNS names resolve inside it from the start.
+	ensureVpcDnsAttributes(ec2Client, vpcId, logsWriter)
 
 	//sync VPC ID to server
 	region, err := jobs.GetParameterValue[int64](parameters, parameters_enums.Region)
@@ -813,7 +816,7 @@ func (c *CreateDefaultAwsVPC) Run(parameters map[string]interface{}, logsWriter 
 			continue
 		}
 		var vpcId string
-		vpcId, err = createVpcIfNeeded(parameters, ec2Client, cidrBlock)
+		vpcId, err = createVpcIfNeeded(parameters, ec2Client, cidrBlock, logsWriter)
 		if err != nil {
 			return parameters, err
 		}

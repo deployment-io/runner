@@ -51,28 +51,11 @@ func (d *DeleteAwsPrivateService) Run(parameters map[string]interface{}, logsWri
 	if err != nil {
 		return parameters, err
 	}
-	ecsServiceName, err := aws_utils.GetEcsServiceName(parameters)
-	if err != nil {
-		return parameters, err
-	}
 	ecsClient, err := cloud_api_clients.GetEcsClient(parameters)
 	if err != nil {
 		return parameters, err
 	}
-	io.WriteString(logsWriter, fmt.Sprintf("Deleting ECS service: %s in cluster: %s\n", ecsServiceName, clusterArn))
-	_, err = ecsClient.DeleteService(context.TODO(), &ecs.DeleteServiceInput{
-		Service: aws.String(ecsServiceName),
-		Cluster: aws.String(clusterArn),
-		Force:   aws.Bool(true),
-	})
-	if err != nil {
-		return parameters, err
-	}
-	inactiveWaiter := ecs.NewServicesInactiveWaiter(ecsClient)
-	err = inactiveWaiter.Wait(context.TODO(), &ecs.DescribeServicesInput{
-		Services: []string{ecsServiceName},
-		Cluster:  aws.String(clusterArn),
-	}, 20*time.Minute)
+	err = deletePrivateServiceEcsService(parameters, ecsClient, clusterArn, logsWriter)
 	if err != nil {
 		return parameters, err
 	}
@@ -117,4 +100,43 @@ func (d *DeleteAwsPrivateService) Run(parameters map[string]interface{}, logsWri
 	}
 
 	return parameters, err
+}
+
+// deletePrivateServiceECSAPI is the part of *ecs.Client deleting a private
+// service's ECS service uses. DescribeServices is also what the inactive
+// waiter polls.
+type deletePrivateServiceECSAPI interface {
+	DeleteService(ctx context.Context, params *ecs.DeleteServiceInput, optFns ...func(*ecs.Options)) (*ecs.DeleteServiceOutput, error)
+	DescribeServices(ctx context.Context, params *ecs.DescribeServicesInput, optFns ...func(*ecs.Options)) (*ecs.DescribeServicesOutput, error)
+}
+
+// deletePrivateServiceEcsService deletes the ECS service, waits for it to go
+// and then deletes its DNS name's Cloud Map service. Only the ECS steps can
+// fail the delete.
+func deletePrivateServiceEcsService(parameters map[string]interface{}, ecsClient deletePrivateServiceECSAPI,
+	clusterArn string, logsWriter io.Writer) error {
+	ecsServiceName, err := aws_utils.GetEcsServiceName(parameters)
+	if err != nil {
+		return err
+	}
+	registryArns := liveServiceRegistryArns(ecsClient, clusterArn, ecsServiceName)
+	io.WriteString(logsWriter, fmt.Sprintf("Deleting ECS service: %s in cluster: %s\n", ecsServiceName, clusterArn))
+	_, err = ecsClient.DeleteService(context.TODO(), &ecs.DeleteServiceInput{
+		Service: aws.String(ecsServiceName),
+		Cluster: aws.String(clusterArn),
+		Force:   aws.Bool(true),
+	})
+	if err != nil {
+		return err
+	}
+	inactiveWaiter := ecs.NewServicesInactiveWaiter(ecsClient)
+	err = inactiveWaiter.Wait(context.TODO(), &ecs.DescribeServicesInput{
+		Services: []string{ecsServiceName},
+		Cluster:  aws.String(clusterArn),
+	}, 20*time.Minute)
+	if err != nil {
+		return err
+	}
+	deleteDnsServices(parameters, registryArns, logsWriter)
+	return nil
 }
