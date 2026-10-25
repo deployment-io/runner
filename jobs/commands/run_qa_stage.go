@@ -21,7 +21,9 @@ import (
 
 // RunQAStage is the QA stage: between RunReviewStage and CommitAndPush, a
 // separate agent run deploys the Task's static-site previews and checks the
-// spec's acceptance criteria in a real browser.
+// spec's acceptance criteria in a real browser. The Task's changed backends
+// (web services) are deployed as previews by the runner itself before each
+// round, and the QA run is told where they are (QA_BACKENDS).
 //
 // THE QA RUN IS BLIND. It gets no diff, no implementer summary and no
 // repository: its /work is a sibling directory holding only agentbox's output
@@ -58,11 +60,25 @@ const (
 	// round and the final QA round, since the fix run can overrun its own
 	// timeout (vendoring a missing cache).
 	qaStageBudget = 100 * time.Minute
+	// qaBackendDeployAllowance is what deploying a QA round's backend previews
+	// is allowed out of the stage's budget, before the QA run's own timeout.
+	// Counted only when the gate found backend repositories.
+	qaBackendDeployAllowance = 15 * time.Minute
 )
 
-// qaNoStaticSiteReason is the skipped reason when no changed repository is a
-// static site the runner can build a preview of.
-const qaNoStaticSiteReason = "no static site in this change"
+// qaNoStaticSiteOrBackendReason is the skipped reason when no changed
+// repository is a static site the runner can build a preview of or a backend
+// it can deploy a preview of.
+const qaNoStaticSiteOrBackendReason = "no static site or backend service in this change"
+
+// minBackendQAAgentboxVersion is the first agentbox that reads QA_BACKENDS: an
+// older one would reject a QA run with no QA_REPOSITORIES and tell the agent
+// nothing about the backends.
+const minBackendQAAgentboxVersion = "1.9.35"
+
+// qaNoTimeToDeployBackendReason is round 1's status reason when the stage's
+// budget can't fit deploying the backend previews and the QA run.
+const qaNoTimeToDeployBackendReason = "no time left to deploy the backend preview"
 
 // qaOlderAgentboxReason names the older-image case: an agentbox before 1.9.32
 // rejects AGENT_MODE=qa at startup.
@@ -89,15 +105,17 @@ func (rq *RunQAStage) Run(parameters map[string]interface{}, logsWriter io.Write
 	defer cleanupQAStageSiblings(workDirHost)
 	qaParams, qaFailure := qaParameters(parameters)
 	stage := &qaStage{
-		ctx:          ctx,
-		parameters:   parameters,
-		workDirHost:  workDirHost,
-		logsWriter:   logsWriter,
-		qaParams:     qaParams,
-		qaFailure:    qaFailure,
-		deadline:     time.Now().Add(qaStageBudget),
-		stopSignal:   rq.stopSignal,
-		progressSink: rq.progressSink,
+		ctx:         ctx,
+		parameters:  parameters,
+		workDirHost: workDirHost,
+		logsWriter:  logsWriter,
+		qaParams:    qaParams,
+		qaFailure:   qaFailure,
+		deadline:    time.Now().Add(qaStageBudget),
+		// One memo for every round, as the tool keeps one per agent run.
+		webDistributions: agenttools.NewWebPreviewDistributions(),
+		stopSignal:       rq.stopSignal,
+		progressSink:     rq.progressSink,
 	}
 	return stage.run()
 }
@@ -153,6 +171,13 @@ type qaStage struct {
 	contextCopyDir string
 	// repositories is QA_REPOSITORIES: the changed, buildable repositories.
 	repositories []string
+	// backends are the changed repositories the runner deploys as backend
+	// previews before each QA round, in work-dir order.
+	backends []string
+	// webDistributions is the stage's one memo of the backend previews'
+	// CloudFront distributions, shared by every round's deploys so a
+	// re-deploy keeps its URL (see agenttools.WebPreviewDistributions).
+	webDistributions *agenttools.WebPreviewDistributions
 
 	out *qaOutput
 	// fixStage is the reviewStage the fix run ran in, and the review round
@@ -166,8 +191,16 @@ type qaStage struct {
 	runQA        func(round int) (agentResult, error)
 	runFix       func(prompt string) (agentResult, error)
 	checkPreview func(repository string) agenttools.RunnerBuiltPreviewCheck
-	cacheExists  func(name string) bool
-	reviewer     func(rs *reviewStage)
+	// checkBackend is the backend check for one repository (nil: it has a
+	// backend preview); webPreviewDeps builds a round's backend deploy deps
+	// around its preview record; deployBackend deploys one backend; spawnQA
+	// runs a round's container.
+	checkBackend   func(repository string) error
+	webPreviewDeps func(record *agenttools.PreviewRecord) *agenttools.DeployWebServicePreviewDeps
+	deployBackend  func(ctx context.Context, deps agenttools.DeployWebServicePreviewDeps, repository string) (agenttools.WebServicePreviewDeployed, error)
+	spawnQA        func(spec agentboxSpawnSpec) (agentResult, error)
+	cacheExists    func(name string) bool
+	reviewer       func(rs *reviewStage)
 	// fixTreesTmpRoot and fixTreesGit are the fix trees' and the gate's
 	// temporary root and git binary; "" means the defaults. Tests only.
 	fixTreesTmpRoot string
@@ -203,16 +236,22 @@ func (s *qaStage) model() string {
 // run is the gate, round 1, and the one fix round. It returns an error only for
 // a user stop and for a fix run whose undo did not work.
 func (s *qaStage) run() (map[string]interface{}, error) {
-	repositories, status, reason := s.gate()
-	if status == "" && len(repositories) == 0 {
+	g := s.gate()
+	if g.status == "" && len(g.static) == 0 && len(g.backends) == 0 {
 		// Nothing changed: nothing to check and nothing to report.
 		io.WriteString(s.logsWriter, "QA stage: no repository changed — no QA run\n")
 		return s.parameters, nil
 	}
-	s.repositories = repositories
-	s.out = &qaOutput{Repositories: repositories}
-	if status != "" {
-		s.out.Status, s.out.StatusReason = status, reason
+	s.repositories = g.static
+	s.backends = g.backends
+	s.out = &qaOutput{Repositories: g.static, Backends: g.backends}
+	if g.status != "" {
+		s.out.Status, s.out.StatusReason = g.status, g.reason
+		return s.finish()
+	}
+	if len(s.backends) > 0 && !s.canAfford(qaBackendDeployAllowance+qaRunTimeout) {
+		io.WriteString(s.logsWriter, "QA: no time left to deploy the backend preview and run QA\n")
+		s.out.Rounds = append(s.out.Rounds, s.couldNotRunRound(1, qaNoTimeToDeployBackendReason))
 		return s.finish()
 	}
 	release, reason := s.holdImage()
@@ -229,7 +268,7 @@ func (s *qaStage) run() (map[string]interface{}, error) {
 	if !s.shouldSendBack(round1) {
 		return s.finish()
 	}
-	if !s.canAfford(mustFixRunTimeout + reviewRunTimeout + qaRunTimeout) {
+	if !s.canAfford(mustFixRunTimeout + reviewRunTimeout + qaRunTimeout + s.backendDeployAllowance()) {
 		io.WriteString(s.logsWriter, "QA: no time left for a fix round\n")
 		return s.finish()
 	}
@@ -243,17 +282,11 @@ func (s *qaStage) run() (map[string]interface{}, error) {
 	if err := s.reviewFix(); err != nil {
 		return s.parameters, err
 	}
-	if !s.canAfford(qaRunTimeout) {
+	if !s.canAfford(qaRunTimeout + s.backendDeployAllowance()) {
 		// Round 1 checked the tree before the fix, so its verdicts are not the
 		// committed tree's: the final round is recorded as one that could not run.
 		io.WriteString(s.logsWriter, "QA: no time left for the final QA round\n")
-		s.out.Rounds = append(s.out.Rounds, qaRoundOutput{
-			Round:        2,
-			Status:       tasks.QAStatusCouldNotRun,
-			StatusReason: qaNoTimeForFinalRoundReason,
-			AgentType:    s.agentType(),
-			Model:        s.model(),
-		})
+		s.out.Rounds = append(s.out.Rounds, s.couldNotRunRound(2, qaNoTimeForFinalRoundReason))
 		return s.finish()
 	}
 	final, err := s.qaRound(2)
@@ -299,11 +332,43 @@ func (s *qaStage) canAfford(d time.Duration) bool {
 	return time.Now().Add(d).Before(s.deadline)
 }
 
+// backendDeployAllowance is what a QA round's backend deploys add to its time:
+// qaBackendDeployAllowance when the gate found backends, else nothing.
+func (s *qaStage) backendDeployAllowance() time.Duration {
+	if len(s.backends) == 0 {
+		return 0
+	}
+	return qaBackendDeployAllowance
+}
+
+// couldNotRunRound is a round recorded as one that could not run, for why,
+// without anything spawned.
+func (s *qaStage) couldNotRunRound(round int, why string) qaRoundOutput {
+	return qaRoundOutput{
+		Round:        round,
+		Status:       tasks.QAStatusCouldNotRun,
+		StatusReason: why,
+		AgentType:    s.agentType(),
+		Model:        s.model(),
+	}
+}
+
+// qaRoundSubject names what a QA round checks, for its log line.
+func (s *qaStage) qaRoundSubject() string {
+	switch {
+	case len(s.backends) == 0:
+		return "a preview of " + strings.Join(s.repositories, ", ")
+	case len(s.repositories) == 0:
+		return "the backend preview of " + strings.Join(s.backends, ", ")
+	}
+	return fmt.Sprintf("a preview of %s and the backend preview of %s", strings.Join(s.repositories, ", "), strings.Join(s.backends, ", "))
+}
+
 // qaRound runs one QA round, records it and folds its usage into the "qa"
 // stage. A user stop is returned; everything else is a recorded round.
 func (s *qaStage) qaRound(round int) (qaRoundOutput, error) {
 	reportTaskStepStage(s.parameters, s.ctx, tasks.StageQA, s.logsWriter)
-	io.WriteString(s.logsWriter, fmt.Sprintf("QA round %d: checking the acceptance criteria on a preview of %s\n", round, strings.Join(s.repositories, ", ")))
+	io.WriteString(s.logsWriter, fmt.Sprintf("QA round %d: checking the acceptance criteria on %s\n", round, s.qaRoundSubject()))
 	var result agentResult
 	var err error
 	s.roundMergeResults = nil

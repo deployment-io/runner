@@ -39,8 +39,11 @@ type qaOutput struct {
 	NoCriteria   bool   `json:"no_criteria,omitempty"`
 	// Repositories is the QA_REPOSITORIES list: the changed repositories the
 	// runner can build a preview of, in work-dir order.
-	Repositories []string        `json:"repositories,omitempty"`
-	Rounds       []qaRoundOutput `json:"rounds,omitempty"`
+	Repositories []string `json:"repositories,omitempty"`
+	// Backends are the changed repositories the runner deployed as backend
+	// previews before each round, in work-dir order.
+	Backends []string        `json:"backends,omitempty"`
+	Rounds   []qaRoundOutput `json:"rounds,omitempty"`
 	// FixedByQA is the criteria that failed in round 1 and passed in the final
 	// round, after a fix run.
 	FixedByQA []string `json:"fixed_by_qa,omitempty"`

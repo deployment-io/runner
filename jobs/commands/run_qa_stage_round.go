@@ -1,6 +1,8 @@
 package commands
 
 import (
+	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -11,6 +13,7 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner-kit/tasks"
+	"github.com/deployment-io/deployment-runner-kit/types"
 	"github.com/deployment-io/deployment-runner/agenttools"
 )
 
@@ -45,6 +48,12 @@ func (s *qaStage) runQARound(round int) (agentResult, error) {
 			io.WriteString(s.logsWriter, fmt.Sprintf("QA round %d: the deployment context cannot be mounted (%s) — running without it\n", round, err))
 		}
 	}
+	return s.deployAndSpawnQA(round, imageRef, qaDir, env)
+}
+
+// deployAndSpawnQA is a QA round once its directory is ready: it deploys the
+// round's backend previews, adds QA_BACKENDS to env and spawns the QA run.
+func (s *qaStage) deployAndSpawnQA(round int, imageRef, qaDir string, env []string) (agentResult, error) {
 	// Previews build from the Task's REAL working tree, which the QA run never
 	// sees: the deploy tool copies <Task dir>/<repository> host-side.
 	previewDeps := buildStaticSitePreviewDeps(s.ctx, s.parameters, s.workDirHost, s.logsWriter)
@@ -57,11 +66,123 @@ func (s *qaStage) runQARound(round int) (agentResult, error) {
 	}()
 	previewDeps.MergeResult = mergeResults
 	label := fmt.Sprintf("QA round %d", round)
+	backends, err := s.deployBackends(label, previewDeps)
+	if err != nil {
+		return agentResult{}, err
+	}
+	env = withQABackends(env, backends)
 	io.WriteString(s.logsWriter, fmt.Sprintf("%s: turn cap %s model responses\n", label, envValue(env, "MAX_TURNS")))
-	impl := &RunAgentStep{stopSignal: s.stopSignal, progressSink: s.progressSink}
-	result, err := impl.spawnAgentboxAndWait(s.qaSpawnSpec(imageRef, qaDir, env, previewDeps), s.logsWriter)
+	spec := s.qaSpawnSpec(imageRef, qaDir, env, previewDeps)
+	var result agentResult
+	if s.spawnQA != nil {
+		result, err = s.spawnQA(spec)
+	} else {
+		impl := &RunAgentStep{stopSignal: s.stopSignal, progressSink: s.progressSink}
+		result, err = impl.spawnAgentboxAndWait(spec, s.logsWriter)
+	}
 	logRoundOutput(filepath.Join(qaDir, agentboxResultDirRel), label, s.logsWriter)
 	return result, err
+}
+
+// qaBackend is one QA_BACKENDS entry: a backend preview the runner deployed
+// (its URL and health URL), or why its deploy failed.
+type qaBackend struct {
+	Repository string `json:"repository"`
+	URL        string `json:"url,omitempty"`
+	HealthURL  string `json:"health_url,omitempty"`
+	Error      string `json:"error,omitempty"`
+}
+
+// deployBackends deploys each backend repository's preview, in work-dir order,
+// synchronously and through deploy_web_service_preview's own plan and deploy:
+// from the round's merge results, into the round's preview record (so the
+// verify tools accept its URL), with the stage's one distributions memo, its
+// output in the Step log. A failed deploy is an entry for the agent to report;
+// when every backend failed and there is no static site to check, the round
+// can't run and the first failure is returned.
+func (s *qaStage) deployBackends(label string, previewDeps *agenttools.DeployStaticSitePreviewDeps) ([]qaBackend, error) {
+	if len(s.backends) == 0 {
+		return nil, nil
+	}
+	deps := s.roundWebPreviewDeps(previewDeps)
+	deploy := s.deployBackend
+	if deploy == nil {
+		deploy = agenttools.DeployWebServicePreview
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		select {
+		case <-s.stopSignal:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	var out []qaBackend
+	firstErr := ""
+	deployed := 0
+	for _, repository := range s.backends {
+		io.WriteString(s.logsWriter, fmt.Sprintf("%s: deploying the backend preview of %s\n", label, repository))
+		d, err := deploy(ctx, *deps, repository)
+		if s.stopped() {
+			return nil, types.ErrJobStoppedByUser
+		}
+		if err != nil {
+			io.WriteString(s.logsWriter, fmt.Sprintf("%s: the backend preview of %s failed to deploy: %s\n", label, repository, err))
+			out = append(out, qaBackend{Repository: repository, Error: err.Error()})
+			if firstErr == "" {
+				firstErr = err.Error()
+			}
+			continue
+		}
+		io.WriteString(s.logsWriter, fmt.Sprintf("%s: the backend preview of %s is deployed at %s (health check %s)\n", label, repository, d.URL, d.HealthURL))
+		out = append(out, qaBackend{Repository: repository, URL: d.URL, HealthURL: d.HealthURL})
+		deployed++
+	}
+	if deployed == 0 && len(s.repositories) == 0 {
+		return out, fmt.Errorf("the backend preview failed to deploy: %s", firstErr)
+	}
+	return out, nil
+}
+
+// roundWebPreviewDeps is a round's backend deploy deps: the tool's, around the
+// round's preview record, with its merge results and the stage's distributions.
+func (s *qaStage) roundWebPreviewDeps(previewDeps *agenttools.DeployStaticSitePreviewDeps) *agenttools.DeployWebServicePreviewDeps {
+	var deps *agenttools.DeployWebServicePreviewDeps
+	if s.webPreviewDeps != nil {
+		deps = s.webPreviewDeps(previewDeps.Record)
+	} else {
+		deps = buildWebServicePreviewDeps(s.ctx, s.parameters, s.workDirHost, s.logsWriter, previewDeps.Record)
+	}
+	deps.MergeResult = previewDeps.MergeResult
+	if s.webDistributions == nil {
+		s.webDistributions = agenttools.NewWebPreviewDistributions()
+	}
+	deps.Distributions = s.webDistributions
+	return deps
+}
+
+// stopped reports whether the user stopped the Step.
+func (s *qaStage) stopped() bool {
+	select {
+	case <-s.stopSignal:
+		return true
+	default:
+		return false
+	}
+}
+
+// withQABackends adds QA_BACKENDS — the round's backend previews as a JSON
+// array — to a QA run's environment; env as it is when there are none.
+func withQABackends(env []string, backends []qaBackend) []string {
+	if len(backends) == 0 {
+		return env
+	}
+	encoded, err := json.Marshal(backends)
+	if err != nil {
+		return env
+	}
+	return append(env, "QA_BACKENDS="+string(encoded))
 }
 
 // qaSpawnSpec is a QA round's container: /work is the QA dir, the context

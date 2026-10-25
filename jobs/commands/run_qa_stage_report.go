@@ -68,6 +68,9 @@ func (s *qaStage) logFullQA() {
 		b.WriteString(qaGateLogLine(out))
 	} else {
 		b.WriteString(fmt.Sprintf("Repositories QA'd: %s\n", strings.Join(out.Repositories, ", ")))
+		if len(out.Backends) > 0 {
+			b.WriteString(fmt.Sprintf("Backend previews QA'd: %s\n", strings.Join(out.Backends, ", ")))
+		}
 	}
 	for _, round := range out.Rounds {
 		b.WriteString(qaRoundLogLine(round))

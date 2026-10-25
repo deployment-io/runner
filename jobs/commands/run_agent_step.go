@@ -1873,8 +1873,9 @@ type agentboxSpawnSpec struct {
 	previewDeps *agenttools.DeployStaticSitePreviewDeps
 	// webPreviewDeps, set beside previewDeps for implement and fix runs only, is
 	// what the deploy_web_service_preview tool closes over; it shares previewDeps'
-	// Record. Nil for QA rounds (they would need the agentbox allowlist to reach
-	// a backend preview) and every other spawn.
+	// Record. Nil for QA rounds — the runner deploys their backend previews itself
+	// before the spawn, so the agent being tested never picks its environment —
+	// and every other spawn.
 	webPreviewDeps *agenttools.DeployWebServicePreviewDeps
 	// waitTimeout overrides how long the container may run. Zero means
 	// defaultWallClockTimeout, which is what an implement run gets. The

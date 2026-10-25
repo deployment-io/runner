@@ -690,16 +690,25 @@ func TestWebServicePreviewToolRegistration(t *testing.T) {
 			t.Errorf("%s tools = %s", name, got)
 		}
 	}
-	// The QA gate serves no tools; neither it nor a QA round builds the web deps.
-	for _, file := range []string{"run_qa_stage_gate.go", "run_qa_stage_round.go", "run_production_qa.go"} {
-		src, err := os.ReadFile(file)
-		if err != nil {
-			t.Fatal(err)
-		}
-		for _, name := range []string{"webPreviewDeps", "buildImplementPreviewTools", "buildWebServicePreviewDeps"} {
-			if strings.Contains(string(src), name) {
-				t.Errorf("%s uses %s", file, name)
-			}
+	// The QA stage builds the web deps to deploy backends itself, but never
+	// hands them to a QA round's spawn; production QA doesn't build them at all.
+	if qa.webPreviewDeps != nil {
+		t.Error("a QA round's spawn carries the web deps")
+	}
+	src, err := os.ReadFile("run_qa_stage_round.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(src), "webPreviewDeps:") || strings.Contains(string(src), "buildImplementPreviewTools") {
+		t.Error("run_qa_stage_round.go puts the web deps on a spawn")
+	}
+	src, err = os.ReadFile("run_production_qa.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"webPreviewDeps", "buildImplementPreviewTools", "buildWebServicePreviewDeps"} {
+		if strings.Contains(string(src), name) {
+			t.Errorf("run_production_qa.go uses %s", name)
 		}
 	}
 }
