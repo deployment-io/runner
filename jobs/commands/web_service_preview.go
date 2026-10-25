@@ -217,6 +217,9 @@ type webPreviewSteps struct {
 	build  webPreviewStep
 	upload webPreviewStep
 	deploy webPreviewStep
+	// database deploys the preview's own database (when it has one) before the
+	// API's steps, and returns what the API's parameters point at.
+	database func(taskID string, apiParameters map[string]interface{}, in agenttools.WebServicePreviewDeployInput) (webPreviewDatabase, error)
 	// loadBalancerDNS reads the DNS name of the load balancer the deploy created or
 	// reused.
 	loadBalancerDNS func(parameters map[string]interface{}) (string, error)
@@ -225,9 +228,10 @@ type webPreviewSteps struct {
 // productionWebPreviewSteps are production's own commands.
 func productionWebPreviewSteps() webPreviewSteps {
 	return webPreviewSteps{
-		build:  (&BuildDockerImage{}).Run,
-		upload: newUploadDockerImageToEcr().Run,
-		deploy: deployAwsWebServicePreview,
+		build:    (&BuildDockerImage{}).Run,
+		upload:   newUploadDockerImageToEcr().Run,
+		deploy:   deployAwsWebServicePreview,
+		database: deployWebPreviewDatabase,
 		loadBalancerDNS: func(parameters map[string]interface{}) (string, error) {
 			elbClient, err := cloud_api_clients.GetElbClient(parameters)
 			if err != nil {
@@ -243,12 +247,14 @@ type webPreviewDeployer struct {
 	organizationIDNamespace string
 	organizationIdFromJob   string
 	region                  int64
-	steps                   webPreviewSteps
+	// taskID names the Task's preview stack security group.
+	taskID string
+	steps  webPreviewSteps
 }
 
 // deploy is DeployWebServicePreviewDeps.Deploy: the parameters map and its checks,
-// the secret files, then the image build, its upload and the web-service deploy, and
-// the load balancer's DNS name.
+// the secret files, the preview's own database when it has one, then the image
+// build, its upload and the web-service deploy, and the load balancer's DNS name.
 func (d webPreviewDeployer) deploy(ctx context.Context, in agenttools.WebServicePreviewDeployInput) (agenttools.WebServicePreviewDeployOutput, error) {
 	parameters, err := buildWebPreviewParameters(webPreviewParametersInput{
 		OrganizationIDNamespace: d.organizationIDNamespace,
@@ -280,7 +286,28 @@ func (d webPreviewDeployer) deploy(ctx context.Context, in agenttools.WebService
 			return agenttools.WebServicePreviewDeployOutput{}, err
 		}
 	}
+	if in.Database != nil {
+		if err := d.deployDatabase(ctx, parameters, in); err != nil {
+			return agenttools.WebServicePreviewDeployOutput{}, err
+		}
+	}
 	return d.runSteps(ctx, parameters, in)
+}
+
+// deployDatabase deploys the preview's own database and points the API's
+// parameters at it.
+func (d webPreviewDeployer) deployDatabase(ctx context.Context, parameters map[string]interface{}, in agenttools.WebServicePreviewDeployInput) error {
+	if err := ctx.Err(); err != nil {
+		return errors.New("the backend preview's deploy was cancelled")
+	}
+	if d.steps.database == nil {
+		return errors.New("deployment.io can't deploy preview databases here")
+	}
+	db, err := d.steps.database(d.taskID, parameters, in)
+	if err != nil {
+		return agenttools.WebPreviewDeployFailed(fmt.Errorf("the preview database: %w", err))
+	}
+	return setWebPreviewDatabaseParameters(parameters, in, db)
 }
 
 // runSteps runs the deploy's commands on parameters, stopping between them once ctx

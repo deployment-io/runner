@@ -671,7 +671,7 @@ func runPrivateServiceDelete(t *testing.T, ecsClient *fakePrivateServiceDelete, 
 	getServiceDiscoveryClient = func(map[string]interface{}) (serviceDiscoveryAPI, error) { return cloudMap, nil }
 	deleteDnsServiceSleep = func(d time.Duration) { calls = append(calls, "sleep "+d.String()) }
 	var logs bytes.Buffer
-	err := deletePrivateServiceEcsService(privateServiceDeployParameters(), ecsClient, testClusterArn, &logs)
+	_, err := deletePrivateServiceEcsService(privateServiceDeployParameters(), ecsClient, testClusterArn, &logs)
 	// The ECS calls, then Cloud Map's, then the pauses between retries.
 	all := append(append([]string{}, ecsClient.calls...), cloudMap.calls...)
 	return logs.String(), append(all, calls...), err
@@ -686,7 +686,7 @@ func TestDeletePrivateServiceDeletesItsDnsServiceAfterTheServiceIsInactive(t *te
 	originalCloudMap := getServiceDiscoveryClient
 	t.Cleanup(func() { getServiceDiscoveryClient = originalCloudMap })
 	getServiceDiscoveryClient = func(map[string]interface{}) (serviceDiscoveryAPI, error) { return cloudMapWrapped, nil }
-	if err := deletePrivateServiceEcsService(privateServiceDeployParameters(), ecsWrapped, testClusterArn, &bytes.Buffer{}); err != nil {
+	if _, err := deletePrivateServiceEcsService(privateServiceDeployParameters(), ecsWrapped, testClusterArn, &bytes.Buffer{}); err != nil {
 		t.Fatal(err)
 	}
 	want := []string{
@@ -774,12 +774,18 @@ func TestDeletePrivateServiceDnsCleanup(t *testing.T) {
 	}
 }
 
-// A service without a registry, or one that can't be described, is deleted
-// exactly as before: no Cloud Map call.
+// A service without a registry is deleted exactly as before: no Cloud Map call.
+// One that can't be described isn't deleted: its security groups (and its
+// registries) are only known before the delete.
 func TestDeletePrivateServiceWithoutRegistry(t *testing.T) {
+	describeFails := &fakePrivateServiceDelete{registries: []string{testDnsServiceArn}, describeErr: errors.New("ThrottlingException")}
+	cloudMap := newFakeCloudMap()
+	if _, _, err := runPrivateServiceDelete(t, describeFails, cloudMap); err == nil || !strings.Contains(err.Error(), "ThrottlingException") ||
+		describeFails.deleted || len(cloudMap.calls) != 0 {
+		t.Errorf("describe fails: err %v, Cloud Map calls %v, deleted %v", err, cloudMap.calls, describeFails.deleted)
+	}
 	for name, ecsClient := range map[string]*fakePrivateServiceDelete{
 		"no registry":       {},
-		"describe fails":    {registries: []string{testDnsServiceArn}, describeErr: errors.New("ThrottlingException")},
 		"service not found": {registries: []string{testDnsServiceArn}, notFound: true},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -790,9 +796,16 @@ func TestDeletePrivateServiceWithoutRegistry(t *testing.T) {
 			}
 		})
 	}
+	// A purged service answers ServiceNotFoundException to both calls: it was
+	// already gone, and the delete carries on.
+	purged := &fakePrivateServiceDelete{describeErr: &ecsTypes.ServiceNotFoundException{Message: aws.String("purged")},
+		deleteErr: &ecsTypes.ServiceNotFoundException{Message: aws.String("purged")}}
+	if logs, _, err := runPrivateServiceDelete(t, purged, newFakeCloudMap()); err != nil || !strings.Contains(logs, "was already gone") {
+		t.Errorf("purged service: err %v, logs:\n%s", err, logs)
+	}
 	// ECS's own DeleteService error still fails the delete, before any Cloud Map call.
 	ecsClient := &fakePrivateServiceDelete{registries: []string{testDnsServiceArn}, deleteErr: errors.New("ClusterNotFoundException")}
-	cloudMap := newFakeCloudMap()
+	cloudMap = newFakeCloudMap()
 	if _, _, err := runPrivateServiceDelete(t, ecsClient, cloudMap); err == nil || len(cloudMap.calls) != 0 {
 		t.Errorf("err %v, Cloud Map calls %v", err, cloudMap.calls)
 	}

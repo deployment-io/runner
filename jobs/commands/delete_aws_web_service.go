@@ -155,6 +155,8 @@ func newDeleteWebServiceClients(parameters map[string]interface{}) (clients dele
 //
 // It never touches what other services share: the VPC default security group's
 // ingress rule for the port, the Service Connect namespace, the cluster and the VPC.
+// Last, it removes the service's Task preview stack group, if it was in one and
+// nothing else uses it (deletePreviewStackSecurityGroups).
 func deleteWebServiceResources(parameters map[string]interface{}, clients deleteWebServiceClients, logsWriter io.Writer) error {
 	// Only a backend preview has a distribution; it goes first so nothing is
 	// left serving a preview whose service is gone.
@@ -163,7 +165,8 @@ func deleteWebServiceResources(parameters map[string]interface{}, clients delete
 			return err
 		}
 	}
-	if err := deleteWebServiceEcsService(parameters, clients.ecs, logsWriter); err != nil {
+	securityGroupIDs, err := deleteWebServiceEcsService(parameters, clients.ecs, logsWriter)
+	if err != nil {
 		return err
 	}
 	if err := deleteTaskDefinitions(parameters, clients.ecs, logsWriter); err != nil {
@@ -180,7 +183,11 @@ func deleteWebServiceResources(parameters map[string]interface{}, clients delete
 	if err := deleteWebServiceTargetGroup(parameters, clients.elb, logsWriter); err != nil {
 		return err
 	}
-	return deleteWebServiceAlbSecurityGroup(parameters, clients.ec2, logsWriter)
+	if err := deleteWebServiceAlbSecurityGroup(parameters, clients.ec2, logsWriter); err != nil {
+		return err
+	}
+	deletePreviewStackSecurityGroups(clients.ec2, securityGroupIDs, logsWriter)
+	return nil
 }
 
 func logAlreadyGone(logsWriter io.Writer, resource, nameOrID string) {
@@ -199,15 +206,22 @@ func deleteWebServiceCloudfrontDistribution(parameters map[string]interface{}, c
 	return err
 }
 
-func deleteWebServiceEcsService(parameters map[string]interface{}, ecsClient deleteWebServiceECSAPI, logsWriter io.Writer) error {
+// deleteWebServiceEcsService deletes the ECS service and waits for it to go. It
+// returns the security groups the service ran in, described before the delete.
+func deleteWebServiceEcsService(parameters map[string]interface{}, ecsClient deleteWebServiceECSAPI, logsWriter io.Writer) ([]string, error) {
 	clusterArn, err := jobs.GetParameterValue[string](parameters, parameters_enums.EcsClusterArn)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	ecsServiceName, err := aws_utils.GetEcsServiceName(parameters)
 	if err != nil {
-		return err
+		return nil, err
 	}
+	service, err := describeServiceBeforeDelete(ecsClient, clusterArn, ecsServiceName)
+	if err != nil {
+		return nil, err
+	}
+	securityGroupIDs := serviceSecurityGroupIDs(service)
 	io.WriteString(logsWriter, fmt.Sprintf("Deleting ECS service: %s in cluster: %s\n", ecsServiceName, clusterArn))
 	_, err = ecsClient.DeleteService(context.TODO(), &ecs.DeleteServiceInput{
 		Service: aws.String(ecsServiceName),
@@ -217,18 +231,22 @@ func deleteWebServiceEcsService(parameters map[string]interface{}, ecsClient del
 	var serviceNotFound *ecsTypes.ServiceNotFoundException
 	if errors.As(err, &serviceNotFound) {
 		logAlreadyGone(logsWriter, "ECS service", ecsServiceName)
-		return nil
+		return securityGroupIDs, nil
 	}
 	// A service that is no longer active is already being deleted: wait for it.
 	var serviceNotActive *ecsTypes.ServiceNotActiveException
 	if err != nil && !errors.As(err, &serviceNotActive) {
-		return err
+		return nil, err
 	}
 	inactiveWaiter := ecs.NewServicesInactiveWaiter(ecsClient)
-	return inactiveWaiter.Wait(context.TODO(), &ecs.DescribeServicesInput{
+	err = inactiveWaiter.Wait(context.TODO(), &ecs.DescribeServicesInput{
 		Services: []string{ecsServiceName},
 		Cluster:  aws.String(clusterArn),
 	}, 20*time.Minute)
+	if err != nil {
+		return nil, err
+	}
+	return securityGroupIDs, nil
 }
 
 func deleteWebServiceEcrRepository(parameters map[string]interface{}, ecrClient deleteWebServiceECRAPI, logsWriter io.Writer) error {

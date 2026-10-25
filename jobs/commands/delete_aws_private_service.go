@@ -2,13 +2,14 @@ package commands
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/service/ecr"
 	"github.com/aws/aws-sdk-go-v2/service/ecs"
+	ecsTypes "github.com/aws/aws-sdk-go-v2/service/ecs/types"
 	"github.com/deployment-io/deployment-runner-kit/cloud_api_clients"
 	"github.com/deployment-io/deployment-runner-kit/deployments"
 	"github.com/deployment-io/deployment-runner-kit/enums/deployment_enums"
@@ -47,43 +48,13 @@ func (d *DeleteAwsPrivateService) Run(parameters map[string]interface{}, logsWri
 			DeletionState: deployment_enums.DeletionInProcess,
 		})
 	}
-	clusterArn, err := jobs.GetParameterValue[string](parameters, parameters_enums.EcsClusterArn)
+	clients, err := newDeletePrivateServiceClients(parameters)
 	if err != nil {
 		return parameters, err
 	}
-	ecsClient, err := cloud_api_clients.GetEcsClient(parameters)
+	err = deletePrivateServiceResources(parameters, clients, logsWriter)
 	if err != nil {
 		return parameters, err
-	}
-	err = deletePrivateServiceEcsService(parameters, ecsClient, clusterArn, logsWriter)
-	if err != nil {
-		return parameters, err
-	}
-
-	err = deleteTaskDefinitions(parameters, ecsClient, logsWriter)
-	if err != nil {
-		return parameters, err
-	}
-
-	deployedFromImage, _ := jobs.GetParameterValue[bool](parameters, parameters_enums.DeployedFromImage)
-	if !deployedFromImage {
-		//delete ecr repository if necessary
-		ecrClient, err := cloud_api_clients.GetEcrClient(parameters)
-		if err != nil {
-			return parameters, err
-		}
-		ecrRepositoryName, err := getEcrRepositoryName(parameters)
-		if err != nil {
-			return parameters, err
-		}
-		io.WriteString(logsWriter, fmt.Sprintf("Deleting ECR repository: %s\n", ecrRepositoryName))
-		_, err = ecrClient.DeleteRepository(context.TODO(), &ecr.DeleteRepositoryInput{
-			RepositoryName: aws.String(ecrRepositoryName),
-			Force:          true,
-		})
-		if err != nil {
-			return parameters, err
-		}
 	}
 	if !isPreview(parameters) {
 		//update deployment to deleted and delete domain
@@ -102,6 +73,56 @@ func (d *DeleteAwsPrivateService) Run(parameters map[string]interface{}, logsWri
 	return parameters, err
 }
 
+// deletePrivateServiceClients are the AWS clients deleting a private service uses.
+type deletePrivateServiceClients struct {
+	ecs deleteWebServiceECSAPI
+	// ecr is nil for a service deployed from an image: it has no repository.
+	ecr deleteWebServiceECRAPI
+	ec2 securityGroupDeleteAPI
+}
+
+func newDeletePrivateServiceClients(parameters map[string]interface{}) (clients deletePrivateServiceClients, err error) {
+	if clients.ecs, err = cloud_api_clients.GetEcsClient(parameters); err != nil {
+		return clients, err
+	}
+	if deployedFromImage, _ := jobs.GetParameterValue[bool](parameters, parameters_enums.DeployedFromImage); !deployedFromImage {
+		if clients.ecr, err = cloud_api_clients.GetEcrClient(parameters); err != nil {
+			return clients, err
+		}
+	}
+	if clients.ec2, err = cloud_api_clients.GetEC2Client(parameters); err != nil {
+		return clients, err
+	}
+	return clients, nil
+}
+
+// deletePrivateServiceResources deletes what a private service deploy creates:
+// the ECS service (and its DNS name), its task definitions and its ECR
+// repository, then its Task preview stack group if it was in one and nothing
+// else uses it. A resource that's already gone counts as deleted: a preview
+// database is deployed from an image but its Deployment doesn't say so, so its
+// ECR repository never existed.
+func deletePrivateServiceResources(parameters map[string]interface{}, clients deletePrivateServiceClients, logsWriter io.Writer) error {
+	clusterArn, err := jobs.GetParameterValue[string](parameters, parameters_enums.EcsClusterArn)
+	if err != nil {
+		return err
+	}
+	securityGroupIDs, err := deletePrivateServiceEcsService(parameters, clients.ecs, clusterArn, logsWriter)
+	if err != nil {
+		return err
+	}
+	if err := deleteTaskDefinitions(parameters, clients.ecs, logsWriter); err != nil {
+		return err
+	}
+	if deployedFromImage, _ := jobs.GetParameterValue[bool](parameters, parameters_enums.DeployedFromImage); !deployedFromImage {
+		if err := deleteWebServiceEcrRepository(parameters, clients.ecr, logsWriter); err != nil {
+			return err
+		}
+	}
+	deletePreviewStackSecurityGroups(clients.ec2, securityGroupIDs, logsWriter)
+	return nil
+}
+
 // deletePrivateServiceECSAPI is the part of *ecs.Client deleting a private
 // service's ECS service uses. DescribeServices is also what the inactive
 // waiter polls.
@@ -111,23 +132,34 @@ type deletePrivateServiceECSAPI interface {
 }
 
 // deletePrivateServiceEcsService deletes the ECS service, waits for it to go
-// and then deletes its DNS name's Cloud Map service. Only the ECS steps can
-// fail the delete.
+// and then deletes its DNS name's Cloud Map service. A service that's already
+// gone is skipped. Only the ECS steps can fail the delete. It returns the
+// security groups the service ran in, described before the delete.
 func deletePrivateServiceEcsService(parameters map[string]interface{}, ecsClient deletePrivateServiceECSAPI,
-	clusterArn string, logsWriter io.Writer) error {
+	clusterArn string, logsWriter io.Writer) ([]string, error) {
 	ecsServiceName, err := aws_utils.GetEcsServiceName(parameters)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	registryArns := liveServiceRegistryArns(ecsClient, clusterArn, ecsServiceName)
+	service, err := describeServiceBeforeDelete(ecsClient, clusterArn, ecsServiceName)
+	if err != nil {
+		return nil, err
+	}
+	registryArns, securityGroupIDs := serviceRegistryArns(service), serviceSecurityGroupIDs(service)
 	io.WriteString(logsWriter, fmt.Sprintf("Deleting ECS service: %s in cluster: %s\n", ecsServiceName, clusterArn))
 	_, err = ecsClient.DeleteService(context.TODO(), &ecs.DeleteServiceInput{
 		Service: aws.String(ecsServiceName),
 		Cluster: aws.String(clusterArn),
 		Force:   aws.Bool(true),
 	})
+	var serviceNotFound *ecsTypes.ServiceNotFoundException
+	if errors.As(err, &serviceNotFound) {
+		logAlreadyGone(logsWriter, "ECS service", ecsServiceName)
+		deleteDnsServices(parameters, registryArns, logsWriter)
+		return securityGroupIDs, nil
+	}
 	if err != nil {
-		return err
+		return nil, err
 	}
 	inactiveWaiter := ecs.NewServicesInactiveWaiter(ecsClient)
 	err = inactiveWaiter.Wait(context.TODO(), &ecs.DescribeServicesInput{
@@ -135,8 +167,8 @@ func deletePrivateServiceEcsService(parameters map[string]interface{}, ecsClient
 		Cluster:  aws.String(clusterArn),
 	}, 20*time.Minute)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	deleteDnsServices(parameters, registryArns, logsWriter)
-	return nil
+	return securityGroupIDs, nil
 }

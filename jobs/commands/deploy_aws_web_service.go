@@ -1167,9 +1167,10 @@ func getInternalDnsName(parameters map[string]interface{}) (string, error) {
 }
 
 // getEcsServiceNetworkConfiguration is the network a deployment's tasks run in:
-// the private subnets, no security groups of their own and no public IP. The
-// service and the pre-deploy command's one-off task both use it, so the
-// pre-deploy command reaches exactly what the service reaches.
+// the private subnets, no public IP and no security groups of their own (so the
+// VPC's default one) — or, for a Task's backend preview, exactly its
+// TaskSecurityGroupIds. The service and the pre-deploy command's one-off task
+// both use it, so the pre-deploy command reaches exactly what the service reaches.
 func getEcsServiceNetworkConfiguration(parameters map[string]interface{}) (*ecsTypes.NetworkConfiguration, error) {
 	privateSubnets, err := jobs.GetParameterValue[primitive.A](parameters, parameters_enums.PrivateSubnets)
 	if err != nil {
@@ -1179,10 +1180,58 @@ func getEcsServiceNetworkConfiguration(parameters map[string]interface{}) (*ecsT
 	if err != nil {
 		return nil, err
 	}
+	securityGroups, err := getTaskSecurityGroupIds(parameters)
+	if err != nil {
+		return nil, err
+	}
 	return &ecsTypes.NetworkConfiguration{
 		AwsvpcConfiguration: &ecsTypes.AwsVpcConfiguration{
-			Subnets: privateSubnetsSlice,
+			Subnets:        privateSubnetsSlice,
+			SecurityGroups: securityGroups,
 		},
+	}, nil
+}
+
+// getTaskSecurityGroupIds is the TaskSecurityGroupIds a Task's backend preview
+// runs in; nil when unset (every production deploy).
+func getTaskSecurityGroupIds(parameters map[string]interface{}) ([]string, error) {
+	groups, err := jobs.GetParameterValue[primitive.A](parameters, parameters_enums.TaskSecurityGroupIds)
+	if err != nil || len(groups) == 0 {
+		return nil, nil
+	}
+	return commandUtils.ConvertPrimitiveAToStringSlice(groups)
+}
+
+// getEcsServiceConnectConfiguration is the Service Connect configuration
+// createEcsServiceIfNeeded creates a service with: its port mapping under its
+// alias in its namespace.
+func getEcsServiceConnectConfiguration(parameters map[string]interface{}) (*ecsTypes.ServiceConnectConfiguration, error) {
+	namespaceName, err := getNamespaceName(parameters)
+	if err != nil {
+		return nil, err
+	}
+	port, err := jobs.GetParameterValue[int64](parameters, parameters_enums.Port)
+	if err != nil {
+		return nil, err
+	}
+	portMappingName, err := getPortMappingName(parameters)
+	if err != nil {
+		return nil, err
+	}
+	dnsName, err := getInternalDnsName(parameters)
+	if err != nil {
+		return nil, err
+	}
+	return &ecsTypes.ServiceConnectConfiguration{
+		Enabled:   true,
+		Namespace: aws.String(namespaceName),
+		Services: []ecsTypes.ServiceConnectService{{
+			PortName: aws.String(portMappingName),
+			ClientAliases: []ecsTypes.ServiceConnectClientAlias{{
+				Port:    aws.Int32(int32(port)),
+				DnsName: aws.String(dnsName),
+			}},
+		}},
 	}, nil
 }
 
@@ -1197,6 +1246,11 @@ type ecsServiceDeployOptions struct {
 	// name in its namespace (private_service_dns.go). Only DeployAwsPrivateService
 	// sets it.
 	registerDnsName bool
+	// updateServiceConnect also passes the Service Connect configuration when
+	// it updates an existing service, so a new task definition whose port (and
+	// so its port mapping's name) changed is accepted. Only a Task's preview
+	// database sets it: changing its engine changes its port.
+	updateServiceConnect bool
 }
 
 // waitForEcsServiceStable waits until the service settles. Swapped by tests
@@ -1402,6 +1456,19 @@ func updateEcsService(parameters map[string]interface{}, ecsClient *ecs.Client, 
 		// In the same call as the new task definition, so it is one ECS
 		// deployment. Nil leaves a registry the service already has as is.
 		updateServiceInput.ServiceRegistries = missingDnsServiceRegistries(parameters, ecsServiceAPIClient, describeServicesInput, logsWriter)
+	}
+	if opts.updateServiceConnect {
+		updateServiceInput.ServiceConnectConfiguration, err = getEcsServiceConnectConfiguration(parameters)
+		if err != nil {
+			return err
+		}
+	}
+	if groups, _ := getTaskSecurityGroupIds(parameters); len(groups) > 0 {
+		// A preview's existing service moves onto its stack's groups.
+		updateServiceInput.NetworkConfiguration, err = getEcsServiceNetworkConfiguration(parameters)
+		if err != nil {
+			return err
+		}
 	}
 	_, err = ecsServiceAPIClient.UpdateService(context.TODO(), updateServiceInput)
 

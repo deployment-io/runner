@@ -644,8 +644,13 @@ func TestPreviewStoreMapsWebFields(t *testing.T) {
 		dto.CloudfrontDistributionDomainName != "d1" || dto.EcsServiceArn != "svc" || dto.LoadBalancerArn != "" {
 		t.Errorf("dto = %+v", dto)
 	}
-	if store := buildWebServicePreviewDeps(commandUtils.TaskJobContext{OrganizationID: "o", TaskID: "t"}, webPreviewJobParameters(t), t.TempDir(), io.Discard, nil).Store.(taskPreviewStore); store.serviceType != task_previews.ServiceTypeWebService {
+	deps := buildWebServicePreviewDeps(commandUtils.TaskJobContext{OrganizationID: "o", TaskID: "t"}, webPreviewJobParameters(t), t.TempDir(), io.Discard, nil)
+	if store := deps.Store.(taskPreviewStore); store.serviceType != task_previews.ServiceTypeWebService {
 		t.Errorf("the web store is bound to %q", store.serviceType)
+	}
+	// The preview database is a private service of the Task.
+	if store := deps.DatabaseStore.(taskPreviewStore); store.serviceType != task_previews.ServiceTypePrivateService || store.taskID != "t" || store.orgID != "o" {
+		t.Errorf("the database store is %+v", store)
 	}
 }
 

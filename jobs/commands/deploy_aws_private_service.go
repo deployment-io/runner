@@ -18,6 +18,35 @@ type DeployAwsPrivateService struct {
 }
 
 func (d *DeployAwsPrivateService) Run(parameters map[string]interface{}, logsWriter io.Writer) (newParameters map[string]interface{}, err error) {
+	return runAwsPrivateServiceDeploy(parameters, logsWriter, privateServiceDeployOptions{addDefaultVpcIngressRule: true})
+}
+
+// deployAwsPrivateServicePreview is DeployAwsPrivateService's steps for a Task's
+// preview database: the same deploy — the VPC's DNS check, the DNS name, waiting
+// for the ECS service to settle — without the ingress rule on the VPC's default
+// security group, which a preview never edits (its own group admits its port),
+// and updating an existing service's Service Connect port with its task
+// definition (a changed engine has another port).
+func deployAwsPrivateServicePreview(parameters map[string]interface{}, logsWriter io.Writer) (map[string]interface{}, error) {
+	return runAwsPrivateServiceDeploy(parameters, logsWriter, privateServiceDeployOptions{updateServiceConnect: true})
+}
+
+// privateServiceDeployOptions changes how a private service deploys.
+type privateServiceDeployOptions struct {
+	// addDefaultVpcIngressRule admits the port into the VPC's default security
+	// group from the VPC. Production deploys set it.
+	addDefaultVpcIngressRule bool
+	// updateServiceConnect is ecsServiceDeployOptions.updateServiceConnect. The
+	// preview database sets it.
+	updateServiceConnect bool
+}
+
+// runAwsPrivateServiceDeploy is deployAwsPrivateService; tests replace it to see
+// the options each entry point deploys with.
+var runAwsPrivateServiceDeploy = deployAwsPrivateService
+
+// deployAwsPrivateService runs the private-service deploy's steps with opts.
+func deployAwsPrivateService(parameters map[string]interface{}, logsWriter io.Writer, opts privateServiceDeployOptions) (newParameters map[string]interface{}, err error) {
 	defer func() {
 		if err != nil {
 			<-MarkDeploymentDone(parameters, err)
@@ -39,9 +68,11 @@ func (d *DeployAwsPrivateService) Run(parameters map[string]interface{}, logsWri
 	if err != nil {
 		return parameters, err
 	}
-	err = addIngressRuleToDefaultVpcSecurityGroupForPortIfNeeded(parameters, ec2Client)
-	if err != nil {
-		return parameters, err
+	if opts.addDefaultVpcIngressRule {
+		err = addIngressRuleToDefaultVpcSecurityGroupForPortIfNeeded(parameters, ec2Client)
+		if err != nil {
+			return parameters, err
+		}
 	}
 
 	ecsClient, err := cloud_api_clients.GetEcsClient(parameters)
@@ -64,7 +95,7 @@ func (d *DeployAwsPrivateService) Run(parameters map[string]interface{}, logsWri
 	// attributes are on.
 	ensurePrivateServiceVpcDns(parameters, ec2Client, logsWriter)
 	err = deployEcsServiceAfterPreDeploy(parameters, ecsClient, logsClient, ecsClusterArn, "", taskDefinitionArn, logsWriter,
-		ecsServiceDeployOptions{registerDnsName: true})
+		ecsServiceDeployOptions{registerDnsName: true, updateServiceConnect: opts.updateServiceConnect})
 	if err != nil {
 		return parameters, err
 	}
