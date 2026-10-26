@@ -810,3 +810,40 @@ func TestDeletePrivateServiceWithoutRegistry(t *testing.T) {
 		t.Errorf("err %v, Cloud Map calls %v", err, cloudMap.calls)
 	}
 }
+
+// A backend preview's service rolls out stop-then-start, so a redeploy's health
+// URL is never answered by the previous revision; production keeps ECS's default
+// rolling deployment.
+func TestPreviewServiceRollsOutStopThenStart(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		opts ecsServiceDeployOptions
+		want *ecsTypes.DeploymentConfiguration
+	}{
+		{"production", ecsServiceDeployOptions{}, nil},
+		{"backend preview", ecsServiceDeployOptions{skipServiceStableWait: true, previewStack: true},
+			&ecsTypes.DeploymentConfiguration{MinimumHealthyPercent: aws.Int32(0), MaximumPercent: aws.Int32(100)}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ecsService, cloudMap := &fakeEcsService{}, newFakeCloudMap()
+			stubServiceAWS(t, ecsService, cloudMap)
+			parameters := privateServiceDeployParameters()
+			if _, _, err := createEcsServiceIfNeeded(parameters, nil, testClusterArn, "arn:tg", testTaskDefinitionArn,
+				&bytes.Buffer{}, tc.opts); err != nil {
+				t.Fatal(err)
+			}
+			ecsService.service = liveService(testNamespaceArn)
+			if err := updateEcsService(parameters, nil, testClusterArn, testTaskDefinitionArn, &bytes.Buffer{}, tc.opts); err != nil {
+				t.Fatal(err)
+			}
+			for name, got := range map[string]*ecsTypes.DeploymentConfiguration{
+				"create": ecsService.createInputs[0].DeploymentConfiguration,
+				"update": ecsService.updateInputs[0].DeploymentConfiguration,
+			} {
+				if !reflect.DeepEqual(got, tc.want) {
+					t.Errorf("%s deployment configuration %+v; want %+v", name, got, tc.want)
+				}
+			}
+		})
+	}
+}

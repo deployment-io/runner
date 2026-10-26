@@ -72,25 +72,33 @@ type DeployWebServicePreviewDeps struct {
 	// BuildCloudFront lazily constructs the CloudFront client (runner IAM role).
 	BuildCloudFront func() (WebPreviewCloudFront, error)
 
-	// distributions remembers the distributions this agent run created
-	// (RegisterDeployWebServicePreview sets it).
-	distributions *webPreviewDistributions
+	// MergeResult, when set, gives the preview's build the merge result of its
+	// repository instead of a copy of the working tree, exactly as
+	// DeployStaticSitePreviewDeps.MergeResult does. Set by the QA stage only; nil
+	// (implement and fix runs) builds the branch as built.
+	MergeResult MergeResultProvider
+
+	// Distributions remembers the distributions created by the deploys that share
+	// it: RegisterDeployWebServicePreview makes one per agent run when unset, and
+	// the QA stage passes one to every round.
+	Distributions *WebPreviewDistributions
 }
 
-// webPreviewDistributions are the CloudFront distributions an agent run created, by
-// preview id. SavePreview only queues a save, so a later deploy's EnsurePreview can
-// still return none; without these it would create a second distribution and the
-// preview's URL would change.
-type webPreviewDistributions struct {
+// WebPreviewDistributions are the CloudFront distributions created by the deploys
+// that share it, by preview id. SavePreview only queues a save, so a later deploy's
+// EnsurePreview can still return none; without these it would create a second
+// distribution and the preview's URL would change.
+type WebPreviewDistributions struct {
 	mu   sync.Mutex
 	byID map[string]PreviewState
 }
 
-func newWebPreviewDistributions() *webPreviewDistributions {
-	return &webPreviewDistributions{byID: map[string]PreviewState{}}
+// NewWebPreviewDistributions is an empty distributions memo.
+func NewWebPreviewDistributions() *WebPreviewDistributions {
+	return &WebPreviewDistributions{byID: map[string]PreviewState{}}
 }
 
-func (d *webPreviewDistributions) remember(previewID string, s PreviewState) {
+func (d *WebPreviewDistributions) remember(previewID string, s PreviewState) {
 	if d == nil {
 		return
 	}
@@ -101,7 +109,7 @@ func (d *webPreviewDistributions) remember(previewID string, s PreviewState) {
 
 // fill returns existing with the distribution this run created for previewID when
 // existing has none on record yet.
-func (d *webPreviewDistributions) fill(previewID string, existing PreviewState) PreviewState {
+func (d *WebPreviewDistributions) fill(previewID string, existing PreviewState) PreviewState {
 	if d == nil || existing.CloudFrontDistributionID != "" {
 		return existing
 	}
@@ -144,6 +152,19 @@ type WebServicePreviewDeployInput struct {
 // returns.
 type WebServicePreviewDeployOutput struct {
 	LoadBalancerDNS string
+}
+
+// WebServicePreviewDeployed is a backend preview deploy that finished: the ECS
+// service was created or updated, not necessarily serving yet.
+type WebServicePreviewDeployed struct {
+	URL        string
+	HealthURL  string
+	Deployment string // the production deployment it's built like
+	// database is the preview's own database (the tool's result reports it);
+	// DatabaseNote says why it has none.
+	database     *previewDatabaseResult
+	DatabaseNote string
+	LogTail      string
 }
 
 // WebPreviewDeployFailed is the error of a failed step of a backend preview deploy.
@@ -189,8 +210,8 @@ const deployWebServicePreviewInputSchema = `{
 // and their build copies to be removed; call it when the agent run ends.
 func RegisterDeployWebServicePreview(s *agentmcp.Server, deps DeployWebServicePreviewDeps) (stop func()) {
 	builds := newPreviewBuildsPending("deploying", webPreviewDeployingMessage)
-	if deps.distributions == nil {
-		deps.distributions = newWebPreviewDistributions()
+	if deps.Distributions == nil {
+		deps.Distributions = NewWebPreviewDistributions()
 	}
 	s.Register(agentmcp.Tool{
 		Name: "deploy_web_service_preview",
@@ -251,8 +272,42 @@ func handleDeployWebServicePreview(ctx context.Context, deps DeployWebServicePre
 		return "", err
 	}
 	return builds.callFor(ctx, request, plan.serviceName, func(buildCtx context.Context) (string, error) {
-		return runWebServicePreview(buildCtx, deps, plan)
+		deployed, err := runWebServicePreview(buildCtx, deps, plan)
+		if err != nil {
+			return "", err
+		}
+		return marshalResult(deployWebServicePreviewResult{
+			URL:        deployed.URL,
+			HealthURL:  deployed.HealthURL,
+			Status:     "deployed",
+			Deployment: deployed.Deployment,
+			Note: "The ECS service was created or updated; it isn't known to be serving yet. Call verify_preview_reachable on " +
+				"health_url until it is live — a new preview takes a few minutes to start and for CloudFront to propagate.",
+			Database:     deployed.database,
+			DatabaseNote: deployed.DatabaseNote,
+			LogTail:      deployed.LogTail,
+		})
 	}, previewBuildCallWait-time.Since(started))
+}
+
+// DeployWebServicePreview is deploy_web_service_preview's plan and deploy of the
+// backend preview of repository (its only web service: no root_directory), run
+// synchronously. The QA stage deploys backends with it; the tool runs the same
+// planWebServicePreview and runWebServicePreview, the deploy in the background.
+func DeployWebServicePreview(ctx context.Context, deps DeployWebServicePreviewDeps, repository string) (WebServicePreviewDeployed, error) {
+	plan, err := planWebServicePreview(deps, repository, nil)
+	if err != nil {
+		return WebServicePreviewDeployed{}, err
+	}
+	return runWebServicePreview(ctx, deps, plan)
+}
+
+// CheckWebServicePreview is deploy_web_service_preview's own decision, without
+// deploying anything: nil when repository has a backend preview (one managed web
+// service built from a Dockerfile in the runner's region), else the refusal.
+func CheckWebServicePreview(deps DeployWebServicePreviewDeps, repository string) error {
+	_, err := planWebServicePreview(deps, repository, nil)
+	return err
 }
 
 // planWebServicePreview resolves repository among the Task's repositories, asks
@@ -390,33 +445,33 @@ func webServiceRoots(services []task_previews.WebServicePreviewSettingsV1) strin
 	return strings.Join(parts, "; ")
 }
 
-// runWebServicePreview deploys p from a copy of the agent's working tree and puts a
-// CloudFront distribution in front of it on the first deploy, removing the copy in
-// every case.
-func runWebServicePreview(ctx context.Context, deps DeployWebServicePreviewDeps, p webServicePreviewPlan) (string, error) {
+// runWebServicePreview deploys p from a copy of the agent's working tree (or the
+// merge result, when deps.MergeResult can make it) and puts a CloudFront
+// distribution in front of it on the first deploy, removing the copy in every case.
+func runWebServicePreview(ctx context.Context, deps DeployWebServicePreviewDeps, p webServicePreviewPlan) (WebServicePreviewDeployed, error) {
 	previewID, existing, err := ensurePreview(ctx, deps.Store, p.serviceName)
 	if err != nil {
-		return "", fmt.Errorf("ensure preview record: %w", err)
+		return WebServicePreviewDeployed{}, fmt.Errorf("ensure preview record: %w", err)
 	}
-	existing = deps.distributions.fill(previewID, existing)
-	copyDir, err := PreviewBuildSource(ctx, DeployStaticSitePreviewDeps{WorkDirHost: deps.WorkDirHost, LogsWriter: deps.LogsWriter}, p.repository)
+	existing = deps.Distributions.fill(previewID, existing)
+	copyDir, err := PreviewBuildSource(ctx, DeployStaticSitePreviewDeps{WorkDirHost: deps.WorkDirHost, LogsWriter: deps.LogsWriter, MergeResult: deps.MergeResult}, p.repository)
 	if copyDir != "" {
 		defer os.RemoveAll(copyDir)
 	}
 	if err != nil {
-		return "", fmt.Errorf("copy %s for the preview build: %w", p.repository, err)
+		return WebServicePreviewDeployed{}, fmt.Errorf("copy %s for the preview build: %w", p.repository, err)
 	}
 	serviceDir := filepath.Join(copyDir, p.rootDirectory)
 	if info, err := os.Stat(serviceDir); err != nil || !info.IsDir() {
-		return "", fmt.Errorf("%s's root directory %q isn't a directory in %s", p.service.DeploymentName, p.service.RootDirectory, p.repository)
+		return WebServicePreviewDeployed{}, fmt.Errorf("%s's root directory %q isn't a directory in %s", p.service.DeploymentName, p.service.RootDirectory, p.repository)
 	}
 	if err := checkInside(copyDir, serviceDir); err != nil {
-		return "", fmt.Errorf("%s's root directory: %w", p.service.DeploymentName, err)
+		return WebServicePreviewDeployed{}, fmt.Errorf("%s's root directory: %w", p.service.DeploymentName, err)
 	}
 
 	database, databaseNote, err := planPreviewDatabase(ctx, deps, p, serviceDir)
 	if err != nil {
-		return "", err
+		return WebServicePreviewDeployed{}, err
 	}
 
 	var tail bytes.Buffer
@@ -435,7 +490,7 @@ func runWebServicePreview(ctx context.Context, deps DeployWebServicePreviewDeps,
 		Logs:          logs,
 	})
 	if err != nil {
-		return "", webPreviewDeployFailure(err, database, deps.LogsWriter, tail.Bytes())
+		return WebServicePreviewDeployed{}, webPreviewDeployFailure(err, database, deps.LogsWriter, tail.Bytes())
 	}
 	var databaseResult *previewDatabaseResult
 	if database != nil {
@@ -446,22 +501,19 @@ func runWebServicePreview(ctx context.Context, deps DeployWebServicePreviewDeps,
 	}
 	domain, err := ensureWebPreviewDistribution(ctx, deps, previewID, existing, out.LoadBalancerDNS, logs)
 	if err != nil {
-		return "", webPreviewFailureWithDetails(err, databaseResult, tail.Bytes())
+		return WebServicePreviewDeployed{}, webPreviewFailureWithDetails(err, databaseResult, tail.Bytes())
 	}
 
 	previewURL := "https://" + domain
 	deps.Record.AddURL(previewURL)
-	return marshalResult(deployWebServicePreviewResult{
-		URL:        previewURL,
-		HealthURL:  previewURL + healthCheckPath(p.service.HealthCheckPath),
-		Status:     "deployed",
-		Deployment: webServiceDeploymentName(p.service),
-		Note: "The ECS service was created or updated; it isn't known to be serving yet. Call verify_preview_reachable on " +
-			"health_url until it is live — a new preview takes a few minutes to start and for CloudFront to propagate.",
-		Database:     databaseResult,
+	return WebServicePreviewDeployed{
+		URL:          previewURL,
+		HealthURL:    previewURL + healthCheckPath(p.service.HealthCheckPath),
+		Deployment:   webServiceDeploymentName(p.service),
+		database:     databaseResult,
 		DatabaseNote: databaseNote,
 		LogTail:      tailString(tail.Bytes(), logTailMaxBytes),
-	})
+	}, nil
 }
 
 // webPreviewFailureDetails is what a failed deploy's error carries after its
@@ -550,7 +602,7 @@ func ensureWebPreviewDistribution(ctx context.Context, deps DeployWebServicePrev
 		CloudFrontDistributionArn: dist.arn,
 		CloudFrontDomainName:      dist.domain,
 	}
-	deps.distributions.remember(previewID, saved)
+	deps.Distributions.remember(previewID, saved)
 	deps.Store.SavePreview(previewID, saved)
 	return dist.domain, nil
 }

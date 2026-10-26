@@ -121,7 +121,7 @@ func TestQASectionIsLeftOutWithNothingToShow(t *testing.T) {
 		"smoke, clean":                    completedQA(qaRoundOutput{NoCriteria: true}),
 		"couldn't run":                    {Status: tasks.QAStatusCouldNotRun, StatusReason: "no preview", Rounds: []qaRoundOutput{{Round: 1, Status: tasks.QAStatusCouldNotRun}}},
 		"couldn't run, placeholders only": {Status: tasks.QAStatusCouldNotRun, StatusReason: "QA didn't report a result", Rounds: []qaRoundOutput{{Round: 1, Status: tasks.QAStatusCouldNotRun, Criteria: qaCriteria(tasks.QACriterionNotChecked, tasks.QACriterionNotChecked)}}},
-		"gate only":                       {Status: tasks.QAStatusSkipped, StatusReason: "no static site in this change"},
+		"gate only":                       {Status: tasks.QAStatusSkipped, StatusReason: "no static site or backend service in this change"},
 	} {
 		opr := reviewTestOpener(nil)
 		opr.qa = qa

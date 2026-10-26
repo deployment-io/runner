@@ -19,32 +19,43 @@ import (
 // start commit (a new, empty repository) is compared against.
 const gitEmptyTree = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 
-// gate decides whether QA runs, before anything is spawned. It returns:
+// qaGate is the gate's decision: the static sites and backends QA checks, and
+// the status ("skipped" or "couldnt_run") and why when it spawns nothing.
+type qaGate struct {
+	static, backends []string
+	status, reason   string
+}
+
+// gate decides whether QA runs, before anything is spawned. It classifies
+// every CHANGED repository: a static site the runner can build a preview of,
+// a backend the runner deploys as a web-service preview itself, or both. It
+// returns:
 //
-//	(repositories, "", "")       run QA on these repositories;
-//	(nil, "", "")                no repository changed — no QA run, no result;
-//	(repositories, status, why)  record status ("skipped" or "couldnt_run")
-//	                             with why, and spawn nothing.
-func (s *qaStage) gate() ([]string, string, string) {
+//	{static, backends, "", ""}       run QA on these repositories;
+//	{nil, nil, "", ""}               no repository changed — no QA run, no result;
+//	{static, backends, status, why}  record status with why, and spawn nothing.
+func (s *qaStage) gate() qaGate {
 	repos := readQARepositoriesFromJobOutput(s.parameters)
 	if !anyBaseCommit(repos) {
-		return nil, tasks.QAStatusCouldNotRun, "no start-of-run commit was recorded"
+		return qaGate{status: tasks.QAStatusCouldNotRun, reason: "no start-of-run commit was recorded"}
 	}
 	changed := s.changedRepositories(repos)
 	if len(changed) == 0 {
-		return nil, "", ""
+		return qaGate{}
 	}
 	buildable, lookupErr := s.buildableRepositories(changed)
-	if len(buildable) == 0 {
+	backends := s.backendRepositories(changed)
+	if len(buildable) == 0 && len(backends) == 0 {
 		if lookupErr != "" {
-			return nil, tasks.QAStatusCouldNotRun, lookupErr
+			return qaGate{status: tasks.QAStatusCouldNotRun, reason: lookupErr}
 		}
-		return nil, tasks.QAStatusSkipped, qaNoStaticSiteReason
+		return qaGate{status: tasks.QAStatusSkipped, reason: qaNoStaticSiteOrBackendReason}
 	}
+	g := qaGate{static: buildable, backends: backends}
 	if s.qaFailure != "" {
-		return buildable, tasks.QAStatusCouldNotRun, s.qaFailure
+		g.status, g.reason = tasks.QAStatusCouldNotRun, s.qaFailure
 	}
-	return buildable, "", ""
+	return g
 }
 
 // changedRepositories is every repository directory whose working tree differs
@@ -134,6 +145,41 @@ func (s *qaStage) buildableRepositories(changed []string) ([]string, string) {
 		firstLookupErr = ""
 	}
 	return buildable, firstLookupErr
+}
+
+// backendRepositories keeps the changed repositories that have a backend
+// preview — deploy_web_service_preview's own decision without root_directory
+// (one managed web service built from a Dockerfile in the runner's region),
+// made without deploying anything. A refused plan is logged with its reason.
+// With an agentbox image that predates backend QA, every backend is left out
+// (logged) and QA proceeds with the static sites alone, as before.
+func (s *qaStage) backendRepositories(changed []string) []string {
+	check := s.checkBackend
+	if check == nil {
+		deps := buildWebServicePreviewDeps(s.ctx, s.parameters, s.workDirHost, s.logsWriter, nil)
+		check = func(repository string) error {
+			return agenttools.CheckWebServicePreview(*deps, repository)
+		}
+	}
+	var backends []string
+	for _, dir := range changed {
+		if err := check(dir); err != nil {
+			io.WriteString(s.logsWriter, fmt.Sprintf("QA stage: %s has no backend preview (%s)\n", dir, err))
+			continue
+		}
+		backends = append(backends, dir)
+	}
+	if len(backends) == 0 {
+		return nil
+	}
+	imageRef, _ := jobs.GetParameterValue[string](s.parameters, parameters_enums.AgentboxImage)
+	if !imageVersionAtLeast(imageRef, minBackendQAAgentboxVersion) {
+		for _, dir := range backends {
+			io.WriteString(s.logsWriter, fmt.Sprintf("QA stage: leaving %s's backend out — the agentbox image predates backend QA (needs %s or later)\n", dir, minBackendQAAgentboxVersion))
+		}
+		return nil
+	}
+	return backends
 }
 
 // readQARepositoriesFromJobOutput is every checked-out repository recorded in

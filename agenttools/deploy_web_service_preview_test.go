@@ -275,7 +275,7 @@ func TestDeployWebServicePreviewReusesDistributionBeforeTheSaveLands(t *testing.
 	deps := webDeps(t, store, cf, func(context.Context, WebServicePreviewDeployInput) (WebServicePreviewDeployOutput, error) {
 		return WebServicePreviewDeployOutput{LoadBalancerDNS: "alb-x.elb.amazonaws.com"}, nil
 	})
-	deps.distributions = newWebPreviewDistributions()
+	deps.Distributions = NewWebPreviewDistributions()
 	builds := newPreviewBuildsPending("deploying", webPreviewDeployingMessage)
 	defer builds.stop()
 	for i := 0; i < 2; i++ {
@@ -379,5 +379,55 @@ func TestStaticPreviewBuildsStillAnswerBuilding(t *testing.T) {
 	defer b.stop()
 	if b.pending.Status != "building" || b.pending.Message != previewBuildingMessage {
 		t.Errorf("static pending = %+v", b.pending)
+	}
+}
+
+// DeployWebServicePreview is the tool's plan and deploy run synchronously: with a
+// merge result it builds from it, and the URL lands in the shared record.
+func TestDeployWebServicePreviewSynchronousBuildsFromTheMergeResult(t *testing.T) {
+	store := &fakeWebStore{}
+	cf := &fakeWebCloudFront{}
+	deps := webDeps(t, store, cf, func(_ context.Context, in WebServicePreviewDeployInput) (WebServicePreviewDeployOutput, error) {
+		if _, err := os.Stat(filepath.Join(in.BuildDir, "services/api/merged.txt")); err != nil {
+			t.Errorf("the build isn't the merge result: %v", err)
+		}
+		return WebServicePreviewDeployOutput{LoadBalancerDNS: "alb-x.elb.amazonaws.com"}, nil
+	})
+	merge := &fakeMergeResult{ok: true, files: map[string]string{"services/api/Dockerfile": "FROM scratch", "services/api/merged.txt": "x"}}
+	deps.MergeResult = merge
+	deps.Distributions = NewWebPreviewDistributions()
+	for i := 0; i < 2; i++ {
+		got, err := DeployWebServicePreview(context.Background(), deps, "1-acme/api")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.URL != "https://d123.cloudfront.net" || got.HealthURL != "https://d123.cloudfront.net/healthz" || got.Deployment != "api (production)" {
+			t.Errorf("deploy %d = %+v", i+1, got)
+		}
+	}
+	if len(merge.calls) != 2 || merge.calls[0] != "1-acme/api" {
+		t.Errorf("merge result asked for %v", merge.calls)
+	}
+	if len(cf.creates) != 1 {
+		t.Errorf("created %d distributions, want 1: the shared memo is reused", len(cf.creates))
+	}
+	if hosts := strings.Join(deps.Record.Hosts(), ","); hosts != "d123.cloudfront.net" {
+		t.Errorf("record hosts = %s", hosts)
+	}
+}
+
+func TestCheckWebServicePreview(t *testing.T) {
+	deps := webDeps(t, &fakeWebStore{}, &fakeWebCloudFront{}, func(context.Context, WebServicePreviewDeployInput) (WebServicePreviewDeployOutput, error) {
+		t.Error("a check deployed")
+		return WebServicePreviewDeployOutput{}, nil
+	})
+	if err := CheckWebServicePreview(deps, "1-acme/api"); err != nil {
+		t.Errorf("a managed Dockerfile web service was refused: %v", err)
+	}
+	deps.Settings = func(string) (task_previews.WebServicePreviewSettingsReplyV1, error) {
+		return readyReply(webService("api", "us-east-1", "a"), webService("worker", "us-east-1", "b")), nil
+	}
+	if err := CheckWebServicePreview(deps, "1-acme/api"); err == nil || !strings.Contains(err.Error(), "several web services") {
+		t.Errorf("several web services: got %v", err)
 	}
 }

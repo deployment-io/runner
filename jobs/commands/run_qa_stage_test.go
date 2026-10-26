@@ -71,8 +71,11 @@ func qaTestStage(t *testing.T, workDir string, bases []baseCommitOutput, logs io
 		logsWriter:   logs,
 		deadline:     time.Now().Add(qaStageBudget),
 		checkPreview: func(string) agenttools.RunnerBuiltPreviewCheck { return agenttools.RunnerBuiltPreviewCheck{OK: true} },
-		cacheExists:  func(string) bool { return true },
-		reviewer:     func(rs *reviewStage) { rs.copyTree = testCopyTree },
+		checkBackend: func(dir string) error {
+			return fmt.Errorf("deployment.io doesn't deploy %s as a web service, so it has no backend preview.", dir)
+		},
+		cacheExists: func(string) bool { return true },
+		reviewer:    func(rs *reviewStage) { rs.copyTree = testCopyTree },
 	}
 }
 
@@ -161,7 +164,7 @@ func TestQAGateOutcomes(t *testing.T) {
 				}
 			},
 			wantStatus: tasks.QAStatusSkipped,
-			wantReason: "no static site in this change",
+			wantReason: "no static site or backend service in this change",
 		},
 		{
 			name: "every lookup failed",

@@ -1242,13 +1242,58 @@ func getEcsServiceConnectConfiguration(parameters map[string]interface{}) (*ecsT
 	}, nil
 }
 
+// previewTargetGroupDeregistrationDelay is how long a backend preview's load
+// balancer drains a stopping task (AWS's default is 300 s). A preview rolls out
+// stop-then-start (previewServiceDeploymentConfiguration), so ECS waits for the
+// drain before starting the new task: the default would add five idle minutes
+// to every redeploy.
+const previewTargetGroupDeregistrationDelay = "5"
+
+// previewTargetGroupAPI is the part of the ELB client setting a preview's
+// target group drain uses.
+type previewTargetGroupAPI interface {
+	ModifyTargetGroupAttributes(ctx context.Context, params *elasticloadbalancingv2.ModifyTargetGroupAttributesInput, optFns ...func(*elasticloadbalancingv2.Options)) (*elasticloadbalancingv2.ModifyTargetGroupAttributesOutput, error)
+}
+
+// setPreviewTargetGroupDeregistrationDelay sets a backend preview's target group
+// drain to previewTargetGroupDeregistrationDelay, on every deploy (it's
+// idempotent, and reaches previews created before it existed).
+func setPreviewTargetGroupDeregistrationDelay(elbClient previewTargetGroupAPI, targetGroupArn string) error {
+	_, err := elbClient.ModifyTargetGroupAttributes(context.TODO(), &elasticloadbalancingv2.ModifyTargetGroupAttributesInput{
+		TargetGroupArn: aws.String(targetGroupArn),
+		Attributes: []elbTypes.TargetGroupAttribute{{
+			Key:   aws.String("deregistration_delay.timeout_seconds"),
+			Value: aws.String(previewTargetGroupDeregistrationDelay),
+		}},
+	})
+	if err != nil {
+		return fmt.Errorf("set the preview target group's deregistration delay: %w", err)
+	}
+	return nil
+}
+
+// previewServiceDeploymentConfiguration is a backend preview's rollout: the old
+// task is stopped (and drained from its load balancer) before the new one starts,
+// never beside it. A redeploy is then never answered by the previous revision:
+// its health URL fails until the new task serves, and keeps failing when the new
+// task can't start — the deploy returns without waiting (skipServiceStableWait),
+// and QA and the agent read readiness from that URL. A preview's brief downtime
+// doesn't matter.
+func previewServiceDeploymentConfiguration() *ecsTypes.DeploymentConfiguration {
+	return &ecsTypes.DeploymentConfiguration{
+		MinimumHealthyPercent: aws.Int32(0),
+		MaximumPercent:        aws.Int32(100),
+	}
+}
+
 // ecsServiceDeployOptions changes how a deploy creates or updates its ECS
 // service. The zero value is what every production deploy does.
 type ecsServiceDeployOptions struct {
 	// previewStack deploys a Task's backend preview into its preview stack's
 	// security group (TaskSecurityGroupIds, exactly one) instead of the VPC's
 	// default group: the default group is never edited, and the stack group admits
-	// the service's port from the preview's own load balancer group.
+	// the service's port from the preview's own load balancer group. Its service
+	// rolls out stop-then-start (previewServiceDeploymentConfiguration).
 	previewStack bool
 	// skipServiceStableWait returns once the service is created or updated,
 	// without waiting for it to settle. A Task's backend preview sets it: its
@@ -1392,6 +1437,9 @@ func createEcsServiceIfNeeded(parameters map[string]interface{}, ecsClient *ecs.
 		if opts.registerDnsName {
 			createServiceInput.ServiceRegistries = dnsServiceRegistries(parameters, namespaceName, dnsName, logsWriter)
 		}
+		if opts.previewStack {
+			createServiceInput.DeploymentConfiguration = previewServiceDeploymentConfiguration()
+		}
 
 		createServiceOutput, err := ecsServiceAPIClient.CreateService(context.TODO(), createServiceInput)
 		if err != nil {
@@ -1463,6 +1511,9 @@ func updateEcsService(parameters map[string]interface{}, ecsClient *ecs.Client, 
 		DesiredCount:   aws.Int32(1),
 		TaskDefinition: aws.String(taskDefinitionArn),
 		PropagateTags:  ecsTypes.PropagateTagsTaskDefinition,
+	}
+	if opts.previewStack {
+		updateServiceInput.DeploymentConfiguration = previewServiceDeploymentConfiguration()
 	}
 	if opts.registerDnsName {
 		// In the same call as the new task definition, so it is one ECS
@@ -1576,6 +1627,11 @@ func deployAwsWebService(parameters map[string]interface{}, logsWriter io.Writer
 	_, targetGroupArn, err := createAlbIfNeeded(parameters, elbClient, securityGroupId, logsWriter)
 	if err != nil {
 		return parameters, err
+	}
+	if opts.previewStack {
+		if err = setPreviewTargetGroupDeregistrationDelay(elbClient, targetGroupArn); err != nil {
+			return parameters, err
+		}
 	}
 	ecsClient, err := cloud_api_clients.GetEcsClient(parameters)
 	if err != nil {
