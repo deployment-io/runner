@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"fmt"
 	"io"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -152,13 +153,16 @@ func deployAwsPrivateService(parameters map[string]interface{}, logsWriter io.Wr
 // mongoReplicaSetContainer makes the official MongoDB image a single-node replica
 // set: started with --replSet, and initiated by its own health check, which runs
 // inside the container (nothing outside can reach it) and is idempotent — it
-// initiates only while rs.status() fails. ECS counts the task healthy, and the
-// deploy settled, once the replica set is up.
+// initiates only while rs.status() fails. Its one member is 127.0.0.1, so the
+// initiate never depends on the container's hostname resolving; clients connect
+// with directConnection and never use the member's name. ECS counts the task
+// healthy, and the deploy settled, once the replica set is up.
 func mongoReplicaSetContainer(container *ecsTypes.ContainerDefinition) {
 	container.Command = []string{"--replSet", mongoReplicaSetName, "--bind_ip_all"}
+	initiate := fmt.Sprintf(`rs.initiate({_id: '%s', members: [{_id: 0, host: '127.0.0.1:27017'}]}).ok`, mongoReplicaSetName)
 	container.HealthCheck = &ecsTypes.HealthCheck{
 		Command: []string{"CMD-SHELL",
-			`mongosh --quiet --eval "try { rs.status().ok } catch (e) { rs.initiate().ok }" | grep -q 1`},
+			`mongosh --quiet --eval "try { rs.status().ok } catch (e) { ` + initiate + ` }" | grep -qx 1`},
 		Interval:    aws.Int32(10),
 		Timeout:     aws.Int32(10),
 		Retries:     aws.Int32(6),

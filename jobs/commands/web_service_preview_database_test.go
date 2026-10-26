@@ -829,7 +829,8 @@ func TestMongoReplicaSetContainer(t *testing.T) {
 	}
 	check := container.HealthCheck
 	if check == nil || len(check.Command) != 2 || check.Command[0] != "CMD-SHELL" ||
-		!strings.Contains(check.Command[1], "rs.initiate()") || !strings.Contains(check.Command[1], "rs.status()") ||
+		!strings.Contains(check.Command[1], "rs.initiate({_id: 'rs0', members: [{_id: 0, host: '127.0.0.1:27017'}]})") ||
+		!strings.Contains(check.Command[1], "rs.status()") || !strings.HasSuffix(check.Command[1], "| grep -qx 1") ||
 		aws.ToInt32(check.StartPeriod) == 0 || aws.ToInt32(check.Retries) == 0 {
 		t.Errorf("health check %+v", check)
 	}
