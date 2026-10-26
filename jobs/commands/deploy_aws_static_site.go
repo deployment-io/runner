@@ -220,7 +220,7 @@ func createDistributionConfigForNewCloudfront(parameters map[string]interface{},
 	var q int32 = 0
 	for _, errorPageRow := range errorPages {
 		if len(errorPageRow) == 3 {
-			i, err := strconv.ParseInt(errorPageRow[0], 10, 64)
+			i, err := strconv.ParseInt(errorPageRow[0], 10, 32)
 			if err == nil {
 				customErrorResponse := cloudfrontTypes.CustomErrorResponse{
 					ErrorCode:        aws.Int32(int32(i)),
