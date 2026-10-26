@@ -144,7 +144,7 @@ func (tc *taskCheckout) getToken(installationID string) (string, error) {
 	if token, ok := tc.tokenCache[installationID]; ok {
 		return token, nil
 	}
-	token, err := commandUtils.RefreshGitTokenForInstallation(installationID, tc.ctx.OrganizationID)
+	token, err := commandUtils.RefreshGitTokenForInstallation(installationID, tc.ctx.OrganizationID, "")
 	if err != nil {
 		return "", err
 	}
@@ -154,9 +154,10 @@ func (tc *taskCheckout) getToken(installationID string) (string, error) {
 
 // refreshToken forces a refresh and overwrites the cache. Called from the
 // retry-on-401 paths so a fresh token reaches subsequent repos in the loop
-// that share this installation.
-func (tc *taskCheckout) refreshToken(installationID string) (string, error) {
-	token, err := commandUtils.RefreshGitTokenForInstallation(installationID, tc.ctx.OrganizationID)
+// that share this installation. rejectedToken is the token the provider just
+// rejected; the server mints a new one if it still holds it.
+func (tc *taskCheckout) refreshToken(installationID, rejectedToken string) (string, error) {
+	token, err := commandUtils.RefreshGitTokenForInstallation(installationID, tc.ctx.OrganizationID, rejectedToken)
 	if err != nil {
 		return "", err
 	}
@@ -280,7 +281,7 @@ func (tc *taskCheckout) cloneWithRetry(repoDir string, entry tasks.RepositoryEnt
 	if !commandUtils.IsErrorAuthenticationRequired(err) {
 		return nil, token, err
 	}
-	token, err = tc.refreshToken(entry.InstallationID)
+	token, err = tc.refreshToken(entry.InstallationID, token)
 	if err != nil {
 		return nil, token, err
 	}
@@ -330,7 +331,7 @@ func (tc *taskCheckout) fetchWithRetry(repository *git.Repository, entry tasks.R
 	} else if !commandUtils.IsErrorAuthenticationRequired(err) {
 		return err
 	}
-	token, err := tc.refreshToken(entry.InstallationID)
+	token, err := tc.refreshToken(entry.InstallationID, token)
 	if err != nil {
 		return err
 	}

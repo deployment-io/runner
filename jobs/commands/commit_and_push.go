@@ -91,7 +91,7 @@ func (tcp *taskCommitPush) getTokenContext(ctx context.Context, installationID s
 	if token, ok := tcp.tokenCache[installationID]; ok {
 		return token, nil
 	}
-	token, err := commandUtils.RefreshGitTokenForInstallationContext(ctx, installationID, tcp.ctx.OrganizationID)
+	token, err := commandUtils.RefreshGitTokenForInstallationContext(ctx, installationID, tcp.ctx.OrganizationID, "")
 	if err != nil {
 		return "", err
 	}
@@ -99,8 +99,10 @@ func (tcp *taskCommitPush) getTokenContext(ctx context.Context, installationID s
 	return token, nil
 }
 
-func (tcp *taskCommitPush) refreshToken(installationID string) (string, error) {
-	token, err := commandUtils.RefreshGitTokenForInstallation(installationID, tcp.ctx.OrganizationID)
+// refreshToken asks for a new token after the provider rejected rejectedToken
+// and overwrites the cache with it.
+func (tcp *taskCommitPush) refreshToken(installationID, rejectedToken string) (string, error) {
+	token, err := commandUtils.RefreshGitTokenForInstallation(installationID, tcp.ctx.OrganizationID, rejectedToken)
 	if err != nil {
 		return "", err
 	}
@@ -333,7 +335,7 @@ func (tcp *taskCommitPush) pushWithRetry(repository *git.Repository, entry tasks
 	} else if !commandUtils.IsErrorAuthenticationRequired(err) {
 		return err
 	}
-	token, err = tcp.refreshToken(entry.InstallationID)
+	token, err = tcp.refreshToken(entry.InstallationID, token)
 	if err != nil {
 		return err
 	}

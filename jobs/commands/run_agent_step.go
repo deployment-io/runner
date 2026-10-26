@@ -2285,7 +2285,7 @@ func vendorGitToken(ctx commandUtils.TaskJobContext) (string, error) {
 	if len(ctx.Entries) == 0 {
 		return "", nil
 	}
-	return commandUtils.RefreshGitTokenForInstallation(ctx.Entries[0].InstallationID, ctx.OrganizationID)
+	return commandUtils.RefreshGitTokenForInstallation(ctx.Entries[0].InstallationID, ctx.OrganizationID, "")
 }
 
 // cacheVolumeName is the per-Step-Job Docker volume holding the shared

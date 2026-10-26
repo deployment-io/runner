@@ -30,7 +30,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/sts v1.28.6
 	github.com/aws/smithy-go v1.27.6
 	github.com/containerd/errdefs v1.0.0
-	github.com/deployment-io/deployment-runner-kit v0.0.0-20261026054951-12ccb5b8f4f1
+	github.com/deployment-io/deployment-runner-kit v0.0.0-20261026132445-946f075f1de6
 	github.com/go-git/go-billy/v5 v5.9.0
 	github.com/go-git/go-git/v5 v5.19.2
 	github.com/joho/godotenv v1.5.1

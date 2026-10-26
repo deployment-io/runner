@@ -4,7 +4,11 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/oauth"
 )
 
-func (r *RunnerClient) RefreshGitToken(installationID string, organizationID string) (string, error) {
+// RefreshGitToken asks the deployment-server for the installation's token.
+// rejectedTokenSHA256 is the lower-case hex SHA-256 of the token the git
+// provider just rejected, or "" for an ordinary request; the token itself is
+// never sent back.
+func (r *RunnerClient) RefreshGitToken(installationID, organizationID, rejectedTokenSHA256 string) (string, error) {
 	if !r.isConnected {
 		return "", ErrConnection
 	}
@@ -12,6 +16,7 @@ func (r *RunnerClient) RefreshGitToken(installationID string, organizationID str
 	args.OrganizationID = r.GetComputedOrganizationID(organizationID)
 	args.Token = r.token
 	args.InstallationID = installationID
+	args.RejectedTokenSHA256 = rejectedTokenSHA256
 	var refreshTokenDto oauth.RefreshGitProviderTokenDtoV1
 	err := r.c.Call("Oauth.RefreshGitProviderTokenV1", args, &refreshTokenDto)
 	if err != nil {
