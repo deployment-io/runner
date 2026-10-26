@@ -299,9 +299,9 @@ func ensureVpcDnsAttributes(ec2Client vpcDnsAttributesAPI, vpcID string, logsWri
 	}
 }
 
-// liveServiceRegistryArns is the registries of the ECS service, or nil if it
-// can't be described or isn't found.
-func liveServiceRegistryArns(ecsClient ecs.DescribeServicesAPIClient, clusterArn, ecsServiceName string) []string {
+// describeLiveService is the ECS service as described before it is deleted, or nil
+// if it can't be described or isn't found.
+func describeLiveService(ecsClient ecs.DescribeServicesAPIClient, clusterArn, ecsServiceName string) *ecsTypes.Service {
 	describeServicesOutput, err := ecsClient.DescribeServices(context.TODO(), &ecs.DescribeServicesInput{
 		Services: []string{ecsServiceName},
 		Cluster:  aws.String(clusterArn),
@@ -309,8 +309,39 @@ func liveServiceRegistryArns(ecsClient ecs.DescribeServicesAPIClient, clusterArn
 	if err != nil || len(describeServicesOutput.Services) == 0 {
 		return nil
 	}
+	return &describeServicesOutput.Services[0]
+}
+
+// describeServiceBeforeDelete is the service a delete is about to remove, nil
+// when there is none. Unlike describeLiveService, a failed call is an error: the
+// security groups read from it are only known before the delete.
+func describeServiceBeforeDelete(ecsClient ecs.DescribeServicesAPIClient, clusterArn, ecsServiceName string) (*ecsTypes.Service, error) {
+	describeServicesOutput, err := ecsClient.DescribeServices(context.TODO(), &ecs.DescribeServicesInput{
+		Services: []string{ecsServiceName},
+		Cluster:  aws.String(clusterArn),
+	})
+	// A purged service is already gone: nothing to read, and the delete's
+	// already-gone handling takes it from here.
+	var serviceNotFound *ecsTypes.ServiceNotFoundException
+	if errors.As(err, &serviceNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("describe ECS service %s before deleting it: %w", ecsServiceName, err)
+	}
+	if len(describeServicesOutput.Services) == 0 {
+		return nil, nil
+	}
+	return &describeServicesOutput.Services[0], nil
+}
+
+// serviceRegistryArns is the registries of a described service.
+func serviceRegistryArns(service *ecsTypes.Service) []string {
+	if service == nil {
+		return nil
+	}
 	var registryArns []string
-	for _, registry := range describeServicesOutput.Services[0].ServiceRegistries {
+	for _, registry := range service.ServiceRegistries {
 		if arn := aws.ToString(registry.RegistryArn); len(arn) > 0 {
 			registryArns = append(registryArns, arn)
 		}

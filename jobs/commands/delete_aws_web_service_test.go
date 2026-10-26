@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -36,6 +37,13 @@ type fakeWebServiceAWS struct {
 	foundLoadBalancers []elbTypes.LoadBalancer
 	foundTargetGroups  []elbTypes.TargetGroup
 	foundGroups        []ec2Types.SecurityGroup
+
+	// serviceGroups are the security groups DescribeServices says the service
+	// runs in; groups what DescribeSecurityGroups by id finds; deleteGroupErrs
+	// the errors deleting a group returns, in turn.
+	serviceGroups   []string
+	groups          map[string]ec2Types.SecurityGroup
+	deleteGroupErrs map[string][]error
 }
 
 func (f *fakeWebServiceAWS) call(operation, argument string) error {
@@ -82,7 +90,13 @@ func (f *fakeWebServiceAWS) DescribeServices(_ context.Context, in *ecs.Describe
 	if err := f.call("DescribeServices", strings.Join(in.Services, ",")); err != nil {
 		return nil, err
 	}
-	return &ecs.DescribeServicesOutput{Services: []ecsTypes.Service{{Status: aws.String("INACTIVE")}}}, nil
+	service := ecsTypes.Service{Status: aws.String("INACTIVE")}
+	if len(f.serviceGroups) > 0 {
+		service.NetworkConfiguration = &ecsTypes.NetworkConfiguration{AwsvpcConfiguration: &ecsTypes.AwsVpcConfiguration{
+			Subnets: []string{"subnet-a"}, SecurityGroups: f.serviceGroups,
+		}}
+	}
+	return &ecs.DescribeServicesOutput{Services: []ecsTypes.Service{service}}, nil
 }
 
 func (f *fakeWebServiceAWS) ListTaskDefinitions(_ context.Context, in *ecs.ListTaskDefinitionsInput, _ ...func(*ecs.Options)) (*ecs.ListTaskDefinitionsOutput, error) {
@@ -129,6 +143,14 @@ func (f *fakeWebServiceAWS) DeleteTargetGroup(_ context.Context, in *elasticload
 }
 
 func (f *fakeWebServiceAWS) DescribeSecurityGroups(_ context.Context, in *ec2.DescribeSecurityGroupsInput, _ ...func(*ec2.Options)) (*ec2.DescribeSecurityGroupsOutput, error) {
+	if len(in.GroupIds) > 0 {
+		f.calls = append(f.calls, "DescribeSecurityGroups id="+strings.Join(in.GroupIds, ","))
+		group, ok := f.groups[in.GroupIds[0]]
+		if !ok {
+			return nil, &smithy.GenericAPIError{Code: "InvalidGroup.NotFound"}
+		}
+		return &ec2.DescribeSecurityGroupsOutput{SecurityGroups: []ec2Types.SecurityGroup{group}}, nil
+	}
 	var filter string
 	for _, fl := range in.Filters {
 		filter += aws.ToString(fl.Name) + "=" + strings.Join(fl.Values, ",")
@@ -140,7 +162,23 @@ func (f *fakeWebServiceAWS) DescribeSecurityGroups(_ context.Context, in *ec2.De
 }
 
 func (f *fakeWebServiceAWS) DeleteSecurityGroup(_ context.Context, in *ec2.DeleteSecurityGroupInput, _ ...func(*ec2.Options)) (*ec2.DeleteSecurityGroupOutput, error) {
+	id := aws.ToString(in.GroupId)
+	if errs := f.deleteGroupErrs[id]; len(errs) > 0 {
+		f.calls = append(f.calls, "DeleteSecurityGroup "+id)
+		f.deleteGroupErrs[id] = errs[1:]
+		return nil, errs[0]
+	}
 	return &ec2.DeleteSecurityGroupOutput{}, f.call("DeleteSecurityGroup", aws.ToString(in.GroupId))
+}
+
+func (f *fakeWebServiceAWS) RevokeSecurityGroupIngress(_ context.Context, in *ec2.RevokeSecurityGroupIngressInput, _ ...func(*ec2.Options)) (*ec2.RevokeSecurityGroupIngressOutput, error) {
+	var rules []string
+	for _, p := range in.IpPermissions {
+		for _, pair := range p.UserIdGroupPairs {
+			rules = append(rules, aws.ToString(pair.GroupId)+":"+strconv.Itoa(int(aws.ToInt32(p.FromPort))))
+		}
+	}
+	return &ec2.RevokeSecurityGroupIngressOutput{}, f.call("RevokeSecurityGroupIngress", aws.ToString(in.GroupId)+" "+strings.Join(rules, ","))
 }
 
 func (f *fakeWebServiceAWS) clients() deleteWebServiceClients {
@@ -166,9 +204,10 @@ func webServiceDeleteParameters() map[string]interface{} {
 	return parameters
 }
 
-// productionDeleteCalls is today's sequence of AWS operations for a web service
-// with every handle saved.
+// productionDeleteCalls is the sequence of AWS operations for a web service with
+// every handle saved: the service is described first for its security groups.
 var productionDeleteCalls = []string{
+	"DescribeServices es-deployment-1",
 	"DeleteService es-deployment-1",
 	"DescribeServices es-deployment-1",
 	"ListTaskDefinitions td-deployment-1",
@@ -199,7 +238,7 @@ func runWebServiceDelete(t *testing.T, parameters map[string]interface{}, fake *
 }
 
 // With every handle saved and no CloudFront distribution, the delete makes the
-// same AWS calls in the same order as it always has.
+// same AWS calls in the same order as it always has, after describing the service.
 func TestDeleteWebServiceAllHandlesSet(t *testing.T) {
 	fake := &fakeWebServiceAWS{}
 	if _, err := runWebServiceDelete(t, webServiceDeleteParameters(), fake); err != nil {
@@ -247,8 +286,9 @@ func TestDeleteWebServiceAlreadyGone(t *testing.T) {
 				t.Fatalf("delete: %v", err)
 			}
 			var want []string
-			for _, c := range productionDeleteCalls {
-				if !containsCall(tc.skipped, c) {
+			for i, c := range productionDeleteCalls {
+				// The first call is the describe before the delete; it always runs.
+				if i == 0 || !containsCall(tc.skipped, c) {
 					want = append(want, c)
 				}
 			}
@@ -269,6 +309,20 @@ func containsCall(list []string, s string) bool {
 		}
 	}
 	return false
+}
+
+// A purged service answers ServiceNotFoundException to the describe before the
+// delete as well: the delete carries on as for any service already gone.
+func TestDeleteWebServicePurgedService(t *testing.T) {
+	notFound := &ecsTypes.ServiceNotFoundException{}
+	fake := &fakeWebServiceAWS{errs: map[string]error{"DescribeServices": notFound, "DeleteService": notFound}}
+	logs, err := runWebServiceDelete(t, webServiceDeleteParameters(), fake)
+	if err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if !containsCall(fake.calls, "DeleteRepository ecr-org-1-deployment-1") || !strings.Contains(logs, "was already gone") {
+		t.Errorf("calls:\n%s\nlogs:\n%s", strings.Join(fake.calls, "\n"), logs)
+	}
 }
 
 // An ECS service that is no longer active is still waited for.
@@ -316,6 +370,7 @@ func TestDeleteWebServiceLooksUpMissingHandles(t *testing.T) {
 		t.Fatalf("delete: %v", err)
 	}
 	want := []string{
+		"DescribeServices es-deployment-1",
 		"DeleteService es-deployment-1",
 		"DescribeServices es-deployment-1",
 		"ListTaskDefinitions td-deployment-1",
@@ -357,6 +412,7 @@ func TestDeleteWebServiceLookupFindsNothing(t *testing.T) {
 				t.Fatalf("delete: %v", err)
 			}
 			want := []string{
+				"DescribeServices es-deployment-1",
 				"DeleteService es-deployment-1",
 				"DescribeServices es-deployment-1",
 				"ListTaskDefinitions td-deployment-1",
