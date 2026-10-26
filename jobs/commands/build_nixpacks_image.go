@@ -8,7 +8,6 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner/utils/reclaim"
-	"github.com/docker/docker/api/types/registry"
 	"github.com/moby/moby/client"
 	"io"
 )
@@ -46,7 +45,7 @@ func (b *BuildNixPacksImage) Run(parameters map[string]interface{}, logsWriter i
 	reclaim.LogFreeDisk("before build", logsWriter)
 	io.WriteString(logsWriter, fmt.Sprintf("Building %s application\n", runtime))
 
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	cli, err := client.New(client.FromEnv)
 	if err != nil {
 		return parameters, err
 	}
@@ -61,7 +60,7 @@ func (b *BuildNixPacksImage) Run(parameters map[string]interface{}, logsWriter i
 		return parameters, err
 	}
 
-	a, err := cli.RegistryLogin(context.TODO(), registry.AuthConfig{
+	a, err := cli.RegistryLogin(context.TODO(), client.RegistryLoginOptions{
 		Username:      nixPacksUsername,
 		Password:      nixPacksPassword,
 		ServerAddress: "ghcr.io",
@@ -70,7 +69,7 @@ func (b *BuildNixPacksImage) Run(parameters map[string]interface{}, logsWriter i
 		return parameters, err
 	}
 
-	if a.Status != "Login Succeeded" {
+	if a.Auth.Status != "Login Succeeded" {
 		return parameters, fmt.Errorf("failed to login to nixpacks builder")
 	}
 

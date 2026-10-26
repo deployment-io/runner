@@ -7,10 +7,10 @@ import (
 	"sort"
 	"testing"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/image"
-	"github.com/docker/docker/api/types/mount"
-	"github.com/docker/docker/api/types/volume"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/image"
+	"github.com/moby/moby/api/types/mount"
+	"github.com/moby/moby/api/types/volume"
 )
 
 const taskID = "6a8fe8be1bcfd79ebf25c046"
@@ -18,39 +18,39 @@ const taskID = "6a8fe8be1bcfd79ebf25c046"
 // What the sweep must NOT match matters more than what it does: a customer's
 // Docker daemon may be shared with their own workloads.
 func TestSelectSweepContainers(t *testing.T) {
-	ours := func(id, state string) types.Container {
-		return types.Container{ID: id, State: state, Labels: Labels(PurposeAgentbox)}
+	ours := func(id, state string) container.Summary {
+		return container.Summary{ID: id, State: container.ContainerState(state), Labels: Labels(PurposeAgentbox)}
 	}
 	tests := []struct {
 		name       string
-		containers []types.Container
+		containers []container.Summary
 		want       []string
 	}{
 		{
 			name:       "our exited agentbox container is an orphan",
-			containers: []types.Container{ours("exited-agentbox", "exited")},
+			containers: []container.Summary{ours("exited-agentbox", "exited")},
 			want:       []string{"exited-agentbox"},
 		},
 		{
 			name:       "our dead container is an orphan too",
-			containers: []types.Container{ours("dead", "dead")},
+			containers: []container.Summary{ours("dead", "dead")},
 			want:       []string{"dead"},
 		},
 		{
 			name:       "a running container of ours is a live job",
-			containers: []types.Container{ours("running", "running")},
+			containers: []container.Summary{ours("running", "running")},
 		},
 		{
 			name:       "a created container is mid-start, not an orphan",
-			containers: []types.Container{ours("created", "created")},
+			containers: []container.Summary{ours("created", "created")},
 		},
 		{
 			name:       "a paused or restarting container is still alive",
-			containers: []types.Container{ours("paused", "paused"), ours("restarting", "restarting")},
+			containers: []container.Summary{ours("paused", "paused"), ours("restarting", "restarting")},
 		},
 		{
 			name: "a customer's exited container is none of our business",
-			containers: []types.Container{
+			containers: []container.Summary{
 				{ID: "customer", State: "exited"},
 				{ID: "customer-labelled", State: "exited", Labels: map[string]string{"com.example.app": "true"}},
 				{ID: "wrong-value", State: "exited", Labels: map[string]string{OwnerLabelKey: "false"}},
@@ -111,33 +111,33 @@ func TestSelectSweepImages(t *testing.T) {
 }
 
 func TestSelectSweepVolumes(t *testing.T) {
-	named := func(name string, labels map[string]string) *volume.Volume {
-		return &volume.Volume{Name: name, Labels: labels}
+	named := func(name string, labels map[string]string) volume.Volume {
+		return volume.Volume{Name: name, Labels: labels}
 	}
 	tests := []struct {
 		name    string
-		volumes []*volume.Volume
+		volumes []volume.Volume
 		mounted map[string]bool
 		want    []string
 	}{
 		{
 			name:    "a cache volume matching our scheme is an orphan",
-			volumes: []*volume.Volume{named("agentbox-cache-"+taskID+"-0", nil)},
+			volumes: []volume.Volume{named("agentbox-cache-"+taskID+"-0", nil)},
 			want:    []string{"agentbox-cache-" + taskID + "-0"},
 		},
 		{
 			name:    "our label is enough even when the name is not recognizable",
-			volumes: []*volume.Volume{named("agentbox-cache-legacy", Labels(PurposeAgentboxCache))},
+			volumes: []volume.Volume{named("agentbox-cache-legacy", Labels(PurposeAgentboxCache))},
 			want:    []string{"agentbox-cache-legacy"},
 		},
 		{
 			name:    "a cache volume a container still mounts stays",
-			volumes: []*volume.Volume{named("agentbox-cache-"+taskID+"-2", Labels(PurposeAgentboxCache))},
+			volumes: []volume.Volume{named("agentbox-cache-"+taskID+"-2", Labels(PurposeAgentboxCache))},
 			mounted: map[string]bool{"agentbox-cache-" + taskID + "-2": true},
 		},
 		{
 			name: "customer volumes are never matched",
-			volumes: []*volume.Volume{
+			volumes: []volume.Volume{
 				named("postgres-data", nil),
 				named("agentbox-cache-not-an-object-id-0", nil),
 				named("my-agentbox-cache-"+taskID+"-0", nil),
@@ -152,11 +152,11 @@ func TestSelectSweepVolumes(t *testing.T) {
 }
 
 func TestMountedVolumesAndBoundPaths(t *testing.T) {
-	containers := []types.Container{
+	containers := []container.Summary{
 		{
 			ID:    "live",
 			State: "running",
-			Mounts: []types.MountPoint{
+			Mounts: []container.MountPoint{
 				{Type: mount.TypeVolume, Name: "agentbox-cache-" + taskID + "-0"},
 				{Type: mount.TypeBind, Source: "/tmp/" + orgID + "/" + taskID},
 			},
@@ -164,7 +164,7 @@ func TestMountedVolumesAndBoundPaths(t *testing.T) {
 		{
 			ID:     "finished",
 			State:  "exited",
-			Mounts: []types.MountPoint{{Type: mount.TypeBind, Source: "/tmp/" + orgID + "/old"}},
+			Mounts: []container.MountPoint{{Type: mount.TypeBind, Source: "/tmp/" + orgID + "/old"}},
 		},
 	}
 	if !mountedVolumes(containers)["agentbox-cache-"+taskID+"-0"] {

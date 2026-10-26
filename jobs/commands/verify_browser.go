@@ -25,13 +25,13 @@ import (
 	"sync"
 	"time"
 
+	"github.com/containerd/errdefs"
 	"github.com/deployment-io/deployment-runner/agenttools"
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
 	"github.com/deployment-io/deployment-runner/utils/reclaim"
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/image"
-	"github.com/docker/docker/api/types/mount"
-	"github.com/docker/docker/pkg/stdcopy"
+	"github.com/moby/moby/api/pkg/stdcopy"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/mount"
 	"github.com/moby/moby/client"
 )
 
@@ -311,12 +311,12 @@ func (v *verifyBrowser) pullInBackground(ref string, done chan struct{}) {
 func pullVerifyBrowserImage(ref string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), defaultImagePullTimeout)
 	defer cancel()
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	cli, err := client.New(client.FromEnv)
 	if err != nil {
 		return err
 	}
 	defer cli.Close()
-	reader, err := cli.ImagePull(ctx, ref, image.PullOptions{})
+	reader, err := cli.ImagePull(ctx, ref, client.ImagePullOptions{})
 	if err != nil {
 		return err
 	}
@@ -462,13 +462,13 @@ func readVerifyBrowserResult(path string) []byte {
 }
 
 func dockerImagePresent(ctx context.Context, ref string) (bool, error) {
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	cli, err := client.New(client.FromEnv)
 	if err != nil {
 		return false, err
 	}
 	defer cli.Close()
-	if _, _, err := cli.ImageInspectWithRaw(ctx, ref); err != nil {
-		if client.IsErrNotFound(err) {
+	if _, err := cli.ImageInspect(ctx, ref); err != nil {
+		if errdefs.IsNotFound(err) {
 			return false, nil
 		}
 		return false, err
@@ -477,12 +477,12 @@ func dockerImagePresent(ctx context.Context, ref string) (bool, error) {
 }
 
 func dockerCreateContainer(ctx context.Context, cfg *container.Config, hostCfg *container.HostConfig) (string, error) {
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	cli, err := client.New(client.FromEnv)
 	if err != nil {
 		return "", err
 	}
 	defer cli.Close()
-	resp, err := cli.ContainerCreate(ctx, cfg, hostCfg, nil, nil, "")
+	resp, err := cli.ContainerCreate(ctx, client.ContainerCreateOptions{Config: cfg, HostConfig: hostCfg})
 	if err != nil {
 		return "", err
 	}
@@ -493,35 +493,35 @@ func dockerCreateContainer(ctx context.Context, cfg *container.Config, hostCfg *
 // then (or when ctx ends) it is stopped with a grace period. Its output and whether
 // it was OOM-killed are read before the caller removes it.
 func dockerRunVerifyBrowser(ctx context.Context, id string, wallClock time.Duration) (verifyBrowserExit, error) {
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	cli, err := client.New(client.FromEnv)
 	if err != nil {
 		return verifyBrowserExit{}, err
 	}
 	defer cli.Close()
-	if err := cli.ContainerStart(ctx, id, container.StartOptions{}); err != nil {
+	if _, err := cli.ContainerStart(ctx, id, client.ContainerStartOptions{}); err != nil {
 		return verifyBrowserExit{}, fmt.Errorf("starting the QA browser container: %w", err)
 	}
 	waitCtx, cancel := context.WithTimeout(ctx, wallClock)
 	defer cancel()
 	var exit verifyBrowserExit
-	statusCh, errCh := cli.ContainerWait(waitCtx, id, container.WaitConditionNotRunning)
+	wait := cli.ContainerWait(waitCtx, id, client.ContainerWaitOptions{Condition: container.WaitConditionNotRunning})
 	select {
-	case status := <-statusCh:
+	case status := <-wait.Result:
 		exit.exitCode = int(status.StatusCode)
-	case err := <-errCh:
+	case err := <-wait.Error:
 		if waitCtx.Err() == nil {
 			return verifyBrowserExit{}, fmt.Errorf("waiting for the QA browser container: %w", err)
 		}
 		grace := verifyBrowserStopGraceSec
-		_ = cli.ContainerStop(context.Background(), id, container.StopOptions{Timeout: &grace})
+		_, _ = cli.ContainerStop(context.Background(), id, client.ContainerStopOptions{Timeout: &grace})
 		if ctx.Err() != nil {
 			return verifyBrowserExit{}, ctx.Err()
 		}
 		exit.timedOut = true
 	}
 	exit.output = verifyBrowserContainerOutput(cli, id)
-	if info, err := cli.ContainerInspect(context.Background(), id); err == nil && info.State != nil {
-		exit.oomKilled = info.State.OOMKilled
+	if info, err := cli.ContainerInspect(context.Background(), id, client.ContainerInspectOptions{}); err == nil && info.Container.State != nil {
+		exit.oomKilled = info.Container.State.OOMKilled
 	}
 	return exit, nil
 }
@@ -531,7 +531,7 @@ func dockerRunVerifyBrowser(ctx context.Context, id string, wallClock time.Durat
 func verifyBrowserContainerOutput(cli *client.Client, id string) string {
 	ctx, cancel := context.WithTimeout(context.Background(), containerInspectTimeout)
 	defer cancel()
-	logs, err := cli.ContainerLogs(ctx, id, container.LogsOptions{ShowStdout: true, ShowStderr: true})
+	logs, err := cli.ContainerLogs(ctx, id, client.ContainerLogsOptions{ShowStdout: true, ShowStderr: true})
 	if err != nil {
 		return ""
 	}

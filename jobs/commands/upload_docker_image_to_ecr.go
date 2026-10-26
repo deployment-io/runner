@@ -21,7 +21,6 @@ import (
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
 	"github.com/deployment-io/deployment-runner/utils"
 	"github.com/deployment-io/deployment-runner/utils/reclaim"
-	"github.com/docker/docker/api/types/image"
 	"github.com/moby/moby/api/types/registry"
 	"github.com/moby/moby/client"
 )
@@ -137,7 +136,7 @@ func createEcrRepositoryIfNeeded(parameters map[string]interface{}, ecrClient *e
 }
 
 func tagDockerImageToRepositoryUri(parameters map[string]interface{}, ecrRepositoryUri string) (string, error) {
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	cli, err := client.New(client.FromEnv)
 	if err != nil {
 		return "", err
 	}
@@ -151,7 +150,7 @@ func tagDockerImageToRepositoryUri(parameters map[string]interface{}, ecrReposit
 		return "", err
 	}
 	ecrRepositoryUriWithTag := ecrRepositoryUri + ":" + commitHash
-	err = cli.ImageTag(context.TODO(), dockerImageNameAndTag, ecrRepositoryUriWithTag)
+	_, err = cli.ImageTag(context.TODO(), client.ImageTagOptions{Source: dockerImageNameAndTag, Target: ecrRepositoryUriWithTag})
 	if err != nil {
 		return "", err
 	}
@@ -180,7 +179,7 @@ func pushDockerImageToEcr(ecrClient *ecr.Client, ecrRepositoryUriWithTag string,
 		return fmt.Errorf("full token not in valid format: %s", fullToken)
 	}
 
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	cli, err := client.New(client.FromEnv)
 	if err != nil {
 		return err
 	}
@@ -196,7 +195,7 @@ func pushDockerImageToEcr(ecrClient *ecr.Client, ecrRepositoryUriWithTag string,
 	}
 	authStr := base64.URLEncoding.EncodeToString(encodedJSON)
 
-	push, err := cli.ImagePush(context.TODO(), ecrRepositoryUriWithTag, image.PushOptions{
+	push, err := cli.ImagePush(context.TODO(), ecrRepositoryUriWithTag, client.ImagePushOptions{
 		RegistryAuth: authStr,
 	})
 	if err != nil {

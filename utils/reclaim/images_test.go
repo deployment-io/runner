@@ -7,8 +7,8 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/image"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/image"
 )
 
 const (
@@ -164,7 +164,7 @@ func TestSelectSupersededRefs(t *testing.T) {
 }
 
 func TestProtectedImagesFromCoversEveryContainerState(t *testing.T) {
-	containers := []types.Container{
+	containers := []container.Summary{
 		{ID: "c1", State: "running", Image: "ghcr.io/deployment-io/agentbox:1.9.9", ImageID: "sha256:old"},
 		{ID: "c2", State: "exited", Image: "node:lts-buster", ImageID: "sha256:nodeold"},
 	}
@@ -187,7 +187,7 @@ func TestProtectedImagesFromCoversEveryContainerState(t *testing.T) {
 func TestRemoveImageRefsNeverForcesAndSkipsReferenced(t *testing.T) {
 	fake := &fakeDocker{
 		images:     []image.Summary{summary("sha256:deploy", deployTag, ecrTag)},
-		containers: []types.Container{{ID: "c1", State: "running", ImageID: "sha256:deploy"}},
+		containers: []container.Summary{{ID: "c1", State: "running", ImageID: "sha256:deploy"}},
 	}
 	var logs bytes.Buffer
 	removeImageRefs(context.Background(), fake, []string{deployTag, ecrTag}, &logs)

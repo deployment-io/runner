@@ -16,8 +16,8 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner/agenttools"
 	"github.com/deployment-io/deployment-runner/utils/reclaim"
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/mount"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/mount"
 )
 
 // fakeVerifyDocker stands in for the Docker daemon behind verifyBrowser's seams.

@@ -8,10 +8,9 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner/jobs/resources"
 	"github.com/deployment-io/deployment-runner/utils/reclaim"
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/image"
-	"github.com/docker/docker/api/types/mount"
-	"github.com/docker/docker/pkg/stdcopy"
+	"github.com/moby/moby/api/pkg/stdcopy"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/mount"
 	"github.com/moby/moby/client"
 	"io"
 	"os"
@@ -110,13 +109,13 @@ func copyExecOutput(logsWriter io.Writer, r io.Reader) error {
 // attach failure nil-panicked. The error from attach was also
 // silently swallowed.
 func execCommand(ctx context.Context, containerID, repoDir string, command []string, env []string, logsWriter io.Writer) error {
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	cli, err := client.New(client.FromEnv)
 	if err != nil {
 		return err
 	}
 	defer cli.Close()
 
-	config := container.ExecOptions{
+	config := client.ExecCreateOptions{
 		AttachStderr: true,
 		AttachStdout: true,
 		WorkingDir:   repoDir,
@@ -124,16 +123,15 @@ func execCommand(ctx context.Context, containerID, repoDir string, command []str
 		Env:          env,
 	}
 
-	idResponse, err := cli.ContainerExecCreate(ctx, containerID, config)
+	idResponse, err := cli.ExecCreate(ctx, containerID, config)
 	if err != nil {
 		return err
 	}
 	execID := idResponse.ID
 
-	resp, err := cli.ContainerExecAttach(ctx, execID,
-		container.ExecAttachOptions{
-			Detach: false,
-			Tty:    false,
+	resp, err := cli.ExecAttach(ctx, execID,
+		client.ExecAttachOptions{
+			TTY: false,
 		},
 	)
 	if err != nil {
@@ -142,7 +140,7 @@ func execCommand(ctx context.Context, containerID, repoDir string, command []str
 	defer resp.Close()
 
 	// Watchdog: close the hijacked conn when ctx cancels so the copy
-	// unblocks. ContainerExecAttach hijacks the underlying TCP conn
+	// unblocks. ExecAttach hijacks the underlying TCP conn
 	// (see moby/client/hijack.go's setupHijackConn) — the conn is
 	// raw net.Conn after that, with no awareness of the original ctx.
 	// Without this watchdog a wall-clock-timeout firing would not
@@ -169,7 +167,7 @@ func execCommand(ctx context.Context, containerID, repoDir string, command []str
 	// while the copy was running but the exec finished cleanly anyway,
 	// in which case we still want the real exit code instead of
 	// ctx.Err().
-	res, err := cli.ContainerExecInspect(context.Background(), execID)
+	res, err := cli.ExecInspect(context.Background(), execID, client.ExecInspectOptions{})
 	if err != nil {
 		return err
 	}
@@ -194,13 +192,13 @@ func pullDockerImageForBuilding(ctx context.Context, imageID string) error {
 	defer func() { <-imagePullLock }()
 	ctx, cancel := context.WithTimeout(ctx, defaultBuildImagePullTimeout)
 	defer cancel()
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	cli, err := client.New(client.FromEnv)
 	if err != nil {
 		return err
 	}
 	defer cli.Close()
 
-	reader, err := cli.ImagePull(ctx, fmt.Sprintf("docker.io/library/%s", imageID), image.PullOptions{})
+	reader, err := cli.ImagePull(ctx, fmt.Sprintf("docker.io/library/%s", imageID), client.ImagePullOptions{})
 	if err != nil {
 		return err
 	}
@@ -244,14 +242,14 @@ func startBuildContainer(ctx context.Context, imageId, repoDir string) (string, 
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	cli, err := client.New(client.FromEnv)
 	if err != nil {
 		return "", err
 	}
 	defer cli.Close()
 
 	memoryBytes, nanoCPUs := resources.LimitsForStaticSiteBuild()
-	resp, err := cli.ContainerCreate(context.Background(), &container.Config{
+	resp, err := cli.ContainerCreate(context.Background(), client.ContainerCreateOptions{Config: &container.Config{
 		Image: imageId,
 		Cmd:   []string{"tail", "-f", "/dev/null"},
 		Tty:   false,
@@ -259,7 +257,7 @@ func startBuildContainer(ctx context.Context, imageId, repoDir string) (string, 
 		// deferred removal never runs — and so it can tell it apart from a
 		// customer's own containers on a shared daemon.
 		Labels: reclaim.Labels(reclaim.PurposeStaticSiteBuild),
-	}, &container.HostConfig{
+	}, HostConfig: &container.HostConfig{
 		Mounts: []mount.Mount{{
 			Type:   mount.TypeBind,
 			Source: repoDir,
@@ -271,12 +269,12 @@ func startBuildContainer(ctx context.Context, imageId, repoDir string) (string, 
 			PidsLimit: pidsLimitPtr(defaultBuildPidsLimit),
 		},
 		ExtraHosts: cloudMetadataExtraHosts(),
-	}, nil, nil, "")
+	}})
 	if err != nil {
 		return "", err
 	}
 
-	if err = cli.ContainerStart(ctx, resp.ID, container.StartOptions{}); err == nil {
+	if _, err = cli.ContainerStart(ctx, resp.ID, client.ContainerStartOptions{}); err == nil {
 		err = ctx.Err()
 	}
 	if err != nil {
@@ -315,12 +313,13 @@ func pidsLimitPtr(n int64) *int64 { return &n }
 // run_agent_step.go.
 func removeBuildContainer(containerID string) error {
 	ctx := context.Background()
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	cli, err := client.New(client.FromEnv)
 	if err != nil {
 		return err
 	}
 	defer cli.Close()
-	return cli.ContainerRemove(ctx, containerID, container.RemoveOptions{Force: true})
+	_, err = cli.ContainerRemove(ctx, containerID, client.ContainerRemoveOptions{Force: true})
+	return err
 }
 
 func (b *BuildStaticSite) Run(parameters map[string]interface{}, logsWriter io.Writer) (newParameters map[string]interface{}, err error) {

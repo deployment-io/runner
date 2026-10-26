@@ -38,11 +38,9 @@ import (
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
 	"github.com/deployment-io/deployment-runner/utils"
 	"github.com/deployment-io/deployment-runner/utils/reclaim"
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/image"
-	"github.com/docker/docker/api/types/mount"
-	"github.com/docker/docker/api/types/volume"
-	"github.com/docker/docker/pkg/stdcopy"
+	"github.com/moby/moby/api/pkg/stdcopy"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/mount"
 	"github.com/moby/moby/client"
 )
 
@@ -436,12 +434,12 @@ func pullAgentboxImage(imageRef string) error {
 func pullImageWithTimeout(imageRef string) error {
 	dockerCtx, cancel := context.WithTimeout(context.Background(), defaultImagePullTimeout)
 	defer cancel()
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	cli, err := client.New(client.FromEnv)
 	if err != nil {
 		return err
 	}
 	defer cli.Close()
-	reader, err := cli.ImagePull(dockerCtx, imageRef, image.PullOptions{})
+	reader, err := cli.ImagePull(dockerCtx, imageRef, client.ImagePullOptions{})
 	if err != nil {
 		return err
 	}
@@ -459,11 +457,11 @@ func pullImageWithTimeout(imageRef string) error {
 // command that runs after RunAgentStep already pulled it, where a registry
 // round trip on every Step would be wasted.
 func ensureAgentboxImage(imageRef string) error {
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	cli, err := client.New(client.FromEnv)
 	if err != nil {
 		return err
 	}
-	_, _, inspectErr := cli.ImageInspectWithRaw(context.Background(), imageRef)
+	_, inspectErr := cli.ImageInspect(context.Background(), imageRef)
 	cli.Close()
 	if inspectErr == nil {
 		return nil
@@ -802,7 +800,7 @@ func mapToEnvSlice(env map[string]string) []string {
 // forwards each fresh snapshot. Nil sink skips the poller entirely.
 func (rs *RunAgentStep) spawnAgentboxAndWait(spec agentboxSpawnSpec, logsWriter io.Writer) (agentResult, error) {
 	dockerCtx := context.Background()
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	cli, err := client.New(client.FromEnv)
 	if err != nil {
 		return agentResult{}, err
 	}
@@ -859,7 +857,7 @@ func (rs *RunAgentStep) spawnAgentboxAndWait(spec agentboxSpawnSpec, logsWriter 
 	var logsWg sync.WaitGroup
 	defer logsWg.Wait()
 	defer func() { _ = removeContainer(dockerCtx, cli, containerID) }()
-	if err := cli.ContainerStart(dockerCtx, containerID, container.StartOptions{}); err != nil {
+	if _, err := cli.ContainerStart(dockerCtx, containerID, client.ContainerStartOptions{}); err != nil {
 		return agentResult{}, fmt.Errorf("error starting container: %s", err)
 	}
 	logsWg.Add(1)
@@ -965,7 +963,7 @@ func createAgentboxContainer(ctx context.Context, cli *client.Client, spec agent
 			"169.254.169.254:127.0.0.1",
 		},
 	}
-	resp, err := cli.ContainerCreate(ctx, cfg, hostCfg, nil, nil, "")
+	resp, err := cli.ContainerCreate(ctx, client.ContainerCreateOptions{Config: cfg, HostConfig: hostCfg})
 	if err != nil {
 		return "", fmt.Errorf("error creating container: %s", err)
 	}
@@ -1086,7 +1084,7 @@ func pollProgressFile(workDirHost string, sink func(jobs.LiveProgressV1), stopCh
 }
 
 func streamContainerLogs(ctx context.Context, cli *client.Client, containerID string, logsWriter io.Writer) {
-	logs, err := cli.ContainerLogs(ctx, containerID, container.LogsOptions{
+	logs, err := cli.ContainerLogs(ctx, containerID, client.ContainerLogsOptions{
 		ShowStdout: true,
 		ShowStderr: true,
 		Follow:     true,
@@ -1122,9 +1120,9 @@ func streamContainerLogs(ctx context.Context, cli *client.Client, containerID st
 // naming the default in the message sent a reader looking for a four-hour run
 // that never happened.
 func waitForContainerExit(ctx context.Context, cli *client.Client, containerID string, stopSignal <-chan struct{}, waitTimeout time.Duration, logsWriter io.Writer) (int, error) {
-	statusCh, errCh := cli.ContainerWait(ctx, containerID, container.WaitConditionNotRunning)
+	wait := cli.ContainerWait(ctx, containerID, client.ContainerWaitOptions{Condition: container.WaitConditionNotRunning})
 	select {
-	case err := <-errCh:
+	case err := <-wait.Error:
 		if errors.Is(err, context.DeadlineExceeded) {
 			// Wall-clock cap fired. SIGTERM the container with the standard
 			// 10s grace; agentbox catches and writes a partial result.json
@@ -1132,13 +1130,13 @@ func waitForContainerExit(ctx context.Context, cli *client.Client, containerID s
 			// error so the Step is marked Failed with a clear cause.
 			stopCtx := context.Background() // ContainerStop on a fresh context — the wait ctx is already done
 			grace := containerStopGraceSec
-			_ = cli.ContainerStop(stopCtx, containerID, container.StopOptions{Timeout: &grace})
+			_, _ = cli.ContainerStop(stopCtx, containerID, client.ContainerStopOptions{Timeout: &grace})
 			return 0, fmt.Errorf("agentbox exceeded wall-clock cap of %s — SIGTERM sent", waitTimeout)
 		}
 		if err != nil {
 			return 0, fmt.Errorf("error waiting for container exit: %s", err)
 		}
-	case status := <-statusCh:
+	case status := <-wait.Result:
 		// Container exited. Agent phase: the exit code is advisory (status
 		// flows via /result.json). Vendor phase: the caller treats a
 		// non-zero code as a dependency-fetch failure.
@@ -1157,10 +1155,10 @@ func waitForContainerExit(ctx context.Context, cli *client.Client, containerID s
 		// partial result.
 		stopCtx := context.Background()
 		grace := containerStopGraceSec
-		_ = cli.ContainerStop(stopCtx, containerID, container.StopOptions{Timeout: &grace})
+		_, _ = cli.ContainerStop(stopCtx, containerID, client.ContainerStopOptions{Timeout: &grace})
 		select {
-		case <-statusCh:
-		case <-errCh:
+		case <-wait.Result:
+		case <-wait.Error:
 		}
 		return 0, types.ErrJobStoppedByUser
 	}
@@ -1168,7 +1166,8 @@ func waitForContainerExit(ctx context.Context, cli *client.Client, containerID s
 }
 
 func removeContainer(ctx context.Context, cli *client.Client, containerID string) error {
-	return cli.ContainerRemove(ctx, containerID, container.RemoveOptions{Force: true})
+	_, err := cli.ContainerRemove(ctx, containerID, client.ContainerRemoveOptions{Force: true})
+	return err
 }
 
 // agentResult mirrors the shape of agentbox's /result.json. Only the
@@ -2212,7 +2211,7 @@ func verifyBrowserForJob(run agenttools.RunVerifyBrowser, parameters map[string]
 func (rs *RunAgentStep) spawnVendorAndWait(spec agentboxSpawnSpec, logsWriter io.Writer) error {
 	io.WriteString(logsWriter, "Vendoring dependencies into shared cache\n")
 	dockerCtx := context.Background()
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	cli, err := client.New(client.FromEnv)
 	if err != nil {
 		return err
 	}
@@ -2224,7 +2223,7 @@ func (rs *RunAgentStep) spawnVendorAndWait(spec agentboxSpawnSpec, logsWriter io
 	var logsWg sync.WaitGroup
 	defer logsWg.Wait()
 	defer func() { _ = removeContainer(dockerCtx, cli, containerID) }()
-	if err := cli.ContainerStart(dockerCtx, containerID, container.StartOptions{}); err != nil {
+	if _, err := cli.ContainerStart(dockerCtx, containerID, client.ContainerStartOptions{}); err != nil {
 		return fmt.Errorf("error starting vendor container: %s", err)
 	}
 	logsWg.Add(1)
@@ -2298,12 +2297,12 @@ func cacheVolumeName(ctx commandUtils.TaskJobContext) string {
 }
 
 func createCacheVolume(name string) error {
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	cli, err := client.New(client.FromEnv)
 	if err != nil {
 		return err
 	}
 	defer cli.Close()
-	_, err = cli.VolumeCreate(context.Background(), volume.CreateOptions{
+	_, err = cli.VolumeCreate(context.Background(), client.VolumeCreateOptions{
 		Name: name,
 		// The name already encodes ownership; the label is what the sweep
 		// matches on first, and it keeps working if the name scheme moves.
@@ -2321,12 +2320,12 @@ func createCacheVolume(name string) error {
 // an empty cache fails on dependencies it cannot fetch, which is worse than one
 // vendor phase nobody needed.
 func cacheVolumeExists(name string) bool {
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	cli, err := client.New(client.FromEnv)
 	if err != nil {
 		return false
 	}
 	defer cli.Close()
-	_, err = cli.VolumeInspect(context.Background(), name)
+	_, err = cli.VolumeInspect(context.Background(), name, client.VolumeInspectOptions{})
 	return err == nil
 }
 
@@ -2346,12 +2345,12 @@ func keepCacheVolumeForStep(runErr error) bool {
 // via defer; a leaked volume is reclaimable out of band, so failures here
 // are swallowed rather than masking the Step's real outcome.
 func removeCacheVolume(name string) {
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	cli, err := client.New(client.FromEnv)
 	if err != nil {
 		return
 	}
 	defer cli.Close()
-	_ = cli.VolumeRemove(context.Background(), name, true)
+	_, _ = cli.VolumeRemove(context.Background(), name, client.VolumeRemoveOptions{Force: true})
 }
 
 // (Language-specific helpers — GOPRIVATE derivation, go.work generation,

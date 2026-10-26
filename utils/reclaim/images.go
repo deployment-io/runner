@@ -6,9 +6,9 @@ import (
 	"os"
 	"strconv"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/image"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/image"
+	"github.com/moby/moby/client"
 )
 
 const (
@@ -76,11 +76,12 @@ type Supersession struct {
 // predecessor leaves.
 func PruneSupersededImages(pulled string, by Supersession, logsWriter io.Writer) {
 	withDocker(logsWriter, "superseded image cleanup", func(ctx context.Context, d Docker) {
-		images, err := d.ImageList(ctx, image.ListOptions{All: false})
+		listed, err := d.ImageList(ctx, client.ImageListOptions{All: false})
 		if err != nil {
 			logf(logsWriter, "Skipping superseded image cleanup — cannot list images: %s", err)
 			return
 		}
+		images := listed.Items
 		protected, err := protectedImages(ctx, d)
 		if err != nil {
 			logf(logsWriter, "Skipping superseded image cleanup — cannot list containers: %s", err)
@@ -103,17 +104,18 @@ func PruneBuildCache(logsWriter io.Writer) {
 	reclaiming(logsWriter, "docker build cache", func() {
 		withDocker(logsWriter, "build cache prune", func(ctx context.Context, d Docker) {
 			keep := buildCacheKeepBytes()
-			report, err := d.BuildCachePrune(ctx, types.BuildCachePruneOptions{
+			res, err := d.BuildCachePrune(ctx, client.BuildCachePruneOptions{
 				// All=false leaves cache that is still attached to an image
 				// on the host alone; only unused records are candidates.
-				All:         false,
-				KeepStorage: keep,
+				All:           false,
+				ReservedSpace: keep,
 			})
 			if err != nil {
 				logf(logsWriter, "Build cache prune failed: %s", err)
 				return
 			}
-			if report == nil || report.SpaceReclaimed == 0 {
+			report := res.Report
+			if report.SpaceReclaimed == 0 {
 				logf(logsWriter, "Build cache already within its %s budget", humanBytes(uint64(keep)))
 				return
 			}
@@ -126,11 +128,12 @@ func PruneBuildCache(logsWriter io.Writer) {
 // removeImageRefs is the reference-checked removal shared by every image
 // path in this package.
 func removeImageRefs(ctx context.Context, d Docker, refs []string, logsWriter io.Writer) {
-	images, err := d.ImageList(ctx, image.ListOptions{All: false})
+	listed, err := d.ImageList(ctx, client.ImageListOptions{All: false})
 	if err != nil {
 		logf(logsWriter, "Skipping image cleanup — cannot list images: %s", err)
 		return
 	}
+	images := listed.Items
 	protected, err := protectedImages(ctx, d)
 	if err != nil {
 		logf(logsWriter, "Skipping image cleanup — cannot list containers: %s", err)
@@ -146,7 +149,7 @@ func removeSelected(ctx context.Context, d Docker, selection imageSelection, log
 	for _, ref := range selection.remove {
 		// Force stays off: a forced remove would tear an image out from
 		// under whatever the daemon knows about that we don't.
-		if _, err := d.ImageRemove(ctx, ref, image.RemoveOptions{PruneChildren: true}); err != nil {
+		if _, err := d.ImageRemove(ctx, ref, client.ImageRemoveOptions{PruneChildren: true}); err != nil {
 			logf(logsWriter, "Could not remove image %s: %s", ref, err)
 			continue
 		}
@@ -171,15 +174,15 @@ func logSkipped(selection imageSelection, logsWriter io.Writer) {
 // container still pins its image, and removing it would need force, which we
 // never use.
 func protectedImages(ctx context.Context, d Docker) (map[string]bool, error) {
-	containers, err := d.ContainerList(ctx, container.ListOptions{All: true})
+	containers, err := d.ContainerList(ctx, client.ContainerListOptions{All: true})
 	if err != nil {
 		return nil, err
 	}
-	return protectedImagesFrom(containers, inUseRefs()), nil
+	return protectedImagesFrom(containers.Items, inUseRefs()), nil
 }
 
 // protectedImagesFrom is the pure half of protectedImages.
-func protectedImagesFrom(containers []types.Container, held map[string]bool) map[string]bool {
+func protectedImagesFrom(containers []container.Summary, held map[string]bool) map[string]bool {
 	protected := map[string]bool{}
 	for _, c := range containers {
 		if c.ImageID != "" {
