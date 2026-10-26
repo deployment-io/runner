@@ -286,7 +286,7 @@ func allowPreviewStackPortFromLoadBalancer(parameters map[string]interface{}, ec
 			IpProtocol:       aws.String("tcp"),
 			FromPort:         aws.Int32(int32(port)),
 			ToPort:           aws.Int32(int32(port)),
-			UserIdGroupPairs: []ec2Types.UserIdGroupPair{{GroupId: aws.String(loadBalancerGroupID), Description: aws.String("the preview's load balancer")}},
+			UserIdGroupPairs: []ec2Types.UserIdGroupPair{{GroupId: aws.String(loadBalancerGroupID), Description: aws.String("preview load balancer")}},
 		}},
 	})
 	if err != nil && !isDuplicateSecurityGroupRuleError(err) {
