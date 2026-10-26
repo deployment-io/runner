@@ -166,7 +166,7 @@ func sessionToken(cache map[string]string, installationID, orgID string) (string
 	if token, ok := cache[installationID]; ok {
 		return token, nil
 	}
-	token, err := commandUtils.RefreshGitTokenForInstallation(installationID, orgID)
+	token, err := commandUtils.RefreshGitTokenForInstallation(installationID, orgID, "")
 	if err != nil {
 		return "", err
 	}
@@ -199,7 +199,7 @@ func cloneSessionWithRetry(ctx context.Context, repoDir string, req sessionClone
 	if !commandUtils.IsErrorAuthenticationRequired(err) {
 		return nil, token, err
 	}
-	token, err = commandUtils.RefreshGitTokenForInstallation(entry.InstallationID, req.orgID)
+	token, err = commandUtils.RefreshGitTokenForInstallation(entry.InstallationID, req.orgID, token)
 	if err != nil {
 		return nil, token, err
 	}

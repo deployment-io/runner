@@ -16,7 +16,7 @@ func TestRefreshGitTokenForInstallationContextStopsPollingWithItsContext(t *test
 	var calls atomic.Int32
 	rpc, interval := refreshGitTokenRPC, refreshGitTokenRetryInterval
 	t.Cleanup(func() { refreshGitTokenRPC, refreshGitTokenRetryInterval = rpc, interval })
-	refreshGitTokenRPC = func(string, string) (string, error) {
+	refreshGitTokenRPC = func(string, string, string) (string, error) {
 		calls.Add(1)
 		return "", oauth.ErrRefreshInProcess
 	}
@@ -25,7 +25,7 @@ func TestRefreshGitTokenForInstallationContextStopsPollingWithItsContext(t *test
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 	start := time.Now()
-	_, err := RefreshGitTokenForInstallationContext(ctx, "inst", "org")
+	_, err := RefreshGitTokenForInstallationContext(ctx, "inst", "org", "")
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("err = %v, want the context's deadline", err)
 	}
@@ -46,14 +46,14 @@ func TestRefreshGitTokenForInstallationRetriesWhileARefreshIsInProcess(t *testin
 	var calls atomic.Int32
 	rpc, interval := refreshGitTokenRPC, refreshGitTokenRetryInterval
 	t.Cleanup(func() { refreshGitTokenRPC, refreshGitTokenRetryInterval = rpc, interval })
-	refreshGitTokenRPC = func(string, string) (string, error) {
+	refreshGitTokenRPC = func(string, string, string) (string, error) {
 		if calls.Add(1) < 3 {
 			return "", oauth.ErrRefreshInProcess
 		}
 		return "token", nil
 	}
 	refreshGitTokenRetryInterval = time.Millisecond
-	token, err := RefreshGitTokenForInstallation("inst", "org")
+	token, err := RefreshGitTokenForInstallation("inst", "org", "")
 	if err != nil || token != "token" || calls.Load() != 3 {
 		t.Errorf("token %q, err %v, calls %d", token, err, calls.Load())
 	}

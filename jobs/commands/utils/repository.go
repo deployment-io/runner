@@ -25,6 +25,8 @@ package utils
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"github.com/deployment-io/deployment-runner-kit/enums/git_provider_enums"
@@ -33,6 +35,7 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/oauth"
 	"github.com/deployment-io/deployment-runner/client"
 	"github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing/transport"
 	"github.com/go-git/go-git/v5/plumbing/transport/http"
 	"io"
 	"strings"
@@ -85,12 +88,12 @@ func GetRepositoryDirectoryPath(parameters map[string]interface{}) (string, erro
 	return fmt.Sprintf("/tmp/%s/%s", organizationID, buildID), nil
 }
 
-// IsErrorAuthenticationRequired checks if the provided error indicates an authentication requirement.
+// IsErrorAuthenticationRequired reports whether err is go-git's "authentication
+// required" (an HTTP 401 from the git provider). go-git wraps it with the
+// provider's message ("authentication required: Invalid username or token..."),
+// so it is matched with errors.Is, not by its text.
 func IsErrorAuthenticationRequired(err error) bool {
-	if err.Error() == "authentication required" {
-		return true
-	}
-	return false
+	return err != nil && errors.Is(err, transport.ErrAuthenticationRequired)
 }
 
 // FetchRepository fetches the latest changes of the provided repository using the given authentication tokens and logs progress.
@@ -106,7 +109,7 @@ func FetchRepository(repository *git.Repository, repoProviderToken, repoGitProvi
 		Force:      true,
 	})
 
-	if err != nil && err != git.NoErrAlreadyUpToDate {
+	if err != nil && !errors.Is(err, git.NoErrAlreadyUpToDate) {
 		return err
 	}
 
@@ -120,7 +123,9 @@ func FetchRepository(repository *git.Repository, repoProviderToken, repoGitProvi
 }
 
 // RefreshGitToken refreshes the Git token using provided parameters with installation ID and organization ID.
-func RefreshGitToken(parameters map[string]interface{}) (string, error) {
+// rejectedToken is the token the git provider just rejected, or "" when asking
+// for a token to start with; see RefreshGitTokenForInstallationContext.
+func RefreshGitToken(parameters map[string]interface{}, rejectedToken string) (string, error) {
 	installationID, err := jobs.GetParameterValue[string](parameters, parameters_enums.InstallationId)
 	if err != nil {
 		return "", err
@@ -129,7 +134,7 @@ func RefreshGitToken(parameters map[string]interface{}) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return RefreshGitTokenForInstallation(installationID, orgIdFromJob)
+	return RefreshGitTokenForInstallation(installationID, orgIdFromJob, rejectedToken)
 }
 
 // RefreshGitTokenForInstallation refreshes the Git token for a specific
@@ -137,28 +142,53 @@ func RefreshGitToken(parameters map[string]interface{}) (string, error) {
 // (each with its own installation) are processed inside one Job and the
 // parameters-map helper's "single InstallationID" assumption doesn't hold.
 // Polls every 10s on ErrRefreshInProcess (another caller holds the lock).
-func RefreshGitTokenForInstallation(installationID, orgID string) (string, error) {
-	return RefreshGitTokenForInstallationContext(context.Background(), installationID, orgID)
+func RefreshGitTokenForInstallation(installationID, orgID, rejectedToken string) (string, error) {
+	return RefreshGitTokenForInstallationContext(context.Background(), installationID, orgID, rejectedToken)
 }
 
 // refreshGitTokenRPC and refreshGitTokenRetryInterval are the refresh's RPC
 // and its poll interval; tests replace them.
 var (
-	refreshGitTokenRPC = func(installationID, orgID string) (string, error) {
-		return client.Get().RefreshGitToken(installationID, orgID)
+	refreshGitTokenRPC = func(installationID, orgID, rejectedTokenSHA256 string) (string, error) {
+		return client.Get().RefreshGitToken(installationID, orgID, rejectedTokenSHA256)
 	}
 	refreshGitTokenRetryInterval = 10 * time.Second
 )
 
+// SwapRefreshGitTokenRPCForTest replaces the refresh RPC (which receives the
+// rejected token's SHA-256, or "") and returns a function restoring it. Only
+// for tests in other packages that drive the retry-after-401 paths.
+func SwapRefreshGitTokenRPCForTest(rpc func(installationID, orgID, rejectedTokenSHA256 string) (string, error)) (restore func()) {
+	orig := refreshGitTokenRPC
+	refreshGitTokenRPC = rpc
+	return func() { refreshGitTokenRPC = orig }
+}
+
+// GitTokenSHA256 is the lower-case hex SHA-256 of token, or "" for an empty
+// token. It is how a refresh request names the token the provider rejected
+// without sending the token back.
+func GitTokenSHA256(token string) string {
+	if token == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:])
+}
+
 // RefreshGitTokenForInstallationContext is RefreshGitTokenForInstallation
 // that stops polling once ctx is done and returns ctx's error. An RPC already
 // in flight still runs to its end; no new one starts after ctx is done.
-func RefreshGitTokenForInstallationContext(ctx context.Context, installationID, orgID string) (string, error) {
+//
+// rejectedToken is the token the git provider just rejected (a retry after a
+// 401), or "" for a first token. Only its SHA-256 is sent: the server mints a
+// new token when it still holds the rejected one, instead of handing it back.
+func RefreshGitTokenForInstallationContext(ctx context.Context, installationID, orgID, rejectedToken string) (string, error) {
+	rejectedTokenSHA256 := GitTokenSHA256(rejectedToken)
 	for {
 		if err := ctx.Err(); err != nil {
 			return "", err
 		}
-		token, err := refreshGitTokenRPC(installationID, orgID)
+		token, err := refreshGitTokenRPC(installationID, orgID, rejectedTokenSHA256)
 		if err == nil {
 			return token, nil
 		}

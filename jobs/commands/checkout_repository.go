@@ -102,8 +102,7 @@ func (cr *CheckoutRepository) Run(parameters map[string]interface{}, logsWriter 
 		return parameters, err
 	}
 
-	repoCloneUrlWithToken, err := commandUtils.GetRepoUrlWithToken(repoGitProvider, repoProviderToken, repoCloneUrl)
-	if err != nil {
+	if _, err = commandUtils.GetRepoUrlWithToken(repoGitProvider, repoProviderToken, repoCloneUrl); err != nil {
 		return parameters, err
 	}
 
@@ -115,25 +114,9 @@ func (cr *CheckoutRepository) Run(parameters map[string]interface{}, logsWriter 
 		return parameters, err
 	}
 	var repository *git.Repository
-	repository, err = commandUtils.CloneRepository(repoDirectoryPath, repoCloneUrlWithToken, repoProviderToken, repoGitProvider, logsWriter)
+	repository, repoProviderToken, err = cloneDeployRepositoryWithRetry(parameters, repoDirectoryPath, repoCloneUrl, repoProviderToken, repoGitProvider, logsWriter)
 	if err != nil {
-		if commandUtils.IsErrorAuthenticationRequired(err) {
-			repoProviderToken, err = commandUtils.RefreshGitToken(parameters)
-			if err != nil {
-				return parameters, err
-			}
-			repoCloneUrlWithToken, err = commandUtils.GetRepoUrlWithToken(repoGitProvider, repoProviderToken, repoCloneUrl)
-			if err != nil {
-				return parameters, err
-			}
-			repository, err = commandUtils.CloneRepository(repoDirectoryPath, repoCloneUrlWithToken, repoProviderToken, repoGitProvider, logsWriter)
-			if err != nil {
-				return parameters, err
-			}
-			jobs.SetParameterValue(parameters, parameters_enums.RepoProviderToken, repoProviderToken)
-		} else {
-			return parameters, err
-		}
+		return parameters, err
 	}
 
 	var worktree *git.Worktree
@@ -142,21 +125,9 @@ func (cr *CheckoutRepository) Run(parameters map[string]interface{}, logsWriter 
 		return parameters, err
 	}
 
-	err = commandUtils.FetchRepository(repository, repoProviderToken, repoGitProvider, logsWriter)
+	repoProviderToken, err = fetchDeployRepositoryWithRetry(parameters, repository, repoProviderToken, repoGitProvider, logsWriter)
 	if err != nil {
-		if commandUtils.IsErrorAuthenticationRequired(err) {
-			repoProviderToken, err = commandUtils.RefreshGitToken(parameters)
-			if err != nil {
-				return parameters, err
-			}
-			err = commandUtils.FetchRepository(repository, repoProviderToken, repoGitProvider, logsWriter)
-			if err != nil {
-				return parameters, err
-			}
-			jobs.SetParameterValue(parameters, parameters_enums.RepoProviderToken, repoProviderToken)
-		} else {
-			return parameters, err
-		}
+		return parameters, err
 	}
 	isPreview := isPreview(parameters)
 	var buildOrPreviewID string
@@ -273,4 +244,59 @@ func (cr *CheckoutRepository) Run(parameters map[string]interface{}, logsWriter 
 	jobs.SetParameterValue[string](parameters, parameters_enums.RepoDirectoryPath, repoDirectoryPath)
 
 	return parameters, nil
+}
+
+// cloneDeployRepositoryWithRetry clones the deployment's repository. On go-git's
+// "authentication required" it refreshes the token once — telling the server
+// which token was rejected — retries the clone with the new token and records
+// it in parameters. Returns the token the successful clone used.
+func cloneDeployRepositoryWithRetry(parameters map[string]interface{}, repoDirectoryPath, repoCloneUrl, repoProviderToken, repoGitProvider string,
+	logsWriter io.Writer) (*git.Repository, string, error) {
+	repoCloneUrlWithToken, err := commandUtils.GetRepoUrlWithToken(repoGitProvider, repoProviderToken, repoCloneUrl)
+	if err != nil {
+		return nil, repoProviderToken, err
+	}
+	repository, err := commandUtils.CloneRepository(repoDirectoryPath, repoCloneUrlWithToken, repoProviderToken, repoGitProvider, logsWriter)
+	if err == nil {
+		return repository, repoProviderToken, nil
+	}
+	if !commandUtils.IsErrorAuthenticationRequired(err) {
+		return nil, repoProviderToken, err
+	}
+	repoProviderToken, err = commandUtils.RefreshGitToken(parameters, repoProviderToken)
+	if err != nil {
+		return nil, repoProviderToken, err
+	}
+	repoCloneUrlWithToken, err = commandUtils.GetRepoUrlWithToken(repoGitProvider, repoProviderToken, repoCloneUrl)
+	if err != nil {
+		return nil, repoProviderToken, err
+	}
+	repository, err = commandUtils.CloneRepository(repoDirectoryPath, repoCloneUrlWithToken, repoProviderToken, repoGitProvider, logsWriter)
+	if err != nil {
+		return nil, repoProviderToken, err
+	}
+	jobs.SetParameterValue(parameters, parameters_enums.RepoProviderToken, repoProviderToken)
+	return repository, repoProviderToken, nil
+}
+
+// fetchDeployRepositoryWithRetry is cloneDeployRepositoryWithRetry for the
+// fetch that follows the clone. Returns the token the successful fetch used.
+func fetchDeployRepositoryWithRetry(parameters map[string]interface{}, repository *git.Repository, repoProviderToken, repoGitProvider string,
+	logsWriter io.Writer) (string, error) {
+	err := commandUtils.FetchRepository(repository, repoProviderToken, repoGitProvider, logsWriter)
+	if err == nil {
+		return repoProviderToken, nil
+	}
+	if !commandUtils.IsErrorAuthenticationRequired(err) {
+		return repoProviderToken, err
+	}
+	repoProviderToken, err = commandUtils.RefreshGitToken(parameters, repoProviderToken)
+	if err != nil {
+		return repoProviderToken, err
+	}
+	if err := commandUtils.FetchRepository(repository, repoProviderToken, repoGitProvider, logsWriter); err != nil {
+		return repoProviderToken, err
+	}
+	jobs.SetParameterValue(parameters, parameters_enums.RepoProviderToken, repoProviderToken)
+	return repoProviderToken, nil
 }
