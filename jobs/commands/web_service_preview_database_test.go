@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -1060,5 +1061,47 @@ func TestDeletePrivateServiceAlreadyGone(t *testing.T) {
 	fake = &fakeWebServiceAWS{}
 	if _, err := runPrivateServiceResourcesDelete(t, parameters, fake); err != nil || containsCall(fake.calls, "DeleteRepository ecr-org-1-deployment-1") {
 		t.Errorf("err %v, calls %v", err, fake.calls)
+	}
+}
+
+// ec2DescriptionRe is the set EC2 accepts for security group and rule
+// descriptions ("strings less than 256 characters from a-zA-Z0-9. _-:/()#,@[]+=&;{}!$*").
+// The fakes accept anything, so a description outside it only fails against AWS
+// (an apostrophe in "the preview's load balancer" did, in the first live run).
+var ec2DescriptionRe = regexp.MustCompile(`^[a-zA-Z0-9. _\-:/()#,@\[\]+=&;{}!$*]{0,255}$`)
+
+// Every description the preview stack sends to EC2 is one EC2 accepts.
+func TestPreviewStackDescriptionsAreValidForEC2(t *testing.T) {
+	check := func(what, description string) {
+		t.Helper()
+		if !ec2DescriptionRe.MatchString(description) {
+			t.Errorf("%s description %q isn't one EC2 accepts", what, description)
+		}
+	}
+
+	stackEC2 := &fakeStackEC2{}
+	if _, _, err := ensurePreviewStackSecurityGroup(stackEC2, testStack, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	check("stack group", aws.ToString(stackEC2.createInputs[0].Description))
+	for _, in := range stackEC2.authorized {
+		for _, p := range in.IpPermissions {
+			for _, pair := range p.UserIdGroupPairs {
+				check("stack self rule", aws.ToString(pair.Description))
+			}
+		}
+	}
+
+	p := map[string]interface{}{}
+	jobs.SetParameterValue(p, parameters_enums.Port, int64(8080))
+	jobs.SetParameterValue(p, parameters_enums.TaskSecurityGroupIds, primitive.A{"sg-pvsg"})
+	albEC2 := &fakeStackEC2{}
+	if err := allowPreviewStackPortFromLoadBalancer(p, albEC2, "sg-alb"); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range albEC2.authorized[0].IpPermissions {
+		for _, pair := range p.UserIdGroupPairs {
+			check("load balancer rule", aws.ToString(pair.Description))
+		}
 	}
 }
