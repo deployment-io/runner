@@ -887,7 +887,10 @@ func getPortMappingName(parameters map[string]interface{}) (string, error) {
 	return fmt.Sprintf("port-mapping-%s-%d", deploymentID, port), nil
 }
 
-func registerTaskDefinition(parameters map[string]interface{}, ecsClient *ecs.Client) (taskDefinitionArn string, err error) {
+// registerTaskDefinition registers the deployment's task definition; customize,
+// when given, adjusts its container before it's registered (the preview MongoDB's
+// replica set).
+func registerTaskDefinition(parameters map[string]interface{}, ecsClient *ecs.Client, customize ...func(*ecsTypes.ContainerDefinition)) (taskDefinitionArn string, err error) {
 
 	taskDefinitionArnFromParams, err := jobs.GetParameterValue[string](parameters, parameters_enums.TaskDefinitionArn)
 	if err == nil && len(taskDefinitionArnFromParams) > 0 {
@@ -966,6 +969,10 @@ func registerTaskDefinition(parameters map[string]interface{}, ecsClient *ecs.Cl
 		Privileged:             aws.Bool(false),
 		PseudoTerminal:         aws.Bool(false),
 		ReadonlyRootFilesystem: aws.Bool(false),
+	}
+
+	for _, c := range customize {
+		c(&containerDefinition)
 	}
 
 	isPrivateRepository, _ := jobs.GetParameterValue[bool](parameters, parameters_enums.IsPrivateRegistry)
@@ -1167,9 +1174,10 @@ func getInternalDnsName(parameters map[string]interface{}) (string, error) {
 }
 
 // getEcsServiceNetworkConfiguration is the network a deployment's tasks run in:
-// the private subnets, no security groups of their own and no public IP. The
-// service and the pre-deploy command's one-off task both use it, so the
-// pre-deploy command reaches exactly what the service reaches.
+// the private subnets, no public IP and no security groups of their own (so the
+// VPC's default one) — or, for a Task's backend preview, exactly its
+// TaskSecurityGroupIds. The service and the pre-deploy command's one-off task
+// both use it, so the pre-deploy command reaches exactly what the service reaches.
 func getEcsServiceNetworkConfiguration(parameters map[string]interface{}) (*ecsTypes.NetworkConfiguration, error) {
 	privateSubnets, err := jobs.GetParameterValue[primitive.A](parameters, parameters_enums.PrivateSubnets)
 	if err != nil {
@@ -1179,16 +1187,69 @@ func getEcsServiceNetworkConfiguration(parameters map[string]interface{}) (*ecsT
 	if err != nil {
 		return nil, err
 	}
+	securityGroups, err := getTaskSecurityGroupIds(parameters)
+	if err != nil {
+		return nil, err
+	}
 	return &ecsTypes.NetworkConfiguration{
 		AwsvpcConfiguration: &ecsTypes.AwsVpcConfiguration{
-			Subnets: privateSubnetsSlice,
+			Subnets:        privateSubnetsSlice,
+			SecurityGroups: securityGroups,
 		},
+	}, nil
+}
+
+// getTaskSecurityGroupIds is the TaskSecurityGroupIds a Task's backend preview
+// runs in; nil when unset (every production deploy).
+func getTaskSecurityGroupIds(parameters map[string]interface{}) ([]string, error) {
+	groups, err := jobs.GetParameterValue[primitive.A](parameters, parameters_enums.TaskSecurityGroupIds)
+	if err != nil || len(groups) == 0 {
+		return nil, nil
+	}
+	return commandUtils.ConvertPrimitiveAToStringSlice(groups)
+}
+
+// getEcsServiceConnectConfiguration is the Service Connect configuration
+// createEcsServiceIfNeeded creates a service with: its port mapping under its
+// alias in its namespace.
+func getEcsServiceConnectConfiguration(parameters map[string]interface{}) (*ecsTypes.ServiceConnectConfiguration, error) {
+	namespaceName, err := getNamespaceName(parameters)
+	if err != nil {
+		return nil, err
+	}
+	port, err := jobs.GetParameterValue[int64](parameters, parameters_enums.Port)
+	if err != nil {
+		return nil, err
+	}
+	portMappingName, err := getPortMappingName(parameters)
+	if err != nil {
+		return nil, err
+	}
+	dnsName, err := getInternalDnsName(parameters)
+	if err != nil {
+		return nil, err
+	}
+	return &ecsTypes.ServiceConnectConfiguration{
+		Enabled:   true,
+		Namespace: aws.String(namespaceName),
+		Services: []ecsTypes.ServiceConnectService{{
+			PortName: aws.String(portMappingName),
+			ClientAliases: []ecsTypes.ServiceConnectClientAlias{{
+				Port:    aws.Int32(int32(port)),
+				DnsName: aws.String(dnsName),
+			}},
+		}},
 	}, nil
 }
 
 // ecsServiceDeployOptions changes how a deploy creates or updates its ECS
 // service. The zero value is what every production deploy does.
 type ecsServiceDeployOptions struct {
+	// previewStack deploys a Task's backend preview into its preview stack's
+	// security group (TaskSecurityGroupIds, exactly one) instead of the VPC's
+	// default group: the default group is never edited, and the stack group admits
+	// the service's port from the preview's own load balancer group.
+	previewStack bool
 	// skipServiceStableWait returns once the service is created or updated,
 	// without waiting for it to settle. A Task's backend preview sets it: its
 	// readiness is checked by verify_preview_reachable on its health URL.
@@ -1197,6 +1258,11 @@ type ecsServiceDeployOptions struct {
 	// name in its namespace (private_service_dns.go). Only DeployAwsPrivateService
 	// sets it.
 	registerDnsName bool
+	// updateServiceConnect also passes the Service Connect configuration when
+	// it updates an existing service, so a new task definition whose port (and
+	// so its port mapping's name) changed is accepted. Only a Task's preview
+	// database sets it: changing its engine changes its port.
+	updateServiceConnect bool
 }
 
 // waitForEcsServiceStable waits until the service settles. Swapped by tests
@@ -1403,6 +1469,19 @@ func updateEcsService(parameters map[string]interface{}, ecsClient *ecs.Client, 
 		// deployment. Nil leaves a registry the service already has as is.
 		updateServiceInput.ServiceRegistries = missingDnsServiceRegistries(parameters, ecsServiceAPIClient, describeServicesInput, logsWriter)
 	}
+	if opts.updateServiceConnect {
+		updateServiceInput.ServiceConnectConfiguration, err = getEcsServiceConnectConfiguration(parameters)
+		if err != nil {
+			return err
+		}
+	}
+	if groups, _ := getTaskSecurityGroupIds(parameters); len(groups) > 0 {
+		// A preview's existing service moves onto its stack's groups.
+		updateServiceInput.NetworkConfiguration, err = getEcsServiceNetworkConfiguration(parameters)
+		if err != nil {
+			return err
+		}
+	}
 	_, err = ecsServiceAPIClient.UpdateService(context.TODO(), updateServiceInput)
 
 	if err != nil {
@@ -1443,7 +1522,7 @@ func (d *DeployAwsWebService) Run(parameters map[string]interface{}, logsWriter 
 // backend preview: the same deploy, without waiting for the ECS service to
 // settle.
 func deployAwsWebServicePreview(parameters map[string]interface{}, logsWriter io.Writer) (map[string]interface{}, error) {
-	return runAwsWebServiceDeploy(parameters, logsWriter, ecsServiceDeployOptions{skipServiceStableWait: true})
+	return runAwsWebServiceDeploy(parameters, logsWriter, ecsServiceDeployOptions{skipServiceStableWait: true, previewStack: true})
 }
 
 // runAwsWebServiceDeploy is deployAwsWebService; tests replace it to see the
@@ -1474,14 +1553,21 @@ func deployAwsWebService(parameters map[string]interface{}, logsWriter io.Writer
 	if err != nil {
 		return parameters, err
 	}
-	err = addIngressRuleToDefaultVpcSecurityGroupForPortIfNeeded(parameters, ec2Client)
-	if err != nil {
-		return parameters, err
+	if !opts.previewStack {
+		err = addIngressRuleToDefaultVpcSecurityGroupForPortIfNeeded(parameters, ec2Client)
+		if err != nil {
+			return parameters, err
+		}
 	}
 	var securityGroupId string
 	securityGroupId, err = createAlbSecurityGroupIfNeeded(parameters, ec2Client, logsWriter)
 	if err != nil {
 		return parameters, err
+	}
+	if opts.previewStack {
+		if err = allowPreviewStackPortFromLoadBalancer(parameters, ec2Client, securityGroupId); err != nil {
+			return parameters, err
+		}
 	}
 	elbClient, err := cloud_api_clients.GetElbClient(parameters)
 	if err != nil {

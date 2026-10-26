@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -316,6 +317,9 @@ type fakeWebPreviewSteps struct {
 	logs  map[string]io.Writer
 	fail  string // the step that fails
 	seen  []map[string]interface{}
+	// stackCreated says the stack group is new to this deploy; stackErr fails it.
+	stackCreated bool
+	stackErr     error
 }
 
 func (f *fakeWebPreviewSteps) step(name string) webPreviewStep {
@@ -339,6 +343,20 @@ func (f *fakeWebPreviewSteps) steps() webPreviewSteps {
 	f.logs = map[string]io.Writer{}
 	return webPreviewSteps{
 		build: f.step("build"), upload: f.step("upload"), deploy: f.step("deploy"),
+		stack: func(taskID string, _ map[string]interface{}, _ agenttools.WebServicePreviewDeployInput, port int64) (string, bool, error) {
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			f.calls = append(f.calls, fmt.Sprintf("stack %s %d", taskID, port))
+			if f.stackErr != nil {
+				return "", false, f.stackErr
+			}
+			return "sg-pvsg", f.stackCreated, nil
+		},
+		removeStack: func(_ map[string]interface{}, groupID string, _ io.Writer) {
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			f.calls = append(f.calls, "removeStack "+groupID)
+		},
 		loadBalancerDNS: func(p map[string]interface{}) (string, error) {
 			f.mu.Lock()
 			defer f.mu.Unlock()
@@ -371,7 +389,7 @@ func webPreviewBuildDir(t *testing.T) (buildDir, org string) {
 }
 
 func testWebPreviewDeployer(org string, steps webPreviewSteps) webPreviewDeployer {
-	return webPreviewDeployer{organizationIDNamespace: org, organizationIdFromJob: testWebOrgID, region: 1, steps: steps}
+	return webPreviewDeployer{organizationIDNamespace: org, organizationIdFromJob: testWebOrgID, region: 1, taskID: "task-1", steps: steps}
 }
 
 func TestWebPreviewDeployRunsProductionStepsInOrder(t *testing.T) {
@@ -384,7 +402,7 @@ func TestWebPreviewDeployRunsProductionStepsInOrder(t *testing.T) {
 	if err != nil || out.LoadBalancerDNS != "alb-x.elb.amazonaws.com" {
 		t.Fatalf("got %+v, %v", out, err)
 	}
-	if got := strings.Join(fake.calls, ","); got != "build,upload,deploy,dns" {
+	if got := strings.Join(fake.calls, ","); got != "stack task-1 0,build,upload,deploy,dns" {
 		t.Errorf("steps = %s", got)
 	}
 	if fake.logs["build"] != &buildLogs || fake.logs["upload"] != &logs || fake.logs["deploy"] != &logs {
@@ -497,7 +515,7 @@ func TestWebPreviewDeployStepFailure(t *testing.T) {
 	if err == nil || err.Error() != "The backend preview's deploy failed: upload broke" {
 		t.Fatalf("got %v", err)
 	}
-	if got := strings.Join(fake.calls, ","); got != "build,upload" {
+	if got := strings.Join(fake.calls, ","); got != "stack task-1 0,build,upload" {
 		t.Errorf("steps = %s", got)
 	}
 
@@ -558,9 +576,9 @@ func TestWebServiceDeployEntryPointsOptions(t *testing.T) {
 	if _, err := deployAwsWebServicePreview(map[string]interface{}{}, io.Discard); err != nil {
 		t.Fatal(err)
 	}
-	want := []ecsServiceDeployOptions{{}, {skipServiceStableWait: true}}
+	want := []ecsServiceDeployOptions{{}, {skipServiceStableWait: true, previewStack: true}}
 	if !reflect.DeepEqual(got, want) {
-		t.Errorf("options = %+v, want production waiting and the preview not", got)
+		t.Errorf("options = %+v, want production waiting in the default group and the preview not waiting, in its stack group", got)
 	}
 	// And the options reach the service steps.
 	steps := &fakeServiceSteps{shouldUpdate: true, preDeployEcsClient: &fakePreDeployEcs{}}
@@ -644,8 +662,13 @@ func TestPreviewStoreMapsWebFields(t *testing.T) {
 		dto.CloudfrontDistributionDomainName != "d1" || dto.EcsServiceArn != "svc" || dto.LoadBalancerArn != "" {
 		t.Errorf("dto = %+v", dto)
 	}
-	if store := buildWebServicePreviewDeps(commandUtils.TaskJobContext{OrganizationID: "o", TaskID: "t"}, webPreviewJobParameters(t), t.TempDir(), io.Discard, nil).Store.(taskPreviewStore); store.serviceType != task_previews.ServiceTypeWebService {
+	deps := buildWebServicePreviewDeps(commandUtils.TaskJobContext{OrganizationID: "o", TaskID: "t"}, webPreviewJobParameters(t), t.TempDir(), io.Discard, nil)
+	if store := deps.Store.(taskPreviewStore); store.serviceType != task_previews.ServiceTypeWebService {
 		t.Errorf("the web store is bound to %q", store.serviceType)
+	}
+	// The preview database is a private service of the Task.
+	if store := deps.DatabaseStore.(taskPreviewStore); store.serviceType != task_previews.ServiceTypePrivateService || store.taskID != "t" || store.orgID != "o" {
+		t.Errorf("the database store is %+v", store)
 	}
 }
 

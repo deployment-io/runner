@@ -2156,6 +2156,7 @@ func buildWebServicePreviewDeps(ctx commandUtils.TaskJobContext, parameters map[
 	deployer := webPreviewDeployer{
 		organizationIDNamespace: orgNamespace,
 		organizationIdFromJob:   orgFromJob,
+		taskID:                  ctx.TaskID,
 		steps:                   productionWebPreviewSteps(),
 	}
 	if rt, err := region_enums.GetType(runnerRegion); err == nil {
@@ -2171,6 +2172,11 @@ func buildWebServicePreviewDeps(ctx commandUtils.TaskJobContext, parameters map[
 			orgID:       orgID,
 			taskID:      taskID,
 			serviceType: task_previews.ServiceTypeWebService,
+		},
+		DatabaseStore: taskPreviewStore{
+			orgID:       orgID,
+			taskID:      taskID,
+			serviceType: task_previews.ServiceTypePrivateService,
 		},
 		Record:       record,
 		Repositories: ctx.Entries,

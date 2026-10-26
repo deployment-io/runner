@@ -512,11 +512,13 @@ func mustKey(t *testing.T, k parameters_enums.Key) string {
 // deployEcsServiceAfterPreDeploy (tested above with fakes) and return on its
 // error, and don't create or update the service themselves. The rest of Run
 // needs live AWS, so this pins it in the source. The web service's steps are
-// deployAwsWebService, which its Run and the backend preview both run.
+// deployAwsWebService, which its Run and the backend preview both run; the
+// private service's are deployAwsPrivateService, which its Run and the preview
+// database both run.
 func TestDeployCommandsDeployTheServiceAfterThePreDeployCommand(t *testing.T) {
 	for file, steps := range map[string]struct{ receiver, name string }{
 		"deploy_aws_web_service.go":     {name: "deployAwsWebService"},
-		"deploy_aws_private_service.go": {receiver: "DeployAwsPrivateService", name: "Run"},
+		"deploy_aws_private_service.go": {name: "deployAwsPrivateService"},
 	} {
 		fset := token.NewFileSet()
 		f, err := parser.ParseFile(fset, file, nil, 0)
