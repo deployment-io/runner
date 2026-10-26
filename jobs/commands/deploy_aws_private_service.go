@@ -3,6 +3,9 @@ package commands
 import (
 	"io"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	ecsTypes "github.com/aws/aws-sdk-go-v2/service/ecs/types"
+
 	"github.com/deployment-io/deployment-runner-kit/builds"
 	"github.com/deployment-io/deployment-runner-kit/cloud_api_clients"
 	"github.com/deployment-io/deployment-runner-kit/enums/iam_policy_enums"
@@ -10,6 +13,7 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/iam_policies"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner-kit/previews"
+	"github.com/deployment-io/deployment-runner-kit/task_previews"
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
 	"github.com/deployment-io/deployment-runner/utils"
 )
@@ -27,8 +31,17 @@ func (d *DeployAwsPrivateService) Run(parameters map[string]interface{}, logsWri
 // security group, which a preview never edits (its own group admits its port),
 // and updating an existing service's Service Connect port with its task
 // definition (a changed engine has another port).
-func deployAwsPrivateServicePreview(parameters map[string]interface{}, logsWriter io.Writer) (map[string]interface{}, error) {
-	return runAwsPrivateServiceDeploy(parameters, logsWriter, privateServiceDeployOptions{updateServiceConnect: true})
+func deployAwsPrivateServicePreview(parameters map[string]interface{}, logsWriter io.Writer, engine string) (map[string]interface{}, error) {
+	return runAwsPrivateServiceDeploy(parameters, logsWriter, previewDatabaseDeployOptions(engine))
+}
+
+// previewDatabaseDeployOptions are the preview database's private-service deploy
+// options: MongoDB runs as a single-node replica set.
+func previewDatabaseDeployOptions(engine string) privateServiceDeployOptions {
+	return privateServiceDeployOptions{
+		updateServiceConnect: true,
+		mongoReplicaSet:      engine == task_previews.PreviewDatabaseEngineMongoDB,
+	}
 }
 
 // privateServiceDeployOptions changes how a private service deploys.
@@ -39,6 +52,9 @@ type privateServiceDeployOptions struct {
 	// updateServiceConnect is ecsServiceDeployOptions.updateServiceConnect. The
 	// preview database sets it.
 	updateServiceConnect bool
+	// mongoReplicaSet runs the container as a single-node MongoDB replica set
+	// (mongoReplicaSetContainer). A MongoDB preview database sets it.
+	mongoReplicaSet bool
 }
 
 // runAwsPrivateServiceDeploy is deployAwsPrivateService; tests replace it to see
@@ -79,7 +95,11 @@ func deployAwsPrivateService(parameters map[string]interface{}, logsWriter io.Wr
 	if err != nil {
 		return parameters, err
 	}
-	taskDefinitionArn, err := registerTaskDefinition(parameters, ecsClient)
+	var customize []func(*ecsTypes.ContainerDefinition)
+	if opts.mongoReplicaSet {
+		customize = append(customize, mongoReplicaSetContainer)
+	}
+	taskDefinitionArn, err := registerTaskDefinition(parameters, ecsClient, customize...)
 	if err != nil {
 		return parameters, err
 	}
@@ -127,4 +147,21 @@ func deployAwsPrivateService(parameters map[string]interface{}, logsWriter io.Wr
 	<-MarkDeploymentDone(parameters, nil)
 
 	return parameters, nil
+}
+
+// mongoReplicaSetContainer makes the official MongoDB image a single-node replica
+// set: started with --replSet, and initiated by its own health check, which runs
+// inside the container (nothing outside can reach it) and is idempotent — it
+// initiates only while rs.status() fails. ECS counts the task healthy, and the
+// deploy settled, once the replica set is up.
+func mongoReplicaSetContainer(container *ecsTypes.ContainerDefinition) {
+	container.Command = []string{"--replSet", mongoReplicaSetName, "--bind_ip_all"}
+	container.HealthCheck = &ecsTypes.HealthCheck{
+		Command: []string{"CMD-SHELL",
+			`mongosh --quiet --eval "try { rs.status().ok } catch (e) { rs.initiate().ok }" | grep -q 1`},
+		Interval:    aws.Int32(10),
+		Timeout:     aws.Int32(10),
+		Retries:     aws.Int32(6),
+		StartPeriod: aws.Int32(30),
+	}
 }

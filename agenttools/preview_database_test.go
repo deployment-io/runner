@@ -124,7 +124,9 @@ func runDatabasePreview(t *testing.T, deps DeployWebServicePreviewDeps) deployWe
 
 func TestDeployWebServicePreviewWithDatabase(t *testing.T) {
 	service := webService("api", "us-east-1", "services/api")
-	service.PreDeployCommand = "npx prisma migrate deploy"
+	// The production pre-deploy command never runs in a preview.
+	service.PreDeployCommand = "DATABASE_URL=postgres://prod:pw@prod-db/app ./prod-migrate"
+	service.PreviewMigrateCommand = "npx prisma migrate deploy"
 	service.VariableNames = []string{"DATABASE_URL"}
 	var logs bytes.Buffer
 	var got WebServicePreviewDeployInput
@@ -137,13 +139,13 @@ func TestDeployWebServicePreviewWithDatabase(t *testing.T) {
 	want := &previewDatabaseResult{
 		Engine: "postgres", Version: "16", Image: "public.ecr.aws/docker/library/postgres:16",
 		Variables: []string{"DATABASE_URL", "DIRECT_URL"}, Evidence: []string{"prisma/schema.prisma"},
-		Source: "detected", Migrations: "ran `npx prisma migrate deploy`",
+		Source: "detected", Migrations: previewMigrationsRan,
 	}
 	if !reflect.DeepEqual(res.Database, want) || res.DatabaseNote != "" {
 		t.Errorf("database = %+v, note %q\nwant %+v", res.Database, res.DatabaseNote, want)
 	}
 	if got.Database == nil || got.Database.PreviewID != "64f0c0ffee0123456789abcd" || got.Database.ServiceKey != got.ServiceKey+"-db" ||
-		got.Database.Engine != "postgres" || got.Database.Port != 5432 {
+		got.Database.Engine != "postgres" || got.Database.Port != 5432 || got.Database.MigrateCommand != "npx prisma migrate deploy" {
 		t.Errorf("deploy input database = %+v", got.Database)
 	}
 	if len(databaseStore.ensured) != 1 || databaseStore.ensured[0] != got.ServiceKey+"-db" {
@@ -154,7 +156,7 @@ func TestDeployWebServicePreviewWithDatabase(t *testing.T) {
 		"Preview database variables: DATABASE_URL, DIRECT_URL\n",
 		"Preview database evidence: prisma/schema.prisma\n",
 		"Preview database: DIRECT_URL is read in the code but not set in production; the preview sets it\n",
-		"Preview database migrations: ran `npx prisma migrate deploy`\n",
+		"Preview database migrations: " + previewMigrationsRan + "\n",
 	} {
 		if !strings.Contains(logs.String(), line) {
 			t.Errorf("Step log lacks %q:\n%s", line, logs.String())
@@ -163,19 +165,35 @@ func TestDeployWebServicePreviewWithDatabase(t *testing.T) {
 	if strings.Contains(res.LogTail, "Preview database") {
 		t.Errorf("the database lines reached the agent's log tail: %q", res.LogTail)
 	}
+	// Neither command's text is shown anywhere.
+	result, _ := json.Marshal(res)
+	for _, text := range []string{"prisma migrate deploy", "prod-migrate", "prod:pw"} {
+		if strings.Contains(logs.String(), text) || strings.Contains(string(result), text) {
+			t.Errorf("%q reached the Step log or the result", text)
+		}
+	}
 }
 
-func TestDeployWebServicePreviewWithDatabaseNoPreDeployCommand(t *testing.T) {
+// With no preview migrate command set, nothing runs: not the production pre-deploy
+// command either.
+func TestDeployWebServicePreviewWithDatabaseNoMigrateCommand(t *testing.T) {
+	service := webService("api", "us-east-1", "services/api")
+	service.PreDeployCommand = "npx prisma migrate deploy"
 	var logs bytes.Buffer
-	deps, _ := databaseDeps(t, webService("api", "us-east-1", "services/api"), nil, &logs,
-		func(context.Context, WebServicePreviewDeployInput) (WebServicePreviewDeployOutput, error) {
+	var got WebServicePreviewDeployInput
+	deps, _ := databaseDeps(t, service, nil, &logs,
+		func(_ context.Context, in WebServicePreviewDeployInput) (WebServicePreviewDeployOutput, error) {
+			got = in
 			return WebServicePreviewDeployOutput{LoadBalancerDNS: "alb-x.elb.amazonaws.com"}, nil
 		})
 	res := runDatabasePreview(t, deps)
-	if res.Database == nil || res.Database.Migrations != "no pre-deploy command" {
+	if got.Database == nil || got.Database.MigrateCommand != "" {
+		t.Fatalf("deploy input database = %+v; want no migrate command", got.Database)
+	}
+	if res.Database == nil || res.Database.Migrations != previewMigrationsNotSet {
 		t.Errorf("database = %+v", res.Database)
 	}
-	if !strings.Contains(logs.String(), "Preview database migrations: no pre-deploy command\n") {
+	if !strings.Contains(logs.String(), "Preview database migrations: "+previewMigrationsNotSet+"\n") {
 		t.Errorf("Step log:\n%s", logs.String())
 	}
 }
@@ -196,6 +214,7 @@ func TestDeployWebServicePreviewWithoutDatabase(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			service := webService("api", "us-east-1", "services/api")
 			service.PreDeployCommand = "./migrate"
+			service.PreviewMigrateCommand = "./migrate"
 			if tc.service != nil {
 				tc.service(&service)
 			}
@@ -235,74 +254,27 @@ func TestDeployWebServicePreviewWithoutDatabase(t *testing.T) {
 }
 
 func TestPreviewDatabaseMigrations(t *testing.T) {
-	variables := []string{"DB_URL"}
 	for _, tc := range []struct {
-		command, wantRun, wantSummary string
+		command, wantRun, wantSummary, wantFailed string
 	}{
-		{"", "", "no pre-deploy command"},
-		{"npx prisma migrate deploy", "npx prisma migrate deploy", "ran `npx prisma migrate deploy`"},
-		{"RAILS_ENV=production SECRET_KEY_BASE=abc123 bin/rails db:migrate", "RAILS_ENV=production SECRET_KEY_BASE=abc123 bin/rails db:migrate",
-			"ran `RAILS_ENV=*** SECRET_KEY_BASE=*** bin/rails db:migrate`"},
-		{"curl -s https://user:t0ken@hooks.example.com && ./migrate", "curl -s https://user:t0ken@hooks.example.com && ./migrate",
-			"ran `curl -s https://***@hooks.example.com && ./migrate`"},
-		{"DATABASE_URL=postgres://prod:pw@prod-db/app ./migrate", "",
-			"didn't run the pre-deploy command: it sets DATABASE_URL itself, which could point it at a database the preview doesn't own"},
-		{"export DB_URL=$PROD_DB; ./migrate", "",
-			"didn't run the pre-deploy command: it sets DB_URL itself, which could point it at a database the preview doesn't own"},
-		{"env PGHOST=prod ./migrate", "",
-			"didn't run the pre-deploy command: it sets PGHOST itself, which could point it at a database the preview doesn't own"},
-		{"./migrate --url mysql://root:pw@prod-db/app", "",
-			"didn't run the pre-deploy command: it names a database URL itself, which could point it at a database the preview doesn't own"},
-		{"psql -h shared-db -U app -d shared -f migrations.sql", "",
-			"didn't run the pre-deploy command: it names a database host itself (psql -h), which could point it at a database the preview doesn't own"},
-		{"./migrate --host shared-db.internal", "",
-			"didn't run the pre-deploy command: it names a database address itself (--host), which could point it at a database the preview doesn't own"},
-		{`psql "host=shared-db dbname=app" -f schema.sql`, "",
-			"didn't run the pre-deploy command: it names a database host itself, which could point it at a database the preview doesn't own"},
-		// The preview's own variable is the preview's address.
-		{`npx prisma db execute --url "$DB_URL" --file x.sql`, `npx prisma db execute --url "$DB_URL" --file x.sql`,
-			"ran `npx prisma db execute --url \"$DB_URL\" --file x.sql`"},
-		{"./migrate --password hunter2 && curl -H 'Authorization: Bearer abc' https://x/?token=zzz", "./migrate --password hunter2 && curl -H 'Authorization: Bearer abc' https://x/?token=zzz",
-			"ran `./migrate --password *** && curl -H 'Authorization: ***' https://x/?token=***`"},
-		{"mysql -upreview -pS3cret < schema.sql && ./notify ghp_a1B2c3D4e5F6g7H8i9J0k1L2m3", "mysql -upreview -pS3cret < schema.sql && ./notify ghp_a1B2c3D4e5F6g7H8i9J0k1L2m3",
-			"ran `mysql -upreview -p*** < schema.sql && ./notify ***`"},
-		{"bin/rails db:migrate", "bin/rails db:migrate", "ran `bin/rails db:migrate`"},
-		{"python manage.py migrate --noinput", "python manage.py migrate --noinput", "ran `python manage.py migrate --noinput`"},
+		{"", "", previewMigrationsNotSet, previewMigrationsNotSet},
+		{" \t", "", previewMigrationsNotSet, previewMigrationsNotSet},
+		{"npx prisma migrate deploy", "npx prisma migrate deploy", previewMigrationsRan, previewMigrationsUnknown},
+		{"DATABASE_URL=postgres://x ./migrate", "DATABASE_URL=postgres://x ./migrate", previewMigrationsRan, previewMigrationsUnknown},
 	} {
-		run, plan := previewDatabaseMigrations(tc.command, variables)
-		if run != tc.wantRun || plan.summary() != tc.wantSummary {
-			t.Errorf("%q: run %q, summary %q; want %q, %q", tc.command, run, plan.summary(), tc.wantRun, tc.wantSummary)
+		run, plan := previewDatabaseMigrations(tc.command)
+		if run != tc.wantRun || plan.summary() != tc.wantSummary || plan.failedSummary() != tc.wantFailed {
+			t.Errorf("%q: run %q, summary %q, failed %q; want %q, %q, %q", tc.command, run, plan.summary(), plan.failedSummary(),
+				tc.wantRun, tc.wantSummary, tc.wantFailed)
 		}
 	}
 }
 
-func TestDeployWebServicePreviewWithDatabaseSkipsOwnDatabaseCommand(t *testing.T) {
-	service := webService("api", "us-east-1", "services/api")
-	service.PreDeployCommand = "DATABASE_URL=postgres://prod:pw@prod-db/app npx prisma migrate deploy"
-	var logs bytes.Buffer
-	var got WebServicePreviewDeployInput
-	deps, _ := databaseDeps(t, service, nil, &logs,
-		func(_ context.Context, in WebServicePreviewDeployInput) (WebServicePreviewDeployOutput, error) {
-			got = in
-			return WebServicePreviewDeployOutput{LoadBalancerDNS: "alb-x.elb.amazonaws.com"}, nil
-		})
-	res := runDatabasePreview(t, deps)
-	if got.Database == nil || got.Database.PreDeployCommand != "" {
-		t.Fatalf("deploy input database = %+v; want no pre-deploy command", got.Database)
-	}
-	if res.Database == nil || !strings.HasPrefix(res.Database.Migrations, "didn't run the pre-deploy command: it sets DATABASE_URL itself") {
-		t.Errorf("database = %+v", res.Database)
-	}
-	if strings.Contains(logs.String(), "prod:pw") {
-		t.Errorf("the command's credentials reached the Step log:\n%s", logs.String())
-	}
-}
-
-// A failed deploy's error carries the database and the log tail (the pre-deploy
-// command's output), never a password or a URL.
+// A failed deploy's error carries the database and the log tail (the preview
+// migrate command's output), never a password, a URL or the command's text.
 func TestDeployWebServicePreviewWithDatabaseFailure(t *testing.T) {
 	service := webService("api", "us-east-1", "services/api")
-	service.PreDeployCommand = "npx prisma migrate deploy"
+	service.PreviewMigrateCommand = "npx prisma migrate deploy"
 	var logs bytes.Buffer
 	deps, _ := databaseDeps(t, service, nil, &logs,
 		func(_ context.Context, in WebServicePreviewDeployInput) (WebServicePreviewDeployOutput, error) {
@@ -317,17 +289,17 @@ func TestDeployWebServicePreviewWithDatabaseFailure(t *testing.T) {
 	}
 	msg := err.Error()
 	for _, want := range []string{"exit code 1", `"engine":"postgres"`, `"variables":["DATABASE_URL","DIRECT_URL"]`,
-		"npx prisma migrate deploy", "P3009 migrate found failed migrations"} {
+		previewMigrationsUnknown, "P3009 migrate found failed migrations"} {
 		if !strings.Contains(msg, want) {
 			t.Errorf("error lacks %q: %s", want, msg)
 		}
 	}
-	for _, secret := range []string{"preview:preview", "postgresql://"} {
+	for _, secret := range []string{"preview:preview", "postgresql://", "npx prisma migrate deploy"} {
 		if strings.Contains(msg, secret) {
 			t.Errorf("error carries %q: %s", secret, msg)
 		}
 	}
-	if !strings.Contains(logs.String(), "Preview database migrations: the deploy failed before it finished") {
+	if !strings.Contains(logs.String(), "Preview database migrations: "+previewMigrationsUnknown) {
 		t.Errorf("Step log:\n%s", logs.String())
 	}
 }

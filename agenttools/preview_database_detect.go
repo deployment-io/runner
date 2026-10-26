@@ -216,6 +216,11 @@ func (s *previewDatabaseScan) file(p, content string) {
 				s.strong.add("sqlite", p)
 			case strings.Contains(m[1], "oracle"):
 				s.strong.add("oracle", p)
+			default:
+				// Any other backend (CockroachDB, SQL Server, a custom one) is an
+				// engine preview databases don't support: it must not fall through
+				// to a driver dependency's weak signal.
+				s.strong.add(m[1], p)
 			}
 		}
 	}
@@ -365,8 +370,10 @@ func (s *previewDatabaseScan) prisma(p, content string) {
 }
 
 var (
-	railsAdapter = regexp.MustCompile(`(?m)^\s*adapter:\s*["']?([A-Za-z0-9_]+)`)
-	railsURL     = regexp.MustCompile(`(?m)^\s*url:\s*(.*)$`)
+	// [ \t]*, never \s*: \s matches a newline, so an empty `url:` would take
+	// the next line as its value.
+	railsAdapter = regexp.MustCompile(`(?m)^[ \t]*adapter:[ \t]*["']?([A-Za-z0-9_]+)`)
+	railsURL     = regexp.MustCompile(`(?m)^[ \t]*url:[ \t]*(.*)$`)
 	railsEnvRead = regexp.MustCompile(`ENV(?:\[\s*|\.fetch\(\s*)["']([A-Za-z_][A-Za-z0-9_]*)["']`)
 )
 

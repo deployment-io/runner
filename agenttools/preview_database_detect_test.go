@@ -153,6 +153,10 @@ func TestDetectPreviewDatabaseConflictsAndOtherEngines(t *testing.T) {
 		{"a cache says nothing", map[string]string{
 			"docker-compose.yml": "services:\n  cache:\n    image: redis:7\n  db:\n    image: postgres:16\n",
 		}, "postgres", ""},
+		{"django unsupported backend over a driver dependency", map[string]string{
+			"settings.py":      "DATABASES = {'default': {'ENGINE': 'django_cockroachdb'}}\n",
+			"requirements.txt": "psycopg2-binary>=2.9\n",
+		}, "", "found signs of django_cockroachdb, which preview databases don't support"},
 		{"nothing", map[string]string{"README.md": "hello"}, "", "no database detected"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -225,6 +229,10 @@ func TestDetectPreviewDatabaseVariables(t *testing.T) {
 		}, reason: "config/database.yml sets the database address itself, not from a variable"},
 		{name: "rails empty url", files: map[string]string{
 			"config/database.yml": "production:\n  adapter: postgresql\n  url:\n",
+		}, vars: []string{"DATABASE_URL"}, notInProd: []string{"DATABASE_URL"}},
+		// An empty url: followed by another key isn't that key's value.
+		{name: "rails empty url before another key", files: map[string]string{
+			"config/database.yml": "production:\n  adapter: postgresql\n  url:\n  pool: 5\n",
 		}, vars: []string{"DATABASE_URL"}, notInProd: []string{"DATABASE_URL"}},
 		{name: "prisma url set in the file", files: map[string]string{
 			"prisma/schema.prisma": "datasource db {\n  provider = \"postgresql\"\n  url = \"postgresql://app:secret@shared-db/app\"\n}\n",

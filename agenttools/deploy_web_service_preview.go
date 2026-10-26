@@ -131,7 +131,7 @@ type WebServicePreviewDeployInput struct {
 	// Existing is what EnsurePreview returned: the handles a prior deploy persisted.
 	Existing PreviewState
 	// Database is the preview's own database, deployed before the API, which
-	// then runs against it (and its pre-deploy command with it). Nil: none, and
+	// then runs against it (and the preview migrate command, if set, with it). Nil: none, and
 	// the API deploys exactly as without one.
 	Database *PreviewDatabaseDeploy
 	// BuildLogs gets the image build's output: the Step log only, since a build can
@@ -203,7 +203,8 @@ func RegisterDeployWebServicePreview(s *agentmcp.Server, deps DeployWebServicePr
 			"was created or updated, not that it's serving yet: call verify_preview_reachable on health_url until it is live " +
 			"(a new preview takes a few minutes). Re-call to redeploy after changes; the same URL is reused. When the service's " +
 			"code needs a Postgres, MySQL or MongoDB database, deployment.io runs a throwaway one beside the preview, points the " +
-			"service's database variables at it and runs the service's pre-deploy command (migrations) against it first: " +
+			"service's database variables at it and, when a person set a preview migrate command for the service, runs it " +
+			"against the database first: " +
 			"`database` in the result says which, from which files, and whether migrations ran; `database_note` says why " +
 			"there is none.",
 		InputSchema: json.RawMessage(deployWebServicePreviewInputSchema),
@@ -438,7 +439,7 @@ func runWebServicePreview(ctx context.Context, deps DeployWebServicePreviewDeps,
 	}
 	var databaseResult *previewDatabaseResult
 	if database != nil {
-		// The API's service deploy runs only after the pre-deploy command succeeded.
+		// The API's service deploy runs only after the preview migrate command, if set, succeeded.
 		migrations := database.Migrations.summary()
 		logPreviewDatabaseMigrations(deps.LogsWriter, migrations)
 		databaseResult = newPreviewDatabaseResult(database.PreviewDatabasePlan, migrations)
@@ -465,7 +466,7 @@ func runWebServicePreview(ctx context.Context, deps DeployWebServicePreviewDeps,
 
 // webPreviewFailureDetails is what a failed deploy's error carries after its
 // message when the preview has its own database: the database, and the log tail
-// (the pre-deploy command's output when it failed). Never a password or a URL.
+// (the preview migrate command's output when it failed). Never a password or a URL.
 type webPreviewFailureDetails struct {
 	Database *previewDatabaseResult `json:"database"`
 	LogTail  string                 `json:"log_tail,omitempty"`
@@ -512,12 +513,12 @@ func planPreviewDatabase(ctx context.Context, deps DeployWebServicePreviewDeps, 
 		return nil, "", fmt.Errorf("ensure preview database record: %w", err)
 	}
 	logPreviewDatabasePlan(deps.LogsWriter, *plan)
-	command, migrations := previewDatabaseMigrations(p.service.PreDeployCommand, plan.Variables)
+	command, migrations := previewDatabaseMigrations(p.service.PreviewMigrateCommand)
 	return &PreviewDatabaseDeploy{
 		PreviewID:           previewID,
 		ServiceKey:          serviceKey,
 		PreviewDatabasePlan: *plan,
-		PreDeployCommand:    command,
+		MigrateCommand:      command,
 		Migrations:          migrations,
 	}, "", nil
 }

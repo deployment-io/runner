@@ -1,10 +1,12 @@
 package commands
 
 // preview_stack_security_group.go is the security group of a Task's backend preview
-// stack, pvsg-<taskID>: the preview database runs in it alone, the API preview in it
-// and the VPC's default group, and it admits the database's port only from itself —
-// so only that Task's preview reaches its database. The deletes of the stack's
-// services remove it once nothing uses it.
+// stack, pvsg-<taskID>. Every backend preview runs in it alone — the API preview,
+// its database and its one-off tasks — never in the VPC's default group, which a
+// preview never edits either. It admits the database's port from itself and the
+// API's port from the preview's own load balancer group, so only that Task's
+// preview reaches its database and only through its load balancer reaches its API.
+// The deletes of the stack's services remove it once nothing uses it.
 
 import (
 	"context"
@@ -18,6 +20,8 @@ import (
 	ec2Types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
 	ecsTypes "github.com/aws/aws-sdk-go-v2/service/ecs/types"
 	"github.com/aws/smithy-go"
+	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
+	"github.com/deployment-io/deployment-runner-kit/jobs"
 )
 
 // previewTaskTagKey tags a Task's preview stack group with the Task's id. A delete
@@ -39,7 +43,7 @@ type previewStackSecurityGroupAPI interface {
 }
 
 // previewStack is a Task's preview stack in a VPC, and the port its database
-// listens on.
+// listens on (0: the stack has no database, so no rule for one).
 type previewStack struct {
 	vpcID  string
 	taskID string
@@ -93,7 +97,7 @@ func ensurePreviewStackSecurityGroup(ec2Client previewStackSecurityGroupAPI, sta
 		}
 	}
 	groupID := aws.ToString(group.GroupId)
-	if hasSelfIngressRule(group, groupID, port) {
+	if port == 0 || hasSelfIngressRule(group, groupID, port) {
 		return groupID, created, nil
 	}
 	_, err = ec2Client.AuthorizeSecurityGroupIngress(context.TODO(), &ec2.AuthorizeSecurityGroupIngressInput{
@@ -250,6 +254,97 @@ func deletePreviewStackSecurityGroup(ec2Client securityGroupDeleteAPI, groupID s
 		default:
 			io.WriteString(logsWriter, fmt.Sprintf("Couldn't delete security group %s: %s\n", groupID, err))
 			return
+		}
+	}
+}
+
+// previewStackIngressAPI is the part of *ec2.Client admitting the API's port into
+// the stack group uses.
+type previewStackIngressAPI interface {
+	AuthorizeSecurityGroupIngress(ctx context.Context, params *ec2.AuthorizeSecurityGroupIngressInput, optFns ...func(*ec2.Options)) (*ec2.AuthorizeSecurityGroupIngressOutput, error)
+}
+
+// allowPreviewStackPortFromLoadBalancer admits the preview's port into its stack
+// group (TaskSecurityGroupIds, exactly one) from its load balancer's group: the
+// load balancer reaches the API through the stack group, never the VPC's default
+// one. A rule that already exists is fine.
+func allowPreviewStackPortFromLoadBalancer(parameters map[string]interface{}, ec2Client previewStackIngressAPI, loadBalancerGroupID string) error {
+	groups, err := getTaskSecurityGroupIds(parameters)
+	if err != nil {
+		return err
+	}
+	if len(groups) != 1 {
+		return fmt.Errorf("a backend preview runs in exactly one security group, its stack's (got %d)", len(groups))
+	}
+	port, err := jobs.GetParameterValue[int64](parameters, parameters_enums.Port)
+	if err != nil {
+		return err
+	}
+	_, err = ec2Client.AuthorizeSecurityGroupIngress(context.TODO(), &ec2.AuthorizeSecurityGroupIngressInput{
+		GroupId: aws.String(groups[0]),
+		IpPermissions: []ec2Types.IpPermission{{
+			IpProtocol:       aws.String("tcp"),
+			FromPort:         aws.Int32(int32(port)),
+			ToPort:           aws.Int32(int32(port)),
+			UserIdGroupPairs: []ec2Types.UserIdGroupPair{{GroupId: aws.String(loadBalancerGroupID), Description: aws.String("the preview's load balancer")}},
+		}},
+	})
+	if err != nil && !isDuplicateSecurityGroupRuleError(err) {
+		return fmt.Errorf("allow port %d into security group %s from the load balancer: %w", port, groups[0], err)
+	}
+	return nil
+}
+
+// previewStackRevokeAPI is the part of *ec2.Client removing the stack group's rule
+// for a load balancer's group uses.
+type previewStackRevokeAPI interface {
+	DescribeSecurityGroups(ctx context.Context, params *ec2.DescribeSecurityGroupsInput, optFns ...func(*ec2.Options)) (*ec2.DescribeSecurityGroupsOutput, error)
+	RevokeSecurityGroupIngress(ctx context.Context, params *ec2.RevokeSecurityGroupIngressInput, optFns ...func(*ec2.Options)) (*ec2.RevokeSecurityGroupIngressOutput, error)
+}
+
+// revokePreviewStackIngressFrom removes, from those of groupIDs that are preview
+// stack groups, every rule admitting traffic from sourceGroupID (a preview's load
+// balancer group, about to be deleted: EC2 refuses to delete a group another
+// group's rule references). It never fails the delete; a rule left behind makes
+// that group's delete fail, which the job reports as before.
+func revokePreviewStackIngressFrom(ec2Client previewStackRevokeAPI, groupIDs []string, sourceGroupID string, logsWriter io.Writer) {
+	for _, groupID := range groupIDs {
+		if groupID == "" || groupID == sourceGroupID {
+			continue
+		}
+		out, err := ec2Client.DescribeSecurityGroups(context.TODO(), &ec2.DescribeSecurityGroupsInput{GroupIds: []string{groupID}})
+		if isSecurityGroupNotFoundError(err) {
+			continue
+		}
+		if err != nil {
+			io.WriteString(logsWriter, fmt.Sprintf("Couldn't check security group %s: %s\n", groupID, err))
+			continue
+		}
+		if len(out.SecurityGroups) == 0 || !isPreviewStackSecurityGroup(out.SecurityGroups[0]) {
+			continue
+		}
+		for _, permission := range out.SecurityGroups[0].IpPermissions {
+			var pairs []ec2Types.UserIdGroupPair
+			for _, pair := range permission.UserIdGroupPairs {
+				if aws.ToString(pair.GroupId) == sourceGroupID {
+					pairs = append(pairs, ec2Types.UserIdGroupPair{GroupId: pair.GroupId})
+				}
+			}
+			if len(pairs) == 0 {
+				continue
+			}
+			_, err := ec2Client.RevokeSecurityGroupIngress(context.TODO(), &ec2.RevokeSecurityGroupIngressInput{
+				GroupId: aws.String(groupID),
+				IpPermissions: []ec2Types.IpPermission{{
+					IpProtocol:       permission.IpProtocol,
+					FromPort:         permission.FromPort,
+					ToPort:           permission.ToPort,
+					UserIdGroupPairs: pairs,
+				}},
+			})
+			if err != nil && !isSecurityGroupNotFoundError(err) {
+				io.WriteString(logsWriter, fmt.Sprintf("Couldn't remove security group %s's rule for %s: %s\n", groupID, sourceGroupID, err))
+			}
 		}
 	}
 }

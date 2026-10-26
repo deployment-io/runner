@@ -44,7 +44,7 @@ func testPreviewDatabase(engine, version string, variables ...string) *agenttool
 		PreviewDatabasePlan: agenttools.PreviewDatabasePlan{
 			Engine: engine, Version: version, Image: image, Port: e.Port, Variables: variables, Source: "detected",
 		},
-		PreDeployCommand: "./migrate",
+		MigrateCommand: "./migrate",
 	}
 }
 
@@ -124,8 +124,8 @@ func TestBuildPreviewDatabaseParametersPerEngine(t *testing.T) {
 	}{
 		{"mysql", "8.0", "public.ecr.aws/docker/library/mysql:8.0", "1024",
 			"MYSQL_DATABASE=preview\nMYSQL_PASSWORD=preview\nMYSQL_RANDOM_ROOT_PASSWORD=yes\nMYSQL_USER=preview\n", 3306},
-		{"mongodb", "", "public.ecr.aws/docker/library/mongo:7.0", "1024",
-			"MONGO_INITDB_DATABASE=preview\nMONGO_INITDB_ROOT_PASSWORD=preview\nMONGO_INITDB_ROOT_USERNAME=preview\n", 27017},
+		// No user: a single-node replica set without auth.
+		{"mongodb", "", "public.ecr.aws/docker/library/mongo:7.0", "1024", "", 27017},
 	} {
 		in := testPreviewDatabaseParametersInput("/tmp/orgns/b")
 		in.Database = *testPreviewDatabase(tc.engine, tc.version, "DATABASE_URL")
@@ -212,24 +212,41 @@ func TestPreviewDatabaseVariableValues(t *testing.T) {
 	for engine, url := range map[string]string{
 		"postgres": "postgresql://preview:preview@" + host + ":5432/preview",
 		"mysql":    "mysql://preview:preview@" + host + ":3306/preview",
-		"mongodb":  "mongodb://preview:preview@" + host + ":27017/preview?authSource=admin",
+		// No user, and reached directly: the driver must not look up the replica
+		// set's member, which is named after the container.
+		"mongodb": "mongodb://" + host + ":27017/preview?directConnection=true",
 	} {
 		e, _ := task_previews.LookupPreviewDatabaseEngine(engine)
 		got := previewDatabaseVariableValues(engine, host, e.Port, names)
 		port := map[string]string{"postgres": "5432", "mysql": "3306", "mongodb": "27017"}[engine]
+		user := "preview"
+		if engine == "mongodb" {
+			user = ""
+		}
 		want := map[string]string{
-			"DATABASE_URL": url, "DB_HOST": host, "DB_PORT": port, "DB_USER": "preview", "DB_USERNAME": "preview",
-			"DB_PASSWORD": "preview", "DB_PASS": "preview", "DB_NAME": "preview", "DB_DATABASE": "preview", "MONGO_DB": "preview",
-			"PGHOST": host, "PGPORT": port, "PGUSER": "preview", "PGPASSWORD": "preview", "PGDATABASE": "preview",
+			"DATABASE_URL": url, "DB_HOST": host, "DB_PORT": port, "DB_USER": user, "DB_USERNAME": user,
+			"DB_PASSWORD": user, "DB_PASS": user, "DB_NAME": "preview", "DB_DATABASE": "preview", "MONGO_DB": "preview",
+			"PGHOST": host, "PGPORT": port, "PGUSER": user, "PGPASSWORD": user, "PGDATABASE": "preview",
 		}
 		if !reflect.DeepEqual(got, want) {
 			t.Errorf("%s: got %v\nwant %v", engine, got, want)
 		}
 	}
+	// A MySQL *_DSN variable gets the Go MySQL driver's form; other engines' DSN a URL.
+	if got := previewDatabaseVariableValues("mysql", host, 3306, []string{"DATABASE_DSN", "MYSQL_DSN", "DATABASE_URL"}); !reflect.DeepEqual(got, map[string]string{
+		"DATABASE_DSN": "preview:preview@tcp(" + host + ":3306)/preview",
+		"MYSQL_DSN":    "preview:preview@tcp(" + host + ":3306)/preview",
+		"DATABASE_URL": "mysql://preview:preview@" + host + ":3306/preview",
+	}) {
+		t.Errorf("mysql DSN values = %v", got)
+	}
+	if got := previewDatabaseVariableValues("postgres", host, 5432, []string{"DATABASE_DSN"}); got["DATABASE_DSN"] != "postgresql://preview:preview@"+host+":5432/preview" {
+		t.Errorf("postgres DSN value = %v", got)
+	}
 	init := map[string]map[string]string{
 		"postgres": {"POSTGRES_USER": "preview", "POSTGRES_PASSWORD": "preview", "POSTGRES_DB": "preview"},
 		"mysql":    {"MYSQL_USER": "preview", "MYSQL_PASSWORD": "preview", "MYSQL_DATABASE": "preview", "MYSQL_RANDOM_ROOT_PASSWORD": "yes"},
-		"mongodb":  {"MONGO_INITDB_ROOT_USERNAME": "preview", "MONGO_INITDB_ROOT_PASSWORD": "preview", "MONGO_INITDB_DATABASE": "preview"},
+		"mongodb":  {},
 	}
 	for engine, want := range init {
 		if got := previewDatabaseInitVariables(engine); !reflect.DeepEqual(got, want) {
@@ -268,9 +285,13 @@ func (f *fakePreviewDatabaseECS) DescribeTaskDefinition(_ context.Context, in *e
 func TestDeployPreviewDatabaseIfChanged(t *testing.T) {
 	const image = "public.ecr.aws/docker/library/postgres:16"
 	active := &ecsTypes.Service{Status: aws.String("ACTIVE"), TaskDefinition: aws.String("arn:td:3"),
-		NetworkConfiguration: &ecsTypes.NetworkConfiguration{AwsvpcConfiguration: &ecsTypes.AwsVpcConfiguration{SecurityGroups: []string{"sg-pvsg"}}}}
+		NetworkConfiguration: &ecsTypes.NetworkConfiguration{AwsvpcConfiguration: &ecsTypes.AwsVpcConfiguration{SecurityGroups: []string{"sg-pvsg"}}},
+		ServiceRegistries:    []ecsTypes.ServiceRegistry{{RegistryArn: aws.String("arn:servicediscovery:srv-1")}}}
 	otherGroup := *active
 	otherGroup.NetworkConfiguration = &ecsTypes.NetworkConfiguration{AwsvpcConfiguration: &ecsTypes.AwsVpcConfiguration{SecurityGroups: []string{"sg-gone"}}}
+	// Created before its DNS registration failed: redeployed, which registers it.
+	noDNS := *active
+	noDNS.ServiceRegistries = nil
 	for _, tc := range []struct {
 		name       string
 		ecs        *fakePreviewDatabaseECS
@@ -282,6 +303,7 @@ func TestDeployPreviewDatabaseIfChanged(t *testing.T) {
 		{"version changed", &fakePreviewDatabaseECS{service: active, image: "public.ecr.aws/docker/library/postgres:15"}, true, false},
 		{"engine changed", &fakePreviewDatabaseECS{service: active, image: "public.ecr.aws/docker/library/mysql:8.4"}, true, false},
 		{"in an earlier stack group", &fakePreviewDatabaseECS{service: &otherGroup, image: image}, true, false},
+		{"no DNS registration", &fakePreviewDatabaseECS{service: &noDNS, image: image}, true, false},
 		{"inactive", &fakePreviewDatabaseECS{service: &ecsTypes.Service{Status: aws.String("INACTIVE"), TaskDefinition: aws.String("arn:td:3")}, image: image}, true, false},
 		{"describe fails", &fakePreviewDatabaseECS{describeErr: errors.New("ThrottlingException")}, false, true},
 	} {
@@ -290,8 +312,11 @@ func TestDeployPreviewDatabaseIfChanged(t *testing.T) {
 			t.Cleanup(func() { getPreviewDatabaseECSClient, runPreviewDatabaseDeploy = originalClient, originalDeploy })
 			getPreviewDatabaseECSClient = func(map[string]interface{}) (previewDatabaseECSAPI, error) { return tc.ecs, nil }
 			deployed := 0
-			runPreviewDatabaseDeploy = func(p map[string]interface{}, _ io.Writer) (map[string]interface{}, error) {
+			runPreviewDatabaseDeploy = func(p map[string]interface{}, _ io.Writer, engine string) (map[string]interface{}, error) {
 				deployed++
+				if engine != "postgres" {
+					t.Errorf("deployed engine %q", engine)
+				}
 				return p, nil
 			}
 			p, err := buildPreviewDatabaseParameters(testPreviewDatabaseParametersInput("/tmp/orgns/b"))
@@ -299,7 +324,7 @@ func TestDeployPreviewDatabaseIfChanged(t *testing.T) {
 				t.Fatal(err)
 			}
 			var logs bytes.Buffer
-			err = deployPreviewDatabaseIfChanged(p, image, "sg-pvsg", &logs)
+			err = deployPreviewDatabaseIfChanged(p, "postgres", image, "sg-pvsg", &logs)
 			if (err != nil) != tc.wantErr || (deployed == 1) != tc.wantDeploy {
 				t.Errorf("err %v, deployed %d times; want deploy %v", err, deployed, tc.wantDeploy)
 			}
@@ -325,7 +350,7 @@ func TestSetWebPreviewDatabaseParameters(t *testing.T) {
 		t.Fatal(err)
 	}
 	host := "pv-db-db01.previews-1b2c"
-	if err := setWebPreviewDatabaseParameters(p, in, webPreviewDatabase{host: host, securityGroupID: "sg-pvsg", defaultSecurityGroupID: "sg-default"}); err != nil {
+	if err := setWebPreviewDatabaseParameters(p, in, webPreviewDatabase{host: host}); err != nil {
 		t.Fatal(err)
 	}
 	url := "postgresql://preview:preview@" + host + ":5432/preview"
@@ -333,43 +358,48 @@ func TestSetWebPreviewDatabaseParameters(t *testing.T) {
 	if got := paramValue(t, p, parameters_enums.EnvironmentVariables); got != wantEnv {
 		t.Errorf("environment = %q\nwant %q", got, wantEnv)
 	}
+	// The person-set preview migrate command, never the production one.
 	if got := paramValue(t, p, parameters_enums.PreDeployCommand); got != "./migrate" {
 		t.Errorf("PreDeployCommand = %v", got)
 	}
-	if got := paramValue(t, p, parameters_enums.TaskSecurityGroupIds); !reflect.DeepEqual(got, primitive.A{"sg-default", "sg-pvsg"}) {
-		t.Errorf("TaskSecurityGroupIds = %v", got)
+	if _, ok := p[mustKey(t, parameters_enums.TaskSecurityGroupIds)]; ok {
+		t.Error("the database step set the API's security groups; the deployer sets the stack group")
 	}
-	// The pre-deploy one-off task runs in the API's groups, so it reaches the database.
+	// The migrate command's one-off task runs in the API's group (the stack group,
+	// as the deployer sets it), so it reaches the database.
+	jobs.SetParameterValue(p, parameters_enums.TaskSecurityGroupIds, primitive.A{"sg-pvsg"})
 	runTask, err := getPreDeployRunTaskInput(p, "arn:cluster", "c", "./migrate")
-	if err != nil || !reflect.DeepEqual(runTask.NetworkConfiguration.AwsvpcConfiguration.SecurityGroups, []string{"sg-default", "sg-pvsg"}) {
+	if err != nil || !reflect.DeepEqual(runTask.NetworkConfiguration.AwsvpcConfiguration.SecurityGroups, []string{"sg-pvsg"}) {
 		t.Errorf("pre-deploy network = %+v, %v", runTask.NetworkConfiguration, err)
 	}
 
-	// A "use" setting's variable wins over Preview configuration's.
+	// A "use" setting's variable wins over Preview configuration's; with no preview
+	// migrate command, nothing runs, whatever production's pre-deploy command is.
 	in.Database.Variables = []string{"API_KEY"}
-	in.Database.PreDeployCommand = ""
+	in.Database.MigrateCommand = ""
+	in.Service.PreDeployCommand = "DATABASE_URL=postgres://prod/app ./migrate"
 	p, _ = buildWebPreviewParameters(webPreviewParametersInput{OrganizationIDNamespace: "orgns", OrganizationIdFromJob: testWebOrgID, Region: 1, Deploy: in})
-	if err := setWebPreviewDatabaseParameters(p, in, webPreviewDatabase{host: host, securityGroupID: "sg-pvsg", defaultSecurityGroupID: "sg-default"}); err != nil {
+	if err := setWebPreviewDatabaseParameters(p, in, webPreviewDatabase{host: host}); err != nil {
 		t.Fatal(err)
 	}
 	if got := paramValue(t, p, parameters_enums.EnvironmentVariables).(string); !strings.Contains(got, "API_KEY="+url+"\n") {
 		t.Errorf("environment = %q", got)
 	}
 	if _, ok := p[mustKey(t, parameters_enums.PreDeployCommand)]; ok {
-		t.Error("PreDeployCommand set without one")
+		t.Error("PreDeployCommand set without a preview migrate command")
 	}
 }
 
 // fakeDatabaseStep records the database step in the fake steps' order.
 func (f *fakeWebPreviewSteps) databaseStep(fail error) func(string, map[string]interface{}, agenttools.WebServicePreviewDeployInput) (webPreviewDatabase, error) {
-	return func(taskID string, _ map[string]interface{}, in agenttools.WebServicePreviewDeployInput) (webPreviewDatabase, error) {
+	return func(stackGroupID string, _ map[string]interface{}, in agenttools.WebServicePreviewDeployInput) (webPreviewDatabase, error) {
 		f.mu.Lock()
 		defer f.mu.Unlock()
-		f.calls = append(f.calls, "database "+taskID+" "+in.Database.ServiceKey)
+		f.calls = append(f.calls, "database "+stackGroupID+" "+in.Database.ServiceKey)
 		if fail != nil {
 			return webPreviewDatabase{}, fail
 		}
-		return webPreviewDatabase{host: "pv-db-db01.previews-1b2c", securityGroupID: "sg-pvsg", defaultSecurityGroupID: "sg-default"}, nil
+		return webPreviewDatabase{host: "pv-db-db01.previews-1b2c"}, nil
 	}
 }
 
@@ -385,12 +415,12 @@ func TestWebPreviewDeployWithDatabase(t *testing.T) {
 	if _, err := d.deploy(context.Background(), in); err != nil {
 		t.Fatal(err)
 	}
-	if got := strings.Join(fake.calls, ","); got != "database task-1 "+in.Database.ServiceKey+",build,upload,deploy,dns" {
+	if got := strings.Join(fake.calls, ","); got != "stack task-1 5432,database sg-pvsg "+in.Database.ServiceKey+",build,upload,deploy,dns" {
 		t.Errorf("steps = %s", got)
 	}
 	p := fake.seen[2]
-	if got := paramValue(t, p, parameters_enums.TaskSecurityGroupIds); !reflect.DeepEqual(got, primitive.A{"sg-default", "sg-pvsg"}) {
-		t.Errorf("TaskSecurityGroupIds = %v", got)
+	if got := paramValue(t, p, parameters_enums.TaskSecurityGroupIds); !reflect.DeepEqual(got, primitive.A{"sg-pvsg"}) {
+		t.Errorf("TaskSecurityGroupIds = %v; want the stack group alone", got)
 	}
 	if paramValue(t, p, parameters_enums.PreDeployCommand) != "./migrate" ||
 		!strings.Contains(paramValue(t, p, parameters_enums.EnvironmentVariables).(string), "DATABASE_URL=postgresql://preview:preview@pv-db-db01.previews-1b2c:5432/preview\n") {
@@ -402,14 +432,15 @@ func TestWebPreviewDeployWithDatabase(t *testing.T) {
 	steps = fake.steps()
 	steps.database = fake.databaseStep(errors.New("ECS said no"))
 	_, err := testWebPreviewDeployer(org, steps).deploy(context.Background(), in)
-	if err == nil || err.Error() != "The backend preview's deploy failed: the preview database: ECS said no" || len(fake.calls) != 1 {
+	if err == nil || err.Error() != "The backend preview's deploy failed: the preview database: ECS said no" || len(fake.calls) != 2 {
 		t.Errorf("got %v, steps %v", err, fake.calls)
 	}
 }
 
-// Without a preview database the API's map is exactly as before: no pre-deploy
-// command, no security groups, Preview configuration's variables only.
-func TestWebPreviewDeployWithoutDatabaseIsUnchanged(t *testing.T) {
+// Without a preview database the API still runs in the stack group alone (no
+// database port), with no pre-deploy command and Preview configuration's
+// variables only.
+func TestWebPreviewDeployWithoutDatabase(t *testing.T) {
 	buildDir, org := webPreviewBuildDir(t)
 	fake := &fakeWebPreviewSteps{}
 	steps := fake.steps()
@@ -418,14 +449,15 @@ func TestWebPreviewDeployWithoutDatabaseIsUnchanged(t *testing.T) {
 	if _, err := testWebPreviewDeployer(org, steps).deploy(context.Background(), in); err != nil {
 		t.Fatal(err)
 	}
-	if got := strings.Join(fake.calls, ","); got != "build,upload,deploy,dns" {
+	if got := strings.Join(fake.calls, ","); got != "stack task-1 0,build,upload,deploy,dns" {
 		t.Errorf("steps = %s", got)
 	}
 	p := fake.seen[2]
-	for _, never := range []parameters_enums.Key{parameters_enums.PreDeployCommand, parameters_enums.TaskSecurityGroupIds} {
-		if _, ok := p[mustKey(t, never)]; ok {
-			t.Errorf("%s is set without a preview database", never)
-		}
+	if _, ok := p[mustKey(t, parameters_enums.PreDeployCommand)]; ok {
+		t.Error("PreDeployCommand is set without a preview database")
+	}
+	if got := paramValue(t, p, parameters_enums.TaskSecurityGroupIds); !reflect.DeepEqual(got, primitive.A{"sg-pvsg"}) {
+		t.Errorf("TaskSecurityGroupIds = %v; want the stack group alone", got)
 	}
 	if got := paramValue(t, p, parameters_enums.EnvironmentVariables); got != "API_KEY=s3cret\nEMPTY=\nURL=https://x/?a=b\nZED=last\n" {
 		t.Errorf("environment = %q", got)
@@ -511,7 +543,8 @@ func TestOnlyPreviewsSetTaskSecurityGroupIds(t *testing.T) {
 			if !ok || sel.Sel.Name != "SetParameterValue" {
 				return true
 			}
-			if key, ok := call.Args[1].(*ast.SelectorExpr); ok && key.Sel.Name == "TaskSecurityGroupIds" && file != "web_service_preview_database.go" {
+			if key, ok := call.Args[1].(*ast.SelectorExpr); ok && key.Sel.Name == "TaskSecurityGroupIds" &&
+				file != "web_service_preview_database.go" && file != "web_service_preview.go" {
 				t.Errorf("%s sets TaskSecurityGroupIds", file)
 			}
 			return true
@@ -530,12 +563,15 @@ func TestPrivateServiceDeployEntryPointsOptions(t *testing.T) {
 	if _, err := (&DeployAwsPrivateService{}).Run(map[string]interface{}{}, io.Discard); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := deployAwsPrivateServicePreview(map[string]interface{}{}, io.Discard); err != nil {
-		t.Fatal(err)
+	for _, engine := range []string{"postgres", "mysql", "mongodb"} {
+		if _, err := deployAwsPrivateServicePreview(map[string]interface{}{}, io.Discard, engine); err != nil {
+			t.Fatal(err)
+		}
 	}
-	want := []privateServiceDeployOptions{{addDefaultVpcIngressRule: true}, {updateServiceConnect: true}}
+	want := []privateServiceDeployOptions{{addDefaultVpcIngressRule: true},
+		{updateServiceConnect: true}, {updateServiceConnect: true}, {updateServiceConnect: true, mongoReplicaSet: true}}
 	if !reflect.DeepEqual(got, want) {
-		t.Errorf("options = %+v; want production editing the default group and the preview not", got)
+		t.Errorf("options = %+v; want production editing the default group, the preview not, and MongoDB a replica set", got)
 	}
 	if runPreviewDatabaseDeploy == nil || reflect.ValueOf(runPreviewDatabaseDeploy).Pointer() != reflect.ValueOf(deployAwsPrivateServicePreview).Pointer() {
 		t.Error("the preview database must deploy through deployAwsPrivateServicePreview")
@@ -690,54 +726,112 @@ func TestPreviewStackGroupRemovedWhenTheDeployFailsFirst(t *testing.T) {
 	if _, _, err := ensurePreviewStackSecurityGroup(ec2Client, testStack, io.Discard); err == nil || containsCall(ec2Client.calls, "DeleteSecurityGroup sg-1") {
 		t.Errorf("err %v, calls %v", err, ec2Client.calls)
 	}
+}
 
-	orgDir, err := os.MkdirTemp("/tmp", "org")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { os.RemoveAll(orgDir) })
-	api := map[string]interface{}{}
-	jobs.SetParameterValue(api, parameters_enums.OrganizationIDNamespace, filepath.Base(orgDir))
-	jobs.SetParameterValue(api, parameters_enums.OrganizationIdFromJob, testWebOrgID)
-	jobs.SetParameterValue(api, parameters_enums.Region, int64(1))
-	in := testWebPreviewInput("/unused")
+// The deployer removes a stack group this deploy created when the deploy fails
+// (removeStack keeps one something already uses); a group that was already there,
+// or a deploy that succeeds, keeps it.
+func TestWebPreviewDeployRemovesTheStackGroupItCreated(t *testing.T) {
+	buildDir, org := webPreviewBuildDir(t)
+	in := testWebPreviewInput(buildDir)
 	in.Database = testPreviewDatabase("postgres", "", "DATABASE_URL")
-	originalClient, originalDeploy := getPreviewDatabaseECSClient, runPreviewDatabaseDeploy
-	t.Cleanup(func() { getPreviewDatabaseECSClient, runPreviewDatabaseDeploy = originalClient, originalDeploy })
-	getPreviewDatabaseECSClient = func(map[string]interface{}) (previewDatabaseECSAPI, error) { return &fakePreviewDatabaseECS{}, nil }
-	deployErr := errors.New("RegisterTaskDefinition: AccessDenied")
-	runPreviewDatabaseDeploy = func(map[string]interface{}, io.Writer) (map[string]interface{}, error) { return nil, deployErr }
+	stack, database := "stack task-1 5432", "database sg-pvsg "+in.Database.ServiceKey
 	for _, tc := range []struct {
-		name       string
-		ec2        *fakeStackEC2
-		wantDelete string
+		name        string
+		created     bool
+		databaseErr error
+		fail        string
+		want        []string
 	}{
-		{"created here", &fakeStackEC2{}, "DeleteSecurityGroup sg-new"},
-		{"created here, already in use", &fakeStackEC2{deleteErr: &smithy.GenericAPIError{Code: "DependencyViolation"}}, "DeleteSecurityGroup sg-new"},
-		{"already there", &fakeStackEC2{groups: []ec2Types.SecurityGroup{stackGroup("sg-1", 5432)}}, ""},
+		{"created, the database fails", true, errors.New("ECS said no"), "",
+			[]string{stack, database, "removeStack sg-pvsg"}},
+		{"created, the API's deploy fails", true, nil, "deploy",
+			[]string{stack, database, "build", "upload", "deploy", "removeStack sg-pvsg"}},
+		{"already there, the database fails", false, errors.New("ECS said no"), "",
+			[]string{stack, database}},
+		{"created, the deploy succeeds", true, nil, "",
+			[]string{stack, database, "build", "upload", "deploy", "dns"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			var logs bytes.Buffer
-			in.Logs = &logs
-			if _, err := deployPreviewDatabaseInStack(tc.ec2, "task-1", api, in); !errors.Is(err, deployErr) {
-				t.Fatalf("err %v", err)
+			fake := &fakeWebPreviewSteps{fail: tc.fail, stackCreated: tc.created}
+			steps := fake.steps()
+			steps.database = fake.databaseStep(tc.databaseErr)
+			_, err := testWebPreviewDeployer(org, steps).deploy(context.Background(), in)
+			if (err != nil) != (tc.databaseErr != nil || tc.fail != "") {
+				t.Errorf("err %v", err)
 			}
-			last := tc.ec2.calls[len(tc.ec2.calls)-1]
-			if gotDelete := strings.HasPrefix(last, "DeleteSecurityGroup"); gotDelete != (tc.wantDelete != "") || (gotDelete && last != tc.wantDelete) {
-				t.Errorf("calls %v; want delete %q", tc.ec2.calls, tc.wantDelete)
-			}
-			if tc.ec2.deleteErr != nil && !strings.Contains(logs.String(), "something already uses it") {
-				t.Errorf("logs:\n%s", logs.String())
+			if !reflect.DeepEqual(fake.calls, tc.want) {
+				t.Errorf("steps %v\nwant %v", fake.calls, tc.want)
 			}
 		})
 	}
-	// A deploy that succeeds keeps the group it created.
-	runPreviewDatabaseDeploy = func(p map[string]interface{}, _ io.Writer) (map[string]interface{}, error) { return p, nil }
-	ec2Client = &fakeStackEC2{}
-	in.Logs = io.Discard
-	db, err := deployPreviewDatabaseInStack(ec2Client, "task-1", api, in)
-	if err != nil || db.securityGroupID != "sg-new" || db.host == "" || containsCall(ec2Client.calls, "DeleteSecurityGroup sg-new") {
-		t.Errorf("db %+v, err %v, calls %v", db, err, ec2Client.calls)
+	// The stack group failing fails the deploy before anything else.
+	fake := &fakeWebPreviewSteps{stackErr: errors.New("UnauthorizedOperation")}
+	steps := fake.steps()
+	steps.database = fake.databaseStep(nil)
+	_, err := testWebPreviewDeployer(org, steps).deploy(context.Background(), in)
+	if err == nil || err.Error() != "The backend preview's deploy failed: the preview's security group: UnauthorizedOperation" ||
+		!reflect.DeepEqual(fake.calls, []string{stack}) {
+		t.Errorf("err %v, steps %v", err, fake.calls)
+	}
+}
+
+// A stack without a database gets its group and no rule within it.
+func TestEnsurePreviewStackSecurityGroupWithoutDatabase(t *testing.T) {
+	ec2Client := &fakeStackEC2{}
+	id, created, err := ensurePreviewStackSecurityGroup(ec2Client, previewStack{vpcID: "vpc-1", taskID: "task-1"}, io.Discard)
+	if err != nil || id != "sg-new" || !created || len(ec2Client.authorized) != 0 {
+		t.Errorf("got %q, %v, %v; authorized %v", id, created, err, ec2Client.authorized)
+	}
+}
+
+// The API preview's port is admitted into its stack group from its load
+// balancer's group only.
+func TestAllowPreviewStackPortFromLoadBalancer(t *testing.T) {
+	p := map[string]interface{}{}
+	jobs.SetParameterValue(p, parameters_enums.Port, int64(8080))
+	jobs.SetParameterValue(p, parameters_enums.TaskSecurityGroupIds, primitive.A{"sg-pvsg"})
+	ec2Client := &fakeStackEC2{}
+	if err := allowPreviewStackPortFromLoadBalancer(p, ec2Client, "sg-alb"); err != nil {
+		t.Fatal(err)
+	}
+	in := ec2Client.authorized[0]
+	permission := in.IpPermissions[0]
+	if aws.ToString(in.GroupId) != "sg-pvsg" || aws.ToInt32(permission.FromPort) != 8080 || aws.ToInt32(permission.ToPort) != 8080 ||
+		len(permission.UserIdGroupPairs) != 1 || aws.ToString(permission.UserIdGroupPairs[0].GroupId) != "sg-alb" || len(permission.IpRanges) != 0 {
+		t.Errorf("ingress %+v into %s", permission, aws.ToString(in.GroupId))
+	}
+	// A rule already there is fine; another error fails the deploy.
+	ec2Client = &fakeStackEC2{authorizeErr: &smithy.GenericAPIError{Code: "InvalidPermission.Duplicate"}}
+	if err := allowPreviewStackPortFromLoadBalancer(p, ec2Client, "sg-alb"); err != nil {
+		t.Errorf("duplicate: %v", err)
+	}
+	ec2Client = &fakeStackEC2{authorizeErr: &smithy.GenericAPIError{Code: "RulesPerSecurityGroupLimitExceeded"}}
+	if err := allowPreviewStackPortFromLoadBalancer(p, ec2Client, "sg-alb"); err == nil {
+		t.Error("an ingress error must fail")
+	}
+	// Exactly one group: the stack's.
+	for _, groups := range []primitive.A{nil, {"sg-default", "sg-pvsg"}} {
+		jobs.SetParameterValue(p, parameters_enums.TaskSecurityGroupIds, groups)
+		if err := allowPreviewStackPortFromLoadBalancer(p, &fakeStackEC2{}, "sg-alb"); err == nil {
+			t.Errorf("groups %v: want a refusal", groups)
+		}
+	}
+}
+
+// A MongoDB preview database is a single-node replica set its own health check
+// initiates.
+func TestMongoReplicaSetContainer(t *testing.T) {
+	container := ecsTypes.ContainerDefinition{Name: aws.String("c")}
+	mongoReplicaSetContainer(&container)
+	if !reflect.DeepEqual(container.Command, []string{"--replSet", "rs0", "--bind_ip_all"}) {
+		t.Errorf("command %v", container.Command)
+	}
+	check := container.HealthCheck
+	if check == nil || len(check.Command) != 2 || check.Command[0] != "CMD-SHELL" ||
+		!strings.Contains(check.Command[1], "rs.initiate()") || !strings.Contains(check.Command[1], "rs.status()") ||
+		aws.ToInt32(check.StartPeriod) == 0 || aws.ToInt32(check.Retries) == 0 {
+		t.Errorf("health check %+v", check)
 	}
 }
 
@@ -757,18 +851,36 @@ func stubSecurityGroupSleep(t *testing.T) *[]time.Duration {
 	return &sleeps
 }
 
+// albRule admits port from the load balancer's group sg-alb.
+func albRule(port int32) ec2Types.IpPermission {
+	return ec2Types.IpPermission{IpProtocol: aws.String("tcp"), FromPort: aws.Int32(port), ToPort: aws.Int32(port),
+		UserIdGroupPairs: []ec2Types.UserIdGroupPair{{GroupId: aws.String("sg-alb")}}}
+}
+
+// previewStackFake is a service in the default group, its Task's stack group
+// (admitting the database's port from itself and the API's from the load
+// balancer) and a team's group. Only the stack group is the preview's.
 func previewStackFake() *fakeWebServiceAWS {
+	pvsg := taggedGroup("sg-pvsg")
+	pvsg.IpPermissions = []ec2Types.IpPermission{
+		{IpProtocol: aws.String("tcp"), FromPort: aws.Int32(5432), ToPort: aws.Int32(5432),
+			UserIdGroupPairs: []ec2Types.UserIdGroupPair{{GroupId: aws.String("sg-pvsg")}}},
+		albRule(8080),
+	}
 	return &fakeWebServiceAWS{
 		serviceGroups: []string{"sg-default", "sg-pvsg", "sg-team"},
 		groups: map[string]ec2Types.SecurityGroup{
-			"sg-default": {GroupId: aws.String("sg-default"), GroupName: aws.String("default")},
-			"sg-pvsg":    taggedGroup("sg-pvsg"),
-			"sg-team":    {GroupId: aws.String("sg-team"), GroupName: aws.String("team"), Tags: []ec2Types.Tag{{Key: aws.String("created by"), Value: aws.String("deployment.io")}}},
+			"sg-default": {GroupId: aws.String("sg-default"), GroupName: aws.String("default"), IpPermissions: []ec2Types.IpPermission{albRule(80)}},
+			"sg-pvsg":    pvsg,
+			"sg-team": {GroupId: aws.String("sg-team"), GroupName: aws.String("team"), IpPermissions: []ec2Types.IpPermission{albRule(81)},
+				Tags: []ec2Types.Tag{{Key: aws.String("created by"), Value: aws.String("deployment.io")}}},
 		},
 	}
 }
 
-// The web delete removes the stack's tagged group, last, and no other group.
+// The web delete removes the stack group's rule for the load balancer's group
+// before deleting that group (EC2 refuses while a rule references it), then the
+// stack's tagged group, last. No other group is touched.
 func TestDeleteWebServiceRemovesTheStackGroupLast(t *testing.T) {
 	stubSecurityGroupSleep(t)
 	fake := previewStackFake()
@@ -776,7 +888,12 @@ func TestDeleteWebServiceRemovesTheStackGroupLast(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := append(append([]string{}, productionDeleteCalls...),
+	want := append(append([]string{}, productionDeleteCalls[:len(productionDeleteCalls)-1]...),
+		"DescribeSecurityGroups id=sg-default",
+		"DescribeSecurityGroups id=sg-pvsg",
+		"RevokeSecurityGroupIngress sg-pvsg sg-alb:8080",
+		"DescribeSecurityGroups id=sg-team",
+		"DeleteSecurityGroup sg-alb",
 		"DescribeSecurityGroups id=sg-default",
 		"DescribeSecurityGroups id=sg-pvsg",
 		"DeleteSecurityGroup sg-pvsg",
@@ -856,17 +973,18 @@ func TestDeleteWebServiceDescribeFailsDeletesNothing(t *testing.T) {
 	}
 }
 
-// A production service (in no group of its own) makes no security group call.
+// A production service (in no group of its own) deletes and edits no group but
+// its load balancer's.
 func TestDeleteWithoutStackGroupTouchesNoGroup(t *testing.T) {
 	var deleted []string
-	for _, groups := range [][]string{nil, {"sg-default"}} {
+	for _, groups := range [][]string{nil, {"sg-default"}, {"sg-default", "sg-team"}} {
 		fake := previewStackFake()
 		fake.serviceGroups = groups
 		if _, err := runWebServiceDelete(t, webServiceDeleteParameters(), fake); err != nil {
 			t.Fatal(err)
 		}
 		for _, c := range fake.calls {
-			if strings.HasPrefix(c, "DeleteSecurityGroup") && c != "DeleteSecurityGroup sg-alb" {
+			if (strings.HasPrefix(c, "DeleteSecurityGroup") && c != "DeleteSecurityGroup sg-alb") || strings.HasPrefix(c, "RevokeSecurityGroupIngress") {
 				deleted = append(deleted, c)
 			}
 		}

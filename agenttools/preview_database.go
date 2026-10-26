@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"regexp"
 	"sort"
 	"strings"
 	"unicode/utf8"
@@ -49,9 +48,9 @@ type PreviewDatabaseDeploy struct {
 	// ServiceKey is its service name in the Task: "<API service key>-db".
 	ServiceKey string
 	PreviewDatabasePlan
-	// PreDeployCommand is the production service's pre-deploy command when it
-	// runs against this database (previewDatabaseMigrations); "" when it doesn't.
-	PreDeployCommand string
+	// MigrateCommand is the person-set preview migrate command, run against this
+	// database before the API starts (previewDatabaseMigrations); "" for none.
+	MigrateCommand string
 	// Migrations says whether it runs, for the result and the Step log.
 	Migrations previewDatabaseMigrationPlan
 }
@@ -167,146 +166,48 @@ type previewDatabaseResult struct {
 	Migrations string   `json:"migrations"`
 }
 
-// previewDatabaseMigrationPlan is whether the pre-deploy command runs against the
-// preview database, as the result and the Step log say it.
+// previewDatabaseMigrationPlan is whether migrations run against the preview
+// database, as the result and the Step log say it. The command's text is never
+// shown: a person typed it, and it can carry anything.
 type previewDatabaseMigrationPlan struct {
-	// command is the command shown, with inline values redacted; "" when none runs.
-	command string
-	// skipped says why the command isn't run, or that there is none.
-	skipped string
+	// runs is true when a preview migrate command is set.
+	runs bool
 }
+
+// Migrations wording for the result and the Step log.
+const (
+	previewMigrationsRan     = "ran the service's preview migrate command"
+	previewMigrationsNotSet  = "not run: no preview migrate command is set for this service (set one in Context → Services)"
+	previewMigrationsUnknown = "the deploy failed before it finished; the preview migrate command's output, if it ran, is in the log tail"
+)
 
 // summary is the result's `migrations` once the deploy succeeded.
 func (m previewDatabaseMigrationPlan) summary() string {
-	if m.command == "" {
-		return m.skipped
+	if !m.runs {
+		return previewMigrationsNotSet
 	}
-	return fmt.Sprintf("ran `%s`", m.command)
+	return previewMigrationsRan
 }
 
 // failedSummary is the result's `migrations` when the deploy failed: whether the
 // command ran isn't known here, its output is in the log tail.
 func (m previewDatabaseMigrationPlan) failedSummary() string {
-	if m.command == "" {
-		return m.skipped
+	if !m.runs {
+		return previewMigrationsNotSet
 	}
-	return fmt.Sprintf("the deploy failed before it finished; the pre-deploy command was `%s` (its output, if it ran, is in the log tail)", m.command)
+	return previewMigrationsUnknown
 }
 
-// previewDatabaseMigrations decides whether preDeployCommand runs against the
-// preview database: never when the command sets a database variable or names a
-// database URL itself, since it would then reach a database the preview doesn't
-// own. It returns the command to run ("" for none).
-func previewDatabaseMigrations(preDeployCommand string, variables []string) (string, previewDatabaseMigrationPlan) {
-	command := strings.TrimSpace(preDeployCommand)
-	if command == "" {
-		return "", previewDatabaseMigrationPlan{skipped: "no pre-deploy command"}
+// previewDatabaseMigrations is the command a preview runs against its own
+// database: the person-set preview migrate command, or none. The production
+// pre-deploy command never runs in a preview — it is production configuration,
+// it can name a production database or carry credentials, and no check of its
+// text can rule that out.
+func previewDatabaseMigrations(previewMigrateCommand string) (string, previewDatabaseMigrationPlan) {
+	if strings.TrimSpace(previewMigrateCommand) == "" {
+		return "", previewDatabaseMigrationPlan{}
 	}
-	if reason := preDeployCommandOwnDatabase(command, variables); reason != "" {
-		return "", previewDatabaseMigrationPlan{skipped: "didn't run the pre-deploy command: " + reason +
-			", which could point it at a database the preview doesn't own"}
-	}
-	return preDeployCommand, previewDatabaseMigrationPlan{command: redactPreDeployCommand(command)}
-}
-
-var (
-	// shellAssignment is NAME= at the start of a command word (VAR=… cmd,
-	// export VAR=…, env VAR=…).
-	shellAssignment = regexp.MustCompile(`(^|[\s;&|(])([A-Za-z_][A-Za-z0-9_]*)=`)
-	// databaseURLLiteral is a database address written into the command.
-	databaseURLLiteral = regexp.MustCompile(`(?i)\b(postgres|postgresql|mysql|mysql2|mongodb|mongodb\+srv)://`)
-	// databaseAddressFlag is a flag naming a database's address, and its value.
-	databaseAddressFlag = regexp.MustCompile(`(?i)(?:^|\s)(--host|--hostname|--server|--uri|--url|--db-url|--database-url|--dsn|--connection|--connection-string|--conn-string)(?:=|\s+)("[^"]*"|'[^']*'|\S+)`)
-	// databaseClientHost is a database client's -h <host>.
-	databaseClientHost = regexp.MustCompile(`(?i)(?:^|[\s;&|(/])(psql|mysql|mariadb|mongosh|mongo|pg_restore|pg_dump|mysqldump|mongorestore|mongoimport|sqlcmd)\b[^;&|]*?\s-h\s*("[^"]*"|'[^']*'|\S+)`)
-	// conninfoAddress is a libpq/ADO-style connection string's host or server.
-	conninfoAddress = regexp.MustCompile(`(?i)(?:^|[\s"';])(host|hostaddr|server|data source)\s*=\s*[^\s"';]`)
-	// ownVariableReference is "$NAME" or "${NAME}", alone.
-	ownVariableReference = regexp.MustCompile(`^\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?$`)
-
-	// assignmentValue is an inline NAME=value's value; urlCredentials a URL's user:password@.
-	assignmentValue = regexp.MustCompile(`(^|[\s;&|(])([A-Za-z_][A-Za-z0-9_]*)=("[^"]*"|'[^']*'|\S*)`)
-	urlCredentials  = regexp.MustCompile(`://[^/\s@]+@`)
-	// secretFlag is a flag whose name says it holds a secret, and its value.
-	secretFlag = regexp.MustCompile(`(?i)((?:^|\s)--?[A-Za-z0-9_-]*(?:password|passwd|pwd|pass|secret|token|key|auth|credential)[A-Za-z0-9_-]*)(=|\s+)("[^"]*"|'[^']*'|\S+)`)
-	// mysqlPassword is mysql's -p<password>.
-	mysqlPassword = regexp.MustCompile(`(\s-p)[^\s"']+`)
-	// secretHeader is a header holding a credential (Authorization, X-Api-Key…).
-	secretHeader = regexp.MustCompile(`(?i)\b((?:proxy-)?authorization|[A-Za-z-]*(?:token|key|secret|auth)[A-Za-z-]*)(\s*:\s*)[^"'\n]+`)
-	// secretParameter is key=value whose key says it holds a secret (a query
-	// parameter, a conninfo field).
-	secretParameter = regexp.MustCompile(`(?i)([A-Za-z0-9_.-]*(?:password|passwd|pwd|secret|token|apikey|api_key|access_key)[A-Za-z0-9_.-]*=)[^&\s"';]+`)
-	// keyLikeWord is a long word of letters and digits with no path or dots:
-	// what an API key or token looks like.
-	keyLikeWord = regexp.MustCompile(`\b[A-Za-z0-9_+=-]{24,}\b`)
-	hasLetter   = regexp.MustCompile(`[A-Za-z]`)
-	hasDigit    = regexp.MustCompile(`[0-9]`)
-)
-
-// preDeployCommandOwnDatabase says how command picks a database of its own: it
-// sets one of variables or a database-looking variable, or names a database URL.
-// "" when it doesn't.
-func preDeployCommandOwnDatabase(command string, variables []string) string {
-	ours := map[string]bool{}
-	for _, name := range variables {
-		ours[name] = true
-	}
-	var set []string
-	seen := map[string]bool{}
-	for _, m := range shellAssignment.FindAllStringSubmatch(command, -1) {
-		name := m[2]
-		kind, _ := task_previews.ClassifyDatabaseVariable(name)
-		if (ours[name] || kind != task_previews.NotDatabaseVariable) && !seen[name] {
-			seen[name] = true
-			set = append(set, name)
-		}
-	}
-	if len(set) > 0 {
-		return "it sets " + strings.Join(set, ", ") + " itself"
-	}
-	if databaseURLLiteral.MatchString(command) {
-		return "it names a database URL itself"
-	}
-	for _, m := range databaseAddressFlag.FindAllStringSubmatch(command, -1) {
-		if !isOwnVariableReference(m[2], ours) {
-			return "it names a database address itself (" + m[1] + ")"
-		}
-	}
-	for _, m := range databaseClientHost.FindAllStringSubmatch(command, -1) {
-		if !isOwnVariableReference(m[2], ours) {
-			return "it names a database host itself (" + m[1] + " -h)"
-		}
-	}
-	if conninfoAddress.MatchString(command) {
-		return "it names a database host itself"
-	}
-	return ""
-}
-
-// isOwnVariableReference reports whether value is "$NAME" or "${NAME}" for one of
-// the preview database's variables: the address the preview sets.
-func isOwnVariableReference(value string, ours map[string]bool) bool {
-	m := ownVariableReference.FindStringSubmatch(strings.Trim(value, `"'`))
-	return m != nil && ours[m[1]]
-}
-
-// redactPreDeployCommand is command as the result and the Step log show it: what
-// can be a secret is replaced — an inline NAME=value's value, a URL's credentials,
-// the value of a flag, header or parameter named like a secret, mysql's
-// -p<password>, and any long word of letters and digits (a key or token).
-func redactPreDeployCommand(command string) string {
-	command = assignmentValue.ReplaceAllString(command, "${1}${2}=***")
-	command = urlCredentials.ReplaceAllString(command, "://***@")
-	command = secretHeader.ReplaceAllString(command, "${1}${2}***")
-	command = secretFlag.ReplaceAllString(command, "${1}${2}***")
-	command = mysqlPassword.ReplaceAllString(command, "${1}***")
-	command = secretParameter.ReplaceAllString(command, "${1}***")
-	return keyLikeWord.ReplaceAllStringFunc(command, func(word string) string {
-		if hasLetter.MatchString(word) && hasDigit.MatchString(word) {
-			return "***"
-		}
-		return word
-	})
+	return previewMigrateCommand, previewDatabaseMigrationPlan{runs: true}
 }
 
 // previewDatabaseEvidenceMax is how many evidence files the result and the Step
@@ -398,7 +299,7 @@ func logPreviewDatabasePlan(w io.Writer, plan PreviewDatabasePlan) {
 	}
 }
 
-// logPreviewDatabaseMigrations writes whether the pre-deploy command ran.
+// logPreviewDatabaseMigrations writes whether the preview migrate command ran.
 func logPreviewDatabaseMigrations(w io.Writer, migrations string) {
 	if w != nil {
 		writePreviewDatabaseLogLine(w, "Preview database migrations: "+migrations)

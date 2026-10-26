@@ -217,9 +217,16 @@ type webPreviewSteps struct {
 	build  webPreviewStep
 	upload webPreviewStep
 	deploy webPreviewStep
-	// database deploys the preview's own database (when it has one) before the
-	// API's steps, and returns what the API's parameters point at.
-	database func(taskID string, apiParameters map[string]interface{}, in agenttools.WebServicePreviewDeployInput) (webPreviewDatabase, error)
+	// stack finds or creates the Task's preview stack security group, admitting
+	// port (the database's; 0 without one) from itself: its id, and whether this
+	// call created it. Every backend preview runs in it alone.
+	stack func(taskID string, apiParameters map[string]interface{}, in agenttools.WebServicePreviewDeployInput, port int64) (string, bool, error)
+	// removeStack removes a stack group this deploy created when the deploy
+	// failed (it keeps one something already uses).
+	removeStack func(apiParameters map[string]interface{}, groupID string, logsWriter io.Writer)
+	// database deploys the preview's own database (when it has one) in the stack
+	// group before the API's steps, and returns what the API's parameters point at.
+	database func(stackGroupID string, apiParameters map[string]interface{}, in agenttools.WebServicePreviewDeployInput) (webPreviewDatabase, error)
 	// loadBalancerDNS reads the DNS name of the load balancer the deploy created or
 	// reused.
 	loadBalancerDNS func(parameters map[string]interface{}) (string, error)
@@ -228,10 +235,12 @@ type webPreviewSteps struct {
 // productionWebPreviewSteps are production's own commands.
 func productionWebPreviewSteps() webPreviewSteps {
 	return webPreviewSteps{
-		build:    (&BuildDockerImage{}).Run,
-		upload:   newUploadDockerImageToEcr().Run,
-		deploy:   deployAwsWebServicePreview,
-		database: deployWebPreviewDatabase,
+		build:       (&BuildDockerImage{}).Run,
+		upload:      newUploadDockerImageToEcr().Run,
+		deploy:      deployAwsWebServicePreview,
+		stack:       ensureWebPreviewStack,
+		removeStack: removeWebPreviewStack,
+		database:    deployWebPreviewDatabase,
 		loadBalancerDNS: func(parameters map[string]interface{}) (string, error) {
 			elbClient, err := cloud_api_clients.GetElbClient(parameters)
 			if err != nil {
@@ -286,9 +295,38 @@ func (d webPreviewDeployer) deploy(ctx context.Context, in agenttools.WebService
 			return agenttools.WebServicePreviewDeployOutput{}, err
 		}
 	}
+	return d.deployInStack(ctx, parameters, in)
+}
+
+// deployInStack deploys the preview — its database first when it has one — in the
+// Task's preview stack group, never the VPC's default group. A stack group this
+// call created is removed again when the deploy fails.
+func (d webPreviewDeployer) deployInStack(ctx context.Context, parameters map[string]interface{}, in agenttools.WebServicePreviewDeployInput) (out agenttools.WebServicePreviewDeployOutput, err error) {
+	if ctx.Err() != nil {
+		return out, errors.New("the backend preview's deploy was cancelled")
+	}
+	if d.steps.stack == nil {
+		return out, errors.New("deployment.io can't deploy backend previews here")
+	}
+	var port int64
 	if in.Database != nil {
-		if err := d.deployDatabase(ctx, parameters, in); err != nil {
-			return agenttools.WebServicePreviewDeployOutput{}, err
+		port = in.Database.Port
+	}
+	groupID, created, err := d.steps.stack(d.taskID, parameters, in, port)
+	if err != nil {
+		return out, agenttools.WebPreviewDeployFailed(fmt.Errorf("the preview's security group: %w", err))
+	}
+	if created && d.steps.removeStack != nil {
+		defer func() {
+			if err != nil {
+				d.steps.removeStack(parameters, groupID, in.Logs)
+			}
+		}()
+	}
+	jobs.SetParameterValue(parameters, parameters_enums.TaskSecurityGroupIds, stringsToPrimitiveA([]string{groupID}))
+	if in.Database != nil {
+		if err = d.deployDatabase(ctx, groupID, parameters, in); err != nil {
+			return out, err
 		}
 	}
 	return d.runSteps(ctx, parameters, in)
@@ -296,14 +334,14 @@ func (d webPreviewDeployer) deploy(ctx context.Context, in agenttools.WebService
 
 // deployDatabase deploys the preview's own database and points the API's
 // parameters at it.
-func (d webPreviewDeployer) deployDatabase(ctx context.Context, parameters map[string]interface{}, in agenttools.WebServicePreviewDeployInput) error {
+func (d webPreviewDeployer) deployDatabase(ctx context.Context, stackGroupID string, parameters map[string]interface{}, in agenttools.WebServicePreviewDeployInput) error {
 	if err := ctx.Err(); err != nil {
 		return errors.New("the backend preview's deploy was cancelled")
 	}
 	if d.steps.database == nil {
 		return errors.New("deployment.io can't deploy preview databases here")
 	}
-	db, err := d.steps.database(d.taskID, parameters, in)
+	db, err := d.steps.database(stackGroupID, parameters, in)
 	if err != nil {
 		return agenttools.WebPreviewDeployFailed(fmt.Errorf("the preview database: %w", err))
 	}

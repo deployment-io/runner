@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -168,6 +169,16 @@ func (f *fakeWebServiceAWS) DeleteSecurityGroup(_ context.Context, in *ec2.Delet
 		return nil, errs[0]
 	}
 	return &ec2.DeleteSecurityGroupOutput{}, f.call("DeleteSecurityGroup", aws.ToString(in.GroupId))
+}
+
+func (f *fakeWebServiceAWS) RevokeSecurityGroupIngress(_ context.Context, in *ec2.RevokeSecurityGroupIngressInput, _ ...func(*ec2.Options)) (*ec2.RevokeSecurityGroupIngressOutput, error) {
+	var rules []string
+	for _, p := range in.IpPermissions {
+		for _, pair := range p.UserIdGroupPairs {
+			rules = append(rules, aws.ToString(pair.GroupId)+":"+strconv.Itoa(int(aws.ToInt32(p.FromPort))))
+		}
+	}
+	return &ec2.RevokeSecurityGroupIngressOutput{}, f.call("RevokeSecurityGroupIngress", aws.ToString(in.GroupId)+" "+strings.Join(rules, ","))
 }
 
 func (f *fakeWebServiceAWS) clients() deleteWebServiceClients {

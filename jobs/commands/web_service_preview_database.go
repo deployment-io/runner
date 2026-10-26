@@ -4,7 +4,7 @@ package commands
 // database: an allowlisted official image run as the Task's "<service>-db" private
 // service, with DeployAwsPrivateService's steps on a parameters map of its own, in
 // the Task's preview stack security group. The API preview then runs against it by
-// its DNS name, and its pre-deploy command (migrations) with it.
+// its DNS name, and the person-set preview migrate command, if any, with it.
 
 import (
 	"context"
@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ecs"
@@ -52,22 +53,32 @@ func previewDatabaseInitVariables(engine string) map[string]string {
 			"MYSQL_RANDOM_ROOT_PASSWORD": "yes",
 		}
 	case task_previews.PreviewDatabaseEngineMongoDB:
-		return map[string]string{
-			"MONGO_INITDB_ROOT_USERNAME": previewDatabaseUser, "MONGO_INITDB_ROOT_PASSWORD": previewDatabasePassword,
-			"MONGO_INITDB_DATABASE": previewDatabaseName,
-		}
+		// No user: MongoDB runs as a single-node replica set (transactions need
+		// one, for every driver), and auth on a replica set needs a shared key
+		// file. It is empty, throwaway and reachable only from its Task's stack.
+		return map[string]string{}
 	}
 	return nil
 }
 
-// previewDatabaseURL is the database's address as a URL variable holds it.
-func previewDatabaseURL(engine, host string, port int64) string {
+// mongoReplicaSetName is the preview MongoDB's replica set.
+const mongoReplicaSetName = "rs0"
+
+// previewDatabaseURL is the database's address as the variable name holds it:
+// a URL, except a MySQL *_DSN variable, which gets the Go MySQL driver's
+// user:password@tcp(host:port)/database form. MongoDB is reached directly
+// (directConnection): the driver must not look up the replica set's member,
+// which is named after the container.
+func previewDatabaseURL(engine, name, host string, port int64) string {
 	credentials := previewDatabaseUser + ":" + previewDatabasePassword
 	switch engine {
 	case task_previews.PreviewDatabaseEngineMySQL:
+		if strings.HasSuffix(strings.ToUpper(name), "DSN") {
+			return fmt.Sprintf("%s@tcp(%s:%d)/%s", credentials, host, port, previewDatabaseName)
+		}
 		return fmt.Sprintf("mysql://%s@%s:%d/%s", credentials, host, port, previewDatabaseName)
 	case task_previews.PreviewDatabaseEngineMongoDB:
-		return fmt.Sprintf("mongodb://%s@%s:%d/%s?authSource=admin", credentials, host, port, previewDatabaseName)
+		return fmt.Sprintf("mongodb://%s:%d/%s?directConnection=true", host, port, previewDatabaseName)
 	}
 	return fmt.Sprintf("postgresql://%s@%s:%d/%s", credentials, host, port, previewDatabaseName)
 }
@@ -76,11 +87,16 @@ func previewDatabaseURL(engine, host string, port int64) string {
 // URL variable gets the URL, a split variable its part. A name that is neither (a
 // person's setting may name any) gets the URL.
 func previewDatabaseVariableValues(engine, host string, port int64, names []string) map[string]string {
+	user, password := previewDatabaseUser, previewDatabasePassword
+	if engine == task_previews.PreviewDatabaseEngineMongoDB {
+		// MongoDB has no user (see previewDatabaseInitVariables).
+		user, password = "", ""
+	}
 	values := make(map[string]string, len(names))
 	for _, name := range names {
 		kind, part := task_previews.ClassifyDatabaseVariable(name)
 		if kind != task_previews.DatabaseSplitVariable {
-			values[name] = previewDatabaseURL(engine, host, port)
+			values[name] = previewDatabaseURL(engine, name, host, port)
 			continue
 		}
 		switch part {
@@ -89,9 +105,9 @@ func previewDatabaseVariableValues(engine, host string, port int64, names []stri
 		case task_previews.DatabasePartPort:
 			values[name] = strconv.FormatInt(port, 10)
 		case task_previews.DatabasePartUser:
-			values[name] = previewDatabaseUser
+			values[name] = user
 		case task_previews.DatabasePartPassword:
-			values[name] = previewDatabasePassword
+			values[name] = password
 		case task_previews.DatabasePartName:
 			values[name] = previewDatabaseName
 		}
@@ -184,17 +200,14 @@ func previewDatabaseHost(parameters map[string]interface{}, namespaceName string
 // webPreviewDatabase is a deployed preview database, as the API preview needs it.
 type webPreviewDatabase struct {
 	host string
-	// securityGroupID is the Task's stack group; defaultSecurityGroupID the VPC's
-	// default group the load balancer reaches the API through.
-	securityGroupID        string
-	defaultSecurityGroupID string
 }
 
 // setWebPreviewDatabaseParameters points the API preview's parameters at its
 // database: Preview configuration's variables plus the database's (a person's
-// "use" setting wins over Preview configuration for its names), the production
-// service's pre-deploy command so the migrations run against it first, and the
-// VPC's default group with the stack's.
+// "use" setting wins over Preview configuration for its names), and the
+// person-set preview migrate command, run against it first. Never the production
+// pre-deploy command. (The stack group is set for every backend preview by the
+// deployer.)
 func setWebPreviewDatabaseParameters(p map[string]interface{}, in agenttools.WebServicePreviewDeployInput, db webPreviewDatabase) error {
 	variables := make(map[string]string, len(in.Settings.Variables)+len(in.Database.Variables))
 	for k, v := range in.Settings.Variables {
@@ -208,12 +221,9 @@ func setWebPreviewDatabaseParameters(p map[string]interface{}, in agenttools.Web
 		return err
 	}
 	jobs.SetParameterValue(p, parameters_enums.EnvironmentVariables, env)
-	// The production service's, unless it picks a database of its own
-	// (agenttools.PreviewDatabaseDeploy.PreDeployCommand is "" then).
-	if in.Database.PreDeployCommand != "" {
-		jobs.SetParameterValue(p, parameters_enums.PreDeployCommand, in.Database.PreDeployCommand)
+	if in.Database.MigrateCommand != "" {
+		jobs.SetParameterValue(p, parameters_enums.PreDeployCommand, in.Database.MigrateCommand)
 	}
-	jobs.SetParameterValue(p, parameters_enums.TaskSecurityGroupIds, stringsToPrimitiveA([]string{db.defaultSecurityGroupID, db.securityGroupID}))
 	return nil
 }
 
@@ -224,9 +234,11 @@ type previewDatabaseECSAPI interface {
 }
 
 // previewDatabaseUnchanged reports whether the database's ECS service exists, runs
-// in the stack group alone and its task definition runs image: then it is kept,
-// with its data and schema. One in another group (the stack group was removed and
-// made again) is redeployed, which moves it onto the current group.
+// in the stack group alone, has its DNS registration and its task definition runs
+// image: then it is kept, with its data and schema. One in another group (the
+// stack group was removed and made again) or without its DNS registration (it
+// failed when the service was created) is redeployed, which moves it onto the
+// current group and registers its DNS name.
 func previewDatabaseUnchanged(ecsClient previewDatabaseECSAPI, clusterArn, serviceName, image, securityGroupID string) (bool, error) {
 	services, err := ecsClient.DescribeServices(context.TODO(), &ecs.DescribeServicesInput{
 		Cluster:  aws.String(clusterArn),
@@ -239,6 +251,9 @@ func previewDatabaseUnchanged(ecsClient previewDatabaseECSAPI, clusterArn, servi
 		return false, nil
 	}
 	if groups := serviceSecurityGroupIDs(&services.Services[0]); len(groups) != 1 || groups[0] != securityGroupID {
+		return false, nil
+	}
+	if len(services.Services[0].ServiceRegistries) == 0 {
 		return false, nil
 	}
 	taskDefinition := aws.ToString(services.Services[0].TaskDefinition)
@@ -260,65 +275,56 @@ func previewDatabaseUnchanged(ecsClient previewDatabaseECSAPI, clusterArn, servi
 	return false, nil
 }
 
-// deployWebPreviewDatabase is webPreviewSteps.database in production: the stack
-// group, then the database — deployed unless it already runs the same image — and
-// its DNS name.
-func deployWebPreviewDatabase(taskID string, apiParameters map[string]interface{}, in agenttools.WebServicePreviewDeployInput) (webPreviewDatabase, error) {
-	// The EC2 actions below are the web-service deploy policy's.
-	organizationID, _ := jobs.GetParameterValue[string](apiParameters, parameters_enums.OrganizationIDNamespace)
-	runnerData := utils.RunnerData.Get()
-	if err := iam_policies.AddAwsPolicyForDeploymentRunner(iam_policy_enums.AwsWebServiceDeployment,
-		runnerData.OsType.String(), runnerData.CpuArchEnum.String(), organizationID, runnerData.RunnerRegion, runnerData.Mode, runnerData.TargetCloud); err != nil {
-		return webPreviewDatabase{}, err
-	}
-	ec2Client, err := cloud_api_clients.GetEC2Client(apiParameters)
-	if err != nil {
-		return webPreviewDatabase{}, err
-	}
-	vpcID := in.Settings.Network.VpcID
-	// Looked up before the stack group exists, so a failure here leaves nothing behind.
-	defaultSecurityGroupID, err := getDefaultSecurityGroupIdForVpc(apiParameters, ec2Client, vpcID)
-	if err != nil {
-		return webPreviewDatabase{}, err
-	}
-	db, err := deployPreviewDatabaseInStack(ec2Client, taskID, apiParameters, in)
-	db.defaultSecurityGroupID = defaultSecurityGroupID
-	return db, err
-}
-
-// deployPreviewDatabaseInStack ensures the stack group and deploys the database in
-// it. When this call created the group and the deploy then fails, the group is
-// removed again unless something already uses it: the deletes find the group only
-// through the stack's services.
-func deployPreviewDatabaseInStack(ec2Client previewStackSecurityGroupAPI, taskID string, apiParameters map[string]interface{},
-	in agenttools.WebServicePreviewDeployInput) (db webPreviewDatabase, err error) {
-	stack := previewStack{vpcID: in.Settings.Network.VpcID, taskID: taskID, port: in.Database.Port}
-	securityGroupID, created, err := ensurePreviewStackSecurityGroup(ec2Client, stack, in.Logs)
-	if err != nil {
-		return webPreviewDatabase{}, err
-	}
-	if created {
-		defer func() {
-			if err != nil {
-				removeUnusedPreviewStackSecurityGroup(ec2Client, securityGroupID, in.Logs)
-			}
-		}()
-	}
-	parameters, err := newPreviewDatabaseParameters(apiParameters, in, securityGroupID)
+// deployWebPreviewDatabase is webPreviewSteps.database in production: the
+// database in the Task's stack group (made by the deployer), deployed unless it
+// already runs the same image, and its DNS name.
+func deployWebPreviewDatabase(stackGroupID string, apiParameters map[string]interface{}, in agenttools.WebServicePreviewDeployInput) (webPreviewDatabase, error) {
+	parameters, err := newPreviewDatabaseParameters(apiParameters, in, stackGroupID)
 	if err != nil {
 		return webPreviewDatabase{}, err
 	}
 	buildDir, _ := commandUtils.GetRepositoryDirectoryPath(parameters)
 	// The deploy removes it when it ends; a kept database never deploys.
 	defer os.RemoveAll(buildDir)
-	if err = deployPreviewDatabaseIfChanged(parameters, in.Database.Image, securityGroupID, in.Logs); err != nil {
+	if err = deployPreviewDatabaseIfChanged(parameters, in.Database.Engine, in.Database.Image, stackGroupID, in.Logs); err != nil {
 		return webPreviewDatabase{}, err
 	}
 	host, err := previewDatabaseHost(parameters, in.Settings.NamespaceName)
 	if err != nil {
 		return webPreviewDatabase{}, err
 	}
-	return webPreviewDatabase{host: host, securityGroupID: securityGroupID}, nil
+	return webPreviewDatabase{host: host}, nil
+}
+
+// ensureWebPreviewStack is webPreviewSteps.stack in production: the Task's stack
+// group in the preview's VPC, admitting port (the database's; 0 without one) from
+// itself. Its id, and whether this call created it.
+func ensureWebPreviewStack(taskID string, apiParameters map[string]interface{}, in agenttools.WebServicePreviewDeployInput, port int64) (string, bool, error) {
+	// The EC2 actions are the web-service deploy policy's.
+	organizationID, _ := jobs.GetParameterValue[string](apiParameters, parameters_enums.OrganizationIDNamespace)
+	runnerData := utils.RunnerData.Get()
+	if err := iam_policies.AddAwsPolicyForDeploymentRunner(iam_policy_enums.AwsWebServiceDeployment,
+		runnerData.OsType.String(), runnerData.CpuArchEnum.String(), organizationID, runnerData.RunnerRegion, runnerData.Mode, runnerData.TargetCloud); err != nil {
+		return "", false, err
+	}
+	ec2Client, err := cloud_api_clients.GetEC2Client(apiParameters)
+	if err != nil {
+		return "", false, err
+	}
+	stack := previewStack{vpcID: in.Settings.Network.VpcID, taskID: taskID, port: port}
+	return ensurePreviewStackSecurityGroup(ec2Client, stack, in.Logs)
+}
+
+// removeWebPreviewStack is webPreviewSteps.removeStack in production: a stack
+// group this deploy created, removed again when the deploy failed before anything
+// used it (the deletes find the group only through the stack's services).
+func removeWebPreviewStack(apiParameters map[string]interface{}, groupID string, logsWriter io.Writer) {
+	ec2Client, err := cloud_api_clients.GetEC2Client(apiParameters)
+	if err != nil {
+		io.WriteString(logsWriter, fmt.Sprintf("Couldn't remove the preview's security group %s: %s\n", groupID, err))
+		return
+	}
+	removeUnusedPreviewStackSecurityGroup(ec2Client, groupID, logsWriter)
 }
 
 // newPreviewDatabaseParameters creates the database deploy's fresh build directory
@@ -359,10 +365,10 @@ func newPreviewDatabaseParameters(apiParameters map[string]interface{}, in agent
 }
 
 // deployPreviewDatabaseIfChanged deploys the database unless its service already
-// runs image (then its data and schema are kept; the pre-deploy command applies
-// new migrations). A first deploy, or a changed engine or version, deploys a
+// runs image (then its data and schema are kept; the preview migrate command, if
+// set, applies new migrations). A first deploy, or a changed engine or version, deploys a
 // fresh, empty database.
-func deployPreviewDatabaseIfChanged(parameters map[string]interface{}, image, securityGroupID string, logsWriter io.Writer) error {
+func deployPreviewDatabaseIfChanged(parameters map[string]interface{}, engine, image, securityGroupID string, logsWriter io.Writer) error {
 	ecsClient, err := getPreviewDatabaseECSClient(parameters)
 	if err != nil {
 		return err
@@ -384,7 +390,7 @@ func deployPreviewDatabaseIfChanged(parameters map[string]interface{}, image, se
 		return nil
 	}
 	io.WriteString(logsWriter, fmt.Sprintf("Preview database: deploying %s\n", image))
-	_, err = runPreviewDatabaseDeploy(parameters, logsWriter)
+	_, err = runPreviewDatabaseDeploy(parameters, logsWriter, engine)
 	return err
 }
 

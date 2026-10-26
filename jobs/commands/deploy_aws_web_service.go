@@ -887,7 +887,10 @@ func getPortMappingName(parameters map[string]interface{}) (string, error) {
 	return fmt.Sprintf("port-mapping-%s-%d", deploymentID, port), nil
 }
 
-func registerTaskDefinition(parameters map[string]interface{}, ecsClient *ecs.Client) (taskDefinitionArn string, err error) {
+// registerTaskDefinition registers the deployment's task definition; customize,
+// when given, adjusts its container before it's registered (the preview MongoDB's
+// replica set).
+func registerTaskDefinition(parameters map[string]interface{}, ecsClient *ecs.Client, customize ...func(*ecsTypes.ContainerDefinition)) (taskDefinitionArn string, err error) {
 
 	taskDefinitionArnFromParams, err := jobs.GetParameterValue[string](parameters, parameters_enums.TaskDefinitionArn)
 	if err == nil && len(taskDefinitionArnFromParams) > 0 {
@@ -966,6 +969,10 @@ func registerTaskDefinition(parameters map[string]interface{}, ecsClient *ecs.Cl
 		Privileged:             aws.Bool(false),
 		PseudoTerminal:         aws.Bool(false),
 		ReadonlyRootFilesystem: aws.Bool(false),
+	}
+
+	for _, c := range customize {
+		c(&containerDefinition)
 	}
 
 	isPrivateRepository, _ := jobs.GetParameterValue[bool](parameters, parameters_enums.IsPrivateRegistry)
@@ -1238,6 +1245,11 @@ func getEcsServiceConnectConfiguration(parameters map[string]interface{}) (*ecsT
 // ecsServiceDeployOptions changes how a deploy creates or updates its ECS
 // service. The zero value is what every production deploy does.
 type ecsServiceDeployOptions struct {
+	// previewStack deploys a Task's backend preview into its preview stack's
+	// security group (TaskSecurityGroupIds, exactly one) instead of the VPC's
+	// default group: the default group is never edited, and the stack group admits
+	// the service's port from the preview's own load balancer group.
+	previewStack bool
 	// skipServiceStableWait returns once the service is created or updated,
 	// without waiting for it to settle. A Task's backend preview sets it: its
 	// readiness is checked by verify_preview_reachable on its health URL.
@@ -1510,7 +1522,7 @@ func (d *DeployAwsWebService) Run(parameters map[string]interface{}, logsWriter 
 // backend preview: the same deploy, without waiting for the ECS service to
 // settle.
 func deployAwsWebServicePreview(parameters map[string]interface{}, logsWriter io.Writer) (map[string]interface{}, error) {
-	return runAwsWebServiceDeploy(parameters, logsWriter, ecsServiceDeployOptions{skipServiceStableWait: true})
+	return runAwsWebServiceDeploy(parameters, logsWriter, ecsServiceDeployOptions{skipServiceStableWait: true, previewStack: true})
 }
 
 // runAwsWebServiceDeploy is deployAwsWebService; tests replace it to see the
@@ -1541,14 +1553,21 @@ func deployAwsWebService(parameters map[string]interface{}, logsWriter io.Writer
 	if err != nil {
 		return parameters, err
 	}
-	err = addIngressRuleToDefaultVpcSecurityGroupForPortIfNeeded(parameters, ec2Client)
-	if err != nil {
-		return parameters, err
+	if !opts.previewStack {
+		err = addIngressRuleToDefaultVpcSecurityGroupForPortIfNeeded(parameters, ec2Client)
+		if err != nil {
+			return parameters, err
+		}
 	}
 	var securityGroupId string
 	securityGroupId, err = createAlbSecurityGroupIfNeeded(parameters, ec2Client, logsWriter)
 	if err != nil {
 		return parameters, err
+	}
+	if opts.previewStack {
+		if err = allowPreviewStackPortFromLoadBalancer(parameters, ec2Client, securityGroupId); err != nil {
+			return parameters, err
+		}
 	}
 	elbClient, err := cloud_api_clients.GetElbClient(parameters)
 	if err != nil {

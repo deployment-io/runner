@@ -111,6 +111,7 @@ type deleteWebServiceELBAPI interface {
 type deleteWebServiceEC2API interface {
 	DescribeSecurityGroups(ctx context.Context, params *ec2.DescribeSecurityGroupsInput, optFns ...func(*ec2.Options)) (*ec2.DescribeSecurityGroupsOutput, error)
 	DeleteSecurityGroup(ctx context.Context, params *ec2.DeleteSecurityGroupInput, optFns ...func(*ec2.Options)) (*ec2.DeleteSecurityGroupOutput, error)
+	RevokeSecurityGroupIngress(ctx context.Context, params *ec2.RevokeSecurityGroupIngressInput, optFns ...func(*ec2.Options)) (*ec2.RevokeSecurityGroupIngressOutput, error)
 }
 
 type deleteWebServiceClients struct {
@@ -183,7 +184,7 @@ func deleteWebServiceResources(parameters map[string]interface{}, clients delete
 	if err := deleteWebServiceTargetGroup(parameters, clients.elb, logsWriter); err != nil {
 		return err
 	}
-	if err := deleteWebServiceAlbSecurityGroup(parameters, clients.ec2, logsWriter); err != nil {
+	if err := deleteWebServiceAlbSecurityGroup(parameters, clients.ec2, securityGroupIDs, logsWriter); err != nil {
 		return err
 	}
 	deletePreviewStackSecurityGroups(clients.ec2, securityGroupIDs, logsWriter)
@@ -358,7 +359,11 @@ func deleteWebServiceTargetGroup(parameters map[string]interface{}, elbClient de
 	return err
 }
 
-func deleteWebServiceAlbSecurityGroup(parameters map[string]interface{}, ec2Client deleteWebServiceEC2API, logsWriter io.Writer) error {
+// deleteWebServiceAlbSecurityGroup deletes the load balancer's security group. A
+// backend preview's stack group (among serviceGroupIDs, the service's groups)
+// admits the API's port from it; that rule goes first, since EC2 refuses to
+// delete a group another group's rule references.
+func deleteWebServiceAlbSecurityGroup(parameters map[string]interface{}, ec2Client deleteWebServiceEC2API, serviceGroupIDs []string, logsWriter io.Writer) error {
 	albSecurityGroupID, _ := jobs.GetParameterValue[string](parameters, parameters_enums.AlbSecurityGroupId)
 	if len(albSecurityGroupID) == 0 {
 		albSecurityGroupName, err := getAlbSecurityGroupName(parameters)
@@ -380,6 +385,7 @@ func deleteWebServiceAlbSecurityGroup(parameters map[string]interface{}, ec2Clie
 		}
 		albSecurityGroupID = aws.ToString(output.SecurityGroups[0].GroupId)
 	}
+	revokePreviewStackIngressFrom(ec2Client, serviceGroupIDs, albSecurityGroupID, logsWriter)
 	io.WriteString(logsWriter, fmt.Sprintf("Deleting security group: %s\n", albSecurityGroupID))
 	_, err := ec2Client.DeleteSecurityGroup(context.TODO(), &ec2.DeleteSecurityGroupInput{
 		DryRun:  aws.Bool(false),
