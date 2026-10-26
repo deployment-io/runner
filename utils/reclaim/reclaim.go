@@ -32,11 +32,8 @@ import (
 	"io"
 	"log"
 	"strings"
+	"time"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/image"
-	"github.com/docker/docker/api/types/volume"
 	"github.com/moby/moby/client"
 )
 
@@ -95,20 +92,40 @@ func ownedByRunner(labels map[string]string) bool {
 // cannot decide what is removable without first listing what exists and what
 // references it. Every method below has at least one caller in this package.
 type Docker interface {
-	ImageList(ctx context.Context, options image.ListOptions) ([]image.Summary, error)
-	ImageRemove(ctx context.Context, imageID string, options image.RemoveOptions) ([]image.DeleteResponse, error)
-	ContainerList(ctx context.Context, options container.ListOptions) ([]types.Container, error)
-	ContainerRemove(ctx context.Context, containerID string, options container.RemoveOptions) error
-	VolumeList(ctx context.Context, options volume.ListOptions) (volume.ListResponse, error)
-	VolumeRemove(ctx context.Context, volumeID string, force bool) error
-	BuildCachePrune(ctx context.Context, opts types.BuildCachePruneOptions) (*types.BuildCachePruneReport, error)
+	ImageList(ctx context.Context, options client.ImageListOptions) (client.ImageListResult, error)
+	ImageRemove(ctx context.Context, imageID string, options client.ImageRemoveOptions) (client.ImageRemoveResult, error)
+	ContainerList(ctx context.Context, options client.ContainerListOptions) (client.ContainerListResult, error)
+	ContainerRemove(ctx context.Context, containerID string, options client.ContainerRemoveOptions) (client.ContainerRemoveResult, error)
+	VolumeList(ctx context.Context, options client.VolumeListOptions) (client.VolumeListResult, error)
+	VolumeRemove(ctx context.Context, volumeID string, options client.VolumeRemoveOptions) (client.VolumeRemoveResult, error)
+	BuildCachePrune(ctx context.Context, opts client.BuildCachePruneOptions) (client.BuildCachePruneResult, error)
 	Close() error
 }
 
+// dockerPingTimeout bounds the version-negotiating ping openDocker makes.
+const dockerPingTimeout = 10 * time.Second
+
 // openDocker connects to the daemon the same way every other Docker call in
 // this repo does. A package-level var so tests can substitute a fake.
+//
+// The client negotiates its API version lazily, on its first request, and
+// BuildCachePrune picks its budget parameter (keep-storage for daemon API
+// 1.47 and older, reserved-space after) from the client's version. A fresh
+// client whose first request is the prune would send reserved-space to an
+// older daemon, which ignores it and prunes all unused cache. Pinging with
+// negotiation here settles the version before any caller's request.
 var openDocker = func() (Docker, error) {
-	return client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	cli, err := client.New(client.FromEnv)
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), dockerPingTimeout)
+	defer cancel()
+	if _, err := cli.Ping(ctx, client.PingOptions{NegotiateAPIVersion: true}); err != nil {
+		_ = cli.Close()
+		return nil, err
+	}
+	return cli, nil
 }
 
 // withDocker runs fn against a daemon connection, logging and swallowing a

@@ -8,14 +8,14 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/image"
-	"github.com/docker/docker/api/types/volume"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/image"
+	"github.com/moby/moby/api/types/volume"
 )
 
 func TestSweepContainersRemovesOnlyOurFinishedOnes(t *testing.T) {
 	fake := &fakeDocker{}
-	containers := []types.Container{
+	containers := []container.Summary{
 		{ID: "ours-exited", State: "exited", Labels: Labels(PurposeStaticSiteBuild)},
 		{ID: "ours-running", State: "running", Labels: Labels(PurposeAgentbox)},
 		{ID: "theirs-exited", State: "exited"},
@@ -29,7 +29,7 @@ func TestSweepContainersRemovesOnlyOurFinishedOnes(t *testing.T) {
 }
 
 func TestSweepVolumesNeverForces(t *testing.T) {
-	fake := &fakeDocker{volumes: []*volume.Volume{
+	fake := &fakeDocker{volumes: []volume.Volume{
 		{Name: "agentbox-cache-" + taskID + "-0", Labels: Labels(PurposeAgentboxCache)},
 		{Name: "customer-data"},
 	}}
@@ -49,7 +49,7 @@ func TestSweepImagesSkipsWhatAContainerReferences(t *testing.T) {
 		summary("sha256:deploy", deployTag),
 		summary("sha256:live", orgID+"-"+deploymentID+":live0001"),
 	}}
-	containers := []types.Container{{ID: "c1", State: "running", ImageID: "sha256:live"}}
+	containers := []container.Summary{{ID: "c1", State: "running", ImageID: "sha256:live"}}
 	sweepImages(context.Background(), fake, containers)
 	if !reflect.DeepEqual(fake.removedImages, []string{deployTag}) {
 		t.Fatalf("removed %v, want only the unreferenced per-deploy image", fake.removedImages)
@@ -62,8 +62,8 @@ func TestPruneBuildCacheIsBoundedNotUnconditional(t *testing.T) {
 	t.Setenv(buildCacheKeepBytesEnvVar, "2147483648") // 2 GiB
 	var logs bytes.Buffer
 	PruneBuildCache(&logs)
-	if !reflect.DeepEqual(fake.prunedKeepStorage, []int64{2 << 30}) {
-		t.Fatalf("prune keep-storage = %v, want the configured budget", fake.prunedKeepStorage)
+	if !reflect.DeepEqual(fake.prunedReservedSpace, []int64{2 << 30}) {
+		t.Fatalf("prune reserved space = %v, want the configured budget", fake.prunedReservedSpace)
 	}
 	if !strings.Contains(logs.String(), "Build cache pruned") {
 		t.Errorf("expected the reclaim to be logged, got %q", logs.String())

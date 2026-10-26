@@ -43,11 +43,11 @@ func reportContainerExit(cli *client.Client, containerID string, logsWriter io.W
 	ctx, cancel := context.WithTimeout(context.Background(), containerInspectTimeout)
 	defer cancel()
 
-	info, err := cli.ContainerInspect(ctx, containerID)
-	if err != nil || info.State == nil {
+	res, err := cli.ContainerInspect(ctx, containerID, client.ContainerInspectOptions{})
+	if err != nil || res.Container.State == nil {
 		return
 	}
-	if msg := describeContainerExit(info.State.OOMKilled, info.State.ExitCode); msg != "" {
+	if msg := describeContainerExit(res.Container.State.OOMKilled, res.Container.State.ExitCode); msg != "" {
 		io.WriteString(logsWriter, msg+"\n")
 	}
 }

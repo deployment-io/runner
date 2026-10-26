@@ -75,7 +75,7 @@ The `client/` package provides operations for:
 ### Key Libraries
 
 - **aws-sdk-go-v2** - AWS services (EC2, ECS, ECR, S3, CloudFront, RDS, etc.)
-- **docker/docker** - Docker client
+- **moby/moby/client** + **moby/moby/api** - Docker client (moby v29 modules; build with `client.New(client.FromEnv)`)
 - **go-git** - Git operations
 - **nixpacks-go** - Nixpacks for builds
 - **tree-sitter** - Code parsing

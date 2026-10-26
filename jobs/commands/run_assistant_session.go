@@ -24,7 +24,6 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/types"
 	runnerclient "github.com/deployment-io/deployment-runner/client"
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
-	"github.com/docker/docker/api/types/container"
 	dockerclient "github.com/moby/moby/client"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 )
@@ -287,7 +286,7 @@ func buildSessionSpawnEnvVars(parameters map[string]interface{}, logsWriter io.W
 func (rs *RunAssistantSession) runSession(run sessionRun) error {
 	orgID, jobID, workDirHost, logsWriter := run.orgID, run.jobID, run.workDirHost, run.logsWriter
 	dockerCtx := context.Background()
-	cli, err := dockerclient.NewClientWithOpts(dockerclient.FromEnv, dockerclient.WithAPIVersionNegotiation())
+	cli, err := dockerclient.New(dockerclient.FromEnv)
 	if err != nil {
 		return err
 	}
@@ -306,7 +305,7 @@ func (rs *RunAssistantSession) runSession(run sessionRun) error {
 	var logsWg sync.WaitGroup
 	defer logsWg.Wait()
 	defer func() { _ = removeContainer(dockerCtx, cli, containerID) }()
-	if err := cli.ContainerStart(dockerCtx, containerID, container.StartOptions{}); err != nil {
+	if _, err := cli.ContainerStart(dockerCtx, containerID, dockerclient.ContainerStartOptions{}); err != nil {
 		return fmt.Errorf("error starting container: %s", err)
 	}
 	logsWg.Add(1)

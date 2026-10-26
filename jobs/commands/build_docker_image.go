@@ -11,9 +11,9 @@ import (
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
 	"github.com/deployment-io/deployment-runner/jobs/resources"
 	"github.com/deployment-io/deployment-runner/utils/reclaim"
-	"github.com/docker/docker/api/types"
+	"github.com/moby/go-archive"
+	"github.com/moby/moby/api/types/build"
 	"github.com/moby/moby/client"
-	"github.com/moby/moby/pkg/archive"
 	"io"
 	"strings"
 	"time"
@@ -96,7 +96,7 @@ func imageBuild(parameters map[string]interface{}, dockerClient *client.Client, 
 	// escape hatch for a build that legitimately needs more.
 	buildMemoryBytes, buildCores := resources.LimitsForImageBuild()
 
-	opts := types.ImageBuildOptions{
+	opts := client.ImageBuildOptions{
 		Dockerfile: dockerFile,
 		Tags:       []string{dockerImageNameAndTag},
 		// Remove discards the intermediate build containers, not the image
@@ -124,7 +124,7 @@ func imageBuild(parameters map[string]interface{}, dockerClient *client.Client, 
 		// comment here, and admission control, assumed it was capped -- the
 		// exact host-OOM path this cap exists to close, in the one place
 		// nobody would look for it.
-		Version: types.BuilderV1,
+		Version: build.BuilderV1,
 		// Labelled so the sweep can recognize this image as ours once it
 		// has been untagged and only its digest is left.
 		Labels: reclaim.Labels(reclaim.PurposeDeploymentImage),
@@ -150,7 +150,7 @@ func (b *BuildDockerImage) Run(parameters map[string]interface{}, logsWriter io.
 			<-MarkDeploymentDone(parameters, err)
 		}
 	}()
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	cli, err := client.New(client.FromEnv)
 	if err != nil {
 		return parameters, err
 	}

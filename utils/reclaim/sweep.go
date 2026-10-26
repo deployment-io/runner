@@ -8,11 +8,11 @@ import (
 	"strings"
 
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/image"
-	"github.com/docker/docker/api/types/mount"
-	"github.com/docker/docker/api/types/volume"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/image"
+	"github.com/moby/moby/api/types/mount"
+	"github.com/moby/moby/api/types/volume"
+	"github.com/moby/moby/client"
 )
 
 // Naming schemes the runner creates resources under. The sweep matches on
@@ -65,18 +65,19 @@ var (
 func Sweep() {
 	LogFreeDisk("at startup", nil)
 	withDocker(nil, "startup sweep", func(ctx context.Context, d Docker) {
-		containers, err := d.ContainerList(ctx, container.ListOptions{All: true})
+		listed, err := d.ContainerList(ctx, client.ContainerListOptions{All: true})
 		if err != nil {
 			logSweep("Startup sweep: cannot list containers: %s", err)
 			return
 		}
+		containers := listed.Items
 		reclaiming(nil, "orphaned containers", func() { sweepContainers(ctx, d, containers) })
 		// Re-read once the orphaned containers are gone: an image or a cache
 		// volume whose only reference was one of them is reclaimable now,
 		// and the pre-sweep list would still show it pinned. A failed
 		// re-read keeps the stale list, which can only over-protect.
-		if fresh, freshErr := d.ContainerList(ctx, container.ListOptions{All: true}); freshErr == nil {
-			containers = fresh
+		if fresh, freshErr := d.ContainerList(ctx, client.ContainerListOptions{All: true}); freshErr == nil {
+			containers = fresh.Items
 		}
 		reclaiming(nil, "orphaned images", func() { sweepImages(ctx, d, containers) })
 		reclaiming(nil, "orphaned cache volumes", func() { sweepVolumes(ctx, d, containers) })
@@ -95,9 +96,9 @@ func logSweep(format string, args ...interface{}) {
 // doing anything — an agentbox or static-site build container whose deferred
 // removal never ran. Never force: a container the daemon still considers
 // live stays.
-func sweepContainers(ctx context.Context, d Docker, containers []types.Container) {
+func sweepContainers(ctx context.Context, d Docker, containers []container.Summary) {
 	for _, id := range selectSweepContainers(containers) {
-		if err := d.ContainerRemove(ctx, id, container.RemoveOptions{}); err != nil {
+		if _, err := d.ContainerRemove(ctx, id, client.ContainerRemoveOptions{}); err != nil {
 			logSweep("Startup sweep: could not remove container %s: %s", shortID(id), err)
 			continue
 		}
@@ -106,7 +107,7 @@ func sweepContainers(ctx context.Context, d Docker, containers []types.Container
 }
 
 // selectSweepContainers picks our own containers in a finished state.
-func selectSweepContainers(containers []types.Container) []string {
+func selectSweepContainers(containers []container.Summary) []string {
 	var ids []string
 	for _, c := range containers {
 		if !ownedByRunner(c.Labels) || isActiveContainer(c.State) {
@@ -121,9 +122,9 @@ func selectSweepContainers(containers []types.Container) []string {
 // about to. "created" counts as active: it is the state a container sits in
 // between ContainerCreate and ContainerStart, so removing one would break a
 // job that is starting rather than reclaim one that died.
-func isActiveContainer(state string) bool {
+func isActiveContainer(state container.ContainerState) bool {
 	switch state {
-	case "running", "paused", "restarting", "created", "removing":
+	case container.StateRunning, container.StatePaused, container.StateRestarting, container.StateCreated, container.StateRemoving:
 		return true
 	}
 	return false
@@ -137,15 +138,15 @@ func isActiveContainer(state string) bool {
 // ECR: the process that built it is gone, so the deploy it belonged to
 // failed, and no rollback targets a build that never completed. What a
 // rollback does need — the pushed image — lives in ECR.
-func sweepImages(ctx context.Context, d Docker, containers []types.Container) {
-	images, err := d.ImageList(ctx, image.ListOptions{All: false})
+func sweepImages(ctx context.Context, d Docker, containers []container.Summary) {
+	images, err := d.ImageList(ctx, client.ImageListOptions{All: false})
 	if err != nil {
 		logSweep("Startup sweep: cannot list images: %s", err)
 		return
 	}
 	protected := protectedImagesFrom(containers, inUseRefs())
-	for _, ref := range selectSweepImages(images, protected) {
-		if _, err := d.ImageRemove(ctx, ref, image.RemoveOptions{PruneChildren: true}); err != nil {
+	for _, ref := range selectSweepImages(images.Items, protected) {
+		if _, err := d.ImageRemove(ctx, ref, client.ImageRemoveOptions{PruneChildren: true}); err != nil {
 			logSweep("Startup sweep: could not remove image %s: %s", ref, err)
 			continue
 		}
@@ -205,14 +206,14 @@ func isDangling(summary image.Summary) bool {
 // sweepVolumes removes per-Step cache volumes whose Step is gone. Never
 // force: the daemon refuses to remove a volume a container still uses, and
 // that refusal is a safety check we want rather than one to override.
-func sweepVolumes(ctx context.Context, d Docker, containers []types.Container) {
-	listed, err := d.VolumeList(ctx, volume.ListOptions{})
+func sweepVolumes(ctx context.Context, d Docker, containers []container.Summary) {
+	listed, err := d.VolumeList(ctx, client.VolumeListOptions{})
 	if err != nil {
 		logSweep("Startup sweep: cannot list volumes: %s", err)
 		return
 	}
-	for _, name := range selectSweepVolumes(listed.Volumes, mountedVolumes(containers)) {
-		if err := d.VolumeRemove(ctx, name, false); err != nil {
+	for _, name := range selectSweepVolumes(listed.Items, mountedVolumes(containers)) {
+		if _, err := d.VolumeRemove(ctx, name, client.VolumeRemoveOptions{Force: false}); err != nil {
 			logSweep("Startup sweep: could not remove volume %s: %s", name, err)
 			continue
 		}
@@ -222,10 +223,10 @@ func sweepVolumes(ctx context.Context, d Docker, containers []types.Container) {
 
 // selectSweepVolumes picks cache volumes that are ours by label or by name
 // and that no container mounts.
-func selectSweepVolumes(volumes []*volume.Volume, mounted map[string]bool) []string {
+func selectSweepVolumes(volumes []volume.Volume, mounted map[string]bool) []string {
 	var names []string
 	for _, v := range volumes {
-		if v == nil || mounted[v.Name] {
+		if mounted[v.Name] {
 			continue
 		}
 		if ownedByRunner(v.Labels) || cacheVolumeRe.MatchString(v.Name) {
@@ -238,7 +239,7 @@ func selectSweepVolumes(volumes []*volume.Volume, mounted map[string]bool) []str
 // mountedVolumes indexes the named volumes any container mounts, in any
 // state — a stopped container still owns its volume as far as the daemon is
 // concerned.
-func mountedVolumes(containers []types.Container) map[string]bool {
+func mountedVolumes(containers []container.Summary) map[string]bool {
 	mounted := map[string]bool{}
 	for _, c := range containers {
 		for _, m := range c.Mounts {
@@ -253,7 +254,7 @@ func mountedVolumes(containers []types.Container) map[string]bool {
 // sweepWorkDirs removes Task working directories a previous process never
 // cleaned up. MarkStepDone os.RemoveAll's these on the way out of every Step
 // Job; a killed runner leaves a full checkout of every repo in the Task.
-func sweepWorkDirs(containers []types.Container) {
+func sweepWorkDirs(containers []container.Summary) {
 	root := taskWorkDirRoot()
 	for _, dir := range selectStaleWorkDirs(root, boundPaths(containers)) {
 		if err := os.RemoveAll(dir); err != nil {
@@ -316,7 +317,7 @@ func taskWorkDirRoot() string {
 }
 
 // boundPaths indexes host paths that active containers bind-mount.
-func boundPaths(containers []types.Container) map[string]bool {
+func boundPaths(containers []container.Summary) map[string]bool {
 	bound := map[string]bool{}
 	for _, c := range containers {
 		if !isActiveContainer(c.State) {
