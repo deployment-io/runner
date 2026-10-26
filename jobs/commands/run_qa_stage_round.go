@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
@@ -129,9 +130,9 @@ func (s *qaStage) deployBackends(label string, previewDeps *agenttools.DeploySta
 		}
 		if err != nil {
 			io.WriteString(s.logsWriter, fmt.Sprintf("%s: the backend preview of %s failed to deploy: %s\n", label, repository, err))
-			out = append(out, qaBackend{Repository: repository, Error: err.Error()})
+			out = append(out, qaBackend{Repository: repository, Error: qaBackendError(err)})
 			if firstErr == "" {
-				firstErr = err.Error()
+				firstErr = qaBackendError(err)
 			}
 			continue
 		}
@@ -143,6 +144,29 @@ func (s *qaStage) deployBackends(label string, previewDeps *agenttools.DeploySta
 		return out, fmt.Errorf("the backend preview failed to deploy: %s", firstErr)
 	}
 	return out, nil
+}
+
+// qaBackendErrorMax caps a failed backend's error in QA_BACKENDS.
+const qaBackendErrorMax = 300
+
+// qaBackendError is a failed backend deploy's error as the QA run is told it:
+// its first line, cut to qaBackendErrorMax bytes. The rest — the deploy's log
+// tail, the build's and the migrate command's output — is the code under test's
+// own output, so it never reaches the tester's prompt; the Step log has it all.
+func qaBackendError(err error) string {
+	msg, _, _ := strings.Cut(err.Error(), "\n")
+	msg = strings.TrimSpace(msg)
+	if len(msg) > qaBackendErrorMax {
+		cut := qaBackendErrorMax
+		for cut > 0 && !utf8.RuneStart(msg[cut]) {
+			cut--
+		}
+		msg = msg[:cut] + "…"
+	}
+	if msg == "" {
+		msg = "the deploy failed"
+	}
+	return msg
 }
 
 // roundWebPreviewDeps is a round's backend deploy deps: the tool's, around the
