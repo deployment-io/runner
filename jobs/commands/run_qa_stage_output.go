@@ -38,10 +38,12 @@ type qaOutput struct {
 	StatusReason string `json:"status_reason,omitempty"`
 	NoCriteria   bool   `json:"no_criteria,omitempty"`
 	// Repositories is the QA_REPOSITORIES list: the changed repositories the
-	// runner can build a preview of, in work-dir order.
+	// runner can build a preview of, in work-dir order — on the stack path, every
+	// repository whose site preview the runner deployed.
 	Repositories []string `json:"repositories,omitempty"`
-	// Backends are the changed repositories the runner deployed as backend
-	// previews before each round, in work-dir order.
+	// Backends are the changed repositories (on the stack path, every
+	// repository) the runner deployed as backend previews before each round, in
+	// work-dir order.
 	Backends []string        `json:"backends,omitempty"`
 	Rounds   []qaRoundOutput `json:"rounds,omitempty"`
 	// FixedByQA is the criteria that failed in round 1 and passed in the final
@@ -75,6 +77,33 @@ type qaRoundOutput struct {
 	// the preview was built from the merge result with the base branch or the
 	// branch as built. Omitted when the round built no preview.
 	MergeResults []qaMergeResultOutput `json:"merge_results,omitempty"`
+	// Wiring is, on the stack path, one entry per (site, backend) pair of the
+	// round's previews: whether the site's preview was built to call the
+	// backend's. Variable names only, never a value or a path.
+	Wiring []qaWiringOutput `json:"wiring,omitempty"`
+}
+
+// Values of qaWiringOutput.Reason.
+const (
+	qaWiringNoLink        = "no link"
+	qaWiringBackendFailed = "backend failed"
+	qaWiringLookupFailed  = "lookup failed"
+	qaWiringSingleOrigin  = "single origin"
+)
+
+// qaWiringOutput is how a stack-path QA round connected one site preview
+// (Frontend) to one backend preview (API), both named as their repositories.
+type qaWiringOutput struct {
+	Frontend  string `json:"frontend"`
+	API       string `json:"api"`
+	Connected bool   `json:"connected"`
+	// FrontendVariables are the site's variables set to the backend preview's
+	// address; APIVariables the backend's set to (or, for "single origin", the
+	// one already holding another site's) origin. Names, sorted.
+	FrontendVariables []string `json:"frontend_variables,omitempty"`
+	APIVariables      []string `json:"api_variables,omitempty"`
+	// Reason is why the site isn't connected (qaWiring*), "" when it is.
+	Reason string `json:"reason,omitempty"`
 }
 
 // finalRound is the round whose result is the stage's, or nil when the gate

@@ -24,6 +24,9 @@ const gitEmptyTree = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 type qaGate struct {
 	static, backends []string
 	status, reason   string
+	// stack is the stack path: static and backends are every repository of the
+	// Task with a site or a backend preview, unchanged ones included.
+	stack bool
 }
 
 // gate decides whether QA runs, before anything is spawned. It classifies
@@ -43,19 +46,54 @@ func (s *qaStage) gate() qaGate {
 	if len(changed) == 0 {
 		return qaGate{}
 	}
-	buildable, lookupErr := s.buildableRepositories(changed)
-	backends := s.backendRepositories(changed)
+	stack := s.stackPath()
+	candidates := changed
+	if stack {
+		// The whole stack, so a new frontend is never checked against the old
+		// backend, or the other way round.
+		candidates = make([]string, 0, len(repos))
+		for _, repo := range repos {
+			candidates = append(candidates, repo.Dir)
+		}
+	}
+	buildable, lookupErr := s.buildableRepositories(candidates)
+	backends := s.backendRepositories(candidates)
 	if len(buildable) == 0 && len(backends) == 0 {
 		if lookupErr != "" {
 			return qaGate{status: tasks.QAStatusCouldNotRun, reason: lookupErr}
 		}
 		return qaGate{status: tasks.QAStatusSkipped, reason: qaNoStaticSiteOrBackendReason}
 	}
-	g := qaGate{static: buildable, backends: backends}
+	if stack {
+		s.logUnchangedInStack(changed, buildable, backends)
+	}
+	g := qaGate{static: buildable, backends: backends, stack: stack}
 	if s.qaFailure != "" {
 		g.status, g.reason = tasks.QAStatusCouldNotRun, s.qaFailure
 	}
 	return g
+}
+
+// stackPath reports whether the agentbox image reads QA_PREVIEWS, so the runner
+// deploys the change's whole stack itself (minPreviewsQAAgentboxVersion).
+func (s *qaStage) stackPath() bool {
+	imageRef, _ := jobs.GetParameterValue[string](s.parameters, parameters_enums.AgentboxImage)
+	return imageVersionAtLeast(imageRef, minPreviewsQAAgentboxVersion)
+}
+
+// logUnchangedInStack logs each repository of the stack that didn't change.
+func (s *qaStage) logUnchangedInStack(changed, static, backends []string) {
+	seen := map[string]bool{}
+	for _, dir := range changed {
+		seen[dir] = true
+	}
+	for _, dir := range qaStackRepositories(static, backends) {
+		if seen[dir] {
+			continue
+		}
+		seen[dir] = true
+		io.WriteString(s.logsWriter, fmt.Sprintf("QA stage: deploying %s too: unchanged, but part of this change's stack\n", dir))
+	}
 }
 
 // changedRepositories is every repository directory whose working tree differs

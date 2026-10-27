@@ -142,6 +142,10 @@ type WebServicePreviewDeployInput struct {
 	// then runs against it (and the preview migrate command, if set, with it). Nil: none, and
 	// the API deploys exactly as without one.
 	Database *PreviewDatabaseDeploy
+	// WiredNames are the names of Settings.Variables the QA stage set (sorted; nil
+	// for the tool). The database's value of such a name replaces it in the build
+	// args as well as the environment.
+	WiredNames []string
 	// BuildLogs gets the image build's output: the Step log only, since a build can
 	// print the preview configuration. Logs gets every later step's.
 	BuildLogs io.Writer
@@ -244,6 +248,9 @@ type webServicePreviewPlan struct {
 	rootDirectory string // service.RootDirectory, cleaned
 	serviceName   string
 	settings      task_previews.WebServicePreviewSettingsReplyV1
+	// wired are variables the QA stage sets on top of the preview configuration's
+	// (the origins of the site previews that call it); nil for the tool.
+	wired map[string]string
 }
 
 func handleDeployWebServicePreview(ctx context.Context, deps DeployWebServicePreviewDeps, builds *previewBuilds, rawArgs json.RawMessage) (string, error) {
@@ -473,6 +480,7 @@ func runWebServicePreview(ctx context.Context, deps DeployWebServicePreviewDeps,
 	if err != nil {
 		return WebServicePreviewDeployed{}, err
 	}
+	settings := withWiredVariables(p.settings, p.wired, database, deps.LogsWriter)
 
 	var tail bytes.Buffer
 	logs := io.MultiWriter(deps.LogsWriter, &tail)
@@ -483,9 +491,10 @@ func runWebServicePreview(ctx context.Context, deps DeployWebServicePreviewDeps,
 		BuildDir:      copyDir,
 		RootDirectory: p.rootDirectory,
 		Service:       p.service,
-		Settings:      p.settings,
+		Settings:      settings,
 		Existing:      existing,
 		Database:      database,
+		WiredNames:    wiredNames(p.wired),
 		BuildLogs:     deps.LogsWriter,
 		Logs:          logs,
 	})
@@ -514,6 +523,43 @@ func runWebServicePreview(ctx context.Context, deps DeployWebServicePreviewDeps,
 		DatabaseNote: databaseNote,
 		LogTail:      tailString(tail.Bytes(), logTailMaxBytes),
 	}, nil
+}
+
+// withWiredVariables is settings with wired's variables replacing the preview
+// configuration's of the same name, so the task definition and the build args read
+// them. The preview database's variables still win over both (the deployer puts the
+// database's values in the environment and, for a wired name, the build args too);
+// a wired one the database sets is logged by name.
+func withWiredVariables(settings task_previews.WebServicePreviewSettingsReplyV1, wired map[string]string, database *PreviewDatabaseDeploy, logs io.Writer) task_previews.WebServicePreviewSettingsReplyV1 {
+	if len(wired) == 0 {
+		return settings
+	}
+	databaseSets := map[string]bool{}
+	if database != nil {
+		for _, name := range database.Variables {
+			databaseSets[name] = true
+		}
+	}
+	variables := make(map[string]string, len(settings.Variables)+len(wired))
+	for k, v := range settings.Variables {
+		variables[k] = v
+	}
+	for _, k := range sortedKeys(wired) {
+		if databaseSets[k] {
+			io.WriteString(logs, fmt.Sprintf("Backend preview: the preview database's %s replaces the value QA set for it\n", k))
+		}
+		variables[k] = wired[k]
+	}
+	settings.Variables = variables
+	return settings
+}
+
+// wiredNames is wired's names, sorted; nil when there are none.
+func wiredNames(wired map[string]string) []string {
+	if len(wired) == 0 {
+		return nil
+	}
+	return sortedKeys(wired)
 }
 
 // webPreviewFailureDetails is what a failed deploy's error carries after its

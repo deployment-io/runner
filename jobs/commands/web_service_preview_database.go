@@ -221,6 +221,22 @@ func setWebPreviewDatabaseParameters(p map[string]interface{}, in agenttools.Web
 		return err
 	}
 	jobs.SetParameterValue(p, parameters_enums.EnvironmentVariables, env)
+	if len(in.WiredNames) > 0 {
+		// A wired name the database sets gets the database's value in the build
+		// args too; every other build arg keeps what buildWebPreviewParameters gave it.
+		buildVariables := make(map[string]string, len(in.Settings.Variables))
+		for k, v := range in.Settings.Variables {
+			buildVariables[k] = v
+		}
+		for _, name := range in.WiredNames {
+			buildVariables[name] = variables[name]
+		}
+		if buildArgs, _ := webPreviewBuildArgs(in.Service.DockerBuildArgs, buildVariables); len(buildArgs) > 0 {
+			jobs.SetParameterValue(p, parameters_enums.DockerBuildArgs, stringsToPrimitiveA(buildArgs))
+		} else if key, err := parameters_enums.DockerBuildArgs.Key(); err == nil {
+			delete(p, key)
+		}
+	}
 	if in.Database.MigrateCommand != "" {
 		jobs.SetParameterValue(p, parameters_enums.PreDeployCommand, in.Database.MigrateCommand)
 	}

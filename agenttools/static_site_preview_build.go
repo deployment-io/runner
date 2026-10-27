@@ -75,6 +75,9 @@ type runnerBuiltPreview struct {
 	publishDir    string // site.PublishDirectory, cleaned, relative to rootDirectory
 	serviceName   string
 	configuration task_previews.StaticSiteBuildSettingsReplyV1 // ConfigurationSet, Variables, Files
+	// wired are variables the QA stage sets on top of the configuration's (the
+	// address of the backend preview the site calls); nil for the tool.
+	wired map[string]string
 }
 
 // displayName names the site in messages and the Step log line.
@@ -340,19 +343,19 @@ func previewBuildLogLine(p runnerBuiltPreview) string {
 }
 
 // previewBuildEnv is the build's environment: the preview configuration's variables
-// as "KEY=value", sorted by key.
-func previewBuildEnv(c task_previews.StaticSiteBuildSettingsReplyV1) []string {
-	if !c.ConfigurationSet {
-		return nil
+// as "KEY=value", sorted by key, then wired's, sorted by key, each replacing the
+// configuration's variable of its name. wired applies with no configuration set too.
+func previewBuildEnv(c task_previews.StaticSiteBuildSettingsReplyV1, wired map[string]string) []string {
+	var env []string
+	if c.ConfigurationSet {
+		for _, k := range sortedKeys(c.Variables) {
+			if _, replaced := wired[k]; !replaced {
+				env = append(env, k+"="+c.Variables[k])
+			}
+		}
 	}
-	keys := make([]string, 0, len(c.Variables))
-	for k := range c.Variables {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	env := make([]string, 0, len(keys))
-	for _, k := range keys {
-		env = append(env, k+"="+c.Variables[k])
+	for _, k := range sortedKeys(wired) {
+		env = append(env, k+"="+wired[k])
 	}
 	return env
 }
@@ -362,59 +365,75 @@ func previewBuildEnv(c task_previews.StaticSiteBuildSettingsReplyV1) []string {
 // its output, removing that build directory in every case. Build output streams to the Step log
 // only — it can print the configuration's values, so it isn't returned.
 func runRunnerBuiltPreview(ctx context.Context, deps DeployStaticSitePreviewDeps, p runnerBuiltPreview) (string, error) {
+	out, err := buildRunnerBuiltPreview(ctx, deps, p)
+	if err != nil {
+		return "", err
+	}
+	return marshalResult(out)
+}
+
+// buildRunnerBuiltPreview is runRunnerBuiltPreview's build and deploy, returning the
+// tool's result.
+func buildRunnerBuiltPreview(ctx context.Context, deps DeployStaticSitePreviewDeps, p runnerBuiltPreview) (deployStaticSitePreviewResult, error) {
+	fail := func(err error) (deployStaticSitePreviewResult, error) { return deployStaticSitePreviewResult{}, err }
 	if deps.BuildSite == nil {
-		return "", fmt.Errorf("deployment.io can't build previews here")
+		return fail(fmt.Errorf("deployment.io can't build previews here"))
 	}
 	copyDir, err := PreviewBuildSource(ctx, deps, p.repository)
 	if copyDir != "" {
 		defer os.RemoveAll(copyDir)
 	}
 	if err != nil {
-		return "", fmt.Errorf("copy %s for the preview build: %w", p.repository, err)
+		return fail(fmt.Errorf("copy %s for the preview build: %w", p.repository, err))
 	}
 	siteDir := filepath.Join(copyDir, p.rootDirectory)
 	if info, err := os.Stat(siteDir); err != nil || !info.IsDir() {
-		return "", fmt.Errorf("%s's root directory %q isn't a directory in %s", p.displayName(), p.site.RootDirectory, p.repository)
+		return fail(fmt.Errorf("%s's root directory %q isn't a directory in %s", p.displayName(), p.site.RootDirectory, p.repository))
 	}
 	if err := checkInside(copyDir, siteDir); err != nil {
-		return "", fmt.Errorf("%s's root directory: %w", p.displayName(), err)
+		return fail(fmt.Errorf("%s's root directory: %w", p.displayName(), err))
 	}
 	if p.configuration.ConfigurationSet {
 		if err := writePreviewFiles(siteDir, p.configuration.Files); err != nil {
-			return "", err
+			return fail(err)
 		}
 	}
 
 	io.WriteString(deps.LogsWriter, previewBuildLogLine(p))
-	if err := deps.BuildSite(ctx, siteDir, p.site.BuildCommand, previewBuildEnv(p.configuration), deps.LogsWriter); err != nil {
+	// The build's output can print a wired variable: its value (an address and a
+	// production path) never reaches the Step log.
+	buildLogs, flushBuildLogs := newRedactingWriter(deps.LogsWriter, p.wired)
+	err = deps.BuildSite(ctx, siteDir, p.site.BuildCommand, previewBuildEnv(p.configuration, p.wired), buildLogs)
+	flushBuildLogs()
+	if err != nil {
 		if ctx.Err() != nil {
-			return "", fmt.Errorf("the preview build of %s was cancelled", p.displayName())
+			return fail(fmt.Errorf("the preview build of %s was cancelled", p.displayName()))
 		}
-		return "", fmt.Errorf("the preview build of %s failed (%s): %w. Its output is in the Step log; it isn't returned here because it can show the preview configuration", p.displayName(), p.site.BuildCommand, err)
+		return fail(fmt.Errorf("the preview build of %s failed (%s): %w. Its output is in the Step log; it isn't returned here because it can show the preview configuration", p.displayName(), p.site.BuildCommand, err))
 	}
 
 	outDir := filepath.Join(siteDir, p.publishDir)
 	shown := path.Join(p.repository, p.rootDirectory, p.publishDir)
 	if info, err := os.Stat(filepath.Join(outDir, "index.html")); err != nil || info.IsDir() {
 		if p.detected != nil {
-			return "", fmt.Errorf("the build of %s didn't produce %s/index.html. If the project writes its build somewhere else, build it yourself and call deploy_static_site_preview with publish_dir and without repository", p.displayName(), shown)
+			return fail(fmt.Errorf("the build of %s didn't produce %s/index.html. If the project writes its build somewhere else, build it yourself and call deploy_static_site_preview with publish_dir and without repository", p.displayName(), shown))
 		}
-		return "", fmt.Errorf("the build of %s didn't produce %s/index.html", p.displayName(), shown)
+		return fail(fmt.Errorf("the build of %s didn't produce %s/index.html", p.displayName(), shown))
 	}
 	if err := checkInside(copyDir, outDir); err != nil {
-		return "", fmt.Errorf("%s's publish directory: %w", p.displayName(), err)
+		return fail(fmt.Errorf("%s's publish directory: %w", p.displayName(), err))
 	}
 	if ctx.Err() != nil {
-		return "", fmt.Errorf("the preview build of %s was cancelled", p.displayName())
+		return fail(fmt.Errorf("the preview build of %s was cancelled", p.displayName()))
 	}
 	out, err := deployPreviewDir(ctx, deps, p.serviceName, outDir, p.site.IsSpa)
 	if err != nil {
-		return "", err
+		return fail(err)
 	}
 	out.BuiltBy = builtByDeploymentIO
 	out.Configuration = configurationText(p.configuration)
 	out.Settings = detectedSettingsText(p)
-	return marshalResult(out)
+	return out, nil
 }
 
 // PreviewBuildSource is the directory a runner-built preview of repository builds
