@@ -12,6 +12,7 @@ import (
 
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
+	"github.com/deployment-io/deployment-runner-kit/task_previews"
 	"github.com/deployment-io/deployment-runner-kit/tasks"
 	"github.com/deployment-io/deployment-runner-kit/types"
 	"github.com/deployment-io/deployment-runner/agenttools"
@@ -23,7 +24,10 @@ import (
 // separate agent run deploys the Task's static-site previews and checks the
 // spec's acceptance criteria in a real browser. The Task's changed backends
 // (web services) are deployed as previews by the runner itself before each
-// round, and the QA run is told where they are (QA_BACKENDS).
+// round, and the QA run is told where they are (QA_BACKENDS). With an agentbox
+// that reads QA_PREVIEWS (minPreviewsQAAgentboxVersion) the runner deploys every
+// preview of the change's stack itself instead, each site built to call this
+// change's backend preview, and the QA run only checks them (run_qa_stage_stack.go).
 //
 // THE QA RUN IS BLIND. It gets no diff, no implementer summary and no
 // repository: its /work is a sibling directory holding only agentbox's output
@@ -76,6 +80,14 @@ const qaNoStaticSiteOrBackendReason = "no static site or backend service in this
 // nothing about the backends.
 const minBackendQAAgentboxVersion = "1.9.35"
 
+// minPreviewsQAAgentboxVersion is the first agentbox that reads QA_PREVIEWS. With
+// it the runner deploys every preview of the change's stack itself before each
+// round — unchanged repositories of the Task too, each frontend built to call
+// this change's backend preview — and the QA run only checks them ("the stack
+// path"). With an older image, or a tag that isn't a version, the QA run deploys
+// its static sites itself, as before.
+const minPreviewsQAAgentboxVersion = "1.9.37"
+
 // qaNoTimeToDeployBackendReason is round 1's status reason when the stage's
 // budget can't fit deploying the backend previews and the QA run.
 const qaNoTimeToDeployBackendReason = "no time left to deploy the backend preview"
@@ -113,9 +125,10 @@ func (rq *RunQAStage) Run(parameters map[string]interface{}, logsWriter io.Write
 		qaFailure:   qaFailure,
 		deadline:    time.Now().Add(qaStageBudget),
 		// One memo for every round, as the tool keeps one per agent run.
-		webDistributions: agenttools.NewWebPreviewDistributions(),
-		stopSignal:       rq.stopSignal,
-		progressSink:     rq.progressSink,
+		webDistributions:    agenttools.NewWebPreviewDistributions(),
+		staticDistributions: agenttools.NewWebPreviewDistributions(),
+		stopSignal:          rq.stopSignal,
+		progressSink:        rq.progressSink,
 	}
 	return stage.run()
 }
@@ -179,6 +192,18 @@ type qaStage struct {
 	// re-deploy keeps its URL (see agenttools.WebPreviewDistributions).
 	webDistributions *agenttools.WebPreviewDistributions
 
+	// stack is the stack path (minPreviewsQAAgentboxVersion): the runner deploys
+	// every site and backend preview itself and the QA run gets QA_PREVIEWS.
+	stack bool
+	// staticDistributions is the stack path's memo of the site previews'
+	// distributions, shared by every round as webDistributions is.
+	staticDistributions *agenttools.WebPreviewDistributions
+	// wiring is how the stack's previews connect, looked up once per stage
+	// (wiringLooked); wiringFailed when the lookup failed.
+	wiring       task_previews.StackWiringReplyV1
+	wiringLooked bool
+	wiringFailed bool
+
 	out *qaOutput
 	// fixStage is the reviewStage the fix run ran in, and the review round
 	// after a kept fix runs in.
@@ -209,10 +234,15 @@ type qaStage struct {
 	// branch from, and the secret to scrub; nil means the installation token.
 	// Tests only.
 	mergeFetchSource func(ctx context.Context, entry tasks.RepositoryEntry) (string, string, error)
+	// stackOps are the stack path's lookups and deploys; nil means the real ones.
+	stackOps *qaStackOps
 
 	// roundMergeResults is what the running QA round's previews were built
 	// from, set when the round ends.
 	roundMergeResults []qaMergeResultOutput
+	// roundWiring is how the running stack-path round connected its previews,
+	// set when its deploys end.
+	roundWiring []qaWiringOutput
 }
 
 // qaView is the parameter view a QA round runs under.
@@ -244,12 +274,13 @@ func (s *qaStage) run() (map[string]interface{}, error) {
 	}
 	s.repositories = g.static
 	s.backends = g.backends
+	s.stack = g.stack
 	s.out = &qaOutput{Repositories: g.static, Backends: g.backends}
 	if g.status != "" {
 		s.out.Status, s.out.StatusReason = g.status, g.reason
 		return s.finish()
 	}
-	if len(s.backends) > 0 && !s.canAfford(qaBackendDeployAllowance+qaRunTimeout) {
+	if (s.stack || len(s.backends) > 0) && !s.canAfford(qaBackendDeployAllowance+qaRunTimeout) {
 		io.WriteString(s.logsWriter, "QA: no time left to deploy the backend preview and run QA\n")
 		s.out.Rounds = append(s.out.Rounds, s.couldNotRunRound(1, qaNoTimeToDeployBackendReason))
 		return s.finish()
@@ -371,7 +402,7 @@ func (s *qaStage) qaRound(round int) (qaRoundOutput, error) {
 	io.WriteString(s.logsWriter, fmt.Sprintf("QA round %d: checking the acceptance criteria on %s\n", round, s.qaRoundSubject()))
 	var result agentResult
 	var err error
-	s.roundMergeResults = nil
+	s.roundMergeResults, s.roundWiring = nil, nil
 	if s.runQA != nil {
 		result, err = s.runQA(round)
 	} else {
@@ -383,6 +414,7 @@ func (s *qaStage) qaRound(round int) (qaRoundOutput, error) {
 	}
 	out := s.roundOutput(round, result, err)
 	out.MergeResults = s.roundMergeResults
+	out.Wiring = s.roundWiring
 	s.out.Rounds = append(s.out.Rounds, out)
 	return out, nil
 }

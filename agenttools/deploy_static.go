@@ -172,9 +172,8 @@ func DeployStaticSitePreview(in StaticPreviewDeployInput, logsWriter io.Writer) 
 	}
 	cf := in.CloudfrontClient
 
-	if err = aws_utils.AttachPolicyToS3Bucket(dist.ARN, bucketName,
-		"AllowCloudFrontServicePrincipal-"+in.PreviewID, "PolicyForCloudFrontPrivateContent-"+in.PreviewID, in.S3Client); err != nil {
-		return StaticPreviewDeployResult{}, fmt.Errorf("attach bucket policy: %w", err)
+	if err = attachPreviewBucketPolicy(in, dist); err != nil {
+		return StaticPreviewDeployResult{}, err
 	}
 
 	if in.SkipDeployWait {
@@ -193,6 +192,42 @@ func DeployStaticSitePreview(in StaticPreviewDeployInput, logsWriter io.Writer) 
 		DomainName:      aws.ToString(dist.DomainName),
 		UploadedKeys:    sortedUploadedKeys(uploadedKeys),
 	}, nil
+}
+
+// ReservePreviewDistribution is DeployStaticSitePreview's first deploy without the
+// upload: the bucket, the distribution in front of it (routed for IsSPA) and the
+// bucket policy that lets it read the bucket, so the preview's address is known
+// before its site is built. A later DeployStaticSitePreview with ExistingDistID set
+// to the returned distribution uploads the site. It doesn't wait for the
+// distribution to deploy.
+func ReservePreviewDistribution(in StaticPreviewDeployInput, logsWriter io.Writer) (StaticPreviewDeployResult, error) {
+	bucketLocation, _, err := aws_utils.CreateS3BucketIfNeeded(in.S3Client, previewBucketName(in), in.Region)
+	if err != nil {
+		return StaticPreviewDeployResult{}, fmt.Errorf("ensure preview bucket: %w", err)
+	}
+	in.ExistingDistID = ""
+	dist, err := deployPreviewDistribution(in.CloudfrontClient, in, bucketLocation, logsWriter)
+	if err != nil {
+		return StaticPreviewDeployResult{}, err
+	}
+	if err = attachPreviewBucketPolicy(in, dist); err != nil {
+		return StaticPreviewDeployResult{}, err
+	}
+	io.WriteString(logsWriter, fmt.Sprintf("Preview distribution reserved: %s (propagating)\n", aws.ToString(dist.Id)))
+	return StaticPreviewDeployResult{
+		DistributionID:  aws.ToString(dist.Id),
+		DistributionArn: aws.ToString(dist.ARN),
+		DomainName:      aws.ToString(dist.DomainName),
+	}, nil
+}
+
+// attachPreviewBucketPolicy lets a new preview distribution read its bucket.
+func attachPreviewBucketPolicy(in StaticPreviewDeployInput, dist *cloudfrontTypes.Distribution) error {
+	if err := aws_utils.AttachPolicyToS3Bucket(dist.ARN, previewBucketName(in),
+		"AllowCloudFrontServicePrincipal-"+in.PreviewID, "PolicyForCloudFrontPrivateContent-"+in.PreviewID, in.S3Client); err != nil {
+		return fmt.Errorf("attach bucket policy: %w", err)
+	}
+	return nil
 }
 
 // previewBucketName matches deploy_aws_static_site's <org>-<deploymentID> scheme.

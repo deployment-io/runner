@@ -53,8 +53,12 @@ func (s *qaStage) runQARound(round int) (agentResult, error) {
 }
 
 // deployAndSpawnQA is a QA round once its directory is ready: it deploys the
-// round's backend previews, adds QA_BACKENDS to env and spawns the QA run.
+// round's backend previews, adds QA_BACKENDS to env and spawns the QA run. On the
+// stack path it deploys every preview instead and adds QA_PREVIEWS.
 func (s *qaStage) deployAndSpawnQA(round int, imageRef, qaDir string, env []string) (agentResult, error) {
+	if s.stack {
+		return s.deployStackAndSpawnQA(round, imageRef, qaDir, env)
+	}
 	// Previews build from the Task's REAL working tree, which the QA run never
 	// sees: the deploy tool copies <Task dir>/<repository> host-side.
 	previewDeps := buildStaticSitePreviewDeps(s.ctx, s.parameters, s.workDirHost, s.logsWriter)
@@ -72,16 +76,21 @@ func (s *qaStage) deployAndSpawnQA(round int, imageRef, qaDir string, env []stri
 		return agentResult{}, err
 	}
 	env = withQABackends(env, backends)
-	io.WriteString(s.logsWriter, fmt.Sprintf("%s: turn cap %s model responses\n", label, envValue(env, "MAX_TURNS")))
-	spec := s.qaSpawnSpec(imageRef, qaDir, env, previewDeps)
+	return s.spawnQARound(label, s.qaSpawnSpec(imageRef, qaDir, env, previewDeps))
+}
+
+// spawnQARound runs a round's QA container once its previews are deployed.
+func (s *qaStage) spawnQARound(label string, spec agentboxSpawnSpec) (agentResult, error) {
+	io.WriteString(s.logsWriter, fmt.Sprintf("%s: turn cap %s model responses\n", label, envValue(spec.env, "MAX_TURNS")))
 	var result agentResult
+	var err error
 	if s.spawnQA != nil {
 		result, err = s.spawnQA(spec)
 	} else {
 		impl := &RunAgentStep{stopSignal: s.stopSignal, progressSink: s.progressSink}
 		result, err = impl.spawnAgentboxAndWait(spec, s.logsWriter)
 	}
-	logRoundOutput(filepath.Join(qaDir, agentboxResultDirRel), label, s.logsWriter)
+	logRoundOutput(filepath.Join(spec.workDirHost, agentboxResultDirRel), label, s.logsWriter)
 	return result, err
 }
 
@@ -110,15 +119,8 @@ func (s *qaStage) deployBackends(label string, previewDeps *agenttools.DeploySta
 	if deploy == nil {
 		deploy = agenttools.DeployWebServicePreview
 	}
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := s.stopContext()
 	defer cancel()
-	go func() {
-		select {
-		case <-s.stopSignal:
-			cancel()
-		case <-ctx.Done():
-		}
-	}()
 	var out []qaBackend
 	firstErr := ""
 	deployed := 0
@@ -154,10 +156,22 @@ const qaBackendErrorMax = 300
 // tail, the build's and the migrate command's output — is the code under test's
 // own output, so it never reaches the tester's prompt; the Step log has it all.
 func qaBackendError(err error) string {
+	return qaFirstErrorLine(err, qaBackendErrorMax)
+}
+
+// qaPreviewError is a failed preview's error as QA_PREVIEWS tells it: its first
+// line, at most qaBackendErrorMax bytes with the "…" that marks a cut.
+func qaPreviewError(err error) string {
+	return qaFirstErrorLine(err, qaBackendErrorMax-len("…"))
+}
+
+// qaFirstErrorLine is err's first line, cut at a rune boundary to max bytes
+// followed by "…" when longer.
+func qaFirstErrorLine(err error, max int) string {
 	msg, _, _ := strings.Cut(err.Error(), "\n")
 	msg = strings.TrimSpace(msg)
-	if len(msg) > qaBackendErrorMax {
-		cut := qaBackendErrorMax
+	if len(msg) > max {
+		cut := max
 		for cut > 0 && !utf8.RuneStart(msg[cut]) {
 			cut--
 		}
@@ -184,6 +198,20 @@ func (s *qaStage) roundWebPreviewDeps(previewDeps *agenttools.DeployStaticSitePr
 	}
 	deps.Distributions = s.webDistributions
 	return deps
+}
+
+// stopContext is a context cancelled when the user stops the Step, and its
+// cancel.
+func (s *qaStage) stopContext() (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		select {
+		case <-s.stopSignal:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, cancel
 }
 
 // stopped reports whether the user stopped the Step.
@@ -233,7 +261,12 @@ func (s *qaStage) qaSpawnEnv() ([]string, error) {
 		return nil, err
 	}
 	spec, _ := jobs.GetParameterValue[string](s.parameters, parameters_enums.ReviewSpec)
-	return applyQAEnv(env, spec, s.repositories), nil
+	repositories := s.repositories
+	if s.stack {
+		// QA_PREVIEWS says it all: QA_REPOSITORIES is blank.
+		repositories = nil
+	}
+	return applyQAEnv(env, spec, repositories), nil
 }
 
 // applyQAEnv turns an implement-run environment into a QA-run one.

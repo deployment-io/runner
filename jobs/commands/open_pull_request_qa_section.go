@@ -132,7 +132,7 @@ func (opr *taskOpenPR) qaSection() string {
 		// A run that reported nothing still built previews: what they were
 		// built from is shown on its own.
 		builtOnly = !qaReportedEvidence(final)
-		if builtOnly && len(final.MergeResults) == 0 {
+		if builtOnly && len(final.MergeResults)+len(final.Wiring) == 0 {
 			return ""
 		}
 		partial = true
@@ -141,7 +141,7 @@ func (opr *taskOpenPR) qaSection() string {
 	}
 	failed, notChecked := splitCriteria(final.Criteria)
 	outcome := qaFixOutcomeLine(qa)
-	built := qaMergeResultItems(final.MergeResults)
+	built := append(qaMergeResultItems(final.MergeResults), qaWiringItems(final.Wiring)...)
 	fixedItems := qa.FixedByQA
 	if builtOnly {
 		failed, notChecked, fixedItems, outcome = nil, nil, nil, ""
@@ -193,6 +193,57 @@ func qaMergeResultItems(results []qaMergeResultOutput) []string {
 		}
 	}
 	return items
+}
+
+// qaWiringItems says, per (site, backend) pair of the final round's previews,
+// whether QA built the site's preview to call the backend's — names only.
+func qaWiringItems(wiring []qaWiringOutput) []string {
+	items := make([]string, 0, len(wiring))
+	for _, w := range wiring {
+		if text := qaPlainText(qaWiringLine(w, wiring), reviewDetailMaxRunes); text != "" {
+			items = append(items, "- "+text+"\n")
+		}
+	}
+	return items
+}
+
+// qaWiringLine is one pair's line, for the pull request and the Step log. all is
+// the round's every pair: a "single origin" line names the site that has it.
+func qaWiringLine(w qaWiringOutput, all []qaWiringOutput) string {
+	if w.Connected {
+		line := fmt.Sprintf("QA built %s's preview to call %s's preview (%s)", w.Frontend, w.API, strings.Join(w.FrontendVariables, ", "))
+		if len(w.APIVariables) > 0 {
+			return line + fmt.Sprintf(" and allowed its origin on %s's preview (%s).", w.API, strings.Join(w.APIVariables, ", "))
+		}
+		return line + fmt.Sprintf(". No production setting of %s lists %s's address, so %s's preview allows the origins Preview configuration gives it.", w.API, w.Frontend, w.API)
+	}
+	prefix := fmt.Sprintf("QA didn't connect %s's preview to %s's preview: ", w.Frontend, w.API)
+	switch w.Reason {
+	case qaWiringBackendFailed:
+		return prefix + fmt.Sprintf("%s's preview failed to deploy.", w.API)
+	case qaWiringLookupFailed:
+		return prefix + "deployment.io couldn't look up their production settings."
+	case qaWiringSingleOrigin:
+		name := strings.Join(w.APIVariables, ", ")
+		return prefix + fmt.Sprintf("%s's production setting %s holds a single origin, used by %s's preview.", w.API, name, singleOriginHolder(w, all))
+	}
+	return prefix + fmt.Sprintf("no production setting of %s holds %s's address.", w.Frontend, w.API)
+}
+
+// singleOriginHolder is the site whose origin w's backend variable holds: the
+// connected pair on the same backend that set it.
+func singleOriginHolder(w qaWiringOutput, all []qaWiringOutput) string {
+	for _, other := range all {
+		if !other.Connected || other.API != w.API {
+			continue
+		}
+		for _, name := range other.APIVariables {
+			if len(w.APIVariables) > 0 && name == w.APIVariables[0] {
+				return other.Frontend
+			}
+		}
+	}
+	return "another site"
 }
 
 // qaReportedEvidence is whether a QA round that couldn't run still reported

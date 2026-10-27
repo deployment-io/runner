@@ -126,3 +126,38 @@ func (r *RunnerClient) WebServicePreviewSettings(organizationID, taskID, cloneUR
 	}
 	return reply, nil
 }
+
+// StackWiring returns how the Task's frontends reach its APIs in production: per
+// static-site and web-service deployment pair, the NAMES of the frontend's variables
+// that hold the API's address (with the URL's path) and of the API's variables that
+// list the frontend's origin. repositories are every repository of the Task. The
+// reply carries names, paths and separators only; still, never log a path.
+//
+// Like StaticSiteBuildSettings, the call runs over its own connection whose deadline
+// is timeout from now.
+func (r *RunnerClient) StackWiring(organizationID, taskID string, repositories []task_previews.StackRepositoryV1, timeout time.Duration) (task_previews.StackWiringReplyV1, error) {
+	if !r.isConnected || r.dial == nil {
+		return task_previews.StackWiringReplyV1{}, ErrConnection
+	}
+	deadline := time.Now().Add(timeout)
+	conn, err := r.dial(timeout)
+	if err != nil {
+		return task_previews.StackWiringReplyV1{}, err
+	}
+	if err := conn.SetDeadline(deadline); err != nil {
+		conn.Close()
+		return task_previews.StackWiringReplyV1{}, err
+	}
+	c := rpc.NewClient(conn)
+	defer c.Close()
+	args := task_previews.StackWiringArgsV1{}
+	args.OrganizationID = r.GetComputedOrganizationID(organizationID)
+	args.Token = r.token
+	args.TaskID = taskID
+	args.Repositories = repositories
+	var reply task_previews.StackWiringReplyV1
+	if err := c.Call("TaskPreviews.StackWiringV1", args, &reply); err != nil {
+		return task_previews.StackWiringReplyV1{}, err
+	}
+	return reply, nil
+}

@@ -324,7 +324,7 @@ func TestConfigurationText(t *testing.T) {
 	if got := previewBuildLogLine(p); got != "Preview build: acme-web-dist built by deployment.io from web-prod with preview configuration (2 variables, 1 secret files)\n" {
 		t.Errorf("log line with a configuration: %q", got)
 	}
-	if env := previewBuildEnv(p.configuration); strings.Join(env, ",") != "API_KEY=s3cret-value,API_URL=https://staging.example" {
+	if env := previewBuildEnv(p.configuration, nil); strings.Join(env, ",") != "API_KEY=s3cret-value,API_URL=https://staging.example" {
 		t.Errorf("env: %v", env)
 	}
 }

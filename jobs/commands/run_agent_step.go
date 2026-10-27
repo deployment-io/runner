@@ -1905,6 +1905,10 @@ type agentboxSpawnSpec struct {
 	// tools with its two read-only checks (registerAgentTools); previewDeps is
 	// nil beside it.
 	productionTools *productionQATools
+	// verifyToolsOnly, set by a stack-path QA round, serves ping and the two
+	// verify tools over previewDeps.Record — the previews the runner deployed —
+	// and no deploy tool.
+	verifyToolsOnly bool
 }
 
 // productionQATools is what a production QA run's tool socket serves: only
@@ -1920,7 +1924,8 @@ type productionQATools struct {
 
 // registerAgentTools registers the tools a spawn's socket serves and returns
 // what stops them. A production QA run gets only its two read-only checks;
-// every other run gets ping and, with previewDeps, the three preview tools —
+// a stack-path QA round gets ping and the two verify tools; every other run
+// gets ping and, with previewDeps, the three preview tools —
 // and deploy_web_service_preview when webPreviewDeps is set too (implement and
 // fix runs). The returned stop stops both deploy tools.
 func registerAgentTools(mcpSrv *agentmcp.Server, spec agentboxSpawnSpec) func() {
@@ -1931,6 +1936,11 @@ func registerAgentTools(mcpSrv *agentmcp.Server, spec agentboxSpawnSpec) func() 
 	}
 	agentmcp.RegisterPing(mcpSrv)
 	if spec.previewDeps == nil {
+		return func() {}
+	}
+	if spec.verifyToolsOnly {
+		agenttools.RegisterVerifyPreviewReachable(mcpSrv, spec.previewDeps.Record, spec.previewDeps.LogsWriter)
+		agenttools.RegisterVerifyPreviewRendered(mcpSrv, spec.previewDeps.Record, spec.previewDeps.VerifyBrowser, spec.previewDeps.LogsWriter)
 		return func() {}
 	}
 	// Preview builds still running when the agent run ends are cancelled

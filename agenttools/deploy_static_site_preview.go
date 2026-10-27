@@ -89,6 +89,12 @@ type DeployStaticSitePreviewDeps struct {
 	// QA stage only; nil (implement and fix runs) builds the branch as built.
 	MergeResult MergeResultProvider
 
+	// Distributions, when set, remembers the distributions this deploy and the
+	// others sharing it reserved or created, as DeployWebServicePreviewDeps'
+	// Distributions does for backends: the QA stage passes one to every round of
+	// its stack. Nil (the tool) relies on the preview record alone.
+	Distributions *WebPreviewDistributions
+
 	// VerifyBrowser runs one verify_preview_rendered check in a verify-browser
 	// container. Not used by deploy_static_site_preview itself; carried here so the
 	// preview tools of a run are wired from one place.
@@ -290,19 +296,16 @@ func deployPreviewDirectory(ctx context.Context, deps DeployStaticSitePreviewDep
 	if err != nil {
 		return deployStaticSitePreviewResult{}, fmt.Errorf("ensure preview record: %w", err)
 	}
+	existing = deps.Distributions.fill(previewID, existing)
 
-	s3Client, cfClient, err := deps.BuildClients()
+	s3Client, cfClient, err := previewClients(ctx, deps)
 	if err != nil {
-		return deployStaticSitePreviewResult{}, fmt.Errorf("build cloud clients: %w", err)
-	}
-	if ctx.Done() != nil {
-		s3Client = s3.New(s3Client.Options(), func(o *s3.Options) { o.HTTPClient = newCtxHTTPClient(ctx, o.HTTPClient) })
-		cfClient = cloudfront.New(cfClient.Options(), func(o *cloudfront.Options) { o.HTTPClient = newCtxHTTPClient(ctx, o.HTTPClient) })
+		return deployStaticSitePreviewResult{}, err
 	}
 
 	var tail bytes.Buffer
 	logs := io.MultiWriter(deps.LogsWriter, &tail)
-	res, err := DeployStaticSitePreview(StaticPreviewDeployInput{
+	res, err := deployStaticPreview(StaticPreviewDeployInput{
 		OrgID:            deps.OrgID,
 		PreviewID:        previewID,
 		DistDirectory:    distDir,
@@ -328,11 +331,13 @@ func deployPreviewDirectory(ctx context.Context, deps DeployStaticSitePreviewDep
 		domain = existing.CloudFrontDomainName
 	}
 	if res.DomainName != "" {
-		deps.Store.SavePreview(previewID, PreviewState{
+		saved := PreviewState{
 			CloudFrontDistributionID:  res.DistributionID,
 			CloudFrontDistributionArn: res.DistributionArn,
 			CloudFrontDomainName:      res.DomainName,
-		})
+		}
+		deps.Distributions.remember(previewID, saved)
+		deps.Store.SavePreview(previewID, saved)
 	}
 
 	previewURL := "https://" + domain
@@ -344,6 +349,23 @@ func deployPreviewDirectory(ctx context.Context, deps DeployStaticSitePreviewDep
 		Note:           "CDN propagation may take a few minutes before the URL serves the latest content.",
 		LogTail:        tailString(tail.Bytes(), logTailMaxBytes),
 	}, nil
+}
+
+// deployStaticPreview is DeployStaticSitePreview; tests replace it to deploy nowhere.
+var deployStaticPreview = DeployStaticSitePreview
+
+// previewClients builds the preview's cloud clients, their requests cancelled with
+// ctx when it can be.
+func previewClients(ctx context.Context, deps DeployStaticSitePreviewDeps) (*s3.Client, *cloudfront.Client, error) {
+	s3Client, cfClient, err := deps.BuildClients()
+	if err != nil {
+		return nil, nil, fmt.Errorf("build cloud clients: %w", err)
+	}
+	if ctx.Done() != nil && s3Client != nil && cfClient != nil {
+		s3Client = s3.New(s3Client.Options(), func(o *s3.Options) { o.HTTPClient = newCtxHTTPClient(ctx, o.HTTPClient) })
+		cfClient = cloudfront.New(cfClient.Options(), func(o *cloudfront.Options) { o.HTTPClient = newCtxHTTPClient(ctx, o.HTTPClient) })
+	}
+	return s3Client, cfClient, nil
 }
 
 // recordPreviewDeploy records previewURL's host and, for a deploy that created its
