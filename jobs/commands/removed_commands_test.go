@@ -16,3 +16,26 @@ func TestGetRefusesRemovedAutomationCommands(t *testing.T) {
 		}
 	}
 }
+
+// Nixpacks builds were removed; a leftover BuildNixPacksImage job fails with
+// a message telling the user to switch to a Dockerfile.
+func TestGetRefusesNixpacksBuild(t *testing.T) {
+	c, err := Get(commands_enums.BuildNixPacksImage)
+	if c != nil {
+		t.Errorf("Get(BuildNixPacksImage) = %T, want nil", c)
+	}
+	want := "Nixpacks builds are no longer supported: deployment.io builds web and private services from a Dockerfile. Add a Dockerfile to the repository and create the service with the Docker runtime."
+	if err == nil || err.Error() != want {
+		t.Errorf("Get(BuildNixPacksImage) error = %v, want %q", err, want)
+	}
+}
+
+func TestGetBuildDockerImage(t *testing.T) {
+	c, err := Get(commands_enums.BuildDockerImage)
+	if err != nil {
+		t.Fatalf("Get(BuildDockerImage) error = %v", err)
+	}
+	if _, ok := c.(*BuildDockerImage); !ok {
+		t.Errorf("Get(BuildDockerImage) = %T, want *BuildDockerImage", c)
+	}
+}
