@@ -139,3 +139,30 @@ func CPUCores() int64 {
 	}
 	return 1
 }
+
+const procMaxUserNamespacesPath = "/proc/sys/user/max_user_namespaces"
+
+// MaxUserNamespaces returns the host's user.max_user_namespaces sysctl,
+// and false when it couldn't be read. Rootless BuildKit needs user
+// namespaces, so it can't run on a host where this is 0.
+//
+// As with /proc/meminfo, the runner reads the host's value from inside its
+// container: Docker doesn't give the runner a user namespace of its own,
+// and this limit is per user namespace, so what it reads is the initial
+// namespace's — the host's.
+func MaxUserNamespaces() (int64, bool) {
+	return readInt(procMaxUserNamespacesPath)
+}
+
+// readInt parses a procfs file holding a single integer, such as a sysctl.
+func readInt(path string) (int64, bool) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return 0, false
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}

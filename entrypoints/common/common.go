@@ -515,6 +515,12 @@ func logResourceBudget() {
 		resources.MemoryBudgetBytes()/mb,
 		agentMemory/mb, agentNanoCPUs/1_000_000_000,
 		staticMemory/mb, imageMemory/mb, resources.MemoryForAssistantSession()/mb)
+	// Rootless BuildKit (build secrets) needs user namespaces on the host.
+	if n, ok := hostinfo.MaxUserNamespaces(); ok {
+		log.Printf("host user.max_user_namespaces=%d (rootless BuildKit needs more than 0)", n)
+	} else {
+		log.Printf("host user.max_user_namespaces couldn't be read")
+	}
 }
 
 func GetRuntimeEnvironment() (cpu_architecture_enums.Type, os_enums.Type) {
