@@ -242,6 +242,7 @@ func (r *qaStackRound) reserveSites() error {
 		}
 		if err != nil {
 			r.fail(site, "site", err)
+			markSiteFailed(r.pairs, site)
 			continue
 		}
 		site.origin = origin
@@ -280,7 +281,7 @@ func (r *qaStackRound) deployBackends() error {
 		if err != nil {
 			r.fail(backend, "backend", err)
 			for _, p := range r.pairs {
-				if p.backend == backend && p.linked() && p.reason != qaWiringLookupFailed {
+				if p.backend == backend && p.linked() && (p.reason == "" || p.reason == qaWiringSingleOrigin) {
 					p.reason = qaWiringBackendFailed
 				}
 			}
@@ -312,6 +313,7 @@ func (r *qaStackRound) deploySites() error {
 		}
 		if err != nil {
 			r.fail(site, "site", err)
+			markSiteFailed(r.pairs, site)
 			continue
 		}
 		site.url = url

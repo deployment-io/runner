@@ -44,7 +44,8 @@ func (p *qaStackPair) connected() bool {
 }
 
 // pairStack makes every (site, backend) pair of the round and its applying
-// link. lookupFailed marks every pair "lookup failed".
+// link. lookupFailed marks every pair "lookup failed"; a backend or site whose
+// plan failed marks its pairs "backend failed" or "site failed".
 func pairStack(sites, backends []*qaStackPreview, links []task_previews.StackLinkV1, lookupFailed bool) []*qaStackPair {
 	var pairs []*qaStackPair
 	for _, site := range sites {
@@ -55,6 +56,8 @@ func pairStack(sites, backends []*qaStackPreview, links []task_previews.StackLin
 				p.reason = qaWiringLookupFailed
 			case backend.planErr != "":
 				p.reason = qaWiringBackendFailed
+			case site.planErr != "":
+				p.reason = qaWiringSiteFailed
 			default:
 				p.link = applyingLink(links, site, backend)
 				if !p.linked() {
@@ -65,6 +68,16 @@ func pairStack(sites, backends []*qaStackPreview, links []task_previews.StackLin
 		}
 	}
 	return pairs
+}
+
+// markSiteFailed marks "site failed" every pair of site that is connected or
+// lost a single origin; a pair keeps any other, earlier failure.
+func markSiteFailed(pairs []*qaStackPair, site *qaStackPreview) {
+	for _, p := range pairs {
+		if p.site == site && (p.reason == "" || p.reason == qaWiringSingleOrigin) {
+			p.reason, p.singleOrigin = qaWiringSiteFailed, ""
+		}
+	}
 }
 
 // applyingLink is the first link for site's and backend's repositories and the

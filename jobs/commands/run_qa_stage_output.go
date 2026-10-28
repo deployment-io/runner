@@ -89,6 +89,7 @@ const (
 	qaWiringBackendFailed = "backend failed"
 	qaWiringLookupFailed  = "lookup failed"
 	qaWiringSingleOrigin  = "single origin"
+	qaWiringSiteFailed    = "site failed"
 )
 
 // qaWiringOutput is how a stack-path QA round connected one site preview
