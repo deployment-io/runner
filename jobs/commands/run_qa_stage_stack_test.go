@@ -35,6 +35,7 @@ type fakeStackOps struct {
 	sites, backends map[string]string
 	planErr         map[string]error // "site:<repo>" / "backend:<repo>"
 	deployErr       map[string]error
+	reserveErr      map[string]error // by repository
 	links           []task_previews.StackLinkV1
 	wiringErr       error
 
@@ -70,6 +71,9 @@ func (f *fakeStackOps) ops() *qaStackOps {
 		reserveSite: func(_ context.Context, deps agenttools.DeployStaticSitePreviewDeps, p agenttools.StaticSitePreviewPlan) (string, error) {
 			f.event("reserve " + p.Repository)
 			f.siteDeps = append(f.siteDeps, deps)
+			if err := f.reserveErr[p.Repository]; err != nil {
+				return "", err
+			}
 			return stackHost("s", p.Repository), nil
 		},
 		deploySite: func(_ context.Context, deps agenttools.DeployStaticSitePreviewDeps, p agenttools.StaticSitePreviewPlan, vars map[string]string) (string, error) {
@@ -469,6 +473,76 @@ func TestQAStackBackendFailed(t *testing.T) {
 	}
 }
 
+// A site whose plan, reservation or build fails isn't connected to the backend
+// it is linked to: "site failed".
+func TestQAStackSiteFailed(t *testing.T) {
+	siteErr := errors.New("the preview build of web failed")
+	for _, tc := range []struct {
+		name                           string
+		planErr, deployErr, reserveErr map[string]error
+	}{
+		{name: "plan", planErr: map[string]error{"site:0-web": siteErr}},
+		{name: "reserve", reserveErr: map[string]error{"0-web": siteErr}},
+		{name: "build", deployErr: map[string]error{"site:0-web": siteErr}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &fakeStackOps{sites: map[string]string{"0-web": "web"}, backends: map[string]string{"1-api": "api"},
+				links:   []task_previews.StackLinkV1{webLink(urlVar("VITE_API_URL", ""), originVar("CORS_ORIGINS", ","))},
+				planErr: tc.planErr, deployErr: tc.deployErr, reserveErr: tc.reserveErr}
+			stage, _, specs := stackStage(t, []string{"web", "api"}, []string{"0-web"}, []string{"1-api"}, f)
+			if _, err := runStackRound(t, stage, 1); err != nil || len(*specs) != 1 {
+				t.Fatalf("err %v, spawns %d; want QA to run", err, len(*specs))
+			}
+			if want := []qaWiringOutput{{Frontend: "web", API: "api", Reason: qaWiringSiteFailed}}; !reflect.DeepEqual(stage.roundWiring, want) {
+				t.Errorf("wiring = %+v", stage.roundWiring)
+			}
+			if line := qaWiringLine(stage.roundWiring[0], stage.roundWiring); line != "QA didn't connect web's preview to api's preview: web's preview failed to deploy." {
+				t.Errorf("line = %q", line)
+			}
+			if tc.name == "reserve" {
+				if got, ok := f.backendVars["1-api"]; !ok || len(got) != 0 {
+					t.Errorf("backend variables = %v (deployed %v); want deployed without the site's origin", got, ok)
+				}
+			}
+		})
+	}
+}
+
+// A site whose reservation failed keeps "site failed" when its backend then
+// fails too.
+func TestQAStackSiteFailedThenBackendFailed(t *testing.T) {
+	f := &fakeStackOps{sites: map[string]string{"0-web": "web"}, backends: map[string]string{"1-api": "api"},
+		links:      []task_previews.StackLinkV1{webLink(urlVar("VITE_API_URL", ""), originVar("CORS_ORIGINS", ","))},
+		reserveErr: map[string]error{"0-web": errors.New("the distribution couldn't be reserved")},
+		deployErr:  map[string]error{"backend:1-api": errors.New("the image build failed")}}
+	stage, _, _ := stackStage(t, []string{"web", "api"}, []string{"0-web"}, []string{"1-api"}, f)
+	runStackRound(t, stage, 1)
+	if want := []qaWiringOutput{{Frontend: "web", API: "api", Reason: qaWiringSiteFailed}}; !reflect.DeepEqual(stage.roundWiring, want) {
+		t.Errorf("wiring = %+v", stage.roundWiring)
+	}
+}
+
+// A site that lost a single origin and then fails to build is "site failed".
+func TestQAStackSingleOriginThenSiteFailed(t *testing.T) {
+	var links []task_previews.StackLinkV1
+	for _, site := range []string{"0-admin", "1-web"} {
+		links = append(links, task_previews.StackLinkV1{FrontendRepository: site, Frontend: site, APIRepository: "2-api", API: "api",
+			APIURLVariables: urlVar("API_URL", ""), AllowedOriginVariables: originVar("ALLOWED_ORIGIN", "")})
+	}
+	f := &fakeStackOps{sites: map[string]string{"0-admin": "0-admin", "1-web": "1-web"}, backends: map[string]string{"2-api": "api"}, links: links,
+		deployErr: map[string]error{"site:1-web": errors.New("the preview build of web failed")}}
+	stage, _, _ := stackStage(t, []string{"admin", "web", "api"}, []string{"0-admin", "1-web"}, []string{"2-api"}, f)
+	if _, err := runStackRound(t, stage, 1); err != nil {
+		t.Fatal(err)
+	}
+	if w := stage.roundWiring[1]; !reflect.DeepEqual(w, qaWiringOutput{Frontend: "web", API: "api", Reason: qaWiringSiteFailed}) {
+		t.Errorf("1-web's wiring = %+v", w)
+	}
+	if w := stage.roundWiring[0]; !w.Connected {
+		t.Errorf("0-admin's wiring = %+v", w)
+	}
+}
+
 // Every preview failed: the round couldn't run and nothing is spawned.
 func TestQAStackNothingDeployed(t *testing.T) {
 	f := &fakeStackOps{sites: map[string]string{"0-web": "web"}, backends: map[string]string{"1-api": "api"},
@@ -544,6 +618,8 @@ func TestQAWiringLines(t *testing.T) {
 			"QA didn't connect web's preview to api's preview: no production setting of web holds api's address."},
 		{qaWiringOutput{Frontend: "web", API: "api", Reason: qaWiringBackendFailed},
 			"QA didn't connect web's preview to api's preview: api's preview failed to deploy."},
+		{qaWiringOutput{Frontend: "web", API: "api", Reason: qaWiringSiteFailed},
+			"QA didn't connect web's preview to api's preview: web's preview failed to deploy."},
 		{qaWiringOutput{Frontend: "web", API: "api", Reason: qaWiringLookupFailed},
 			"QA didn't connect web's preview to api's preview: deployment.io couldn't look up their production settings."},
 	} {

@@ -221,6 +221,8 @@ func qaWiringLine(w qaWiringOutput, all []qaWiringOutput) string {
 	switch w.Reason {
 	case qaWiringBackendFailed:
 		return prefix + fmt.Sprintf("%s's preview failed to deploy.", w.API)
+	case qaWiringSiteFailed:
+		return prefix + fmt.Sprintf("%s's preview failed to deploy.", w.Frontend)
 	case qaWiringLookupFailed:
 		return prefix + "deployment.io couldn't look up their production settings."
 	case qaWiringSingleOrigin:
