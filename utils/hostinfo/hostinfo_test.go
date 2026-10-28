@@ -122,3 +122,31 @@ func TestCPUCoresAlwaysPositive(t *testing.T) {
 		t.Errorf("CPUCores() = %d, want at least 1", got)
 	}
 }
+
+// TestReadInt covers reading a single-integer procfs file such as
+// /proc/sys/user/max_user_namespaces: 0 is a real value (user namespaces
+// off), so anything unreadable must report false rather than 0.
+func TestReadInt(t *testing.T) {
+	dir := t.TempDir()
+	for _, tc := range []struct {
+		name, content string
+		want          int64
+		ok            bool
+	}{
+		{"enabled", "31125\n", 31125, true},
+		{"disabled", "0\n", 0, true},
+		{"not a number", "abc\n", 0, false},
+		{"empty", "", 0, false},
+	} {
+		path := filepath.Join(dir, tc.name)
+		if err := os.WriteFile(path, []byte(tc.content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if got, ok := readInt(path); got != tc.want || ok != tc.ok {
+			t.Errorf("%s: readInt = %d, %v; want %d, %v", tc.name, got, ok, tc.want, tc.ok)
+		}
+	}
+	if _, ok := readInt(filepath.Join(dir, "missing")); ok {
+		t.Error("missing file: readInt reported ok")
+	}
+}
