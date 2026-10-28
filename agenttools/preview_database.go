@@ -177,7 +177,7 @@ type previewDatabaseMigrationPlan struct {
 // Migrations wording for the result and the Step log.
 const (
 	previewMigrationsRan     = "ran the service's preview migrate command"
-	previewMigrationsNotSet  = "not run: no preview migrate command is set for this service (set one in Context → Services)"
+	previewMigrationsNotSet  = "not run: no preview migrate command is set for this service (set one in Resources → Services)"
 	previewMigrationsUnknown = "the deploy failed before it finished; the preview migrate command's output, if it ran, is in the log tail"
 )
 
