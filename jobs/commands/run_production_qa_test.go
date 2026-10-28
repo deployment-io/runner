@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -56,7 +57,11 @@ func productionQAParameters(t *testing.T) map[string]interface{} {
 // and returns the job output's qa block and the whole envelope.
 func runProductionQA(t *testing.T, parameters map[string]interface{}, spawn func(agentboxSpawnSpec, io.Writer) (agentResult, error)) (*qaOutput, jobOutputData) {
 	t.Helper()
-	cmd := &RunProductionQA{spawn: spawn}
+	return runProductionQAWith(t, &RunProductionQA{spawn: spawn, prefetchBrowser: func(context.Context, string, io.Writer) {}}, parameters)
+}
+
+func runProductionQAWith(t *testing.T, cmd *RunProductionQA, parameters map[string]interface{}) (*qaOutput, jobOutputData) {
+	t.Helper()
 	out, err := cmd.Run(parameters, io.Discard)
 	if err != nil {
 		t.Fatalf("Run returned %v; every outcome must complete the Job", err)
@@ -327,4 +332,55 @@ func TestProductionQACouldntRunBeforeSpawning(t *testing.T) {
 			}
 		})
 	}
+}
+
+// The QA browser's download starts once, for the Job's image, before the QA
+// agent starts.
+func TestProductionQAPrefetchesTheBrowserBeforeTheRun(t *testing.T) {
+	var events []string
+	cmd := &RunProductionQA{
+		spawn: func(agentboxSpawnSpec, io.Writer) (agentResult, error) {
+			events = append(events, "spawn")
+			return qaCompleted(signUpPassed, pricingPassed), nil
+		},
+		prefetchBrowser: func(ctx context.Context, jobRef string, _ io.Writer) {
+			if _, ok := ctx.Deadline(); !ok {
+				t.Error("prefetch's context has no deadline")
+			}
+			events = append(events, "prefetch "+jobRef)
+		},
+	}
+	qa, _ := runProductionQAWith(t, cmd, productionQAParameters(t))
+	if qa.Status != tasks.QAStatusCompleted {
+		t.Errorf("qa = %+v", qa)
+	}
+	if want := []string{"prefetch " + productionTestBrowser, "spawn"}; strings.Join(events, ",") != strings.Join(want, ",") {
+		t.Errorf("events = %v, want %v", events, want)
+	}
+}
+
+func TestProductionQANoPrefetchWhenTheRunDoesNotGoAhead(t *testing.T) {
+	noPrefetch := func(context.Context, string, io.Writer) { t.Error("prefetched for a run that did not go ahead") }
+	t.Run("image refused", func(t *testing.T) {
+		parameters := productionQAParameters(t)
+		jobs.SetParameterValue[string](parameters, parameters_enums.VerifyBrowserImage, "docker.io/deploymenthq/verify-browser:1.2.0")
+		cmd := &RunProductionQA{
+			spawn: func(agentboxSpawnSpec, io.Writer) (agentResult, error) {
+				return agentResult{}, errors.New("must not run")
+			},
+			prefetchBrowser: noPrefetch,
+		}
+		if qa, _ := runProductionQAWith(t, cmd, parameters); qa.Status != tasks.QAStatusCouldNotRun {
+			t.Errorf("qa = %+v, want couldnt_run", qa)
+		}
+	})
+	t.Run("agentbox image unavailable", func(t *testing.T) {
+		// No spawn seam: holdImage asks Docker, which isn't there.
+		t.Setenv("DOCKER_HOST", "unix://"+t.TempDir()+"/no-docker.sock")
+		cmd := &RunProductionQA{prefetchBrowser: noPrefetch}
+		qa, _ := runProductionQAWith(t, cmd, productionQAParameters(t))
+		if qa.Status != tasks.QAStatusCouldNotRun || !strings.Contains(qa.StatusReason, "agentbox image") {
+			t.Errorf("qa = %s %q, want couldnt_run naming the agentbox image", qa.Status, qa.StatusReason)
+		}
+	})
 }

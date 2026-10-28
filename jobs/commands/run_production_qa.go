@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -41,6 +42,9 @@ type RunProductionQA struct {
 
 	// spawn runs the QA container; nil is the real thing. Tests only.
 	spawn func(spec agentboxSpawnSpec, logsWriter io.Writer) (agentResult, error)
+	// prefetchBrowser starts the QA browser image's download; nil is
+	// runnerVerifyBrowser.prefetch. Tests only.
+	prefetchBrowser func(ctx context.Context, jobRef string, logsWriter io.Writer)
 }
 
 func (rp *RunProductionQA) SetStopSignal(stop <-chan struct{}) { rp.stopSignal = stop }
@@ -104,6 +108,7 @@ func (rp *RunProductionQA) check(parameters map[string]interface{}, logsWriter i
 	if reason != "" {
 		return couldntRun(reason)
 	}
+	prefetchVerifyBrowserImage(rp.prefetchBrowser, parameters, logsWriter)
 	stage := &qaStage{
 		parameters:   parameters,
 		workDirHost:  commandUtils.GetTaskRepositoriesBaseDir(orgID, taskID),

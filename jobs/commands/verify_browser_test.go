@@ -349,6 +349,136 @@ func TestVerifyBrowser_OnePullAtATimeAcrossRefs(t *testing.T) {
 	}
 }
 
+// --- prefetch ----------------------------------------------------------------
+
+// A prefetch starts the one download; a check during it is "preparing" and
+// starts no second one, and a check after it runs the container.
+func TestVerifyBrowserPrefetch_StartsTheDownload(t *testing.T) {
+	t.Setenv(verifyBrowserImageEnv, "")
+	d := &fakeVerifyDocker{pullGate: make(chan struct{})}
+	v := newTestVerifyBrowser(t, d)
+	var logs strings.Builder
+	v.prefetch(context.Background(), "", &logs)
+	if want := "QA: downloading the QA browser image " + verifyBrowserImage + " on this runner before the first check\n"; logs.String() != want {
+		t.Errorf("logs = %q, want %q", logs.String(), want)
+	}
+	if out, err := v.run(context.Background(), verifyRequest(), nil); err != nil || !out.Preparing {
+		t.Fatalf("check during the download: %+v, %v; want preparing", out, err)
+	}
+	close(d.pullGate)
+	<-v.pulled
+	if d.pulls != 1 {
+		t.Fatalf("pulls = %d, want 1", d.pulls)
+	}
+	if out, err := v.run(context.Background(), verifyRequest(), nil); err != nil || out.Preparing || len(d.created) != 1 {
+		t.Fatalf("check after the download: %+v, %v, %d containers; want it run", out, err, len(d.created))
+	}
+}
+
+func TestVerifyBrowserPrefetch_ImagePresentDownloadsNothing(t *testing.T) {
+	d := &fakeVerifyDocker{present: true}
+	v := newTestVerifyBrowser(t, d)
+	var logs strings.Builder
+	v.prefetch(context.Background(), "", &logs)
+	if d.pulls != 0 || v.pulled != nil || logs.Len() != 0 {
+		t.Errorf("pulls = %d, logs = %q; want nothing", d.pulls, logs.String())
+	}
+}
+
+func TestVerifyBrowserPrefetch_TwiceDownloadsOnce(t *testing.T) {
+	d := &fakeVerifyDocker{pullGate: make(chan struct{})}
+	v := newTestVerifyBrowser(t, d)
+	var logs strings.Builder
+	v.prefetch(context.Background(), "", &logs)
+	v.prefetch(context.Background(), "", &logs)
+	close(d.pullGate)
+	<-v.pulled
+	v.prefetch(context.Background(), "", &logs)
+	if d.pulls != 1 {
+		t.Errorf("pulls = %d, want 1", d.pulls)
+	}
+	if n := strings.Count(logs.String(), "QA: downloading"); n != 1 {
+		t.Errorf("logged %d downloads, want 1: %q", n, logs.String())
+	}
+}
+
+func TestVerifyBrowserPrefetch_AnotherRefDownloadingStartsNothing(t *testing.T) {
+	t.Setenv(verifyBrowserImageEnv, "")
+	d := &fakeVerifyDocker{pullGate: make(chan struct{})}
+	v := newTestVerifyBrowser(t, d)
+	r := verifyRequest()
+	r.ImageRef = "a/verify-browser:1"
+	if out, err := v.run(context.Background(), r, nil); err != nil || !out.Preparing {
+		t.Fatalf("check: %+v, %v", out, err)
+	}
+	var logs strings.Builder
+	v.prefetch(context.Background(), "a/verify-browser:2", &logs)
+	if logs.Len() != 0 {
+		t.Errorf("logs = %q, want nothing", logs.String())
+	}
+	close(d.pullGate)
+	<-v.pulled
+	if d.pulls != 1 {
+		t.Fatalf("pulls = %d, want 1", d.pulls)
+	}
+}
+
+func TestVerifyBrowserPrefetch_RetriesAFailedDownload(t *testing.T) {
+	t.Setenv(verifyBrowserImageEnv, "")
+	d := &fakeVerifyDocker{pullErr: errors.New("manifest unknown")}
+	v := newTestVerifyBrowser(t, d)
+	if out, err := v.run(context.Background(), verifyRequest(), nil); err != nil || !out.Preparing {
+		t.Fatalf("first check: %+v, %v", out, err)
+	}
+	<-v.pulled
+
+	gate := make(chan struct{})
+	d.mu.Lock()
+	d.pullGate, d.pullErr = gate, nil
+	d.mu.Unlock()
+	var logs strings.Builder
+	v.prefetch(context.Background(), "", &logs)
+	if want := "QA: the last download of the QA browser image " + verifyBrowserImage + " failed (manifest unknown); downloading it again\n"; logs.String() != want {
+		t.Errorf("logs = %q, want %q", logs.String(), want)
+	}
+	// The prefetch consumed the failure: the check sees the retry running.
+	if out, err := v.run(context.Background(), verifyRequest(), nil); err != nil || !out.Preparing {
+		t.Fatalf("check during the retry: %+v, %v; want preparing", out, err)
+	}
+	close(gate)
+	<-v.pulled
+	if d.pulls != 2 {
+		t.Errorf("pulls = %d, want 2", d.pulls)
+	}
+}
+
+// prefetch returns at once when the download hangs, and when Docker can't say
+// whether the image is there.
+func TestVerifyBrowserPrefetch_NeverBlocks(t *testing.T) {
+	d := &fakeVerifyDocker{pullGate: make(chan struct{})}
+	v := newTestVerifyBrowser(t, d)
+	done := make(chan struct{})
+	go func() {
+		v.prefetch(context.Background(), "", io.Discard)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("prefetch waited for the download")
+	}
+	close(d.pullGate)
+	<-v.pulled
+
+	v = newTestVerifyBrowser(t, &fakeVerifyDocker{})
+	v.imagePresent = func(context.Context, string) (bool, error) { return false, errors.New("daemon down") }
+	var logs strings.Builder
+	v.prefetch(context.Background(), "", &logs)
+	if v.pulled != nil || logs.Len() != 0 {
+		t.Errorf("a failed presence check started a download or logged %q", logs.String())
+	}
+}
+
 // buildStaticSitePreviewDeps' wrapper puts the Job's image on every check.
 func TestVerifyBrowserForJobCarriesTheJobImage(t *testing.T) {
 	parameters := map[string]interface{}{}

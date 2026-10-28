@@ -226,6 +226,9 @@ type qaStage struct {
 	spawnQA        func(spec agentboxSpawnSpec) (agentResult, error)
 	cacheExists    func(name string) bool
 	reviewer       func(rs *reviewStage)
+	// prefetchBrowser starts the QA browser image's download before round 1;
+	// nil is runnerVerifyBrowser.prefetch.
+	prefetchBrowser func(ctx context.Context, jobRef string, logsWriter io.Writer)
 	// fixTreesTmpRoot and fixTreesGit are the fix trees' and the gate's
 	// temporary root and git binary; "" means the defaults. Tests only.
 	fixTreesTmpRoot string
@@ -291,6 +294,7 @@ func (s *qaStage) run() (map[string]interface{}, error) {
 		s.out.Status, s.out.StatusReason = tasks.QAStatusCouldNotRun, reason
 		return s.finish()
 	}
+	s.prefetchVerifyBrowser()
 	defer s.prepareContextCopy()()
 	round1, err := s.qaRound(1)
 	if err != nil {
@@ -326,6 +330,25 @@ func (s *qaStage) run() (map[string]interface{}, error) {
 	}
 	s.out.FixedByQA = fixedByQA(round1, final)
 	return s.finish()
+}
+
+// prefetchVerifyBrowser starts downloading the QA browser image while round 1's
+// previews build, so it is usually on the runner by the first check.
+func (s *qaStage) prefetchVerifyBrowser() {
+	prefetchVerifyBrowserImage(s.prefetchBrowser, s.parameters, s.logsWriter)
+}
+
+// prefetchVerifyBrowserImage calls prefetch (nil: runnerVerifyBrowser.prefetch)
+// for the Job's VerifyBrowserImage, bounding its presence check so a slow
+// Docker daemon can't hold up the run.
+func prefetchVerifyBrowserImage(prefetch func(ctx context.Context, jobRef string, logsWriter io.Writer), parameters map[string]interface{}, logsWriter io.Writer) {
+	if prefetch == nil {
+		prefetch = runnerVerifyBrowser.prefetch
+	}
+	jobRef, _ := jobs.GetParameterValue[string](parameters, parameters_enums.VerifyBrowserImage)
+	ctx, cancel := context.WithTimeout(context.Background(), verifyBrowserPrefetchCheckTimeout)
+	defer cancel()
+	prefetch(ctx, jobRef, logsWriter)
 }
 
 // holdImage re-holds the agentbox image for the stage's runs, as

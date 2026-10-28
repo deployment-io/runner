@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -76,6 +77,8 @@ func qaTestStage(t *testing.T, workDir string, bases []baseCommitOutput, logs io
 		},
 		cacheExists: func(string) bool { return true },
 		reviewer:    func(rs *reviewStage) { rs.copyTree = testCopyTree },
+		// Never touch the runner's Docker daemon from a test.
+		prefetchBrowser: func(context.Context, string, io.Writer) {},
 	}
 }
 
@@ -128,6 +131,45 @@ func TestQAGateNoChangedRepositoryRunsNothingAndRecordsNothing(t *testing.T) {
 	}
 	if qa := readQAFromJobOutput(stage.parameters); qa != nil {
 		t.Errorf("an unchanged tree recorded a QA result: %+v", qa)
+	}
+}
+
+// The QA browser's download starts once, for the Job's image, before round 1.
+func TestQAStagePrefetchesTheBrowserBeforeRound1(t *testing.T) {
+	stage, _ := changedQAStage(t, nil)
+	const jobBrowser = "docker.io/deploymenthq/verify-browser:1.4.0"
+	jobs.SetParameterValue[string](stage.parameters, parameters_enums.VerifyBrowserImage, jobBrowser)
+	var events []string
+	stage.prefetchBrowser = func(ctx context.Context, jobRef string, _ io.Writer) {
+		if _, ok := ctx.Deadline(); !ok {
+			t.Error("prefetch's context has no deadline")
+		}
+		events = append(events, "prefetch "+jobRef)
+	}
+	stage.runQA = func(round int) (agentResult, error) {
+		events = append(events, fmt.Sprintf("qa %d", round))
+		return qaCompleted(signUpPassed, pricingPassed), nil
+	}
+	if _, err := stage.run(); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"prefetch " + jobBrowser, "qa 1"}; !reflect.DeepEqual(events, want) {
+		t.Errorf("events = %v, want %v", events, want)
+	}
+}
+
+func TestQAStageNothingChangedDoesNotPrefetch(t *testing.T) {
+	workDir := t.TempDir()
+	base := qaTestRepo(t, workDir, "0-acme-site")
+	logs := &lockedBuffer{}
+	stage := qaTestStage(t, workDir, []baseCommitOutput{{Index: 0, Dir: "0-acme-site", CommitSHA: base}}, logs)
+	stage.runQA, _ = qaRounds()
+	stage.prefetchBrowser = func(context.Context, string, io.Writer) { t.Error("prefetched with nothing to check") }
+	if _, err := stage.run(); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(logs.String(), "no repository changed") {
+		t.Errorf("logs = %q, want the no-change line", logs.String())
 	}
 }
 
