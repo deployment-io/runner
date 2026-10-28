@@ -627,3 +627,42 @@ func TestCheckPullStream(t *testing.T) {
 		t.Fatal("truncated stream: want an error")
 	}
 }
+
+// A check that needs a newer image than the Task's is refused before anything
+// is downloaded or run.
+func TestVerifyBrowser_MinImageVersion(t *testing.T) {
+	t.Setenv(verifyBrowserImageEnv, "")
+	for _, tc := range []struct {
+		ref, min string
+		refused  bool
+	}{
+		{"docker.io/deploymenthq/verify-browser:1.3.1", "1.4.0", true},
+		{"docker.io/deploymenthq/verify-browser:latest", "1.4.0", true},
+		{"docker.io/deploymenthq/verify-browser:1.4.0", "1.4.0", false},
+		{"docker.io/deploymenthq/verify-browser:1.3.1", "", false},
+	} {
+		d := &fakeVerifyDocker{run: writeResult(`{"schema_version":1,"status":"completed","verdict":"pass"}`)}
+		v := newTestVerifyBrowser(t, d)
+		checked := 0
+		v.imagePresent = func(context.Context, string) (bool, error) {
+			checked++
+			return true, nil
+		}
+		req := verifyRequest()
+		req.ImageRef, req.MinImageVersion = tc.ref, tc.min
+		out, err := v.run(context.Background(), req, nil)
+		if !tc.refused {
+			if err != nil || len(d.created) != 1 || out.ImageRef != tc.ref {
+				t.Errorf("%s (min %q): %+v, %v, %d containers; want it run", tc.ref, tc.min, out, err, len(d.created))
+			}
+			continue
+		}
+		want := "the QA browser image " + tc.ref + " doesn't support the back step (it needs verify-browser 1.4.0 or later); check without it, for example with a goto to the earlier page"
+		if err == nil || !errors.Is(err, agenttools.ErrVerifyBrowserNotRun) || !strings.Contains(err.Error(), want) {
+			t.Errorf("%s: err = %v, want %q", tc.ref, err, want)
+		}
+		if checked != 0 || d.pulls != 0 || len(d.created) != 0 || v.pulled != nil {
+			t.Errorf("%s: checked %d, pulled %d, created %d; want nothing", tc.ref, checked, d.pulls, len(d.created))
+		}
+	}
+}

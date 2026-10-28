@@ -75,7 +75,13 @@ type VerifyBrowserRequest struct {
 	// none. Filled by the runner where it wires the tool, not by the tool;
 	// the runner's VERIFY_BROWSER_IMAGE still wins over it.
 	ImageRef string
+	// MinImageVersion is the oldest verify-browser release (X.Y.Z) that can run
+	// this check, "" for any. The runner refuses an older image without running it.
+	MinImageVersion string
 }
+
+// verifyBrowserBackVersion is the first verify-browser release with the back step.
+const verifyBrowserBackVersion = "1.4.0"
 
 // VerifyBrowserOutcome is what one verify-browser run left behind.
 type VerifyBrowserOutcome struct {
@@ -107,11 +113,11 @@ const verifyPreviewRenderedInputSchema = `{
     "steps": {
       "type": "array",
       "maxItems": 30,
-      "description": "Optional actions run in order after the page loads. Each is one of: {\"action\":\"goto\",\"url\":\"<preview URL>\"}, {\"action\":\"click\",\"selector\":\"…\"}, {\"action\":\"fill\",\"selector\":\"…\",\"value\":\"…\"}, {\"action\":\"press\",\"selector\":\"…\",\"key\":\"Enter\"}, {\"action\":\"wait_for\",\"selector\":\"…\"} or {\"action\":\"wait_for\",\"text\":\"…\"}. Selectors are Playwright selectors (CSS, text=…, role=button[name=\"Save\"]). Each step times out after 10 s; the first failing step stops the rest.",
+      "description": "Optional actions run in order after the page loads. Each is one of: {\"action\":\"goto\",\"url\":\"<preview URL>\"}, {\"action\":\"click\",\"selector\":\"…\"}, {\"action\":\"fill\",\"selector\":\"…\",\"value\":\"…\"}, {\"action\":\"press\",\"selector\":\"…\",\"key\":\"Enter\"}, {\"action\":\"wait_for\",\"selector\":\"…\"}, {\"action\":\"wait_for\",\"text\":\"…\"} or {\"action\":\"back\"} (go back one page, like the browser's Back button; client-side route changes count). Selectors are Playwright selectors (CSS, text=…, role=button[name=\"Save\"]). Each step times out after 10 s; the first failing step stops the rest.",
       "items": {
         "type": "object",
         "properties": {
-          "action": {"type": "string", "enum": ["goto", "click", "fill", "press", "wait_for"]},
+          "action": {"type": "string", "enum": ["goto", "click", "fill", "press", "wait_for", "back"]},
           "url": {"type": "string"},
           "selector": {"type": "string"},
           "value": {"type": "string"},
@@ -309,8 +315,20 @@ func (t *verifyPreviewRendered) handle(ctx context.Context, rawArgs json.RawMess
 	}
 	t.logf("verify_preview_rendered: checking %s in the QA browser (%d steps, %d assertions, timeout %ds%s)", input.URL, len(input.Steps), len(input.Assertions), input.TimeoutMS/1000, input.Viewport.logSuffix())
 	started := time.Now()
-	outcome, err := t.run(ctx, VerifyBrowserRequest{Input: inputJSON, Timeout: time.Duration(input.TimeoutMS) * time.Millisecond}, t.logsWriter)
+	req := VerifyBrowserRequest{Input: inputJSON, Timeout: time.Duration(input.TimeoutMS) * time.Millisecond, MinImageVersion: minVerifyBrowserVersion(input.Steps)}
+	outcome, err := t.run(ctx, req, t.logsWriter)
 	return t.finish(outcome, err, input.Viewport != nil, time.Since(started))
+}
+
+// minVerifyBrowserVersion is the oldest verify-browser release that runs steps,
+// "" when any does.
+func minVerifyBrowserVersion(steps []verifyRenderedStep) string {
+	for _, s := range steps {
+		if s.Action == "back" {
+			return verifyBrowserBackVersion
+		}
+	}
+	return ""
 }
 
 // logSuffix describes a requested viewport in the Step log, "" when none was.
@@ -532,8 +550,10 @@ func checkRenderedStep(s verifyRenderedStep) error {
 			return checkRenderedOptional("selector", s.Selector, false)
 		}
 		return checkRenderedOptional("text", s.Text, false)
+	case "back":
+		return nil
 	}
-	return fmt.Errorf("unknown action %q (want goto, click, fill, press or wait_for)", s.Action)
+	return fmt.Errorf("unknown action %q (want goto, click, fill, press, wait_for or back)", s.Action)
 }
 
 func checkRenderedAssertion(a verifyRenderedAssertion) error {
