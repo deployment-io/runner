@@ -28,7 +28,7 @@ func Get(p commands_enums.Type) (jobs.Command, error) {
 	case commands_enums.BuildDockerImage:
 		return &BuildDockerImage{}, nil
 	case commands_enums.BuildNixPacksImage:
-		return &BuildNixPacksImage{}, nil
+		return nil, fmt.Errorf("Nixpacks builds are no longer supported: deployment.io builds web and private services from a Dockerfile. Add a Dockerfile to the repository and create the service with the Docker runtime.")
 	case commands_enums.DeployAwsWebService:
 		return &DeployAwsWebService{}, nil
 	case commands_enums.DeployAwsPrivateService:

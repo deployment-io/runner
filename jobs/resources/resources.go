@@ -13,7 +13,7 @@ import (
 // # WHY THIS EXISTS
 //
 // Every container the runner spawns (agentbox for Tasks and Assistant
-// sessions, the static-site build container, docker/nixpacks image
+// sessions, the static-site build container, Docker image
 // builds) used to carry a hardcoded memory cap that had no relationship
 // to the machine underneath. That was wrong in both directions:
 //
@@ -123,7 +123,7 @@ const (
 	// silently move the other.
 	sessionBudgetDivisor = 3
 
-	// Image builds (docker / nixpacks) get the WHOLE budget rather than a
+	// Docker image builds get the WHOLE budget rather than a
 	// share, unlike static-site builds. Two reasons:
 	//
 	//  1. This path was completely UNBOUNDED until now — a `docker build`
@@ -185,7 +185,7 @@ const (
 )
 
 // LimitsForImageBuild returns the memory cap (bytes) and CPU core
-// count for a docker/nixpacks image build. Returns CORES, not NanoCPUs,
+// count for a Docker image build. Returns CORES, not NanoCPUs,
 // because ImageBuildOptions wants a CFS quota/period pair — the caller
 // multiplies by CPUPeriodMicroseconds.
 //
@@ -343,7 +343,7 @@ func JobMemoryBytes(commandEnums []commands_enums.Type) int64 {
 		case commands_enums.BuildStaticSite:
 			bytes, _ := LimitsForStaticSiteBuild()
 			consider(bytes)
-		case commands_enums.BuildDockerImage, commands_enums.BuildNixPacksImage:
+		case commands_enums.BuildDockerImage:
 			bytes, _ := LimitsForImageBuild()
 			consider(bytes)
 		}

@@ -305,6 +305,16 @@ func executeJobs(jobsStream <-chan pendingJobType, noOfWorkers int, mode runner_
 									handleLogEnd(err, pendingJob.jobID, logsWriter)
 									result := getJobResult(pendingJob, err.Error(), parameters)
 									resultsStream <- result
+									//no command ran to do its own failure bookkeeping (e.g. a
+									//removed command after CheckoutRepo), so mark the
+									//deployment/build/preview done or clean up the working dir here
+									if commandUtils.IsSessionMode(parameters) {
+										cleanupSessionWorkDir(parameters)
+									} else if commandUtils.IsTasksMode(parameters) {
+										<-commands.MarkStepDone(parameters, err)
+									} else {
+										<-commands.MarkDeploymentDone(parameters, err)
+									}
 									return
 								}
 								// Plumb the stop signal into commands that opt in.
