@@ -8,6 +8,7 @@ import (
 	"go/parser"
 	"go/token"
 	"io"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -591,6 +592,33 @@ type fakeStackEC2 struct {
 	// createdByOther is a group a concurrent create made (found after DuplicateGroup).
 	createdByOther *ec2Types.SecurityGroup
 	deleteErr      error
+	// The outbound rules: what was added and removed, and the errors of each
+	// AuthorizeSecurityGroupEgress call in turn (nil after the last one).
+	egressAuthorized    []*ec2.AuthorizeSecurityGroupEgressInput
+	egressAuthorizeErrs []error
+	egressRevoked       []*ec2.RevokeSecurityGroupEgressInput
+	egressRevokeErr     func(*ec2.RevokeSecurityGroupEgressInput) error
+	// describedByID is what DescribeSecurityGroups finds by id (default: groups).
+	describedByID []ec2Types.SecurityGroup
+}
+
+func (f *fakeStackEC2) AuthorizeSecurityGroupEgress(_ context.Context, in *ec2.AuthorizeSecurityGroupEgressInput, _ ...func(*ec2.Options)) (*ec2.AuthorizeSecurityGroupEgressOutput, error) {
+	f.calls = append(f.calls, "AuthorizeSecurityGroupEgress "+aws.ToString(in.GroupId))
+	f.egressAuthorized = append(f.egressAuthorized, in)
+	var err error
+	if len(f.egressAuthorizeErrs) > 0 {
+		err, f.egressAuthorizeErrs = f.egressAuthorizeErrs[0], f.egressAuthorizeErrs[1:]
+	}
+	return &ec2.AuthorizeSecurityGroupEgressOutput{}, err
+}
+
+func (f *fakeStackEC2) RevokeSecurityGroupEgress(_ context.Context, in *ec2.RevokeSecurityGroupEgressInput, _ ...func(*ec2.Options)) (*ec2.RevokeSecurityGroupEgressOutput, error) {
+	f.calls = append(f.calls, "RevokeSecurityGroupEgress "+aws.ToString(in.GroupId))
+	f.egressRevoked = append(f.egressRevoked, in)
+	if f.egressRevokeErr != nil {
+		return nil, f.egressRevokeErr(in)
+	}
+	return &ec2.RevokeSecurityGroupEgressOutput{}, nil
 }
 
 func (f *fakeStackEC2) DeleteSecurityGroup(_ context.Context, in *ec2.DeleteSecurityGroupInput, _ ...func(*ec2.Options)) (*ec2.DeleteSecurityGroupOutput, error) {
@@ -602,6 +630,13 @@ func (f *fakeStackEC2) DescribeSecurityGroups(_ context.Context, in *ec2.Describ
 	var filters []string
 	for _, fl := range in.Filters {
 		filters = append(filters, aws.ToString(fl.Name)+"="+strings.Join(fl.Values, ","))
+	}
+	if len(in.GroupIds) > 0 {
+		f.calls = append(f.calls, "DescribeSecurityGroups ids="+strings.Join(in.GroupIds, ","))
+		if f.describedByID != nil {
+			return &ec2.DescribeSecurityGroupsOutput{SecurityGroups: f.describedByID}, nil
+		}
+		return &ec2.DescribeSecurityGroupsOutput{SecurityGroups: f.groups}, nil
 	}
 	f.calls = append(f.calls, "DescribeSecurityGroups "+strings.Join(filters, " "))
 	return &ec2.DescribeSecurityGroupsOutput{SecurityGroups: f.groups}, nil
@@ -625,8 +660,11 @@ func (f *fakeStackEC2) AuthorizeSecurityGroupIngress(_ context.Context, in *ec2.
 	return &ec2.AuthorizeSecurityGroupIngressOutput{}, f.authorizeErr
 }
 
+// stackGroup is a described stack group with the preview outbound rules, admitting
+// selfPort (when > 0) from itself.
 func stackGroup(id string, selfPort int32) ec2Types.SecurityGroup {
-	g := ec2Types.SecurityGroup{GroupId: aws.String(id), GroupName: aws.String("pvsg-task-1"), VpcId: aws.String("vpc-1")}
+	g := ec2Types.SecurityGroup{GroupId: aws.String(id), GroupName: aws.String("pvsg-task-1"), VpcId: aws.String("vpc-1"),
+		IpPermissionsEgress: previewEgressRules(id, previewStackInternetCIDRs)}
 	if selfPort > 0 {
 		g.IpPermissions = []ec2Types.IpPermission{{
 			IpProtocol: aws.String("tcp"), FromPort: aws.Int32(selfPort), ToPort: aws.Int32(selfPort),
@@ -635,6 +673,23 @@ func stackGroup(id string, selfPort int32) ec2Types.SecurityGroup {
 	}
 	return g
 }
+
+// previewEgressRules are outbound rules as EC2 describes them: protocol "-1" to
+// cidrs and to the group itself.
+func previewEgressRules(id string, cidrs []string) []ec2Types.IpPermission {
+	var ranges []ec2Types.IpRange
+	for _, cidr := range cidrs {
+		ranges = append(ranges, ec2Types.IpRange{CidrIp: aws.String(cidr)})
+	}
+	return []ec2Types.IpPermission{
+		{IpProtocol: aws.String("-1"), IpRanges: ranges},
+		{IpProtocol: aws.String("-1"), UserIdGroupPairs: []ec2Types.UserIdGroupPair{{GroupId: aws.String(id)}}},
+	}
+}
+
+// awsDefaultEgress is the outbound rule AWS gives every new group.
+var awsDefaultEgress = []ec2Types.IpPermission{{IpProtocol: aws.String("-1"),
+	IpRanges: []ec2Types.IpRange{{CidrIp: aws.String("0.0.0.0/0")}}, Ipv6Ranges: []ec2Types.Ipv6Range{{CidrIpv6: aws.String("::/0")}}}}
 
 var testStack = previewStack{vpcID: "vpc-1", taskID: "task-1", port: 5432}
 
@@ -648,6 +703,8 @@ func TestEnsurePreviewStackSecurityGroupCreates(t *testing.T) {
 		"DescribeSecurityGroups group-name=pvsg-task-1 vpc-id=vpc-1",
 		"CreateSecurityGroup pvsg-task-1",
 		"AuthorizeSecurityGroupIngress sg-new",
+		"AuthorizeSecurityGroupEgress sg-new",
+		"RevokeSecurityGroupEgress sg-new",
 	}
 	if !reflect.DeepEqual(ec2Client.calls, want) {
 		t.Errorf("calls %v", ec2Client.calls)
@@ -665,6 +722,65 @@ func TestEnsurePreviewStackSecurityGroupCreates(t *testing.T) {
 		len(permission.UserIdGroupPairs) != 1 || aws.ToString(permission.UserIdGroupPairs[0].GroupId) != "sg-new" ||
 		len(permission.IpRanges) != 0 {
 		t.Errorf("ingress %+v; want the port from the group itself only", permission)
+	}
+	// All 48 outbound rules in one call, then AWS's allow-all rule removed.
+	checkPreviewEgressAdded(t, ec2Client.egressAuthorized[0], "sg-new", previewStackInternetCIDRs, true)
+	checkRevoked(t, ec2Client.egressRevoked, "-1 0.0.0.0/0")
+}
+
+// checkPreviewEgressAdded checks in adds protocol "-1" to exactly cidrs, and to
+// the group itself when self.
+func checkPreviewEgressAdded(t *testing.T, in *ec2.AuthorizeSecurityGroupEgressInput, id string, cidrs []string, self bool) {
+	t.Helper()
+	var gotCIDRs, gotSelf []string
+	for _, p := range in.IpPermissions {
+		if aws.ToString(p.IpProtocol) != "-1" || p.FromPort != nil || p.ToPort != nil || len(p.Ipv6Ranges) != 0 {
+			t.Errorf("outbound rule %+v; want protocol -1 only", p)
+		}
+		for _, r := range p.IpRanges {
+			gotCIDRs = append(gotCIDRs, aws.ToString(r.CidrIp))
+			if aws.ToString(r.Description) != previewStackInternetRuleDescription {
+				t.Errorf("range %s description %q", aws.ToString(r.CidrIp), aws.ToString(r.Description))
+			}
+		}
+		for _, pair := range p.UserIdGroupPairs {
+			gotSelf = append(gotSelf, aws.ToString(pair.GroupId))
+			if aws.ToString(pair.Description) != "the preview stack" {
+				t.Errorf("self rule description %q", aws.ToString(pair.Description))
+			}
+		}
+	}
+	if aws.ToString(in.GroupId) != id || !reflect.DeepEqual(gotCIDRs, cidrs) {
+		t.Errorf("added to %s: %v\nwant %v", aws.ToString(in.GroupId), gotCIDRs, cidrs)
+	}
+	if wantSelf := map[bool]int{true: 1}[self]; len(gotSelf) != wantSelf || (self && gotSelf[0] != id) {
+		t.Errorf("self rules %v; want %v", gotSelf, self)
+	}
+}
+
+// checkRevoked checks the revokes each removed exactly one range ("<protocol> <range>").
+func checkRevoked(t *testing.T, revoked []*ec2.RevokeSecurityGroupEgressInput, want ...string) {
+	t.Helper()
+	var got []string
+	for _, in := range revoked {
+		if len(in.IpPermissions) != 1 {
+			t.Fatalf("revoke %+v; want one rule", in)
+		}
+		p := in.IpPermissions[0]
+		var ranges []string
+		for _, r := range p.IpRanges {
+			ranges = append(ranges, aws.ToString(r.CidrIp))
+		}
+		for _, r := range p.Ipv6Ranges {
+			ranges = append(ranges, aws.ToString(r.CidrIpv6))
+		}
+		if len(ranges) != 1 || len(p.UserIdGroupPairs) != 0 || len(p.PrefixListIds) != 0 {
+			t.Errorf("revoke %+v; want exactly one range", p)
+		}
+		got = append(got, aws.ToString(p.IpProtocol)+" "+strings.Join(ranges, ","))
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("revoked %v; want %v", got, want)
 	}
 }
 
@@ -783,6 +899,173 @@ func TestEnsurePreviewStackSecurityGroupWithoutDatabase(t *testing.T) {
 	id, created, err := ensurePreviewStackSecurityGroup(ec2Client, previewStack{vpcID: "vpc-1", taskID: "task-1"}, io.Discard)
 	if err != nil || id != "sg-new" || !created || len(ec2Client.authorized) != 0 {
 		t.Errorf("got %q, %v, %v; authorized %v", id, created, err, ec2Client.authorized)
+	}
+	// It still gets the outbound rules.
+	if len(ec2Client.egressAuthorized) != 1 {
+		t.Fatalf("calls %v", ec2Client.calls)
+	}
+	checkPreviewEgressAdded(t, ec2Client.egressAuthorized[0], "sg-new", previewStackInternetCIDRs, true)
+	checkRevoked(t, ec2Client.egressRevoked, "-1 0.0.0.0/0")
+	// A found group without a database, with AWS's default rule, too.
+	g := stackGroup("sg-1", 0)
+	g.IpPermissionsEgress = awsDefaultEgress
+	ec2Client = &fakeStackEC2{groups: []ec2Types.SecurityGroup{g}}
+	if _, _, err := ensurePreviewStackSecurityGroup(ec2Client, previewStack{vpcID: "vpc-1", taskID: "task-1"}, io.Discard); err != nil ||
+		len(ec2Client.egressAuthorized) != 1 || len(ec2Client.egressRevoked) != 2 {
+		t.Errorf("err %v, calls %v", err, ec2Client.calls)
+	}
+}
+
+// A found group's outbound rules become the preview outbound rules: only what's
+// missing is added, the open ranges are removed after, and nothing else.
+func TestEnsurePreviewStackEgressOfAFoundGroup(t *testing.T) {
+	const logLine = "Limited the preview's outbound traffic to the internet and its own stack (security group sg-1)\n"
+	// AWS's default rule: all 48 added, then both open ranges removed.
+	g := stackGroup("sg-1", 5432)
+	g.IpPermissionsEgress = awsDefaultEgress
+	ec2Client, logs := &fakeStackEC2{groups: []ec2Types.SecurityGroup{g}}, &bytes.Buffer{}
+	if _, _, err := ensurePreviewStackSecurityGroup(ec2Client, testStack, logs); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"DescribeSecurityGroups group-name=pvsg-task-1 vpc-id=vpc-1",
+		"AuthorizeSecurityGroupEgress sg-1",
+		"RevokeSecurityGroupEgress sg-1",
+		"RevokeSecurityGroupEgress sg-1",
+	}
+	if !reflect.DeepEqual(ec2Client.calls, want) || logs.String() != logLine {
+		t.Errorf("calls %v, logs %q", ec2Client.calls, logs.String())
+	}
+	checkPreviewEgressAdded(t, ec2Client.egressAuthorized[0], "sg-1", previewStackInternetCIDRs, true)
+	checkRevoked(t, ec2Client.egressRevoked, "-1 0.0.0.0/0", "-1 ::/0")
+
+	// Already right: no outbound calls and no log line.
+	ec2Client, logs = &fakeStackEC2{groups: []ec2Types.SecurityGroup{stackGroup("sg-1", 5432)}}, &bytes.Buffer{}
+	if _, _, err := ensurePreviewStackSecurityGroup(ec2Client, testStack, logs); err != nil || len(ec2Client.calls) != 1 || logs.Len() != 0 {
+		t.Errorf("err %v, calls %v, logs %q", err, ec2Client.calls, logs.String())
+	}
+
+	// Some blocks missing (and the self rule there): only those are added. Other
+	// rules — a tcp rule to 0.0.0.0/0 among them — keep all but the open range.
+	g = stackGroup("sg-1", 5432)
+	g.IpPermissionsEgress = append(previewEgressRules("sg-1", previewStackInternetCIDRs[2:]),
+		ec2Types.IpPermission{IpProtocol: aws.String("tcp"), FromPort: aws.Int32(443), ToPort: aws.Int32(443),
+			IpRanges: []ec2Types.IpRange{{CidrIp: aws.String("0.0.0.0/0")}, {CidrIp: aws.String("10.0.0.0/8")}}},
+		ec2Types.IpPermission{IpProtocol: aws.String("-1"), UserIdGroupPairs: []ec2Types.UserIdGroupPair{{GroupId: aws.String("sg-other")}}})
+	ec2Client, logs = &fakeStackEC2{groups: []ec2Types.SecurityGroup{g}}, &bytes.Buffer{}
+	if _, _, err := ensurePreviewStackSecurityGroup(ec2Client, testStack, logs); err != nil || logs.String() != logLine {
+		t.Fatalf("err %v, logs %q", err, logs.String())
+	}
+	checkPreviewEgressAdded(t, ec2Client.egressAuthorized[0], "sg-1", previewStackInternetCIDRs[:2], false)
+	checkRevoked(t, ec2Client.egressRevoked, "tcp 0.0.0.0/0")
+	if p := ec2Client.egressRevoked[0].IpPermissions[0]; aws.ToInt32(p.FromPort) != 443 || aws.ToInt32(p.ToPort) != 443 {
+		t.Errorf("revoked %+v; want that rule's ports", p)
+	}
+	// The inbound rules are left alone.
+	if len(ec2Client.authorized) != 0 {
+		t.Errorf("calls %v", ec2Client.calls)
+	}
+}
+
+// A concurrent deploy adding some of the rules first (Duplicate): the group is
+// described again and only what's still missing is added.
+func TestEnsurePreviewStackEgressDuplicate(t *testing.T) {
+	g := stackGroup("sg-1", 5432)
+	g.IpPermissionsEgress = awsDefaultEgress
+	meanwhile := stackGroup("sg-1", 5432)
+	meanwhile.IpPermissionsEgress = append(previewEgressRules("sg-1", previewStackInternetCIDRs[:40])[:1], awsDefaultEgress...)
+	ec2Client := &fakeStackEC2{groups: []ec2Types.SecurityGroup{g}, describedByID: []ec2Types.SecurityGroup{meanwhile},
+		egressAuthorizeErrs: []error{&smithy.GenericAPIError{Code: "InvalidPermission.Duplicate"}}}
+	if _, _, err := ensurePreviewStackSecurityGroup(ec2Client, testStack, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"DescribeSecurityGroups group-name=pvsg-task-1 vpc-id=vpc-1",
+		"AuthorizeSecurityGroupEgress sg-1",
+		"DescribeSecurityGroups ids=sg-1",
+		"AuthorizeSecurityGroupEgress sg-1",
+		"RevokeSecurityGroupEgress sg-1",
+		"RevokeSecurityGroupEgress sg-1",
+	}
+	if !reflect.DeepEqual(ec2Client.calls, want) {
+		t.Errorf("calls %v", ec2Client.calls)
+	}
+	checkPreviewEgressAdded(t, ec2Client.egressAuthorized[1], "sg-1", previewStackInternetCIDRs[40:], true)
+
+	// Everything there by then: no second add.
+	ec2Client = &fakeStackEC2{groups: []ec2Types.SecurityGroup{g}, describedByID: []ec2Types.SecurityGroup{stackGroup("sg-1", 5432)},
+		egressAuthorizeErrs: []error{&smithy.GenericAPIError{Code: "InvalidPermission.Duplicate"}}}
+	if _, _, err := ensurePreviewStackSecurityGroup(ec2Client, testStack, io.Discard); err != nil || len(ec2Client.egressAuthorized) != 1 {
+		t.Errorf("err %v, calls %v", err, ec2Client.calls)
+	}
+
+	// Any error on the second add fails, a Duplicate too.
+	ec2Client = &fakeStackEC2{groups: []ec2Types.SecurityGroup{g}, describedByID: []ec2Types.SecurityGroup{meanwhile},
+		egressAuthorizeErrs: []error{&smithy.GenericAPIError{Code: "InvalidPermission.Duplicate"}, &smithy.GenericAPIError{Code: "InvalidPermission.Duplicate"}}}
+	if _, _, err := ensurePreviewStackSecurityGroup(ec2Client, testStack, io.Discard); err == nil || len(ec2Client.egressRevoked) != 0 {
+		t.Errorf("err %v, calls %v", err, ec2Client.calls)
+	}
+}
+
+// A revoke of a rule already gone is fine; another error fails, and a group this
+// call created is removed again (one it found is kept).
+func TestEnsurePreviewStackEgressRevokeErrors(t *testing.T) {
+	notFound := func(*ec2.RevokeSecurityGroupEgressInput) error {
+		return &smithy.GenericAPIError{Code: "InvalidPermission.NotFound"}
+	}
+	ec2Client := &fakeStackEC2{egressRevokeErr: notFound}
+	if id, created, err := ensurePreviewStackSecurityGroup(ec2Client, testStack, io.Discard); err != nil || id != "sg-new" || !created {
+		t.Errorf("got %q, %v, %v", id, created, err)
+	}
+	failing := func(*ec2.RevokeSecurityGroupEgressInput) error {
+		return &smithy.GenericAPIError{Code: "UnauthorizedOperation"}
+	}
+	ec2Client = &fakeStackEC2{egressRevokeErr: failing}
+	_, _, err := ensurePreviewStackSecurityGroup(ec2Client, testStack, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "limit outbound traffic of security group sg-new") ||
+		ec2Client.calls[len(ec2Client.calls)-1] != "DeleteSecurityGroup sg-new" {
+		t.Errorf("err %v, calls %v", err, ec2Client.calls)
+	}
+	g := stackGroup("sg-1", 5432)
+	g.IpPermissionsEgress = awsDefaultEgress
+	ec2Client = &fakeStackEC2{groups: []ec2Types.SecurityGroup{g}, egressRevokeErr: failing}
+	if _, _, err := ensurePreviewStackSecurityGroup(ec2Client, testStack, io.Discard); err == nil || containsCall(ec2Client.calls, "DeleteSecurityGroup sg-1") {
+		t.Errorf("err %v, calls %v", err, ec2Client.calls)
+	}
+	// An add error fails and removes a created group, before any revoke.
+	ec2Client = &fakeStackEC2{egressAuthorizeErrs: []error{&smithy.GenericAPIError{Code: "RulesPerSecurityGroupLimitExceeded"}}}
+	if _, _, err := ensurePreviewStackSecurityGroup(ec2Client, testStack, io.Discard); err == nil || len(ec2Client.egressRevoked) != 0 ||
+		ec2Client.calls[len(ec2Client.calls)-1] != "DeleteSecurityGroup sg-new" {
+		t.Errorf("err %v, calls %v", err, ec2Client.calls)
+	}
+}
+
+// The preview's internet blocks don't overlap each other or the private ranges,
+// and with those cover every IPv4 address.
+func TestPreviewStackInternetCIDRsCoverPublicIPv4(t *testing.T) {
+	excluded := []string{"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "169.254.0.0/16"}
+	if len(previewStackInternetCIDRs) != 47 {
+		t.Errorf("%d blocks; want 47", len(previewStackInternetCIDRs))
+	}
+	var blocks []netip.Prefix
+	for _, cidr := range append(append([]string(nil), previewStackInternetCIDRs...), excluded...) {
+		prefix, err := netip.ParsePrefix(cidr)
+		if err != nil || !prefix.Addr().Is4() || prefix.Masked() != prefix {
+			t.Fatalf("%s: %v (not a canonical IPv4 block)", cidr, err)
+		}
+		blocks = append(blocks, prefix)
+	}
+	var total uint64
+	for i, a := range blocks {
+		total += uint64(1) << (32 - a.Bits())
+		for _, b := range blocks[:i] {
+			if a.Overlaps(b) {
+				t.Errorf("%s overlaps %s", a, b)
+			}
+		}
+	}
+	if total != uint64(1)<<32 {
+		t.Errorf("the blocks cover %d addresses; want 2^32", total)
 	}
 }
 
@@ -1088,6 +1371,19 @@ func TestPreviewStackDescriptionsAreValidForEC2(t *testing.T) {
 		for _, p := range in.IpPermissions {
 			for _, pair := range p.UserIdGroupPairs {
 				check("stack self rule", aws.ToString(pair.Description))
+			}
+		}
+	}
+	if len(stackEC2.egressAuthorized) == 0 {
+		t.Fatal("no outbound rules added")
+	}
+	for _, in := range stackEC2.egressAuthorized {
+		for _, p := range in.IpPermissions {
+			for _, r := range p.IpRanges {
+				check("stack internet rule", aws.ToString(r.Description))
+			}
+			for _, pair := range p.UserIdGroupPairs {
+				check("stack outbound self rule", aws.ToString(pair.Description))
 			}
 		}
 	}
