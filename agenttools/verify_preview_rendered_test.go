@@ -760,3 +760,38 @@ func TestVerifyRendered_CallCapAllowsTwoSizesPerPage(t *testing.T) {
 		t.Fatalf("verifyRenderedMaxCalls = %d, want 30", verifyRenderedMaxCalls)
 	}
 }
+
+func TestVerifyRendered_BackStep(t *testing.T) {
+	if err := checkRenderedStep(verifyRenderedStep{Action: "back"}); err != nil {
+		t.Errorf("back step: %v", err)
+	}
+	if err := checkRenderedStep(verifyRenderedStep{Action: "hover"}); err == nil || !strings.Contains(err.Error(), "wait_for or back") {
+		t.Errorf("unknown action error = %v", err)
+	}
+	if !strings.Contains(verifyPreviewRenderedInputSchema, `"enum": ["goto", "click", "fill", "press", "wait_for", "back"]`) {
+		t.Error("the steps action enum is missing back")
+	}
+	if !strings.Contains(verifyPreviewRenderedInputSchema, `{\"action\":\"back\"} (go back one page, like the browser's Back button; client-side route changes count)`) {
+		t.Error("the steps description is missing back")
+	}
+	if err := json.Unmarshal([]byte(verifyPreviewRenderedInputSchema), new(any)); err != nil {
+		t.Fatalf("schema: %v", err)
+	}
+}
+
+func TestVerifyRendered_BackStepNeedsImage140(t *testing.T) {
+	for args, want := range map[string]string{
+		`{"url":"` + renderedPreview + `","steps":[{"action":"click","selector":"a"},{"action":"back"}]}`: "1.4.0",
+		`{"url":"` + renderedPreview + `","steps":[{"action":"click","selector":"a"}]}`:                   "",
+		`{"url":"` + renderedPreview + `"}`: "",
+	} {
+		fb := &fakeBrowser{outcome: VerifyBrowserOutcome{Result: passResult()}}
+		tool, _ := newRenderedTool(renderedRecord(renderedPreview), fb)
+		if _, err := call(t, tool, args); err != nil {
+			t.Fatalf("%s: %v", args, err)
+		}
+		if got := fb.requests[0].MinImageVersion; got != want {
+			t.Errorf("%s: MinImageVersion = %q, want %q", args, got, want)
+		}
+	}
+}

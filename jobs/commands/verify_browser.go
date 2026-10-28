@@ -37,8 +37,9 @@ import (
 
 // verifyBrowserImage is the verify-browser release this runner uses. Pinned to an
 // exact version; bump it deliberately when a new verify-browser-vX.Y.Z ships.
-// 1.3.0 is the first with read_only, which production QA requires.
-const verifyBrowserImage = "docker.io/deploymenthq/verify-browser:1.3.0"
+// 1.3.0 is the first with read_only, which production QA requires; 1.4.0 the
+// first with the back step.
+const verifyBrowserImage = "docker.io/deploymenthq/verify-browser:1.4.0"
 
 // minReadOnlyVerifyBrowserVersion is the first verify-browser release that
 // honours read_only. A production QA run refuses an older image rather than
@@ -216,6 +217,9 @@ func newVerifyBrowser() *verifyBrowser {
 // run is agenttools.RunVerifyBrowser.
 func (v *verifyBrowser) run(ctx context.Context, req agenttools.VerifyBrowserRequest, logsWriter io.Writer) (agenttools.VerifyBrowserOutcome, error) {
 	ref := v.imageRef(req.ImageRef)
+	if req.MinImageVersion != "" && !imageVersionAtLeast(ref, req.MinImageVersion) {
+		return agenttools.VerifyBrowserOutcome{}, fmt.Errorf("%w: the QA browser image %s doesn't support the back step (it needs verify-browser %s or later); check without it, for example with a goto to the earlier page", agenttools.ErrVerifyBrowserNotRun, ref, req.MinImageVersion)
+	}
 	// Held from before the presence check so a concurrent prune can't remove the
 	// image between the check and the container's start.
 	releaseImage := reclaim.MarkImageInUse(ref)
