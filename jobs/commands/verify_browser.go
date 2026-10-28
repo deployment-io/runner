@@ -61,6 +61,8 @@ const (
 	// verifyBrowserSlotWait is how long a check waits for a free slot, at most —
 	// see slotWaitFor.
 	verifyBrowserSlotWait = 20 * time.Second
+	// verifyBrowserPrefetchCheckTimeout bounds prefetch's presence check.
+	verifyBrowserPrefetchCheckTimeout = 10 * time.Second
 	// verifyBrowserCallBudget keeps a whole call under the agent's MCP tool-call
 	// timeout (~120 s observed for codex), the same bound verify_preview_reachable
 	// keeps: slot wait + the check's timeout + verifyBrowserWallClockExtra.
@@ -266,25 +268,58 @@ func (v *verifyBrowser) ensureImage(ctx context.Context, ref string, logsWriter 
 	if present {
 		return true, nil
 	}
+	started, lastErr := v.startPull(ref)
+	if !started {
+		// Another ref's pull holds the one download; this ref's starts on a
+		// later check once it ends. Either way the check is "preparing".
+		return false, nil
+	}
+	if logsWriter != nil {
+		io.WriteString(logsWriter, fmt.Sprintf("verify_preview_rendered: downloading the QA browser image %s on this runner\n", ref))
+	}
+	if lastErr != nil {
+		return false, fmt.Errorf("%w: downloading the QA browser image %s failed: %v — the download is being retried; call verify_preview_rendered again in a minute", agenttools.ErrVerifyBrowserNotRun, ref, lastErr)
+	}
+	return false, nil
+}
+
+// startPull starts a background pull of ref unless a pull (of any ref) is
+// running. When it starts one it reports true and returns — and clears — ref's
+// last failed pull, which the new pull retries.
+func (v *verifyBrowser) startPull(ref string) (bool, error) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	if v.pullingRef != "" {
-		// Another ref's pull holds the one download; this ref's starts on a
-		// later check once it ends. Either way the check is "preparing".
 		return false, nil
 	}
 	lastErr := v.pullErrs[ref]
 	delete(v.pullErrs, ref)
 	v.pullingRef = ref
 	v.pulled = make(chan struct{})
-	if logsWriter != nil {
-		io.WriteString(logsWriter, fmt.Sprintf("verify_preview_rendered: downloading the QA browser image %s on this runner\n", ref))
-	}
 	go v.pullInBackground(ref, v.pulled)
-	if lastErr != nil {
-		return false, fmt.Errorf("%w: downloading the QA browser image %s failed: %v — the download is being retried; call verify_preview_rendered again in a minute", agenttools.ErrVerifyBrowserNotRun, ref, lastErr)
+	return true, lastErr
+}
+
+// prefetch starts downloading the image a check for jobRef would use, when it
+// isn't on the host and no download is running, so it is usually there by the
+// QA agent's first check. It is best-effort: it never waits for the download
+// and never fails; a later check behaves as it would without it. ctx bounds
+// only the presence check.
+func (v *verifyBrowser) prefetch(ctx context.Context, jobRef string, logsWriter io.Writer) {
+	ref := v.imageRef(jobRef)
+	present, err := v.imagePresent(ctx, ref)
+	if err != nil || present {
+		return
 	}
-	return false, nil
+	started, lastErr := v.startPull(ref)
+	if !started || logsWriter == nil {
+		return
+	}
+	if lastErr != nil {
+		io.WriteString(logsWriter, fmt.Sprintf("QA: the last download of the QA browser image %s failed (%v); downloading it again\n", ref, lastErr))
+		return
+	}
+	io.WriteString(logsWriter, fmt.Sprintf("QA: downloading the QA browser image %s on this runner before the first check\n", ref))
 }
 
 func (v *verifyBrowser) pullInBackground(ref string, done chan struct{}) {
