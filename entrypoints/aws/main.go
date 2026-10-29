@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
 	"github.com/aws/aws-sdk-go-v2/service/sts"
 	"github.com/deployment-io/deployment-runner-kit/cloud_api_clients"
 	"github.com/deployment-io/deployment-runner-kit/enums/iam_policy_enums"
@@ -11,6 +13,7 @@ import (
 	"github.com/deployment-io/deployment-runner/client"
 	"github.com/deployment-io/deployment-runner/entrypoints/common"
 	"github.com/deployment-io/deployment-runner/utils"
+	"github.com/deployment-io/deployment-runner/utils/loggers/cloudwatch"
 	"log"
 )
 
@@ -60,6 +63,21 @@ func main() {
 			log.Fatal(err)
 		}
 	}
+	go setMissingLogGroupRetention(organizationId, region)
 	c := client.Get()
 	common.GetAndRunJobs(c, runnerMode, organizationId)
+}
+
+// setMissingLogGroupRetention gives the organization's existing log groups without a retention one.
+// Errors are logged; the sweep runs again at the next runner start.
+func setMissingLogGroupRetention(organizationId, region string) {
+	cfg, err := config.LoadDefaultConfig(context.TODO())
+	if err != nil {
+		log.Printf("log group retention: error loading config for cloudwatch client: %s", err)
+		return
+	}
+	cloudwatchClient := cloudwatchlogs.NewFromConfig(cfg, func(options *cloudwatchlogs.Options) {
+		options.Region = region
+	})
+	cloudwatch.SetMissingRetention(context.TODO(), cloudwatchClient, organizationId+"/")
 }
