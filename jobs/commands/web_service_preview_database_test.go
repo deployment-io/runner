@@ -571,7 +571,8 @@ func TestPrivateServiceDeployEntryPointsOptions(t *testing.T) {
 		}
 	}
 	want := []privateServiceDeployOptions{{addDefaultVpcIngressRule: true},
-		{updateServiceConnect: true}, {updateServiceConnect: true}, {updateServiceConnect: true, mongoReplicaSet: true}}
+		{updateServiceConnect: true, noCircuitBreaker: true}, {updateServiceConnect: true, noCircuitBreaker: true},
+		{updateServiceConnect: true, noCircuitBreaker: true, mongoReplicaSet: true}}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("options = %+v; want production editing the default group, the preview not, and MongoDB a replica set", got)
 	}

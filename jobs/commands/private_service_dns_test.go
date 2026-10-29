@@ -7,6 +7,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"io"
 	"reflect"
 	"strings"
 	"testing"
@@ -152,6 +153,28 @@ type fakeEcsService struct {
 	describeErr  error
 	createInputs []*ecs.CreateServiceInput
 	updateInputs []*ecs.UpdateServiceInput
+	// noPrimary leaves the PRIMARY deployment out of CreateService's and
+	// UpdateService's output.
+	noPrimary bool
+	// waits are the deployment IDs waitForEcsDeployment was called with; each
+	// wait returns waitErr.
+	waits   []string
+	waitErr error
+}
+
+const (
+	testCreatedDeploymentID = "ecs-svc/1111"
+	testUpdatedDeploymentID = "ecs-svc/2222"
+)
+
+// deploymentsOutput is what ECS returns for a create or update that started
+// deploymentID: it PRIMARY, beside an older ACTIVE one.
+func (f *fakeEcsService) deploymentsOutput(deploymentID string) []ecsTypes.Deployment {
+	deployments := []ecsTypes.Deployment{{Id: aws.String("ecs-svc/0000"), Status: aws.String("ACTIVE")}}
+	if !f.noPrimary {
+		deployments = append(deployments, ecsTypes.Deployment{Id: aws.String(deploymentID), Status: aws.String("PRIMARY")})
+	}
+	return deployments
 }
 
 func (f *fakeEcsService) DescribeServices(_ context.Context, in *ecs.DescribeServicesInput, _ ...func(*ecs.Options)) (*ecs.DescribeServicesOutput, error) {
@@ -168,19 +191,15 @@ func (f *fakeEcsService) DescribeServices(_ context.Context, in *ecs.DescribeSer
 func (f *fakeEcsService) CreateService(_ context.Context, in *ecs.CreateServiceInput, _ ...func(*ecs.Options)) (*ecs.CreateServiceOutput, error) {
 	f.calls = append(f.calls, "CreateService "+aws.ToString(in.ServiceName))
 	f.createInputs = append(f.createInputs, in)
-	return &ecs.CreateServiceOutput{Service: &ecsTypes.Service{ServiceArn: aws.String(testEcsServiceArn)}}, nil
+	return &ecs.CreateServiceOutput{Service: &ecsTypes.Service{ServiceArn: aws.String(testEcsServiceArn),
+		Deployments: f.deploymentsOutput(testCreatedDeploymentID)}}, nil
 }
 
 func (f *fakeEcsService) UpdateService(_ context.Context, in *ecs.UpdateServiceInput, _ ...func(*ecs.Options)) (*ecs.UpdateServiceOutput, error) {
 	f.calls = append(f.calls, "UpdateService "+aws.ToString(in.Service))
 	f.updateInputs = append(f.updateInputs, in)
-	// The describe after the update finds the service.
-	f.describeErr = nil
-	if f.service == nil {
-		f.service = &ecsTypes.Service{}
-	}
-	f.service.ServiceArn = aws.String(testEcsServiceArn)
-	return &ecs.UpdateServiceOutput{}, nil
+	return &ecs.UpdateServiceOutput{Service: &ecsTypes.Service{ServiceArn: aws.String(testEcsServiceArn),
+		Deployments: f.deploymentsOutput(testUpdatedDeploymentID)}}, nil
 }
 
 // liveService is a running service with Service Connect at testAlias in
@@ -219,23 +238,27 @@ func privateServiceDeployParameters() map[string]interface{} {
 	return parameters
 }
 
-// stubServiceAWS points the service steps at the fakes and makes them not
-// wait for the service to settle or queue updates for the server.
+// stubServiceAWS points the service steps at the fakes, records each wait for
+// an ECS deployment in ecsService (without waiting) and queues no updates for
+// the server.
 func stubServiceAWS(t *testing.T, ecsService *fakeEcsService, cloudMap *fakeCloudMap) {
 	t.Helper()
-	originalEcs, originalCloudMap, originalWait := ecsServiceClient, getServiceDiscoveryClient, waitForEcsServiceStable
+	originalEcs, originalCloudMap, originalWait := ecsServiceClient, getServiceDiscoveryClient, waitForEcsDeployment
 	originalDeployments, originalPreviews := commandUtils.UpdateDeploymentsPipeline, commandUtils.UpdatePreviewsPipeline
 	commandUtils.UpdateDeploymentsPipeline, _ = goPipeline.NewPipeline(5, time.Hour, func(string, []deployments.UpdateDeploymentDtoV1) {})
 	commandUtils.UpdatePreviewsPipeline, _ = goPipeline.NewPipeline(5, time.Hour, func(string, []previews.UpdatePreviewDtoV1) {})
 	t.Cleanup(func() {
 		commandUtils.UpdateDeploymentsPipeline.Shutdown()
 		commandUtils.UpdatePreviewsPipeline.Shutdown()
-		ecsServiceClient, getServiceDiscoveryClient, waitForEcsServiceStable = originalEcs, originalCloudMap, originalWait
+		ecsServiceClient, getServiceDiscoveryClient, waitForEcsDeployment = originalEcs, originalCloudMap, originalWait
 		commandUtils.UpdateDeploymentsPipeline, commandUtils.UpdatePreviewsPipeline = originalDeployments, originalPreviews
 	})
 	ecsServiceClient = func(*ecs.Client) ecsServiceAPI { return ecsService }
 	getServiceDiscoveryClient = func(map[string]interface{}) (serviceDiscoveryAPI, error) { return cloudMap, nil }
-	waitForEcsServiceStable = func(*ecs.Client, *ecs.DescribeServicesInput) error { return nil }
+	waitForEcsDeployment = func(_ ecsServiceAPI, _ *ecs.DescribeServicesInput, deploymentID string, _ io.Writer) error {
+		ecsService.waits = append(ecsService.waits, deploymentID)
+		return ecsService.waitErr
+	}
 }
 
 func registryArns(registries []ecsTypes.ServiceRegistry) []string {
@@ -472,8 +495,8 @@ func TestWebServiceDeploysRegisterNoDnsName(t *testing.T) {
 	if ecsService.createInputs[0].ServiceRegistries != nil || ecsService.updateInputs[0].ServiceRegistries != nil {
 		t.Errorf("a web service was given a registry")
 	}
-	// The update is still UpdateService then DescribeServices, as before.
-	want := []string{"DescribeServices es-deployment-1", "CreateService es-deployment-1", "UpdateService es-deployment-1", "DescribeServices es-deployment-1"}
+	// The update takes the service's ARN and deployment from UpdateService's output.
+	want := []string{"DescribeServices es-deployment-1", "CreateService es-deployment-1", "UpdateService es-deployment-1"}
 	if !reflect.DeepEqual(ecsService.calls, want) {
 		t.Errorf("ECS calls %v; want %v", ecsService.calls, want)
 	}
@@ -812,17 +835,22 @@ func TestDeletePrivateServiceWithoutRegistry(t *testing.T) {
 }
 
 // A backend preview's service rolls out stop-then-start, so a redeploy's health
-// URL is never answered by the previous revision; production keeps ECS's default
-// rolling deployment.
-func TestPreviewServiceRollsOutStopThenStart(t *testing.T) {
+// URL is never answered by the previous revision; a preview database keeps ECS's
+// defaults; production keeps ECS's default rolling deployment with the circuit
+// breaker rolling a failed deployment back.
+func TestServiceDeploymentConfiguration(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		opts ecsServiceDeployOptions
 		want *ecsTypes.DeploymentConfiguration
 	}{
-		{"production", ecsServiceDeployOptions{}, nil},
-		{"backend preview", ecsServiceDeployOptions{skipServiceStableWait: true, previewStack: true},
+		{"production web service", ecsServiceDeployOptions{},
+			&ecsTypes.DeploymentConfiguration{DeploymentCircuitBreaker: &ecsTypes.DeploymentCircuitBreaker{Enable: true, Rollback: true}}},
+		{"production private service", ecsServiceDeployOptions{registerDnsName: true},
+			&ecsTypes.DeploymentConfiguration{DeploymentCircuitBreaker: &ecsTypes.DeploymentCircuitBreaker{Enable: true, Rollback: true}}},
+		{"backend preview", ecsServiceDeployOptions{skipServiceStableWait: true, previewStack: true, noCircuitBreaker: true},
 			&ecsTypes.DeploymentConfiguration{MinimumHealthyPercent: aws.Int32(0), MaximumPercent: aws.Int32(100)}},
+		{"preview database", ecsServiceDeployOptions{registerDnsName: true, updateServiceConnect: true, noCircuitBreaker: true}, nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ecsService, cloudMap := &fakeEcsService{}, newFakeCloudMap()

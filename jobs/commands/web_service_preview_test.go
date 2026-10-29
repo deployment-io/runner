@@ -576,7 +576,7 @@ func TestWebServiceDeployEntryPointsOptions(t *testing.T) {
 	if _, err := deployAwsWebServicePreview(map[string]interface{}{}, io.Discard); err != nil {
 		t.Fatal(err)
 	}
-	want := []ecsServiceDeployOptions{{}, {skipServiceStableWait: true, previewStack: true}}
+	want := []ecsServiceDeployOptions{{}, {skipServiceStableWait: true, previewStack: true, noCircuitBreaker: true}}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("options = %+v, want production waiting in the default group and the preview not waiting, in its stack group", got)
 	}
@@ -600,6 +600,9 @@ func (fakeEcsHTTP) Do(req *http.Request) (*http.Response, error) {
 	if strings.HasSuffix(req.Header.Get("X-Amz-Target"), ".DescribeServices") {
 		body = `{"services":[{"serviceArn":"arn:aws:ecs:us-east-1:1:service/c/es-x"}]}`
 	}
+	if strings.HasSuffix(req.Header.Get("X-Amz-Target"), ".UpdateService") {
+		body = `{"service":{"serviceArn":"arn:aws:ecs:us-east-1:1:service/c/es-x","deployments":[{"id":"ecs-svc/1","status":"PRIMARY"}]}}`
+	}
 	return &http.Response{
 		StatusCode: 200,
 		Header:     http.Header{"Content-Type": []string{"application/x-amz-json-1.1"}},
@@ -609,11 +612,14 @@ func (fakeEcsHTTP) Do(req *http.Request) (*http.Response, error) {
 }
 
 func TestUpdateEcsServiceWaitsOnlyWithoutSkip(t *testing.T) {
-	original := waitForEcsServiceStable
-	t.Cleanup(func() { waitForEcsServiceStable = original })
+	original := waitForEcsDeployment
+	t.Cleanup(func() { waitForEcsDeployment = original })
 	waits := 0
-	waitForEcsServiceStable = func(*ecs.Client, *ecs.DescribeServicesInput) error {
+	waitForEcsDeployment = func(_ ecsServiceAPI, _ *ecs.DescribeServicesInput, deploymentID string, _ io.Writer) error {
 		waits++
+		if deploymentID != "ecs-svc/1" {
+			t.Errorf("waited on deployment %q; want UpdateService's PRIMARY ecs-svc/1", deploymentID)
+		}
 		return nil
 	}
 	client := ecs.New(ecs.Options{Region: "us-east-1", Credentials: aws.AnonymousCredentials{}, HTTPClient: fakeEcsHTTP{}})
