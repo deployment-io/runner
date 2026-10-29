@@ -887,6 +887,21 @@ func getPortMappingName(parameters map[string]interface{}) (string, error) {
 	return fmt.Sprintf("port-mapping-%s-%d", deploymentID, port), nil
 }
 
+// allowUnprivilegedPorts lets a non-root process in a Linux container bind any
+// port, as it can under plain Docker (which sets ip_unprivileged_port_start to 0).
+// Fargate's awsvpc task namespace keeps Linux's default of 1024, so images that drop
+// root and listen on port 80 (e.g. Rails 8 + Thruster) fail with "bind: permission
+// denied". Windows containers don't support systemControls.
+func allowUnprivilegedPorts(def *ecsTypes.ContainerDefinition, osFamily ecsTypes.OSFamily) {
+	if osFamily != ecsTypes.OSFamilyLinux {
+		return
+	}
+	def.SystemControls = []ecsTypes.SystemControl{{
+		Namespace: aws.String("net.ipv4.ip_unprivileged_port_start"),
+		Value:     aws.String("0"),
+	}}
+}
+
 // registerTaskDefinition registers the deployment's task definition; customize,
 // when given, adjusts its container before it's registered (the preview MongoDB's
 // replica set).
@@ -1013,6 +1028,7 @@ func registerTaskDefinition(parameters map[string]interface{}, ecsClient *ecs.Cl
 	if runnerData.OsType == os_enums.WINDOWS {
 		osFamily = ecsTypes.OSFamilyWindowsServer2022Core
 	}
+	allowUnprivilegedPorts(&containerDefinition, osFamily)
 
 	registerTaskDefinitionInput := &ecs.RegisterTaskDefinitionInput{
 		ContainerDefinitions: []ecsTypes.ContainerDefinition{
