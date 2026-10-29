@@ -1391,8 +1391,9 @@ var waitForEcsDeployment = func(client ecsServiceAPI, describeServicesInput *ecs
 	deadline := ecsDeploymentNow().Add(ecsDeploymentWaitLimit)
 	ctx, cancel := context.WithDeadline(context.Background(), deadline)
 	defer cancel()
+	seen := false
 	for {
-		done, err := ecsDeploymentDone(ctx, client, describeServicesInput, deploymentID, logsWriter)
+		done, err := ecsDeploymentDone(ctx, client, describeServicesInput, deploymentID, &seen, logsWriter)
 		if done {
 			return nil
 		}
@@ -1410,9 +1411,12 @@ var waitForEcsDeployment = func(client ecsServiceAPI, describeServicesInput *ecs
 }
 
 // ecsDeploymentDone reads deploymentID's rollout state once: done when it's
-// COMPLETED, an error when it can no longer complete.
+// COMPLETED, an error when it can no longer complete. seen records whether a
+// read has listed the deployment yet: DescribeServices is eventually
+// consistent, so a deployment missing before it was first seen is still
+// starting, not rolled back.
 func ecsDeploymentDone(ctx context.Context, client ecsServiceAPI, describeServicesInput *ecs.DescribeServicesInput,
-	deploymentID string, logsWriter io.Writer) (bool, error) {
+	deploymentID string, seen *bool, logsWriter io.Writer) (bool, error) {
 	output, err := client.DescribeServices(ctx, describeServicesInput)
 	if err != nil {
 		return false, err
@@ -1433,6 +1437,7 @@ func ecsDeploymentDone(ctx context.Context, client ecsServiceAPI, describeServic
 		if aws.ToString(deployment.Id) != deploymentID {
 			continue
 		}
+		*seen = true
 		switch deployment.RolloutState {
 		case ecsTypes.DeploymentRolloutStateCompleted:
 			return true, nil
@@ -1441,6 +1446,9 @@ func ecsDeploymentDone(ctx context.Context, client ecsServiceAPI, describeServic
 			io.WriteString(logsWriter, err.Error()+"\n")
 			return false, err
 		}
+		return false, nil
+	}
+	if !*seen {
 		return false, nil
 	}
 	err = fmt.Errorf("ECS deployment %s was rolled back", deploymentID)

@@ -104,6 +104,15 @@ func TestWaitForEcsDeployment(t *testing.T) {
 			describes: []*ecs.DescribeServicesOutput{rollout(ecsTypes.DeploymentRolloutStateInProgress, ""),
 				describedService("ACTIVE", ecsTypes.Deployment{Id: aws.String("ecs-svc/0000"), Status: aws.String("PRIMARY"),
 					RolloutState: ecsTypes.DeploymentRolloutStateCompleted})}},
+		// DescribeServices lags the create/update: a deployment not listed yet is
+		// still starting, so the wait keeps polling until it shows up.
+		{name: "not listed yet then completed", wantCalls: 2, describes: []*ecs.DescribeServicesOutput{
+			describedService("ACTIVE", ecsTypes.Deployment{Id: aws.String("ecs-svc/0000"), Status: aws.String("PRIMARY"),
+				RolloutState: ecsTypes.DeploymentRolloutStateCompleted}),
+			rollout(ecsTypes.DeploymentRolloutStateCompleted, "")}},
+		{name: "never listed", wantCalls: 5, wantErr: "timed out waiting for the ECS deployment to complete",
+			describes: []*ecs.DescribeServicesOutput{describedService("ACTIVE", ecsTypes.Deployment{Id: aws.String("ecs-svc/0000"),
+				Status: aws.String("PRIMARY"), RolloutState: ecsTypes.DeploymentRolloutStateCompleted})}},
 		{name: "inactive", wantCalls: 1, wantErr: "is INACTIVE",
 			describes: []*ecs.DescribeServicesOutput{describedService("INACTIVE")}},
 		{name: "draining", wantCalls: 1, wantErr: "is DRAINING",
