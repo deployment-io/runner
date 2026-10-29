@@ -3,6 +3,7 @@ package cloudwatch
 import (
 	"context"
 	"log"
+	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatchlogs"
@@ -20,7 +21,14 @@ type RetentionClient interface {
 // that has no retention. Groups that already have a retention are left alone. Errors are logged, never
 // returned: a failed group doesn't stop the rest and a failed listing ends the sweep.
 // It returns the number of groups updated and the number of groups listed.
+//
+// A prefix with nothing before its trailing "/" (an empty organization ID) is refused: "/" matches
+// groups the runner never created, such as /aws/lambda/..., and would expire their logs.
 func SetMissingRetention(ctx context.Context, client RetentionClient, prefix string) (updated, total int) {
+	if strings.TrimSuffix(prefix, "/") == "" {
+		log.Printf("log group retention: skipped, no organization ID in prefix %q", prefix)
+		return 0, 0
+	}
 	paginator := cloudwatchlogs.NewDescribeLogGroupsPaginator(client, &cloudwatchlogs.DescribeLogGroupsInput{
 		LogGroupNamePrefix: aws.String(prefix),
 	})

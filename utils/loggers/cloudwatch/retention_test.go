@@ -131,6 +131,20 @@ func TestSetMissingRetentionStopsOnDescribeError(t *testing.T) {
 	}
 }
 
+func TestSetMissingRetentionRefusesEmptyOrganization(t *testing.T) {
+	for _, prefix := range []string{"", "/"} {
+		f := newFakeClient()
+		f.pages = []*cloudwatchlogs.DescribeLogGroupsOutput{
+			{LogGroups: []types.LogGroup{group("/aws/lambda/fn", nil)}},
+		}
+		updated, total := SetMissingRetention(context.Background(), f, prefix)
+		if updated != 0 || total != 0 || len(f.describeCalls) != 0 || len(f.putCallsInSeq) != 0 {
+			t.Errorf("prefix %q: got updated=%d total=%d describes=%d puts=%v, want no calls",
+				prefix, updated, total, len(f.describeCalls), f.putCallsInSeq)
+		}
+	}
+}
+
 func TestCreateLogGroupSetsRetention(t *testing.T) {
 	f := newFakeClient()
 	if err := createLogGroup(context.Background(), f, "org/dep"); err != nil {
