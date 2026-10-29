@@ -41,6 +41,7 @@ func deployAwsPrivateServicePreview(parameters map[string]interface{}, logsWrite
 func previewDatabaseDeployOptions(engine string) privateServiceDeployOptions {
 	return privateServiceDeployOptions{
 		updateServiceConnect: true,
+		noCircuitBreaker:     true,
 		mongoReplicaSet:      engine == task_previews.PreviewDatabaseEngineMongoDB,
 	}
 }
@@ -56,6 +57,9 @@ type privateServiceDeployOptions struct {
 	// mongoReplicaSet runs the container as a single-node MongoDB replica set
 	// (mongoReplicaSetContainer). A MongoDB preview database sets it.
 	mongoReplicaSet bool
+	// noCircuitBreaker is ecsServiceDeployOptions.noCircuitBreaker. The preview
+	// database sets it.
+	noCircuitBreaker bool
 }
 
 // runAwsPrivateServiceDeploy is deployAwsPrivateService; tests replace it to see
@@ -116,7 +120,8 @@ func deployAwsPrivateService(parameters map[string]interface{}, logsWriter io.Wr
 	// attributes are on.
 	ensurePrivateServiceVpcDns(parameters, ec2Client, logsWriter)
 	err = deployEcsServiceAfterPreDeploy(parameters, ecsClient, logsClient, ecsClusterArn, "", taskDefinitionArn, logsWriter,
-		ecsServiceDeployOptions{registerDnsName: true, updateServiceConnect: opts.updateServiceConnect})
+		ecsServiceDeployOptions{registerDnsName: true, updateServiceConnect: opts.updateServiceConnect,
+			noCircuitBreaker: opts.noCircuitBreaker})
 	if err != nil {
 		return parameters, err
 	}

@@ -1324,12 +1324,136 @@ type ecsServiceDeployOptions struct {
 	// so its port mapping's name) changed is accepted. Only a Task's preview
 	// database sets it: changing its engine changes its port.
 	updateServiceConnect bool
+	// noCircuitBreaker leaves out ECS's deployment circuit breaker (and its
+	// rollback), which every production service gets
+	// (productionServiceDeploymentConfiguration). Previews set it: a backend
+	// preview rolls out stop-then-start and must never fall back to its previous
+	// revision; a preview database keeps ECS's defaults.
+	noCircuitBreaker bool
 }
 
-// waitForEcsServiceStable waits until the service settles. Swapped by tests
-// so they see whether a deploy waits, without AWS.
-var waitForEcsServiceStable = func(ecsClient *ecs.Client, describeServicesInput *ecs.DescribeServicesInput) error {
-	return ecs.NewServicesStableWaiter(ecsClient).Wait(context.TODO(), describeServicesInput, time.Minute*20)
+// productionServiceDeploymentConfiguration turns on ECS's deployment circuit
+// breaker: a deployment whose tasks keep failing is marked FAILED (ending
+// waitForEcsDeployment) and ECS rolls the service back to its last COMPLETED
+// deployment. Minimum healthy and maximum percent keep ECS's defaults.
+func productionServiceDeploymentConfiguration() *ecsTypes.DeploymentConfiguration {
+	return &ecsTypes.DeploymentConfiguration{
+		DeploymentCircuitBreaker: &ecsTypes.DeploymentCircuitBreaker{Enable: true, Rollback: true},
+	}
+}
+
+// serviceDeploymentConfiguration is the rollout a create or update asks for:
+// a backend preview's stop-then-start, nothing for a preview database, and the
+// circuit breaker with rollback for every production service.
+func serviceDeploymentConfiguration(opts ecsServiceDeployOptions) *ecsTypes.DeploymentConfiguration {
+	if opts.previewStack {
+		return previewServiceDeploymentConfiguration()
+	}
+	if opts.noCircuitBreaker {
+		return nil
+	}
+	return productionServiceDeploymentConfiguration()
+}
+
+// primaryDeploymentID is the ID of service's PRIMARY deployment: the one the
+// CreateService or UpdateService call that returned it started (or, when an
+// update changed nothing, the one already rolling out or done).
+func primaryDeploymentID(service *ecsTypes.Service, ecsServiceName string) (string, error) {
+	if service != nil {
+		for _, deployment := range service.Deployments {
+			if aws.ToString(deployment.Status) == "PRIMARY" {
+				return aws.ToString(deployment.Id), nil
+			}
+		}
+	}
+	return "", fmt.Errorf("ECS returned no primary deployment for %s", ecsServiceName)
+}
+
+// The wait for a deploy's ECS deployment polls every interval for at most
+// limit of wall-clock time, DescribeServices calls included. Swapped by tests.
+var (
+	ecsDeploymentPollInterval = 15 * time.Second
+	ecsDeploymentWaitLimit    = 20 * time.Minute
+	ecsDeploymentSleep        = time.Sleep
+	ecsDeploymentNow          = time.Now
+)
+
+var errEcsDeploymentTimeout = errors.New("timed out waiting for the ECS deployment to complete")
+
+// waitForEcsDeployment waits until ECS's rollout of deploymentID is COMPLETED —
+// the service reached steady state on it: its new tasks are running and, for a
+// web service, passing the load balancer's health check. A FAILED rollout (the
+// circuit breaker), a rolled-back deployment, a missing or inactive service, or
+// the limit ends it with an error. Swapped by tests so they see whether and on
+// which deployment a deploy waits, without AWS.
+var waitForEcsDeployment = func(client ecsServiceAPI, describeServicesInput *ecs.DescribeServicesInput,
+	deploymentID string, logsWriter io.Writer) error {
+	deadline := ecsDeploymentNow().Add(ecsDeploymentWaitLimit)
+	ctx, cancel := context.WithDeadline(context.Background(), deadline)
+	defer cancel()
+	seen := false
+	for {
+		done, err := ecsDeploymentDone(ctx, client, describeServicesInput, deploymentID, &seen, logsWriter)
+		if done {
+			return nil
+		}
+		if err != nil {
+			if errors.Is(err, context.DeadlineExceeded) {
+				return errEcsDeploymentTimeout
+			}
+			return err
+		}
+		if ecsDeploymentNow().Add(ecsDeploymentPollInterval).After(deadline) {
+			return errEcsDeploymentTimeout
+		}
+		ecsDeploymentSleep(ecsDeploymentPollInterval)
+	}
+}
+
+// ecsDeploymentDone reads deploymentID's rollout state once: done when it's
+// COMPLETED, an error when it can no longer complete. seen records whether a
+// read has listed the deployment yet: DescribeServices is eventually
+// consistent, so a deployment missing before it was first seen is still
+// starting, not rolled back.
+func ecsDeploymentDone(ctx context.Context, client ecsServiceAPI, describeServicesInput *ecs.DescribeServicesInput,
+	deploymentID string, seen *bool, logsWriter io.Writer) (bool, error) {
+	output, err := client.DescribeServices(ctx, describeServicesInput)
+	if err != nil {
+		return false, err
+	}
+	for _, failure := range output.Failures {
+		if aws.ToString(failure.Reason) == "MISSING" {
+			return false, fmt.Errorf("ECS service %s is missing", aws.ToString(failure.Arn))
+		}
+	}
+	if len(output.Services) == 0 {
+		return false, errors.New("ECS service is missing")
+	}
+	service := output.Services[0]
+	if status := aws.ToString(service.Status); status == "INACTIVE" || status == "DRAINING" {
+		return false, fmt.Errorf("ECS service %s is %s", aws.ToString(service.ServiceArn), status)
+	}
+	for _, deployment := range service.Deployments {
+		if aws.ToString(deployment.Id) != deploymentID {
+			continue
+		}
+		*seen = true
+		switch deployment.RolloutState {
+		case ecsTypes.DeploymentRolloutStateCompleted:
+			return true, nil
+		case ecsTypes.DeploymentRolloutStateFailed:
+			err := fmt.Errorf("ECS deployment failed: %s", aws.ToString(deployment.RolloutStateReason))
+			io.WriteString(logsWriter, err.Error()+"\n")
+			return false, err
+		}
+		return false, nil
+	}
+	if !*seen {
+		return false, nil
+	}
+	err = fmt.Errorf("ECS deployment %s was rolled back", deploymentID)
+	io.WriteString(logsWriter, err.Error()+"\n")
+	return false, err
 }
 
 func createEcsServiceIfNeeded(parameters map[string]interface{}, ecsClient *ecs.Client,
@@ -1360,7 +1484,8 @@ func createEcsServiceIfNeeded(parameters map[string]interface{}, ecsClient *ecs.
 		return "", false, err
 	}
 
-	var dnsName, namespaceName string
+	var dnsName, namespaceName, createdDeploymentID string
+	var created bool
 
 	if len(describeServicesOutput.Services) > 0 {
 		ecsServiceArn = aws.ToString(describeServicesOutput.Services[0].ServiceArn)
@@ -1453,9 +1578,7 @@ func createEcsServiceIfNeeded(parameters map[string]interface{}, ecsClient *ecs.
 		if opts.registerDnsName {
 			createServiceInput.ServiceRegistries = dnsServiceRegistries(parameters, namespaceName, dnsName, logsWriter)
 		}
-		if opts.previewStack {
-			createServiceInput.DeploymentConfiguration = previewServiceDeploymentConfiguration()
-		}
+		createServiceInput.DeploymentConfiguration = serviceDeploymentConfiguration(opts)
 
 		createServiceOutput, err := ecsServiceAPIClient.CreateService(context.TODO(), createServiceInput)
 		if err != nil {
@@ -1463,16 +1586,11 @@ func createEcsServiceIfNeeded(parameters map[string]interface{}, ecsClient *ecs.
 		}
 
 		ecsServiceArn = aws.ToString(createServiceOutput.Service.ServiceArn)
-
-		if !opts.skipServiceStableWait {
-			io.WriteString(logsWriter, fmt.Sprintf("Waiting for ECS service to be stable: %s\n", ecsServiceArn))
-
-			err = waitForEcsServiceStable(ecsClient, describeServicesInput)
-
-			if err != nil {
-				return "", false, err
-			}
+		createdDeploymentID, err = primaryDeploymentID(createServiceOutput.Service, ecsServiceName)
+		if err != nil {
+			return "", false, err
 		}
+		created = true
 	}
 
 	io.WriteString(logsWriter, fmt.Sprintf("Created ECS service: %s\n", ecsServiceArn))
@@ -1503,6 +1621,16 @@ func createEcsServiceIfNeeded(parameters map[string]interface{}, ecsClient *ecs.
 		})
 	}
 
+	// Saved above before waiting, so a first deploy that fails still records
+	// its service, DNS name and namespace.
+	if created && !opts.skipServiceStableWait {
+		io.WriteString(logsWriter, fmt.Sprintf("Waiting for ECS deployment %s to complete: %s\n", createdDeploymentID, ecsServiceArn))
+		err = waitForEcsDeployment(ecsServiceAPIClient, describeServicesInput, createdDeploymentID, logsWriter)
+		if err != nil {
+			return "", false, err
+		}
+	}
+
 	return
 }
 
@@ -1528,9 +1656,7 @@ func updateEcsService(parameters map[string]interface{}, ecsClient *ecs.Client, 
 		TaskDefinition: aws.String(taskDefinitionArn),
 		PropagateTags:  ecsTypes.PropagateTagsTaskDefinition,
 	}
-	if opts.previewStack {
-		updateServiceInput.DeploymentConfiguration = previewServiceDeploymentConfiguration()
-	}
+	updateServiceInput.DeploymentConfiguration = serviceDeploymentConfiguration(opts)
 	if opts.registerDnsName {
 		// In the same call as the new task definition, so it is one ECS
 		// deployment. Nil leaves a registry the service already has as is.
@@ -1549,33 +1675,25 @@ func updateEcsService(parameters map[string]interface{}, ecsClient *ecs.Client, 
 			return err
 		}
 	}
-	_, err = ecsServiceAPIClient.UpdateService(context.TODO(), updateServiceInput)
-
+	updateServiceOutput, err := ecsServiceAPIClient.UpdateService(context.TODO(), updateServiceInput)
+	if err != nil {
+		return err
+	}
+	deploymentID, err := primaryDeploymentID(updateServiceOutput.Service, ecsServiceName)
 	if err != nil {
 		return err
 	}
 
-	describeServicesOutput, err := ecsServiceAPIClient.DescribeServices(context.TODO(), describeServicesInput)
-	if err != nil {
-		return err
-	}
-
-	ecsServiceArn := aws.ToString(describeServicesOutput.Services[0].ServiceArn)
+	ecsServiceArn := aws.ToString(updateServiceOutput.Service.ServiceArn)
 
 	if opts.skipServiceStableWait {
 		io.WriteString(logsWriter, fmt.Sprintf("Updated ECS service: %s\n", ecsServiceArn))
 		return nil
 	}
 
-	io.WriteString(logsWriter, fmt.Sprintf("Waiting for ECS service to be stable: %s\n", ecsServiceArn))
+	io.WriteString(logsWriter, fmt.Sprintf("Waiting for ECS deployment %s to complete: %s\n", deploymentID, ecsServiceArn))
 
-	err = waitForEcsServiceStable(ecsClient, describeServicesInput)
-
-	if err != nil {
-		return err
-	}
-
-	return nil
+	return waitForEcsDeployment(ecsServiceAPIClient, describeServicesInput, deploymentID, logsWriter)
 }
 
 //TODO
@@ -1589,7 +1707,7 @@ func (d *DeployAwsWebService) Run(parameters map[string]interface{}, logsWriter 
 // backend preview: the same deploy, without waiting for the ECS service to
 // settle.
 func deployAwsWebServicePreview(parameters map[string]interface{}, logsWriter io.Writer) (map[string]interface{}, error) {
-	return runAwsWebServiceDeploy(parameters, logsWriter, ecsServiceDeployOptions{skipServiceStableWait: true, previewStack: true})
+	return runAwsWebServiceDeploy(parameters, logsWriter, ecsServiceDeployOptions{skipServiceStableWait: true, previewStack: true, noCircuitBreaker: true})
 }
 
 // runAwsWebServiceDeploy is deployAwsWebService; tests replace it to see the
