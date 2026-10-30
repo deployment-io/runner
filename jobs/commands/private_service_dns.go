@@ -29,7 +29,7 @@ import (
 // reachable over Service Connect.
 
 // serviceDiscoveryAPI is the part of *servicediscovery.Client deploys,
-// deletes and namespace cleanup (DeleteAwsNamespaces) use.
+// deletes and namespace cleanup (DeleteAwsCloudMapNamespaces) use.
 type serviceDiscoveryAPI interface {
 	ListNamespaces(ctx context.Context, params *servicediscovery.ListNamespacesInput, optFns ...func(*servicediscovery.Options)) (*servicediscovery.ListNamespacesOutput, error)
 	CreatePrivateDnsNamespace(ctx context.Context, params *servicediscovery.CreatePrivateDnsNamespaceInput, optFns ...func(*servicediscovery.Options)) (*servicediscovery.CreatePrivateDnsNamespaceOutput, error)

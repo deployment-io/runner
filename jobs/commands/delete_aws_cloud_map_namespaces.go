@@ -17,14 +17,14 @@ import (
 	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
-// DeleteAwsNamespaces is the only command of a Delete environment namespaces Job, sent when an
+// DeleteAwsCloudMapNamespaces is the only command of a Delete environment Cloud Map namespaces Job, sent when an
 // environment is deleted. The first web service, private service or database deployed into an
 // environment creates a Cloud Map private DNS namespace for it (createNamespaceIfNeeded), and
 // with it a Route 53 private hosted zone; nothing else ever deletes them. It deletes each of the
-// environment's namespaces — the names its deployments recorded (NamespaceNames) and the one
+// environment's namespaces — the names its deployments recorded (CloudMapNamespaceNames) and the one
 // getNamespaceName computes from its current name — that no Cloud Map service uses any more. A
 // namespace with a service is left in place: no service is ever deleted here.
-type DeleteAwsNamespaces struct {
+type DeleteAwsCloudMapNamespaces struct {
 }
 
 // addDeleteNamespacesPolicy grants the runner the web-service deploy policy, which has the
@@ -39,7 +39,7 @@ var addDeleteNamespacesPolicy = func(parameters map[string]interface{}) error {
 		runnerData.OsType.String(), runnerData.CpuArchEnum.String(), organizationID, runnerData.RunnerRegion, runnerData.Mode, runnerData.TargetCloud)
 }
 
-func (d *DeleteAwsNamespaces) Run(parameters map[string]interface{}, logsWriter io.Writer) (map[string]interface{}, error) {
+func (d *DeleteAwsCloudMapNamespaces) Run(parameters map[string]interface{}, logsWriter io.Writer) (map[string]interface{}, error) {
 	if err := addDeleteNamespacesPolicy(parameters); err != nil {
 		return parameters, err
 	}
@@ -65,7 +65,7 @@ func (d *DeleteAwsNamespaces) Run(parameters map[string]interface{}, logsWriter 
 	return parameters, nil
 }
 
-// namespaceCandidates are the job's NamespaceNames followed by the environment's computed
+// namespaceCandidates are the job's CloudMapNamespaceNames followed by the environment's computed
 // namespace name, de-duplicated.
 func namespaceCandidates(parameters map[string]interface{}) ([]string, error) {
 	var names []string
@@ -76,7 +76,7 @@ func namespaceCandidates(parameters map[string]interface{}) ([]string, error) {
 			names = append(names, name)
 		}
 	}
-	recorded, err := jobs.GetParameterValue[primitive.A](parameters, parameters_enums.NamespaceNames)
+	recorded, err := jobs.GetParameterValue[primitive.A](parameters, parameters_enums.CloudMapNamespaceNames)
 	if err == nil {
 		for _, value := range recorded {
 			if name, ok := value.(string); ok {

@@ -110,7 +110,7 @@ func (f *fakeNamespaces) listed() []string {
 	return names
 }
 
-func runDeleteAwsNamespaces(t *testing.T, cloudMap *fakeNamespaces, recorded ...string) (string, error) {
+func runDeleteAwsCloudMapNamespaces(t *testing.T, cloudMap *fakeNamespaces, recorded ...string) (string, error) {
 	t.Helper()
 	originalPolicy, originalClient := addDeleteNamespacesPolicy, getServiceDiscoveryClient
 	t.Cleanup(func() { addDeleteNamespacesPolicy, getServiceDiscoveryClient = originalPolicy, originalClient })
@@ -124,9 +124,9 @@ func runDeleteAwsNamespaces(t *testing.T, cloudMap *fakeNamespaces, recorded ...
 	for _, name := range recorded {
 		names = append(names, name)
 	}
-	jobs.SetParameterValue(parameters, parameters_enums.NamespaceNames, names)
+	jobs.SetParameterValue(parameters, parameters_enums.CloudMapNamespaceNames, names)
 
-	command, err := Get(commands_enums.DeleteAwsNamespaces)
+	command, err := Get(commands_enums.DeleteAwsCloudMapNamespaces)
 	if err != nil {
 		t.Fatalf("Get: %v", err)
 	}
@@ -135,9 +135,9 @@ func runDeleteAwsNamespaces(t *testing.T, cloudMap *fakeNamespaces, recorded ...
 	return logs.String(), err
 }
 
-func TestDeleteAwsNamespacesDeletesAnUnusedNamespace(t *testing.T) {
+func TestDeleteAwsCloudMapNamespacesDeletesAnUnusedNamespace(t *testing.T) {
 	cloudMap := &fakeNamespaces{namespaces: map[string]string{"rollout-test-cc26": "ns-1"}}
-	logs, err := runDeleteAwsNamespaces(t, cloudMap)
+	logs, err := runDeleteAwsCloudMapNamespaces(t, cloudMap)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -149,12 +149,12 @@ func TestDeleteAwsNamespacesDeletesAnUnusedNamespace(t *testing.T) {
 	}
 }
 
-func TestDeleteAwsNamespacesLeavesANamespaceWithServices(t *testing.T) {
+func TestDeleteAwsCloudMapNamespacesLeavesANamespaceWithServices(t *testing.T) {
 	cloudMap := &fakeNamespaces{
 		namespaces: map[string]string{"rollout-test-cc26": "ns-1"},
 		services:   map[string]int{"ns-1": 2},
 	}
-	logs, err := runDeleteAwsNamespaces(t, cloudMap)
+	logs, err := runDeleteAwsCloudMapNamespaces(t, cloudMap)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -166,9 +166,9 @@ func TestDeleteAwsNamespacesLeavesANamespaceWithServices(t *testing.T) {
 	}
 }
 
-func TestDeleteAwsNamespacesSkipsAMissingNamespace(t *testing.T) {
+func TestDeleteAwsCloudMapNamespacesSkipsAMissingNamespace(t *testing.T) {
 	cloudMap := &fakeNamespaces{}
-	logs, err := runDeleteAwsNamespaces(t, cloudMap)
+	logs, err := runDeleteAwsCloudMapNamespaces(t, cloudMap)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -183,12 +183,12 @@ func TestDeleteAwsNamespacesSkipsAMissingNamespace(t *testing.T) {
 }
 
 // The recorded names come first, each once; the computed name is added (once, even when recorded).
-func TestDeleteAwsNamespacesCandidates(t *testing.T) {
+func TestDeleteAwsCloudMapNamespacesCandidates(t *testing.T) {
 	cloudMap := &fakeNamespaces{namespaces: map[string]string{
 		"old-name-cc26":     "ns-old",
 		"rollout-test-cc26": "ns-1",
 	}}
-	if _, err := runDeleteAwsNamespaces(t, cloudMap, "old-name-cc26", "old-name-cc26", "rollout-test-cc26"); err != nil {
+	if _, err := runDeleteAwsCloudMapNamespaces(t, cloudMap, "old-name-cc26", "old-name-cc26", "rollout-test-cc26"); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	if got, want := cloudMap.listed(), []string{"old-name-cc26", "rollout-test-cc26"}; !reflect.DeepEqual(got, want) {
@@ -199,9 +199,9 @@ func TestDeleteAwsNamespacesCandidates(t *testing.T) {
 	}
 }
 
-func TestDeleteAwsNamespacesIncludesTheComputedName(t *testing.T) {
+func TestDeleteAwsCloudMapNamespacesIncludesTheComputedName(t *testing.T) {
 	cloudMap := &fakeNamespaces{namespaces: map[string]string{"rollout-test-cc26": "ns-1"}}
-	if _, err := runDeleteAwsNamespaces(t, cloudMap, "old-name-cc26"); err != nil {
+	if _, err := runDeleteAwsCloudMapNamespaces(t, cloudMap, "old-name-cc26"); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	if got, want := cloudMap.listed(), []string{"old-name-cc26", "rollout-test-cc26"}; !reflect.DeepEqual(got, want) {
@@ -210,13 +210,13 @@ func TestDeleteAwsNamespacesIncludesTheComputedName(t *testing.T) {
 }
 
 // A failed call fails the command, but only after every other candidate was tried.
-func TestDeleteAwsNamespacesFailureTriesTheRest(t *testing.T) {
+func TestDeleteAwsCloudMapNamespacesFailureTriesTheRest(t *testing.T) {
 	for _, failing := range []string{"ListNamespaces a-0001", "ListServices ns-b", "DeleteNamespace ns-c"} {
 		cloudMap := &fakeNamespaces{
 			namespaces: map[string]string{"a-0001": "ns-a", "b-0001": "ns-b", "c-0001": "ns-c", "rollout-test-cc26": "ns-1"},
 			errs:       map[string]error{failing: errors.New("throttled")},
 		}
-		_, err := runDeleteAwsNamespaces(t, cloudMap, "a-0001", "b-0001", "c-0001")
+		_, err := runDeleteAwsCloudMapNamespaces(t, cloudMap, "a-0001", "b-0001", "c-0001")
 		if err == nil {
 			t.Fatalf("%s failing: want an error", failing)
 		}
@@ -232,7 +232,7 @@ func TestDeleteAwsNamespacesFailureTriesTheRest(t *testing.T) {
 	}
 }
 
-func TestDeleteAwsNamespacesErrorNamesTheFailedNamespaces(t *testing.T) {
+func TestDeleteAwsCloudMapNamespacesErrorNamesTheFailedNamespaces(t *testing.T) {
 	cloudMap := &fakeNamespaces{
 		namespaces: map[string]string{"b-0001": "ns-b", "rollout-test-cc26": "ns-1"},
 		errs: map[string]error{
@@ -240,7 +240,7 @@ func TestDeleteAwsNamespacesErrorNamesTheFailedNamespaces(t *testing.T) {
 			"ListNamespaces a-0001": errors.New("access denied"),
 		},
 	}
-	_, err := runDeleteAwsNamespaces(t, cloudMap, "a-0001", "b-0001")
+	_, err := runDeleteAwsCloudMapNamespaces(t, cloudMap, "a-0001", "b-0001")
 	if err == nil {
 		t.Fatal("want an error")
 	}
@@ -254,11 +254,11 @@ func TestDeleteAwsNamespacesErrorNamesTheFailedNamespaces(t *testing.T) {
 	}
 }
 
-func TestDeleteAwsNamespacesPolicyFailure(t *testing.T) {
+func TestDeleteAwsCloudMapNamespacesPolicyFailure(t *testing.T) {
 	originalPolicy := addDeleteNamespacesPolicy
 	t.Cleanup(func() { addDeleteNamespacesPolicy = originalPolicy })
 	addDeleteNamespacesPolicy = func(map[string]interface{}) error { return errors.New("no iam") }
-	if _, err := (&DeleteAwsNamespaces{}).Run(map[string]interface{}{}, &bytes.Buffer{}); err == nil || err.Error() != "no iam" {
+	if _, err := (&DeleteAwsCloudMapNamespaces{}).Run(map[string]interface{}{}, &bytes.Buffer{}); err == nil || err.Error() != "no iam" {
 		t.Errorf("Run = %v; want the policy error", err)
 	}
 }
