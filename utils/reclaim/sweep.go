@@ -82,6 +82,7 @@ func Sweep() {
 		reclaiming(nil, "orphaned images", func() { sweepImages(ctx, d, containers) })
 		reclaiming(nil, "orphaned cache volumes", func() { sweepVolumes(ctx, d, containers) })
 		reclaiming(nil, "stale task working directories", func() { sweepWorkDirs(containers) })
+		reclaiming(nil, "stale BuildKit output directories", func() { sweepBuildkitOutputDirs() })
 	})
 	PruneBuildCache(nil)
 }
@@ -304,6 +305,52 @@ func selectStaleWorkDirs(root string, bound map[string]bool) []string {
 			}
 			stale = append(stale, taskPath)
 		}
+	}
+	return stale
+}
+
+// BuildkitOutputRoot and BuildkitOutputDirPattern name the per-build
+// directories a BuildKit image build writes its image tar into
+// (os.MkdirTemp(BuildkitOutputRoot, BuildkitOutputDirPattern), in
+// jobs/commands). The build removes its own; a killed runner leaves it, tar
+// and all.
+const (
+	BuildkitOutputRoot       = "/tmp"
+	BuildkitOutputDirPattern = "buildkit-out-*"
+)
+
+// sweepBuildkitOutputDirs removes BuildKit output directories a previous
+// process never cleaned up. None is in use before the job loop starts: a
+// buildkitd container a killed runner left running may still mount one, but
+// the next BuildKit build force-removes that container and never reads its
+// output directory.
+func sweepBuildkitOutputDirs() {
+	for _, dir := range selectBuildkitOutputDirs(BuildkitOutputRoot) {
+		if err := os.RemoveAll(dir); err != nil {
+			logSweep("Startup sweep: could not remove BuildKit output dir %s: %s", dir, err)
+			continue
+		}
+		logSweep("Startup sweep: removed stale BuildKit output dir %s", dir)
+	}
+}
+
+// selectBuildkitOutputDirs lists the real directories in root matching
+// BuildkitOutputDirPattern. A symlink or a plain file of that name is left
+// alone.
+func selectBuildkitOutputDirs(root string) []string {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return nil
+	}
+	var stale []string
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		if ok, _ := filepath.Match(BuildkitOutputDirPattern, entry.Name()); !ok {
+			continue
+		}
+		stale = append(stale, filepath.Join(root, entry.Name()))
 	}
 	return stale
 }

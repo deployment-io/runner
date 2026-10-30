@@ -209,6 +209,37 @@ func TestSelectStaleWorkDirs(t *testing.T) {
 	}
 }
 
+// Leftover BuildKit output directories are reclaimed, including one a
+// surviving buildkitd container still mounts; other /tmp entries and a symlink
+// or file of that name are not.
+func TestSelectBuildkitOutputDirs(t *testing.T) {
+	root := t.TempDir()
+	stale := filepath.Join(root, "buildkit-out-123")
+	live := filepath.Join(root, "buildkit-out-456")
+	for _, dir := range []string{stale, live, filepath.Join(root, "buildkit-cache"), filepath.Join(root, "verify-browser-1")} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(stale, "image.tar"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "buildkit-out-file"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(t.TempDir(), filepath.Join(root, "buildkit-out-link")); err != nil {
+		t.Fatal(err)
+	}
+
+	got := selectBuildkitOutputDirs(root)
+	if want := []string{stale, live}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("stale BuildKit output dirs = %v, want %v", got, want)
+	}
+	if got := selectBuildkitOutputDirs(filepath.Join(root, "missing")); got != nil {
+		t.Errorf("a missing root gave %v", got)
+	}
+}
+
 // The directories commands park beside a work dir — the Review stage's round
 // outputs, fix-round snapshots and context copies, the Task preview build's
 // copies — are reclaimed with it. Near misses, symlinks, plain files and a

@@ -35,6 +35,7 @@ import (
 
 	"github.com/deployment-io/deployment-runner-kit/task_previews"
 	"github.com/deployment-io/deployment-runner-kit/tasks"
+	"github.com/deployment-io/deployment-runner/utils/redact"
 )
 
 // previewBuildCallWait is the longest one deploy_static_site_preview call waits for a
@@ -402,7 +403,7 @@ func buildRunnerBuiltPreview(ctx context.Context, deps DeployStaticSitePreviewDe
 	io.WriteString(deps.LogsWriter, previewBuildLogLine(p))
 	// The build's output can print a wired variable: its value (an address and a
 	// production path) never reaches the Step log.
-	buildLogs, flushBuildLogs := newRedactingWriter(deps.LogsWriter, p.wired)
+	buildLogs, flushBuildLogs := redact.NewWriter(deps.LogsWriter, p.wired)
 	err = deps.BuildSite(ctx, siteDir, p.site.BuildCommand, previewBuildEnv(p.configuration, p.wired), buildLogs)
 	flushBuildLogs()
 	if err != nil {

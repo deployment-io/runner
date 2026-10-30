@@ -1,4 +1,5 @@
-package agenttools
+// Package redact hides known secret values in output written to a log.
+package redact
 
 import (
 	"bytes"
@@ -8,17 +9,17 @@ import (
 	"sync"
 )
 
-// redactingMaxPending bounds what a redactingWriter holds back waiting for a line
+// maxPending bounds what a writer holds back waiting for a line
 // end: past it, all but the last few bytes (that could still start a value) are
 // written, so a long line or progress output without a line break doesn't grow the
 // runner's memory.
-const redactingMaxPending = 64 << 10
+const maxPending = 64 << 10
 
-// redactingWriter writes to w line by line ("\n" or "\r" ending a line), each
+// writer writes to w line by line ("\n" or "\r" ending a line), each
 // value of values replaced by "<NAME>" (its name), so a build that prints a wired
-// variable doesn't put its value in the Step log. Flush writes the last,
+// variable or a build secret doesn't put its value in the log. Flush writes the last,
 // unterminated line.
-type redactingWriter struct {
+type writer struct {
 	mu       sync.Mutex
 	w        io.Writer
 	replacer *strings.Replacer
@@ -27,8 +28,8 @@ type redactingWriter struct {
 	pending  []byte
 }
 
-// newRedactingWriter is w with values' values hidden; w itself when there are none.
-func newRedactingWriter(w io.Writer, values map[string]string) (io.Writer, func()) {
+// NewWriter is w with values' values hidden; w itself when there are none.
+func NewWriter(w io.Writer, values map[string]string) (io.Writer, func()) {
 	names := make([]string, 0, len(values))
 	for name, value := range values {
 		if value != "" {
@@ -45,7 +46,7 @@ func newRedactingWriter(w io.Writer, values map[string]string) (io.Writer, func(
 		}
 		return names[i] < names[j]
 	})
-	r := &redactingWriter{w: w}
+	r := &writer{w: w}
 	pairs := make([]string, 0, 2*len(names))
 	for _, name := range names {
 		pairs = append(pairs, values[name], "<"+name+">")
@@ -58,7 +59,7 @@ func newRedactingWriter(w io.Writer, values map[string]string) (io.Writer, func(
 	return r, r.flush
 }
 
-func (r *redactingWriter) Write(p []byte) (int, error) {
+func (r *writer) Write(p []byte) (int, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.pending = append(r.pending, p...)
@@ -67,7 +68,7 @@ func (r *redactingWriter) Write(p []byte) (int, error) {
 			return 0, err
 		}
 	}
-	if len(r.pending) > redactingMaxPending {
+	if len(r.pending) > maxPending {
 		if err := r.emit(r.safeCut(len(r.pending) - (r.maxLen - 1))); err != nil {
 			return 0, err
 		}
@@ -76,7 +77,7 @@ func (r *redactingWriter) Write(p []byte) (int, error) {
 }
 
 // safeCut is cut, moved back to the start of any value that would straddle it.
-func (r *redactingWriter) safeCut(cut int) int {
+func (r *writer) safeCut(cut int) int {
 	for moved := true; moved && cut > 0; {
 		moved = false
 		for _, v := range r.values {
@@ -92,7 +93,7 @@ func (r *redactingWriter) safeCut(cut int) int {
 }
 
 // emit writes pending's first n bytes, redacted, and keeps the rest.
-func (r *redactingWriter) emit(n int) error {
+func (r *writer) emit(n int) error {
 	if n <= 0 {
 		return nil
 	}
@@ -102,7 +103,7 @@ func (r *redactingWriter) emit(n int) error {
 	return err
 }
 
-func (r *redactingWriter) flush() {
+func (r *writer) flush() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if len(r.pending) > 0 {
