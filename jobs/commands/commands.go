@@ -85,6 +85,8 @@ func Get(p commands_enums.Type) (jobs.Command, error) {
 		return &BuildInfraContext{}, nil
 	case commands_enums.MaterializeContext:
 		return &MaterializeContext{}, nil
+	case commands_enums.DeleteAwsCloudMapNamespaces:
+		return &DeleteAwsCloudMapNamespaces{}, nil
 	}
 	return nil, fmt.Errorf("error getting command for %s", p)
 }

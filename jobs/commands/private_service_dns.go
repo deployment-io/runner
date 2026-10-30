@@ -28,8 +28,8 @@ import (
 // None of this ever fails a deploy: without the DNS name the service is still
 // reachable over Service Connect.
 
-// serviceDiscoveryAPI is the part of *servicediscovery.Client deploys and
-// deletes use.
+// serviceDiscoveryAPI is the part of *servicediscovery.Client deploys,
+// deletes and namespace cleanup (DeleteAwsCloudMapNamespaces) use.
 type serviceDiscoveryAPI interface {
 	ListNamespaces(ctx context.Context, params *servicediscovery.ListNamespacesInput, optFns ...func(*servicediscovery.Options)) (*servicediscovery.ListNamespacesOutput, error)
 	CreatePrivateDnsNamespace(ctx context.Context, params *servicediscovery.CreatePrivateDnsNamespaceInput, optFns ...func(*servicediscovery.Options)) (*servicediscovery.CreatePrivateDnsNamespaceOutput, error)
@@ -37,6 +37,7 @@ type serviceDiscoveryAPI interface {
 	ListServices(ctx context.Context, params *servicediscovery.ListServicesInput, optFns ...func(*servicediscovery.Options)) (*servicediscovery.ListServicesOutput, error)
 	CreateService(ctx context.Context, params *servicediscovery.CreateServiceInput, optFns ...func(*servicediscovery.Options)) (*servicediscovery.CreateServiceOutput, error)
 	DeleteService(ctx context.Context, params *servicediscovery.DeleteServiceInput, optFns ...func(*servicediscovery.Options)) (*servicediscovery.DeleteServiceOutput, error)
+	DeleteNamespace(ctx context.Context, params *servicediscovery.DeleteNamespaceInput, optFns ...func(*servicediscovery.Options)) (*servicediscovery.DeleteNamespaceOutput, error)
 }
 
 // ecsServiceAPI is the part of *ecs.Client creating and updating a service uses.
