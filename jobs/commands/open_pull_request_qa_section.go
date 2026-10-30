@@ -221,6 +221,8 @@ func qaWiringLine(w qaWiringOutput, all []qaWiringOutput) string {
 	switch w.Reason {
 	case qaWiringBackendFailed:
 		return prefix + fmt.Sprintf("%s's preview failed to deploy.", w.API)
+	case qaWiringBackendLeftOut:
+		return prefix + fmt.Sprintf("%s's preview was left out, because it uses a Go module from another repository this Task also changes, and a preview builds against the released version.", w.API)
 	case qaWiringSiteFailed:
 		return prefix + fmt.Sprintf("%s's preview failed to deploy.", w.Frontend)
 	case qaWiringLookupFailed:

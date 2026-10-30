@@ -75,6 +75,13 @@ const (
 // it can deploy a preview of.
 const qaNoStaticSiteOrBackendReason = "no static site or backend service in this change"
 
+// qaBackendUsesChangedRepositoryReason is the skipped reason when every backend
+// was left out because it uses a Go module another repository of the Task
+// changes, and no static site is left: a backend preview builds against the
+// version its go.mod pins, not this Task's change. Formatted with the first
+// backend left out and the repository it depends on (the latter twice).
+const qaBackendUsesChangedRepositoryReason = "%s depends on %s, which this Task also changes; previews build against the released %s, so QA can't check this change yet"
+
 // minBackendQAAgentboxVersion is the first agentbox that reads QA_BACKENDS: an
 // older one would reject a QA run with no QA_REPOSITORIES and tell the agent
 // nothing about the backends.
@@ -187,6 +194,10 @@ type qaStage struct {
 	// backends are the changed repositories the runner deploys as backend
 	// previews before each QA round, in work-dir order.
 	backends []string
+	// droppedBackends are, in the stack path, the backends the gate left out
+	// because they use a Go module of another changed repository: each round
+	// reports them as backend previews that couldn't be planned.
+	droppedBackends []droppedBackend
 	// webDistributions is the stage's one memo of the backend previews'
 	// CloudFront distributions, shared by every round's deploys so a
 	// re-deploy keeps its URL (see agenttools.WebPreviewDistributions).
@@ -226,6 +237,9 @@ type qaStage struct {
 	spawnQA        func(spec agentboxSpawnSpec) (agentResult, error)
 	cacheExists    func(name string) bool
 	reviewer       func(rs *reviewStage)
+	// readFile reads a file host-side for the gate's go.mod check; nil is
+	// os.ReadFile.
+	readFile func(path string) ([]byte, error)
 	// prefetchBrowser starts the QA browser image's download before round 1;
 	// nil is runnerVerifyBrowser.prefetch.
 	prefetchBrowser func(ctx context.Context, jobRef string, logsWriter io.Writer)
@@ -277,6 +291,7 @@ func (s *qaStage) run() (map[string]interface{}, error) {
 	}
 	s.repositories = g.static
 	s.backends = g.backends
+	s.droppedBackends = g.dropped
 	s.stack = g.stack
 	s.out = &qaOutput{Repositories: g.static, Backends: g.backends}
 	if g.status != "" {

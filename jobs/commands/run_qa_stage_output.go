@@ -87,9 +87,12 @@ type qaRoundOutput struct {
 const (
 	qaWiringNoLink        = "no link"
 	qaWiringBackendFailed = "backend failed"
-	qaWiringLookupFailed  = "lookup failed"
-	qaWiringSingleOrigin  = "single origin"
-	qaWiringSiteFailed    = "site failed"
+	// qaWiringBackendLeftOut: the gate left the backend out (it uses a Go
+	// module another repository of the Task changes); nothing was deployed.
+	qaWiringBackendLeftOut = "backend left out"
+	qaWiringLookupFailed   = "lookup failed"
+	qaWiringSingleOrigin   = "single origin"
+	qaWiringSiteFailed     = "site failed"
 )
 
 // qaWiringOutput is how a stack-path QA round connected one site preview
