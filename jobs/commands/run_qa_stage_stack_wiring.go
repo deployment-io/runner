@@ -45,13 +45,16 @@ func (p *qaStackPair) connected() bool {
 
 // pairStack makes every (site, backend) pair of the round and its applying
 // link. lookupFailed marks every pair "lookup failed"; a backend or site whose
-// plan failed marks its pairs "backend failed" or "site failed".
+// plan failed marks its pairs "backend failed" or "site failed"; a backend the
+// gate left out marks its pairs "backend left out", whatever else happened.
 func pairStack(sites, backends []*qaStackPreview, links []task_previews.StackLinkV1, lookupFailed bool) []*qaStackPair {
 	var pairs []*qaStackPair
 	for _, site := range sites {
 		for _, backend := range backends {
 			p := &qaStackPair{site: site, backend: backend}
 			switch {
+			case backend.leftOut:
+				p.reason = qaWiringBackendLeftOut
 			case lookupFailed:
 				p.reason = qaWiringLookupFailed
 			case backend.planErr != "":

@@ -352,10 +352,13 @@ func readGoModFile(path string) ([]byte, error) {
 
 // parseGoMod is a small go.mod reader: the module path (module path or
 // module ( path )) and the paths of every require, single-line or in a
-// require ( … ) block, // indirect included.
+// require ( … ) block, // indirect included. Every other directive's block is
+// skipped whole.
 func parseGoMod(data []byte) (module string, required map[string]bool) {
 	required = map[string]bool{}
-	inRequire, inModule := false, false
+	// inOther is inside another directive's block (replace, exclude,
+	// retract, …): its lines are never read as directives.
+	inRequire, inModule, inOther := false, false, false
 	for _, line := range strings.Split(string(data), "\n") {
 		if i := strings.Index(line, "//"); i >= 0 {
 			line = line[:i]
@@ -373,6 +376,12 @@ func parseGoMod(data []byte) (module string, required map[string]bool) {
 				inModule = false
 			} else if module == "" {
 				module = goModPath(fields[0])
+			}
+			continue
+		}
+		if inOther {
+			if fields[0] == ")" {
+				inOther = false
 			}
 			continue
 		}
@@ -405,6 +414,9 @@ func parseGoMod(data []byte) (module string, required map[string]bool) {
 			case len(fields) >= 2:
 				required[goModPath(fields[1])] = true
 			}
+		default:
+			// Another directive's block, unless it closes on the same line.
+			inOther = len(fields) >= 2 && fields[1] == "(" && fields[len(fields)-1] != ")"
 		}
 	}
 	return module, required

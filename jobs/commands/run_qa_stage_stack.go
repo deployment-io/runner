@@ -88,6 +88,9 @@ type qaStackPreview struct {
 	// planErr is why it couldn't be planned; err why it failed (planErr too).
 	planErr string
 	err     string
+	// leftOut is a backend the gate left out (droppedBackends): planErr says
+	// why, and its pairs are "backend left out", not a failed deploy.
+	leftOut bool
 	// origin is a site's reserved address, https://<distribution domain>.
 	origin         string
 	url, healthURL string
@@ -201,9 +204,10 @@ func (r *qaStackRound) plan() {
 		p := &qaStackPreview{repository: repository}
 		if d, ok := dropped[repository]; ok {
 			// Left out by the gate: nothing is deployed for it, and its pairs
-			// are "backend failed".
+			// are "backend left out".
 			p.planErr = d.previewError()
 			p.err = p.planErr
+			p.leftOut = true
 			r.backends = append(r.backends, p)
 			continue
 		}

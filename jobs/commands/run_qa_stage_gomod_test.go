@@ -327,7 +327,28 @@ func TestQAStackReportsADroppedBackend(t *testing.T) {
 	if got != want {
 		t.Errorf("QA_PREVIEWS = %s\nwant %s", got, want)
 	}
-	if want := []qaWiringOutput{{Frontend: "web", API: "api", Reason: qaWiringBackendFailed}}; !reflect.DeepEqual(stage.roundWiring, want) {
+	if want := []qaWiringOutput{{Frontend: "web", API: "api", Reason: qaWiringBackendLeftOut}}; !reflect.DeepEqual(stage.roundWiring, want) {
 		t.Errorf("wiring = %+v", stage.roundWiring)
+	}
+	// The pull request says it was left out, not that it failed to deploy.
+	if line := qaWiringLine(stage.roundWiring[0], stage.roundWiring); !strings.Contains(line, "api's preview was left out") || strings.Contains(line, "failed") {
+		t.Errorf("wiring line = %q", line)
+	}
+}
+
+// A line inside another directive's block is never read as module or require.
+func TestParseGoModSkipsOtherBlocks(t *testing.T) {
+	data := "module github.com/deployment-io/kit\n\n" +
+		"replace (\n\tmodule => ./module\n\trequire => ./require\n)\n" +
+		"exclude ( example.com/old v1.0.0 )\n" +
+		"require example.com/dep v1.0.0\n" +
+		"retract (\n\tv1.0.0\n)\n" +
+		"require (\n\tgithub.com/acme/kit v1.2.0 // indirect\n)\n"
+	module, required := parseGoMod([]byte(data))
+	if module != "github.com/deployment-io/kit" {
+		t.Errorf("module = %q", module)
+	}
+	if want := map[string]bool{"example.com/dep": true, "github.com/acme/kit": true}; !reflect.DeepEqual(required, want) {
+		t.Errorf("required = %v, want %v", required, want)
 	}
 }
