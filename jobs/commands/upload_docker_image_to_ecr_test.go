@@ -2,9 +2,11 @@ package commands
 
 import (
 	"bytes"
+	"encoding/base64"
 	"errors"
 	"io"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/service/ecr"
@@ -77,5 +79,31 @@ func TestNewUploadDockerImageToEcrIsFullyWired(t *testing.T) {
 	command := newUploadDockerImageToEcr()
 	if command.pushImage == nil || command.reclaimLocalImages == nil {
 		t.Fatal("both seams must default to the production implementations")
+	}
+}
+
+func TestEcrRegistryPassword(t *testing.T) {
+	encoded := base64.StdEncoding.EncodeToString([]byte("AWS:pass:word"))
+	if got, err := ecrRegistryPassword(encoded); err != nil || got != "pass:word" {
+		t.Errorf("got %q, %v; want the password", got, err)
+	}
+}
+
+// A malformed token's error carries no part of the token: it is a live credential.
+func TestEcrRegistryPasswordMalformedTokenNotInError(t *testing.T) {
+	decoded := "liveRegistrySecretNoColon"
+	encoded := base64.StdEncoding.EncodeToString([]byte(decoded))
+	_, err := ecrRegistryPassword(encoded)
+	if err == nil {
+		t.Fatal("no error for a token without a colon")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "unexpected format") {
+		t.Errorf("error %q, want it to say unexpected format", msg)
+	}
+	for _, secret := range []string{decoded, "liveRegistrySecret", encoded} {
+		if strings.Contains(msg, secret) {
+			t.Errorf("error %q contains the token %q", msg, secret)
+		}
 	}
 }

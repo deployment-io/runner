@@ -20,9 +20,10 @@ func GetDockerBuildArgs(parameters map[string]interface{}) (map[string]*string, 
 		return nil, fmt.Errorf("error getting docker build args: %s", err)
 	}
 	for _, dockerBuildArg := range dockerBuildArgsStrings {
-		entry := strings.Split(dockerBuildArg, "=")
-		if len(entry) == 2 {
-			dockerBuildArgsMap[entry[0]] = &entry[1]
+		// The value keeps every "=" after the first (URL=https://x/?a=b).
+		name, value, found := strings.Cut(dockerBuildArg, "=")
+		if found {
+			dockerBuildArgsMap[name] = &value
 		}
 	}
 	return dockerBuildArgsMap, nil

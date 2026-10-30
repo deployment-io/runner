@@ -97,7 +97,7 @@ func TestBuildWebPreviewParametersKeysAndTypes(t *testing.T) {
 		parameters_enums.RepoDirectoryPath:       "/tmp/orgns/task-preview-build-123/services/api",
 		parameters_enums.CommitHash:              "preview-1700000000",
 		parameters_enums.DockerFilePath:          "docker/Dockerfile.prod",
-		parameters_enums.DockerBuildArgs:         primitive.A{"API_KEY=s3cret"},
+		parameters_enums.DockerBuildArgs:         primitive.A{"API_KEY=s3cret", "URL=https://x/?a=b"},
 		parameters_enums.Region:                  int64(1),
 		parameters_enums.Port:                    int64(8080),
 		parameters_enums.HealthCheckPath:         "/healthz",
@@ -181,7 +181,7 @@ func TestWebPreviewBuildArgs(t *testing.T) {
 		{name: "value from the preview configuration", production: []string{"API_KEY=prod-key"}, args: []string{"API_KEY=preview-key"}},
 		{name: "empty preview value", production: []string{"EMPTY=prod"}, args: []string{"EMPTY="}},
 		{name: "no preview variable", production: []string{"NPM_TOKEN=prod-token"}, left: []string{"NPM_TOKEN"}},
-		{name: "preview value with =", production: []string{"URL=prod"}, left: []string{"URL"}},
+		{name: "preview value with =", production: []string{"URL=prod"}, args: []string{"URL=https://x/?a=b"}},
 		{name: "name only", production: []string{"API_KEY"}, args: []string{"API_KEY=preview-key"}},
 		{name: "duplicates and blanks", production: []string{"API_KEY=a", " API_KEY =b", "=c", ""}, args: []string{"API_KEY=preview-key"}},
 		{name: "order kept", production: []string{"NPM_TOKEN=t", "EMPTY=e", "API_KEY=k"}, args: []string{"EMPTY=", "API_KEY=preview-key"}, left: []string{"NPM_TOKEN"}},
@@ -430,7 +430,7 @@ func TestWebPreviewDeployLogsLeftOutBuildArgNames(t *testing.T) {
 	if _, err := testWebPreviewDeployer(org, fake.steps()).deploy(context.Background(), in); err != nil {
 		t.Fatal(err)
 	}
-	want := "Backend preview: build args left out, with no usable Preview configuration variable of the same name: A, URL\n"
+	want := "Backend preview: build args left out, with no usable Preview configuration variable of the same name: A\n"
 	if !strings.Contains(buildLogs.String(), want) {
 		t.Errorf("build log %q, want it to contain %q", buildLogs.String(), want)
 	}
@@ -443,8 +443,9 @@ func TestWebPreviewDeployLogsLeftOutBuildArgNames(t *testing.T) {
 		t.Error("the left-out names reached the deploy log")
 	}
 	args, err := commandUtils.GetDockerBuildArgs(fake.seen[0])
-	if err != nil || len(args) != 1 || args["API_KEY"] == nil || *args["API_KEY"] != "s3cret" {
-		t.Errorf("the build got %v (%v), want only API_KEY from the preview configuration", args, err)
+	if err != nil || len(args) != 2 || args["API_KEY"] == nil || *args["API_KEY"] != "s3cret" ||
+		args["URL"] == nil || *args["URL"] != "https://x/?a=b" {
+		t.Errorf("the build got %v (%v), want only API_KEY and URL from the preview configuration", args, err)
 	}
 }
 
