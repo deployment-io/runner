@@ -133,6 +133,10 @@ func (f *fakeCloudMap) DeleteService(_ context.Context, in *servicediscovery.Del
 	return nil, err
 }
 
+func (f *fakeCloudMap) DeleteNamespace(_ context.Context, in *servicediscovery.DeleteNamespaceInput, _ ...func(*servicediscovery.Options)) (*servicediscovery.DeleteNamespaceOutput, error) {
+	return &servicediscovery.DeleteNamespaceOutput{}, f.call("DeleteNamespace", aws.ToString(in.Id))
+}
+
 // registryCalls are the calls that register a DNS name, as opposed to the
 // namespace lookup every create makes.
 func (f *fakeCloudMap) registryCalls() []string {
