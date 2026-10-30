@@ -146,9 +146,8 @@ func webPreviewDockerFile(path string) string {
 // service's build args, each with the preview configuration variable of that name as
 // its value. Production's values never reach a preview build: the agent writes the
 // Dockerfile, so it could serve whatever the image is built with. A name with no such
-// variable, or whose variable's value has an "=" (GetDockerBuildArgs reads "K=V" with
-// exactly one "=", as production does), is left out so the Dockerfile's own ARG
-// default applies; left lists those names, never a value.
+// variable is left out so the Dockerfile's own ARG default applies; left lists those
+// names, never a value.
 func webPreviewBuildArgs(productionArgs []string, variables map[string]string) (args, left []string) {
 	seen := map[string]bool{}
 	for _, arg := range productionArgs {
@@ -159,7 +158,7 @@ func webPreviewBuildArgs(productionArgs []string, variables map[string]string) (
 		}
 		seen[name] = true
 		value, ok := variables[name]
-		if !ok || strings.Contains(value, "=") {
+		if !ok {
 			left = append(left, name)
 			continue
 		}

@@ -157,6 +157,21 @@ func tagDockerImageToRepositoryUri(parameters map[string]interface{}, ecrReposit
 	return ecrRepositoryUriWithTag, nil
 }
 
+// ecrRegistryPassword is the password in an ECR authorization token (base64 of
+// "user:password"). Its error never carries any part of the token: it is a live
+// registry credential, and the error reaches the job log, the Job and alerts.
+func ecrRegistryPassword(encodedToken string) (string, error) {
+	decodedBytes, err := base64.StdEncoding.DecodeString(encodedToken)
+	if err != nil {
+		return "", err
+	}
+	_, password, found := strings.Cut(string(decodedBytes), ":")
+	if !found {
+		return "", fmt.Errorf("ECR returned an authorization token in an unexpected format")
+	}
+	return password, nil
+}
+
 func pushDockerImageToEcr(ecrClient *ecr.Client, ecrRepositoryUriWithTag string, logsWriter io.Writer) error {
 	getAuthorizationTokenOutput, err := ecrClient.GetAuthorizationToken(context.TODO(), &ecr.GetAuthorizationTokenInput{})
 	if err != nil {
@@ -167,16 +182,9 @@ func pushDockerImageToEcr(ecrClient *ecr.Client, ecrRepositoryUriWithTag string,
 		return fmt.Errorf("no auth token from ECR")
 	}
 
-	encodedToken := aws.ToString(getAuthorizationTokenOutput.AuthorizationData[0].AuthorizationToken)
-	decodedBytes, err := base64.StdEncoding.DecodeString(encodedToken)
+	token, err := ecrRegistryPassword(aws.ToString(getAuthorizationTokenOutput.AuthorizationData[0].AuthorizationToken))
 	if err != nil {
 		return err
-	}
-
-	fullToken := string(decodedBytes)
-	_, token, found := strings.Cut(fullToken, ":")
-	if !found {
-		return fmt.Errorf("full token not in valid format: %s", fullToken)
 	}
 
 	cli, err := client.New(client.FromEnv)
