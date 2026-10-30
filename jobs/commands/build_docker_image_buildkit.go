@@ -28,6 +28,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
 	"github.com/deployment-io/deployment-runner/jobs/resources"
@@ -304,7 +305,11 @@ func (l *buildLogWriter) Write(p []byte) (int, error) {
 		if c == '\n' || c == '\r' {
 			l.lineLen = 0
 		} else {
-			if l.lineLen == buildLogMaxLine {
+			// Break before a character, never inside one: a UTF-8
+			// continuation byte runs the line up to 3 bytes past the cap.
+			// Output that isn't UTF-8 (a run of continuation bytes) is
+			// still broken there.
+			if l.lineLen >= buildLogMaxLine && (utf8.RuneStart(c) || l.lineLen >= buildLogMaxLine+utf8.UTFMax-1) {
 				out = append(out, '\n')
 				l.lineLen = 0
 			}

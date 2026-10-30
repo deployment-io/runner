@@ -14,6 +14,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
@@ -657,6 +658,43 @@ func TestBuildkitBuildLogLines(t *testing.T) {
 	closed.Close()
 	if err := newTestBuildkitBuilder(t, &fakeBuildkitDocker{present: true}).build(testBuildkitRequest(), w); err != nil {
 		t.Errorf("a closed job log failed the build: %v", err)
+	}
+}
+
+// A long line is broken between characters, never inside a multi-byte one.
+func TestBuildLogWriterBreaksBetweenCharacters(t *testing.T) {
+	var got bytes.Buffer
+	w := &buildLogWriter{w: &got}
+	line := strings.Repeat("x", buildLogMaxLine-1) + strings.Repeat("€", 3) + "\n"
+	// One byte at a time, so a break can't rely on a whole character arriving
+	// in one write.
+	for i := 0; i < len(line); i++ {
+		w.Write([]byte{line[i]})
+	}
+	pieces := strings.Split(strings.TrimSuffix(got.String(), "\n"), "\n")
+	if len(pieces) != 2 {
+		t.Fatalf("got %d pieces, want 2", len(pieces))
+	}
+	for i, piece := range pieces {
+		if !utf8.ValidString(piece) {
+			t.Errorf("piece %d isn't valid UTF-8", i)
+		}
+		if len(piece) > buildLogMaxLine+utf8.UTFMax-1 {
+			t.Errorf("piece %d is %d bytes, over the cap", i, len(piece))
+		}
+	}
+	if strings.Join(pieces, "") != strings.TrimSuffix(line, "\n") {
+		t.Error("the output changed")
+	}
+
+	// Bytes that aren't UTF-8 are still broken at most 3 bytes past the cap.
+	got.Reset()
+	w = &buildLogWriter{w: &got}
+	w.Write(bytes.Repeat([]byte{0x80}, 3*buildLogMaxLine))
+	for i, piece := range strings.Split(got.String(), "\n") {
+		if len(piece) > buildLogMaxLine+utf8.UTFMax-1 {
+			t.Errorf("non-UTF-8 piece %d is %d bytes, over the cap", i, len(piece))
+		}
 	}
 }
 
