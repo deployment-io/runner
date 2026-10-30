@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -54,6 +56,10 @@ type fakeBuildkitDocker struct {
 	loaded     []string
 	loadErr    error
 	containers int
+	// volumes are the cache volumes that exist; volumeRemoveErr fails the
+	// removal of the named ones.
+	volumes         map[string]bool
+	volumeRemoveErr map[string]error
 }
 
 func (d *fakeBuildkitDocker) event(e string) {
@@ -90,7 +96,29 @@ func newTestBuildkitBuilder(t *testing.T, d *fakeBuildkitDocker) *buildkitBuilde
 		d.present = true
 		return nil
 	}
-	b.createVolume = func(context.Context) error { d.event("volume"); return nil }
+	orig := buildkitCaches
+	buildkitCaches = newBuildkitCacheState()
+	t.Cleanup(func() { buildkitCaches = orig })
+	b.createVolume = func(_ context.Context, name string) error {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		if d.volumes == nil {
+			d.volumes = map[string]bool{}
+		}
+		d.volumes[name] = true
+		d.events = append(d.events, "volume "+name)
+		return nil
+	}
+	b.removeVolume = func(_ context.Context, name string) error {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		d.events = append(d.events, "remove volume "+name)
+		if err := d.volumeRemoveErr[name]; err != nil {
+			return err
+		}
+		delete(d.volumes, name)
+		return nil
+	}
 	b.createContainer = func(_ context.Context, cfg *container.Config, hostCfg *container.HostConfig) (string, error) {
 		d.mu.Lock()
 		defer d.mu.Unlock()
@@ -177,6 +205,7 @@ func outputDest(cmd []string) string {
 func testBuildkitRequest() buildkitRequest {
 	value := "1.2.3"
 	return buildkitRequest{
+		deploymentID:    "deploy",
 		repoDir:         "/tmp/org/build/repo",
 		imageNameAndTag: "org-deploy:abc123",
 		buildArgs:       map[string]*string{"VERSION": &value},
@@ -263,7 +292,7 @@ func TestBuildDockerImageChoosesTheBuilder(t *testing.T) {
 			}
 		})
 	}
-	want := buildkitRequest{repoDir: "/tmp/org/build/repo", dockerFile: "Dockerfile", imageNameAndTag: "org-deploy:abc123", secrets: map[string]string{"NPM_TOKEN": "v"}}
+	want := buildkitRequest{deploymentID: "deploy", repoDir: "/tmp/org/build/repo", dockerFile: "Dockerfile", imageNameAndTag: "org-deploy:abc123", secrets: map[string]string{"NPM_TOKEN": "v"}}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("BuildKit request = %+v, want %+v", got, want)
 	}
@@ -336,7 +365,7 @@ func TestBuildkitContainerConfig(t *testing.T) {
 	wantMounts := []mount.Mount{
 		{Type: mount.TypeBind, Source: req.repoDir, Target: req.repoDir, ReadOnly: true},
 		{Type: mount.TypeBind, Source: outputDir, Target: outputDir},
-		{Type: mount.TypeVolume, Source: "buildkit-cache", Target: "/home/user/.local/share/buildkit"},
+		{Type: mount.TypeVolume, Source: "buildkit-cache-deploy", Target: "/home/user/.local/share/buildkit"},
 	}
 	if !reflect.DeepEqual(hc.Mounts, wantMounts) {
 		t.Errorf("mounts = %+v, want %+v", hc.Mounts, wantMounts)
@@ -475,7 +504,7 @@ func TestBuildkitSuccessLifecycle(t *testing.T) {
 	if err := b.build(testBuildkitRequest(), io.Discard); err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"remove old-buildkit", "volume", "create buildkit-a", "start buildkit-a",
+	want := []string{"remove old-buildkit", "remove volume buildkit-cache-deploy", "volume buildkit-cache-deploy", "create buildkit-a", "start buildkit-a",
 		"exec debug", "exec debug", "exec debug", "exec build", "exec prune", "load", "remove buildkit-a"}
 	if !reflect.DeepEqual(d.events, want) {
 		t.Errorf("events =\n%q\nwant\n%q", d.events, want)
@@ -732,5 +761,329 @@ func TestBuildkitBuildsRunOneAtATime(t *testing.T) {
 	}
 	if maxRunning != 1 {
 		t.Errorf("%d builds ran at once", maxRunning)
+	}
+}
+
+// testServiceRequest is a build of deploymentID with the given secrets.
+func testServiceRequest(deploymentID string, secrets map[string]string) buildkitRequest {
+	req := testBuildkitRequest()
+	req.deploymentID = deploymentID
+	req.secrets = secrets
+	return req
+}
+
+// volumeEvents are d's volume events since from.
+func (d *fakeBuildkitDocker) volumeEvents(from int) []string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	var got []string
+	for _, e := range d.events[from:] {
+		if strings.HasPrefix(e, "volume ") || strings.HasPrefix(e, "remove volume ") {
+			got = append(got, e)
+		}
+	}
+	return got
+}
+
+func (d *fakeBuildkitDocker) eventCount() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return len(d.events)
+}
+
+func (d *fakeBuildkitDocker) mountedVolume(t *testing.T) string {
+	t.Helper()
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for _, m := range d.hostConfigs[len(d.hostConfigs)-1].Mounts {
+		if m.Target == buildkitStateDir {
+			if m.Type != mount.TypeVolume {
+				t.Errorf("state dir mount = %+v", m)
+			}
+			return m.Source
+		}
+	}
+	t.Fatal("no state dir mount")
+	return ""
+}
+
+const secretsChangedLine = "Build secrets changed since this service's last build on this runner: building without the BuildKit cache\n"
+
+// Each service's buildkitd mounts its own cache volume, created with the
+// cache label.
+func TestBuildkitCacheVolumePerService(t *testing.T) {
+	d := &fakeBuildkitDocker{present: true}
+	b := newTestBuildkitBuilder(t, d)
+	var labels []map[string]string
+	createVolume := b.createVolume
+	b.createVolume = func(ctx context.Context, name string) error {
+		labels = append(labels, reclaim.Labels(reclaim.PurposeBuildkitCache))
+		return createVolume(ctx, name)
+	}
+	secrets := map[string]string{"NPM_TOKEN": "npm_s3cr3tvalue"}
+	for _, id := range []string{"svc-a", "svc-b"} {
+		if err := b.build(testServiceRequest(id, secrets), io.Discard); err != nil {
+			t.Fatal(err)
+		}
+		if got := d.mountedVolume(t); got != "buildkit-cache-"+id {
+			t.Errorf("%s mounted %q", id, got)
+		}
+	}
+	if !d.volumes["buildkit-cache-svc-a"] || !d.volumes["buildkit-cache-svc-b"] || len(d.volumes) != 2 {
+		t.Errorf("volumes = %v", d.volumes)
+	}
+}
+
+// The same secrets keep the service's volume; changed values, an added,
+// removed or renamed secret reset it, with the log line, and the next build
+// with the new secrets keeps it.
+func TestBuildkitCacheResetWhenSecretsChange(t *testing.T) {
+	base := map[string]string{"NPM_TOKEN": "npm_s3cr3tvalue", "GH_TOKEN": "ghp_an0thervalue"}
+	for _, test := range []struct {
+		name    string
+		secrets map[string]string
+	}{
+		{"a value changed", map[string]string{"NPM_TOKEN": "npm_n3wvalue", "GH_TOKEN": "ghp_an0thervalue"}},
+		{"a name added", map[string]string{"NPM_TOKEN": "npm_s3cr3tvalue", "GH_TOKEN": "ghp_an0thervalue", "TEST_TOKEN": "t0kenvalue"}},
+		{"a name removed", map[string]string{"NPM_TOKEN": "npm_s3cr3tvalue"}},
+		{"a name renamed", map[string]string{"NPM_TOKEN": "npm_s3cr3tvalue", "GITHUB_TOKEN": "ghp_an0thervalue"}},
+		{"value moved between names", map[string]string{"NPM_TOKEN": "ghp_an0thervalue", "GH_TOKEN": "npm_s3cr3tvalue"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			d := &fakeBuildkitDocker{present: true}
+			b := newTestBuildkitBuilder(t, d)
+			var all bytes.Buffer
+			build := func(secrets map[string]string) (string, []string) {
+				t.Helper()
+				from := d.eventCount()
+				var logs bytes.Buffer
+				if err := b.build(testServiceRequest("svc", secrets), &logs); err != nil {
+					t.Fatal(err)
+				}
+				all.Write(logs.Bytes())
+				return logs.String(), d.volumeEvents(from)
+			}
+			build(base)
+			logs, events := build(base)
+			if want := []string{"volume buildkit-cache-svc"}; !reflect.DeepEqual(events, want) {
+				t.Errorf("same secrets: volume events = %q, want %q", events, want)
+			}
+			if strings.Contains(logs, secretsChangedLine) {
+				t.Errorf("same secrets logged a change: %q", logs)
+			}
+			logs, events = build(test.secrets)
+			if want := []string{"remove volume buildkit-cache-svc", "volume buildkit-cache-svc"}; !reflect.DeepEqual(events, want) {
+				t.Errorf("changed secrets: volume events = %q, want %q", events, want)
+			}
+			if !strings.Contains(logs, secretsChangedLine) {
+				t.Errorf("changed secrets: log = %q", logs)
+			}
+			logs, events = build(test.secrets)
+			if want := []string{"volume buildkit-cache-svc"}; !reflect.DeepEqual(events, want) {
+				t.Errorf("same new secrets: volume events = %q, want %q", events, want)
+			}
+			if strings.Contains(logs, secretsChangedLine) {
+				t.Errorf("same new secrets logged a change: %q", logs)
+			}
+			assertNoSecretLeak(t, all.String(), d, base, test.secrets)
+		})
+	}
+}
+
+// Two services with an NPM_TOKEN of different values build on two volumes,
+// and building one never resets or mounts the other's.
+func TestBuildkitServicesNeverShareACache(t *testing.T) {
+	d := &fakeBuildkitDocker{present: true}
+	b := newTestBuildkitBuilder(t, d)
+	a := map[string]string{"NPM_TOKEN": "npm_v4lue_a"}
+	other := map[string]string{"NPM_TOKEN": "npm_v4lue_b"}
+	var logs bytes.Buffer
+	for i, step := range []struct {
+		id      string
+		secrets map[string]string
+	}{{"svc-a", a}, {"svc-b", other}, {"svc-a", a}, {"svc-b", other}} {
+		from := d.eventCount()
+		if err := b.build(testServiceRequest(step.id, step.secrets), &logs); err != nil {
+			t.Fatal(err)
+		}
+		if got := d.mountedVolume(t); got != "buildkit-cache-"+step.id {
+			t.Errorf("build %d of %s mounted %q", i, step.id, got)
+		}
+		for _, e := range d.volumeEvents(from) {
+			if !strings.HasSuffix(e, " buildkit-cache-"+step.id) {
+				t.Errorf("build %d of %s: %q", i, step.id, e)
+			}
+		}
+		if i >= 2 && len(d.volumeEvents(from)) != 1 {
+			t.Errorf("build %d of %s reset its cache: %q", i, step.id, d.volumeEvents(from))
+		}
+	}
+	if strings.Contains(logs.String(), secretsChangedLine) {
+		t.Errorf("log = %q", logs.String())
+	}
+	assertNoSecretLeak(t, logs.String(), d, a, other)
+}
+
+// A volume a previous runner process left is removed before the service's
+// first build in this one, without the secrets-changed line.
+func TestBuildkitFirstBuildRemovesAStaleVolume(t *testing.T) {
+	d := &fakeBuildkitDocker{present: true, volumes: map[string]bool{"buildkit-cache-svc": true}}
+	b := newTestBuildkitBuilder(t, d)
+	var logs bytes.Buffer
+	if err := b.build(testServiceRequest("svc", map[string]string{"NPM_TOKEN": "npm_s3cr3tvalue"}), &logs); err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"remove volume buildkit-cache-svc", "volume buildkit-cache-svc"}; !reflect.DeepEqual(d.volumeEvents(0), want) {
+		t.Errorf("volume events = %q, want %q", d.volumeEvents(0), want)
+	}
+	if strings.Contains(logs.String(), "Build secrets changed") {
+		t.Errorf("log = %q", logs.String())
+	}
+	// It is removed after the leftover containers: nothing mounts it.
+	d2 := &fakeBuildkitDocker{present: true, leftovers: []string{"old"}}
+	if err := newTestBuildkitBuilder(t, d2).build(testServiceRequest("svc", map[string]string{"A": "b"}), io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if d2.events[0] != "remove old" || d2.events[1] != "remove volume buildkit-cache-svc" {
+		t.Errorf("events = %q", d2.events)
+	}
+}
+
+// A runner keeps the volume being built and the most recently used other
+// one: a third service's build removes the least recently used.
+func TestBuildkitKeepsTwoCacheVolumes(t *testing.T) {
+	d := &fakeBuildkitDocker{present: true}
+	b := newTestBuildkitBuilder(t, d)
+	secrets := map[string]string{"NPM_TOKEN": "npm_s3cr3tvalue"}
+	build := func(id string) []string {
+		t.Helper()
+		from := d.eventCount()
+		if err := b.build(testServiceRequest(id, secrets), io.Discard); err != nil {
+			t.Fatal(err)
+		}
+		return d.volumeEvents(from)
+	}
+	build("svc-a")
+	build("svc-b")
+	build("svc-a") // svc-b is now the least recently used.
+	events := build("svc-c")
+	want := []string{"remove volume buildkit-cache-svc-c", "remove volume buildkit-cache-svc-b", "volume buildkit-cache-svc-c"}
+	if !reflect.DeepEqual(events, want) {
+		t.Errorf("volume events = %q, want %q", events, want)
+	}
+	if want := map[string]bool{"buildkit-cache-svc-a": true, "buildkit-cache-svc-c": true}; !reflect.DeepEqual(d.volumes, want) {
+		t.Errorf("volumes = %v, want %v", d.volumes, want)
+	}
+	// svc-b was evicted: its next build starts empty, and evicts svc-a.
+	events = build("svc-b")
+	want = []string{"remove volume buildkit-cache-svc-b", "remove volume buildkit-cache-svc-a", "volume buildkit-cache-svc-b"}
+	if !reflect.DeepEqual(events, want) {
+		t.Errorf("volume events = %q, want %q", events, want)
+	}
+}
+
+// A failed removal of the service's own volume fails the build before
+// buildkitd starts; another service's is logged and the build goes on.
+func TestBuildkitCacheVolumeRemovalFailures(t *testing.T) {
+	secrets := map[string]string{"NPM_TOKEN": "npm_s3cr3tvalue"}
+	d := &fakeBuildkitDocker{present: true, volumeRemoveErr: map[string]error{"buildkit-cache-svc": errors.New("volume is in use")}}
+	b := newTestBuildkitBuilder(t, d)
+	var logs bytes.Buffer
+	err := b.build(testServiceRequest("svc", secrets), &logs)
+	if err == nil || err.Error() != "could not reset the BuildKit cache for this service" {
+		t.Fatalf("err = %v", err)
+	}
+	if !strings.Contains(logs.String(), "Could not remove the BuildKit cache volume buildkit-cache-svc: volume is in use\n") {
+		t.Errorf("log = %q", logs.String())
+	}
+	if len(d.configs) != 0 {
+		t.Errorf("buildkitd started on a stale cache")
+	}
+	// It is tried again next time.
+	delete(d.volumeRemoveErr, "buildkit-cache-svc")
+	if err := b.build(testServiceRequest("svc", secrets), io.Discard); err != nil {
+		t.Fatal(err)
+	}
+
+	d = &fakeBuildkitDocker{present: true, volumeRemoveErr: map[string]error{}}
+	b = newTestBuildkitBuilder(t, d)
+	logs.Reset()
+	for _, id := range []string{"svc-a", "svc-b"} {
+		if err := b.build(testServiceRequest(id, secrets), io.Discard); err != nil {
+			t.Fatal(err)
+		}
+	}
+	d.volumeRemoveErr["buildkit-cache-svc-a"] = errors.New("volume is in use")
+	if err := b.build(testServiceRequest("svc-c", secrets), &logs); err != nil {
+		t.Fatalf("another service's failed removal failed the build: %v", err)
+	}
+	if !strings.Contains(logs.String(), "Could not remove the BuildKit cache volume buildkit-cache-svc-a: volume is in use\n") {
+		t.Errorf("log = %q", logs.String())
+	}
+	if got := d.mountedVolume(t); got != "buildkit-cache-svc-c" {
+		t.Errorf("mounted %q", got)
+	}
+}
+
+// assertNoSecretLeak fails when a value, or the hash of any of the secret
+// sets, is in the log, a volume name, a label or the build's container
+// settings.
+func assertNoSecretLeak(t *testing.T, logs string, d *fakeBuildkitDocker, sets ...map[string]string) {
+	t.Helper()
+	var places []string
+	places = append(places, logs)
+	d.mu.Lock()
+	for name := range d.volumes {
+		places = append(places, name)
+	}
+	for _, e := range d.events {
+		places = append(places, e)
+	}
+	for i, cfg := range d.configs {
+		for k, v := range cfg.Labels {
+			places = append(places, k, v)
+		}
+		for _, m := range d.hostConfigs[i].Mounts {
+			places = append(places, m.Source, m.Target)
+		}
+	}
+	d.mu.Unlock()
+	for k, v := range reclaim.Labels(reclaim.PurposeBuildkitCache) {
+		places = append(places, k, v)
+	}
+	for _, secrets := range sets {
+		hash := buildkitSecretsHash(secrets)
+		needles := []string{fmt.Sprintf("%x", hash), fmt.Sprintf("%X", hash), base64.StdEncoding.EncodeToString(hash[:]), string(hash[:])}
+		for _, v := range secrets {
+			needles = append(needles, v)
+		}
+		for _, place := range places {
+			for _, needle := range needles {
+				if strings.Contains(place, needle) {
+					t.Errorf("%q contains a secret value or hash", place)
+				}
+			}
+		}
+	}
+}
+
+// The secrets' hash depends on every name and value, not on map order, and
+// length prefixes keep different sets apart.
+func TestBuildkitSecretsHash(t *testing.T) {
+	a := buildkitSecretsHash(map[string]string{"A": "1", "B": "2"})
+	if a != buildkitSecretsHash(map[string]string{"B": "2", "A": "1"}) {
+		t.Error("the hash depends on map order")
+	}
+	for _, other := range []map[string]string{
+		{"A": "1", "B": "3"},
+		{"A": "1"},
+		{"A": "1", "B": "2", "C": ""},
+		{"A": "1B2"},
+		{"A1": "", "B": "2"},
+		{"A": "", "1B": "2"},
+	} {
+		if buildkitSecretsHash(other) == a {
+			t.Errorf("%v hashes like {A:1 B:2}", other)
+		}
 	}
 }

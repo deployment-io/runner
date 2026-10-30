@@ -18,6 +18,8 @@ package commands
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -30,6 +32,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/containerd/errdefs"
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
 	"github.com/deployment-io/deployment-runner/jobs/resources"
 	"github.com/deployment-io/deployment-runner/utils/hostinfo"
@@ -46,9 +49,13 @@ const (
 	buildkitImage = "docker.io/moby/buildkit:v0.34.1-rootless"
 	// buildkitStateDir is where the image's buildkitd keeps its state and cache.
 	buildkitStateDir = "/home/user/.local/share/buildkit"
-	// buildkitCacheVolume holds buildkitd's state across builds. One build
-	// uses it at a time (buildkitBuildLock).
-	buildkitCacheVolume = "buildkit-cache"
+	// buildkitCacheVolumePrefix, followed by the DeploymentID, names a
+	// service's volume holding buildkitd's state across its builds. One build
+	// uses one at a time (buildkitBuildLock).
+	buildkitCacheVolumePrefix = "buildkit-cache-"
+	// buildkitCacheVolumesKept is how many service cache volumes a runner
+	// keeps: the one being built and the most recently used other one.
+	buildkitCacheVolumesKept = 2
 	// buildkitCacheKeepMB is the cache budget `buildctl prune --keep-storage`
 	// trims to after every build.
 	buildkitCacheKeepMB = 5120
@@ -82,8 +89,67 @@ const (
 // any other buildkit container as a leftover.
 var buildkitBuildLock sync.Mutex
 
+// buildkitCaches is what this runner process knows of the service cache
+// volumes it created; read and written under buildkitBuildLock, never stored
+// anywhere else.
+var buildkitCaches = newBuildkitCacheState()
+
+type buildkitCacheState struct {
+	// secretsHash is, per DeploymentID, the hash of the build secrets the
+	// service's volume was last used with (buildkitSecretsHash).
+	secretsHash map[string][sha256.Size]byte
+	// lru lists the DeploymentIDs whose volume this process created, least
+	// recently used first.
+	lru []string
+}
+
+func newBuildkitCacheState() *buildkitCacheState {
+	return &buildkitCacheState{secretsHash: map[string][sha256.Size]byte{}}
+}
+
+// touch moves deploymentID to the most recently used end of the LRU.
+func (c *buildkitCacheState) touch(deploymentID string) {
+	c.forget(deploymentID)
+	c.lru = append(c.lru, deploymentID)
+}
+
+func (c *buildkitCacheState) forget(deploymentID string) {
+	for i, id := range c.lru {
+		if id == deploymentID {
+			c.lru = append(c.lru[:i:i], c.lru[i+1:]...)
+			return
+		}
+	}
+}
+
+// buildkitSecretsHash is a SHA-256 of the secrets, names sorted, each name
+// and value length-prefixed so that different sets never hash alike.
+// BuildKit leaves secret values out of its cache keys, so a cache is reused
+// only with the secrets it was built with.
+func buildkitSecretsHash(secrets map[string]string) [sha256.Size]byte {
+	h := sha256.New()
+	var n [8]byte
+	write := func(s string) {
+		binary.BigEndian.PutUint64(n[:], uint64(len(s)))
+		h.Write(n[:])
+		h.Write([]byte(s))
+	}
+	for _, name := range sortedNames(secrets) {
+		write(name)
+		write(secrets[name])
+	}
+	var sum [sha256.Size]byte
+	copy(sum[:], h.Sum(nil))
+	return sum
+}
+
+func buildkitCacheVolumeName(deploymentID string) string {
+	return buildkitCacheVolumePrefix + deploymentID
+}
+
 // buildkitRequest is one image build with build secrets.
 type buildkitRequest struct {
+	deploymentID    string
 	repoDir         string
 	dockerFile      string
 	imageNameAndTag string
@@ -99,7 +165,8 @@ type buildkitBuilder struct {
 	listContainers    func(ctx context.Context) ([]string, error)
 	imagePresent      func(ctx context.Context, ref string) (bool, error)
 	pullImage         func(ref string) error
-	createVolume      func(ctx context.Context) error
+	createVolume      func(ctx context.Context, name string) error
+	removeVolume      func(ctx context.Context, name string) error
 	createContainer   func(ctx context.Context, cfg *container.Config, hostCfg *container.HostConfig) (string, error)
 	startContainer    func(ctx context.Context, id string) error
 	exec              func(ctx context.Context, id string, cmd, env []string, out io.Writer) (int, error)
@@ -126,6 +193,7 @@ func newBuildkitBuilder() *buildkitBuilder {
 		// stream for a failure; nothing in it is verify-browser's own.
 		pullImage:       pullVerifyBrowserImage,
 		createVolume:    createBuildkitCacheVolume,
+		removeVolume:    removeBuildkitCacheVolume,
 		createContainer: dockerCreateContainer,
 		startContainer:  dockerStartContainer,
 		exec:            dockerExec,
@@ -163,7 +231,7 @@ func (b *buildkitBuilder) build(req buildkitRequest, logsWriter io.Writer) error
 	defer buildkitBuildLock.Unlock()
 	releaseImage := reclaim.MarkImageInUse(buildkitImage)
 	defer releaseImage()
-	if err := b.prepare(logsWriter); err != nil {
+	if err := b.prepare(req, logsWriter); err != nil {
 		return err
 	}
 	outputDir, err := os.MkdirTemp(b.outputRoot, reclaim.BuildkitOutputDirPattern)
@@ -175,7 +243,7 @@ func (b *buildkitBuilder) build(req buildkitRequest, logsWriter io.Writer) error
 		return fmt.Errorf("preparing the BuildKit output directory: %w", err)
 	}
 	memoryBytes, cores := b.limits()
-	id, err := b.startBuildkitd(req.repoDir, outputDir, memoryBytes, cores)
+	id, err := b.startBuildkitd(req.repoDir, outputDir, buildkitCacheVolumeName(req.deploymentID), memoryBytes, cores)
 	if err != nil {
 		return err
 	}
@@ -196,8 +264,9 @@ func (b *buildkitBuilder) build(req buildkitRequest, logsWriter io.Writer) error
 }
 
 // prepare removes a leftover buildkit container, makes sure the image is on
-// the host and creates the cache volume.
-func (b *buildkitBuilder) prepare(logsWriter io.Writer) error {
+// the host, resets or keeps the service's cache volume, removes the older
+// services' volumes and creates the service's.
+func (b *buildkitBuilder) prepare(req buildkitRequest, logsWriter io.Writer) error {
 	ctx := context.Background()
 	// A buildkit container here is a runner's that died mid-build: this
 	// build holds buildkitBuildLock. The startup sweep leaves a running one.
@@ -218,17 +287,68 @@ func (b *buildkitBuilder) prepare(logsWriter io.Writer) error {
 			return fmt.Errorf("pulling the BuildKit image %s: %w", buildkitImage, err)
 		}
 	}
-	if err := b.createVolume(ctx); err != nil {
+	// No buildkit container is left to mount a cache volume now.
+	if err := b.resetCacheVolume(ctx, req, logsWriter); err != nil {
+		return err
+	}
+	b.evictCacheVolumes(ctx, logsWriter)
+	if err := b.createVolume(ctx, buildkitCacheVolumeName(req.deploymentID)); err != nil {
 		return fmt.Errorf("creating the BuildKit cache volume: %w", err)
 	}
 	return nil
 }
 
+// resetCacheVolume removes the service's cache volume unless this process
+// last built the service with the same build secrets, then records them. A
+// volume from before this process is stale.
+func (b *buildkitBuilder) resetCacheVolume(ctx context.Context, req buildkitRequest, logsWriter io.Writer) error {
+	hash := buildkitSecretsHash(req.secrets)
+	previous, built := buildkitCaches.secretsHash[req.deploymentID]
+	if !built || previous != hash {
+		if built {
+			io.WriteString(logsWriter, "Build secrets changed since this service's last build on this runner: building without the BuildKit cache\n")
+		}
+		if !b.removeCacheVolume(ctx, buildkitCacheVolumeName(req.deploymentID), logsWriter) {
+			return errors.New("could not reset the BuildKit cache for this service")
+		}
+	}
+	buildkitCaches.secretsHash[req.deploymentID] = hash
+	buildkitCaches.touch(req.deploymentID)
+	return nil
+}
+
+// evictCacheVolumes removes the cache volumes of every service but the one
+// being built (the most recently used) and the most recently used other one,
+// least recently used first. Their builds are over: buildkitBuildLock is
+// held. A volume that can't be removed stays listed, to be tried again.
+func (b *buildkitBuilder) evictCacheVolumes(ctx context.Context, logsWriter io.Writer) {
+	evict := len(buildkitCaches.lru) - buildkitCacheVolumesKept
+	if evict <= 0 {
+		return
+	}
+	for _, deploymentID := range append([]string(nil), buildkitCaches.lru[:evict]...) {
+		if b.removeCacheVolume(ctx, buildkitCacheVolumeName(deploymentID), logsWriter) {
+			delete(buildkitCaches.secretsHash, deploymentID)
+			buildkitCaches.forget(deploymentID)
+		}
+	}
+}
+
+// removeCacheVolume removes a cache volume, logging a failure; a volume that
+// isn't there counts as removed.
+func (b *buildkitBuilder) removeCacheVolume(ctx context.Context, name string, logsWriter io.Writer) bool {
+	if err := b.removeVolume(ctx, name); err != nil {
+		io.WriteString(logsWriter, fmt.Sprintf("Could not remove the BuildKit cache volume %s: %s\n", name, err))
+		return false
+	}
+	return true
+}
+
 // startBuildkitd creates and starts the buildkitd container, removing it if
 // it doesn't start.
-func (b *buildkitBuilder) startBuildkitd(repoDir, outputDir string, memoryBytes, cores int64) (string, error) {
+func (b *buildkitBuilder) startBuildkitd(repoDir, outputDir, cacheVolume string, memoryBytes, cores int64) (string, error) {
 	ctx := context.Background()
-	id, err := b.createContainer(ctx, buildkitContainerConfig(), buildkitHostConfig(repoDir, outputDir, memoryBytes, cores))
+	id, err := b.createContainer(ctx, buildkitContainerConfig(), buildkitHostConfig(repoDir, outputDir, cacheVolume, memoryBytes, cores))
 	if err != nil {
 		return "", fmt.Errorf("creating the BuildKit container: %w", err)
 	}
@@ -417,12 +537,12 @@ func buildkitContainerConfig() *container.Config {
 // the masked /proc paths are lifted so rootlesskit can set up its user
 // namespace, but the container is never privileged, gets no added capability
 // and no no-new-privileges (newuidmap/newgidmap are setuid).
-func buildkitHostConfig(repoDir, outputDir string, memoryBytes, cores int64) *container.HostConfig {
+func buildkitHostConfig(repoDir, outputDir, cacheVolume string, memoryBytes, cores int64) *container.HostConfig {
 	return &container.HostConfig{
 		Mounts: []mount.Mount{
 			{Type: mount.TypeBind, Source: repoDir, Target: repoDir, ReadOnly: true},
 			{Type: mount.TypeBind, Source: outputDir, Target: outputDir},
-			{Type: mount.TypeVolume, Source: buildkitCacheVolume, Target: buildkitStateDir},
+			{Type: mount.TypeVolume, Source: cacheVolume, Target: buildkitStateDir},
 		},
 		SecurityOpt: []string{"seccomp=unconfined", "apparmor=unconfined"},
 		// systempaths=unconfined: empty, not nil — nil means Docker's defaults.
@@ -462,18 +582,34 @@ func listBuildkitContainers(ctx context.Context) ([]string, error) {
 	return ids, nil
 }
 
-// createBuildkitCacheVolume creates the cache volume; Docker returns the
-// existing one when it is already there.
-func createBuildkitCacheVolume(ctx context.Context) error {
+// createBuildkitCacheVolume creates a service's cache volume; Docker returns
+// the existing one when it is already there.
+func createBuildkitCacheVolume(ctx context.Context, name string) error {
 	cli, err := client.New(client.FromEnv)
 	if err != nil {
 		return err
 	}
 	defer cli.Close()
 	_, err = cli.VolumeCreate(ctx, client.VolumeCreateOptions{
-		Name:   buildkitCacheVolume,
+		Name:   name,
 		Labels: reclaim.Labels(reclaim.PurposeBuildkitCache),
 	})
+	return err
+}
+
+// removeBuildkitCacheVolume removes a cache volume; one that isn't there is
+// no error. Never forced: the daemon refuses to remove a volume a container
+// still mounts.
+func removeBuildkitCacheVolume(ctx context.Context, name string) error {
+	cli, err := client.New(client.FromEnv)
+	if err != nil {
+		return err
+	}
+	defer cli.Close()
+	_, err = cli.VolumeRemove(ctx, name, client.VolumeRemoveOptions{Force: false})
+	if errdefs.IsNotFound(err) {
+		return nil
+	}
 	return err
 }
 

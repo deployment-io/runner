@@ -185,7 +185,13 @@ func (b *BuildDockerImage) Run(parameters map[string]interface{}, logsWriter io.
 	// carry them.
 	buildSecrets, _ := jobs.GetParameterValue[map[string]string](parameters, parameters_enums.BuildSecrets)
 	if len(buildSecrets) > 0 {
+		var deploymentID string
+		deploymentID, err = jobs.GetParameterValue[string](parameters, parameters_enums.DeploymentID)
+		if err != nil {
+			return parameters, err
+		}
 		err = buildkitImageBuild(parameters, buildkitRequest{
+			deploymentID:    deploymentID,
 			repoDir:         repoDirectoryPath,
 			dockerFile:      dockerFile,
 			imageNameAndTag: dockerImageNameAndTag,
