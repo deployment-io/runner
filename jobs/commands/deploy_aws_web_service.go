@@ -1627,7 +1627,8 @@ func createEcsServiceIfNeeded(parameters map[string]interface{}, ecsClient *ecs.
 		io.WriteString(logsWriter, fmt.Sprintf("Waiting for ECS deployment %s to complete: %s\n", createdDeploymentID, ecsServiceArn))
 		err = waitForEcsDeployment(ecsServiceAPIClient, describeServicesInput, createdDeploymentID, logsWriter)
 		if err != nil {
-			return "", false, err
+			// A first deploy has no earlier version to go back to.
+			return "", false, settleTimedOutDeploy(err, ecsServiceAPIClient, ecsServiceName, ecsClusterArn, "", opts, logsWriter)
 		}
 	}
 
@@ -1685,6 +1686,7 @@ func updateEcsService(parameters map[string]interface{}, ecsClient *ecs.Client, 
 	}
 
 	ecsServiceArn := aws.ToString(updateServiceOutput.Service.ServiceArn)
+	previousTaskDefinition := rollbackTaskDefinition(updateServiceOutput.Service.Deployments, deploymentID)
 
 	if opts.skipServiceStableWait {
 		io.WriteString(logsWriter, fmt.Sprintf("Updated ECS service: %s\n", ecsServiceArn))
@@ -1693,7 +1695,71 @@ func updateEcsService(parameters map[string]interface{}, ecsClient *ecs.Client, 
 
 	io.WriteString(logsWriter, fmt.Sprintf("Waiting for ECS deployment %s to complete: %s\n", deploymentID, ecsServiceArn))
 
-	return waitForEcsDeployment(ecsServiceAPIClient, describeServicesInput, deploymentID, logsWriter)
+	err = waitForEcsDeployment(ecsServiceAPIClient, describeServicesInput, deploymentID, logsWriter)
+	return settleTimedOutDeploy(err, ecsServiceAPIClient, ecsServiceName, ecsClusterArn, previousTaskDefinition, opts, logsWriter)
+}
+
+// rollbackTaskDefinition is the task definition of the most recently created
+// COMPLETED deployment in deployments other than newDeploymentID that wants
+// tasks: the version that was serving before the deploy that started
+// newDeploymentID. A COMPLETED deployment with a desired count of 0 is one a
+// timed-out deploy stopped (see settleTimedOutDeploy); it served nothing. Empty
+// when there's none.
+func rollbackTaskDefinition(deployments []ecsTypes.Deployment, newDeploymentID string) string {
+	var taskDefinition string
+	var createdAt time.Time
+	found := false
+	for _, deployment := range deployments {
+		if aws.ToString(deployment.Id) == newDeploymentID ||
+			deployment.RolloutState != ecsTypes.DeploymentRolloutStateCompleted ||
+			deployment.DesiredCount == 0 {
+			continue
+		}
+		created := aws.ToTime(deployment.CreatedAt)
+		if !found || created.After(createdAt) {
+			taskDefinition, createdAt, found = aws.ToString(deployment.TaskDefinition), created, true
+		}
+	}
+	return taskDefinition
+}
+
+// ecsSettleTimeout bounds the UpdateService settling a timed-out deploy: the
+// wait's own deadline has already passed.
+const ecsSettleTimeout = time.Minute
+
+// settleTimedOutDeploy returns waitErr, the outcome of waiting for a deploy's
+// ECS deployment. When a production deploy (one with the circuit breaker)
+// timed out, it first ends the rollout ECS is still trying: back to
+// rollbackTaskDefinition, or, with none, it stops the service (the next
+// deploy's update sets its desired count back to 1). A FAILED or rolled-back
+// deployment has already been rolled back by ECS and is returned as is.
+func settleTimedOutDeploy(waitErr error, client ecsServiceAPI, serviceName, cluster, rollbackTaskDefinition string,
+	opts ecsServiceDeployOptions, logsWriter io.Writer) error {
+	if !errors.Is(waitErr, errEcsDeploymentTimeout) || opts.noCircuitBreaker {
+		return waitErr
+	}
+	input := &ecs.UpdateServiceInput{
+		Service:      aws.String(serviceName),
+		Cluster:      aws.String(cluster),
+		DesiredCount: aws.Int32(0),
+	}
+	if rollbackTaskDefinition != "" {
+		input.DesiredCount = aws.Int32(1)
+		input.TaskDefinition = aws.String(rollbackTaskDefinition)
+		input.DeploymentConfiguration = serviceDeploymentConfiguration(opts)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), ecsSettleTimeout)
+	defer cancel()
+	if _, err := client.UpdateService(ctx, input); err != nil {
+		io.WriteString(logsWriter, fmt.Sprintf("Couldn't roll back after the time limit: %s\n", err))
+		return fmt.Errorf("%w; rolling back failed: %v", waitErr, err)
+	}
+	if rollbackTaskDefinition != "" {
+		io.WriteString(logsWriter, fmt.Sprintf("Rolled back to %s, the version that was running before this deploy.\n", rollbackTaskDefinition))
+		return fmt.Errorf("%w; rolled back to the previous version", waitErr)
+	}
+	io.WriteString(logsWriter, "Stopped the service: there's no earlier working version to roll back to. The next deploy starts it again.\n")
+	return fmt.Errorf("%w; stopped the service (no earlier working version)", waitErr)
 }
 
 //TODO
