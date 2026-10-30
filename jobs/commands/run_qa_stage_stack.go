@@ -160,7 +160,7 @@ func (s *qaStage) deployStack(label string, previewDeps *agenttools.DeployStatic
 // stackWiringReply is how the stack's previews connect, looked up once per
 // stage when it has a site and a backend; true when the lookup failed.
 func (s *qaStage) stackWiringReply(ops qaStackOps) (task_previews.StackWiringReplyV1, bool) {
-	if len(s.repositories) == 0 || len(s.backends) == 0 {
+	if len(s.repositories) == 0 || len(s.stackBackends()) == 0 {
 		return task_previews.StackWiringReplyV1{}, false
 	}
 	if !s.wiringLooked {
@@ -193,8 +193,20 @@ func (r *qaStackRound) plan() {
 		}
 		r.sites = append(r.sites, p)
 	}
-	for _, repository := range r.stage.backends {
+	dropped := map[string]droppedBackend{}
+	for _, d := range r.stage.droppedBackends {
+		dropped[d.backendDir] = d
+	}
+	for _, repository := range r.stage.stackBackends() {
 		p := &qaStackPreview{repository: repository}
+		if d, ok := dropped[repository]; ok {
+			// Left out by the gate: nothing is deployed for it, and its pairs
+			// are "backend failed".
+			p.planErr = d.previewError()
+			p.err = p.planErr
+			r.backends = append(r.backends, p)
+			continue
+		}
 		plan, err := r.ops.planBackend(r.webDeps, repository)
 		if err != nil {
 			r.fail(p, "backend", err)
@@ -204,6 +216,19 @@ func (r *qaStackRound) plan() {
 		}
 		r.backends = append(r.backends, p)
 	}
+}
+
+// stackBackends is every backend of a stack-path round in work-dir order: the
+// ones it deploys and the ones the gate left out (droppedBackends).
+func (s *qaStage) stackBackends() []string {
+	if len(s.droppedBackends) == 0 {
+		return s.backends
+	}
+	all := append([]string{}, s.backends...)
+	for _, d := range s.droppedBackends {
+		all = append(all, d.backendDir)
+	}
+	return qaStackRepositories(nil, all)
 }
 
 // fail records why p failed (its first line, capped, as QA_PREVIEWS tells it)
@@ -358,7 +383,7 @@ func (r *qaStackRound) previews() []qaPreview {
 		backends[p.repository] = p
 	}
 	var out []qaPreview
-	for _, repository := range qaStackRepositories(r.stage.repositories, r.stage.backends) {
+	for _, repository := range qaStackRepositories(r.stage.repositories, r.stage.stackBackends()) {
 		if site := sites[repository]; site != nil {
 			out = append(out, r.sitePreview(site))
 		}
