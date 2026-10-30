@@ -160,6 +160,11 @@ type fakeEcsService struct {
 	// wait returns waitErr.
 	waits   []string
 	waitErr error
+	// earlier, when set, are the deployments beside the new PRIMARY one in
+	// CreateService's and UpdateService's output, in place of one ACTIVE.
+	earlier []ecsTypes.Deployment
+	// updateErrs[i] is what the i-th UpdateService call returns.
+	updateErrs []error
 }
 
 const (
@@ -171,6 +176,9 @@ const (
 // deploymentID: it PRIMARY, beside an older ACTIVE one.
 func (f *fakeEcsService) deploymentsOutput(deploymentID string) []ecsTypes.Deployment {
 	deployments := []ecsTypes.Deployment{{Id: aws.String("ecs-svc/0000"), Status: aws.String("ACTIVE")}}
+	if f.earlier != nil {
+		deployments = append([]ecsTypes.Deployment(nil), f.earlier...)
+	}
 	if !f.noPrimary {
 		deployments = append(deployments, ecsTypes.Deployment{Id: aws.String(deploymentID), Status: aws.String("PRIMARY")})
 	}
@@ -198,6 +206,9 @@ func (f *fakeEcsService) CreateService(_ context.Context, in *ecs.CreateServiceI
 func (f *fakeEcsService) UpdateService(_ context.Context, in *ecs.UpdateServiceInput, _ ...func(*ecs.Options)) (*ecs.UpdateServiceOutput, error) {
 	f.calls = append(f.calls, "UpdateService "+aws.ToString(in.Service))
 	f.updateInputs = append(f.updateInputs, in)
+	if i := len(f.updateInputs) - 1; i < len(f.updateErrs) && f.updateErrs[i] != nil {
+		return nil, f.updateErrs[i]
+	}
 	return &ecs.UpdateServiceOutput{Service: &ecsTypes.Service{ServiceArn: aws.String(testEcsServiceArn),
 		Deployments: f.deploymentsOutput(testUpdatedDeploymentID)}}, nil
 }
