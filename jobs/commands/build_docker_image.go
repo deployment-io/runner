@@ -144,6 +144,13 @@ func imageBuild(parameters map[string]interface{}, dockerClient *client.Client, 
 	return nil
 }
 
+// classicImageBuild and buildkitImageBuild are the two builds Run chooses
+// between; vars so tests can see which one ran.
+var (
+	classicImageBuild  = imageBuild
+	buildkitImageBuild = buildImageWithBuildkit
+)
+
 func (b *BuildDockerImage) Run(parameters map[string]interface{}, logsWriter io.Writer) (newParameters map[string]interface{}, err error) {
 	defer func() {
 		if err != nil {
@@ -173,8 +180,24 @@ func (b *BuildDockerImage) Run(parameters map[string]interface{}, logsWriter io.
 	// job log says how much room there was going in — the alternative is
 	// finding out from an ENOSPC with no context.
 	reclaim.LogFreeDisk("before build", logsWriter)
+	// Build secrets need BuildKit (RUN --mount=type=secret); every other
+	// build stays on the classic builder. A Task preview's parameters never
+	// carry them.
+	buildSecrets, _ := jobs.GetParameterValue[map[string]string](parameters, parameters_enums.BuildSecrets)
+	if len(buildSecrets) > 0 {
+		err = buildkitImageBuild(parameters, buildkitRequest{
+			repoDir:         repoDirectoryPath,
+			dockerFile:      dockerFile,
+			imageNameAndTag: dockerImageNameAndTag,
+			secrets:         buildSecrets,
+		}, logsWriter)
+		if err != nil {
+			return parameters, err
+		}
+		return parameters, nil
+	}
 	io.WriteString(logsWriter, fmt.Sprintf("Building docker image\n"))
-	err = imageBuild(parameters, cli, repoDirectoryPath, dockerImageNameAndTag, dockerFile, logsWriter)
+	err = classicImageBuild(parameters, cli, repoDirectoryPath, dockerImageNameAndTag, dockerFile, logsWriter)
 	if err != nil {
 		return parameters, err
 	}

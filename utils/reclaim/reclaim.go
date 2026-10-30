@@ -64,8 +64,12 @@ const (
 	PurposeDeploymentImage = "deployment-image"
 	PurposeAgentbox        = "agentbox"
 	PurposeStaticSiteBuild = "static-site-build"
-	PurposeAgentboxCache   = "agentbox-cache"
-	PurposeVerifyBrowser   = "verify-browser"
+	// PurposeBuildkit is the buildkitd container an image build with build
+	// secrets runs in; PurposeBuildkitCache its build cache volume.
+	PurposeBuildkit      = "buildkit"
+	PurposeBuildkitCache = "buildkit-cache"
+	PurposeAgentboxCache = "agentbox-cache"
+	PurposeVerifyBrowser = "verify-browser"
 )
 
 // Labels returns the label set stamped on a Docker object the runner
