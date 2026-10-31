@@ -332,7 +332,7 @@ func planWebServicePreview(deps DeployWebServicePreviewDeps, repository string, 
 	if err != nil {
 		return webServicePreviewPlan{}, fmt.Errorf("look up how deployment.io deploys %s: %w", repoDir, err)
 	}
-	service, err := chooseWebService(settings, repoDir, rootDirectory, deps.Region)
+	service, err := chooseWebService(settings, repoDir, rootDirectory, deps.Region, entry.BaseBranch)
 	if err != nil {
 		return webServicePreviewPlan{}, err
 	}
@@ -372,9 +372,11 @@ func webPreviewServiceKey(repoDir, root string) (string, bool) {
 }
 
 // chooseWebService picks the web service to preview from settings: the one whose
-// root directory is rootDirectory (when given) and whose region is region. Every
-// other outcome is the refusal the agent sees.
-func chooseWebService(settings task_previews.WebServicePreviewSettingsReplyV1, repository string, rootDirectory *string, region string) (task_previews.WebServicePreviewSettingsV1, error) {
+// root directory is rootDirectory (when given) and whose region is region. Of
+// several there, the one preferTaskBranchServices leaves: deploying baseBranch (the
+// Task repository's base branch), in a Production environment. Every other outcome
+// is the refusal the agent sees.
+func chooseWebService(settings task_previews.WebServicePreviewSettingsReplyV1, repository string, rootDirectory *string, region, baseBranch string) (task_previews.WebServicePreviewSettingsV1, error) {
 	if len(settings.Services) == 0 {
 		if len(settings.RuntimeBuiltServices) == 0 {
 			return task_previews.WebServicePreviewSettingsV1{}, fmt.Errorf("deployment.io doesn't deploy %s as a web service, so it has no backend preview.", repository)
@@ -410,11 +412,39 @@ func chooseWebService(settings task_previews.WebServicePreviewSettingsReplyV1, r
 	case 1:
 		return inRegion[0], nil
 	}
-	names := make([]string, 0, len(inRegion))
-	for _, s := range inRegion {
-		names = append(names, s.DeploymentName)
+	remaining := preferTaskBranchServices(inRegion, baseBranch)
+	if len(remaining) == 1 {
+		return remaining[0], nil
 	}
-	return task_previews.WebServicePreviewSettingsV1{}, fmt.Errorf("%s is deployed as several web services here (%s); pass root_directory to choose one.", repository, strings.Join(names, ", "))
+	if rootDirectory == nil && !sameWebServiceRoot(remaining) {
+		names := make([]string, 0, len(remaining))
+		for _, s := range remaining {
+			names = append(names, s.DeploymentName)
+		}
+		return task_previews.WebServicePreviewSettingsV1{}, fmt.Errorf("%s is deployed as several web services here (%s); pass root_directory to choose one.", repository, strings.Join(names, ", "))
+	}
+	described := make([]string, 0, len(remaining))
+	for _, s := range remaining {
+		d := fmt.Sprintf("%s in %s", s.DeploymentName, s.EnvironmentName)
+		if s.Branch != "" {
+			d += ", from " + s.Branch
+		}
+		described = append(described, d)
+	}
+	return task_previews.WebServicePreviewSettingsV1{}, fmt.Errorf("%s is deployed as several web services here that a preview can't choose between (%s). "+
+		"A preview uses the one that deploys the Task's base branch (%s) and, among those, one in an environment classified Production.",
+		repository, strings.Join(described, "; "), baseBranch)
+}
+
+// sameWebServiceRoot reports whether every service has the same root directory
+// (trimRootDirectory).
+func sameWebServiceRoot(services []task_previews.WebServicePreviewSettingsV1) bool {
+	for _, s := range services[1:] {
+		if trimRootDirectory(s.RootDirectory) != trimRootDirectory(services[0].RootDirectory) {
+			return false
+		}
+	}
+	return true
 }
 
 // trimRootDirectory is a root directory as chooseWebService compares it: surrounding

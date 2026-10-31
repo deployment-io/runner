@@ -106,16 +106,17 @@ func planRunnerBuiltPreview(deps DeployStaticSitePreviewDeps, repository string,
 	if err != nil {
 		return runnerBuiltPreview{}, false, fmt.Errorf("look up how deployment.io deploys %s: %w", repoDir, err)
 	}
-	return planFromBuildSettings(deps, repoDir, rootDirectory, settings)
+	return planFromBuildSettings(deps, repoDir, rootDirectory, entry.BaseBranch, settings)
 }
 
 // planFromBuildSettings is planRunnerBuiltPreview after the lookup: the deployment's
-// static site when deployment.io deploys one, else the detected settings.
-func planFromBuildSettings(deps DeployStaticSitePreviewDeps, repoDir string, rootDirectory *string, settings task_previews.StaticSiteBuildSettingsReplyV1) (runnerBuiltPreview, bool, error) {
+// static site when deployment.io deploys one (chooseStaticSite, with baseBranch the
+// Task repository's base branch), else the detected settings.
+func planFromBuildSettings(deps DeployStaticSitePreviewDeps, repoDir string, rootDirectory *string, baseBranch string, settings task_previews.StaticSiteBuildSettingsReplyV1) (runnerBuiltPreview, bool, error) {
 	if len(settings.Sites) == 0 {
 		return planDetectedPreview(deps, repoDir, rootDirectory, settings)
 	}
-	site, err := chooseStaticSite(settings.Sites, rootDirectory)
+	site, err := chooseStaticSite(settings.Sites, rootDirectory, baseBranch)
 	if err != nil {
 		return runnerBuiltPreview{}, false, err
 	}
@@ -239,17 +240,20 @@ func resolveTaskRepository(entries []tasks.RepositoryEntry, repository string) (
 	return "", tasks.RepositoryEntry{}, fmt.Errorf("unknown repository %q — pass one of the Task's repositories: %s", repository, strings.Join(dirs, ", "))
 }
 
-// chooseStaticSite picks the site to build: the first when all sites build the same
+// chooseStaticSite picks the site to build. The sites are first narrowed by
+// preferTaskBranchServices (deploying baseBranch, the Task repository's base branch,
+// in a Production environment); of those left, the first when all build the same
 // way, else the one (or the identically-built ones) whose root directory is
 // rootDirectory — nil when the agent didn't pass it; "" or "." is the repository
 // root. Otherwise the error lists each site's root directory. A rootDirectory that
 // leaves the repository is an error, never the repository root.
-func chooseStaticSite(sites []task_previews.StaticSiteBuildSettingsV1, rootDirectory *string) (task_previews.StaticSiteBuildSettingsV1, error) {
+func chooseStaticSite(sites []task_previews.StaticSiteBuildSettingsV1, rootDirectory *string, baseBranch string) (task_previews.StaticSiteBuildSettingsV1, error) {
 	if rootDirectory != nil {
 		if _, err := cleanRelativeDir(*rootDirectory); err != nil {
 			return task_previews.StaticSiteBuildSettingsV1{}, fmt.Errorf("root_directory: %w", err)
 		}
 	}
+	sites = preferTaskBranchServices(sites, baseBranch)
 	if sameBuild(sites) {
 		return sites[0], nil
 	}

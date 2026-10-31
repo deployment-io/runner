@@ -35,10 +35,25 @@ func TestChooseWebService(t *testing.T) {
 	worker := webService("worker", "us-east-1", "./services/worker/")
 	apiEU := webService("api-eu", "eu-west-1", "services/api")
 
+	// One repository deployed from the same root directory in several environments.
+	shop := webService("shop", "us-east-1", "services/shop")
+	shop.Branch, shop.ProductionEnvironment = "main", true
+	shopStaging := webService("shop-staging", "us-east-1", "./services/shop")
+	shopStaging.EnvironmentName, shopStaging.Branch = "staging", "main"
+	shopStagingDevelop := shopStaging
+	shopStagingDevelop.Branch = "develop"
+	shopQA := webService("shop-qa", "us-east-1", "services/shop/")
+	shopQA.EnvironmentName = "qa" // Branch unknown
+	shopEU := shop
+	shopEU.DeploymentName, shopEU.Region = "shop-eu", "eu-west-1"
+	workerStaging := webService("worker-staging", "us-east-1", "services/worker")
+	workerStaging.EnvironmentName, workerStaging.Branch = "staging", "main"
+
 	for _, tt := range []struct {
 		name    string
 		reply   task_previews.WebServicePreviewSettingsReplyV1
 		root    *string
+		base    string // the Task repository's base branch
 		want    string // DeploymentName
 		wantErr string
 	}{
@@ -58,9 +73,21 @@ func TestChooseWebService(t *testing.T) {
 			wantErr: "1-acme/api is deployed as several web services here (api, worker); pass root_directory to choose one."},
 		{name: "no such root directory", reply: readyReply(api, worker), root: strPtr("web"),
 			wantErr: `1-acme/api has no web service with root directory "web" here`},
+
+		{name: "Staging + Production on main, base main", reply: readyReply(shopStaging, shop), base: "main", want: "shop"},
+		{name: "Staging + Production on main, root directory passed", reply: readyReply(shop, shopStaging), root: strPtr("services/shop"), base: "main", want: "shop"},
+		{name: "Staging on develop + Production on main, base develop", reply: readyReply(shop, shopStagingDevelop), base: "develop", want: "shop-staging"},
+		{name: "one in the region, other branch", reply: readyReply(shopStagingDevelop, shopEU), base: "main", want: "shop-staging"},
+		{name: "same root, can't choose", reply: readyReply(shopStaging, shopQA), base: "release",
+			wantErr: "1-acme/api is deployed as several web services here that a preview can't choose between (shop-staging in staging, from main; shop-qa in qa). " +
+				"A preview uses the one that deploys the Task's base branch (release) and, among those, one in an environment classified Production."},
+		{name: "same root, root directory passed, can't choose", reply: readyReply(shopStaging, shopQA), root: strPtr("services/shop"), base: "release",
+			wantErr: "1-acme/api is deployed as several web services here that a preview can't choose between"},
+		{name: "different roots left, no root directory", reply: readyReply(shopStaging, workerStaging, shopStagingDevelop), base: "main",
+			wantErr: "1-acme/api is deployed as several web services here (shop-staging, worker-staging); pass root_directory to choose one."},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := chooseWebService(tt.reply, repo, tt.root, "us-east-1")
+			got, err := chooseWebService(tt.reply, repo, tt.root, "us-east-1", tt.base)
 			if tt.wantErr != "" {
 				if err == nil || !strings.HasPrefix(err.Error(), tt.wantErr) {
 					t.Fatalf("got %+v, %v; want error %q", got, err, tt.wantErr)
