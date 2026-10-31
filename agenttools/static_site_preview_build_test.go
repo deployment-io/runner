@@ -48,30 +48,30 @@ func TestChooseStaticSite(t *testing.T) {
 	webStaging := site("web-staging", "./apps/web/", "npm run build", "dist", true)
 	admin := site("admin", "apps/admin", "npm run build", "build", false)
 
-	if got, err := chooseStaticSite([]task_previews.StaticSiteBuildSettingsV1{web, webStaging}, nil); err != nil || got.DeploymentName != "web" {
+	if got, err := chooseStaticSite([]task_previews.StaticSiteBuildSettingsV1{web, webStaging}, nil, ""); err != nil || got.DeploymentName != "web" {
 		t.Errorf("identical settings: got %+v, %v; want the first", got, err)
 	}
-	if got, err := chooseStaticSite([]task_previews.StaticSiteBuildSettingsV1{web, admin}, strPtr("apps/admin")); err != nil || got.DeploymentName != "admin" {
+	if got, err := chooseStaticSite([]task_previews.StaticSiteBuildSettingsV1{web, admin}, strPtr("apps/admin"), ""); err != nil || got.DeploymentName != "admin" {
 		t.Errorf("root_directory: got %+v, %v; want admin", got, err)
 	}
-	if got, err := chooseStaticSite([]task_previews.StaticSiteBuildSettingsV1{web, admin, webStaging}, strPtr("/apps/web")); err != nil || got.DeploymentName != "web" {
+	if got, err := chooseStaticSite([]task_previews.StaticSiteBuildSettingsV1{web, admin, webStaging}, strPtr("/apps/web"), ""); err != nil || got.DeploymentName != "web" {
 		t.Errorf("root_directory matching identical sites: got %+v, %v; want web", got, err)
 	}
 	repoRoot := site("root", "", "npm run build", "out", false)
 	for _, root := range []string{"", "."} {
-		if got, err := chooseStaticSite([]task_previews.StaticSiteBuildSettingsV1{web, admin, repoRoot}, strPtr(root)); err != nil || got.DeploymentName != "root" {
+		if got, err := chooseStaticSite([]task_previews.StaticSiteBuildSettingsV1{web, admin, repoRoot}, strPtr(root), ""); err != nil || got.DeploymentName != "root" {
 			t.Errorf("root_directory %q: got %+v, %v; want the repository-root site", root, got, err)
 		}
 	}
 	// A selector that leaves the repository is refused — never read as the
 	// repository root, which cleanRelativeDir returns alongside its error.
 	for _, sites := range [][]task_previews.StaticSiteBuildSettingsV1{{web, admin, repoRoot}, {web, webStaging}} {
-		if got, err := chooseStaticSite(sites, strPtr("apps/../../other")); err == nil || !strings.Contains(err.Error(), "leaves the repository") {
+		if got, err := chooseStaticSite(sites, strPtr("apps/../../other"), ""); err == nil || !strings.Contains(err.Error(), "leaves the repository") {
 			t.Errorf("escaping root_directory: got %+v, %v; want a refusal", got, err)
 		}
 	}
 	for _, root := range []*string{nil, strPtr("apps/other")} {
-		_, err := chooseStaticSite([]task_previews.StaticSiteBuildSettingsV1{web, admin, repoRoot}, root)
+		_, err := chooseStaticSite([]task_previews.StaticSiteBuildSettingsV1{web, admin, repoRoot}, root, "")
 		if err == nil {
 			t.Fatalf("ambiguous with root_directory %v: no error", root)
 		}
@@ -80,6 +80,85 @@ func TestChooseStaticSite(t *testing.T) {
 				t.Errorf("ambiguous error %q doesn't contain %q", err, want)
 			}
 		}
+	}
+}
+
+// Staging and Production deploy the same root directory and build differently: the
+// preview builds like the one deploying the Task's base branch in Production.
+func TestChooseStaticSiteTaskBranch(t *testing.T) {
+	prod := site("web", "apps/web", "npm run build", "dist", true)
+	prod.Branch, prod.ProductionEnvironment = "main", true
+	staging := site("web-staging", "apps/web", "npm run build:staging", "dist", true)
+	staging.EnvironmentName, staging.Branch = "staging", "main"
+
+	for _, sites := range [][]task_previews.StaticSiteBuildSettingsV1{{staging, prod}, {prod, staging}} {
+		if got, err := chooseStaticSite(sites, nil, "main"); err != nil || got.DeploymentName != "web" {
+			t.Errorf("Staging + Production on main, base main: got %+v, %v; want web", got, err)
+		}
+		if got, err := chooseStaticSite(sites, strPtr("apps/web"), "main"); err != nil || got.DeploymentName != "web" {
+			t.Errorf("with root_directory: got %+v, %v; want web", got, err)
+		}
+	}
+	// Neither in Production, both on main: today's refusal, listing both.
+	staging2 := staging
+	staging2.DeploymentName = "web-qa"
+	staging2.BuildCommand = "npm run build:qa"
+	if _, err := chooseStaticSite([]task_previews.StaticSiteBuildSettingsV1{staging, staging2}, nil, "main"); err == nil ||
+		!strings.Contains(err.Error(), "web-staging") || !strings.Contains(err.Error(), "web-qa") {
+		t.Errorf("no Production: got %v, want the refusal listing both", err)
+	}
+	// Different sites (different root directories) are never chosen by branch or
+	// environment: without root_directory the refusal lists every site.
+	docs := site("docs", "apps/docs", "npm run docs", "out", false)
+	docs.Branch = "main"
+	_, err := chooseStaticSite([]task_previews.StaticSiteBuildSettingsV1{prod, docs}, nil, "main")
+	if err == nil || !strings.Contains(err.Error(), "docs") || !strings.Contains(err.Error(), "pass root_directory") {
+		t.Errorf("different sites: got %v, want the refusal listing docs", err)
+	}
+	// root_directory picks its site even when another site is in Production.
+	if got, err := chooseStaticSite([]task_previews.StaticSiteBuildSettingsV1{prod, docs}, strPtr("apps/docs"), "main"); err != nil || got.DeploymentName != "docs" {
+		t.Errorf("root_directory apps/docs: got %+v, %v; want docs", got, err)
+	}
+	// Copies of two sites, root_directory passed: the Production copy of that site.
+	if got, err := chooseStaticSite([]task_previews.StaticSiteBuildSettingsV1{staging, docs, prod}, strPtr("apps/web"), "main"); err != nil || got.DeploymentName != "web" {
+		t.Errorf("root_directory apps/web: got %+v, %v; want web", got, err)
+	}
+}
+
+func TestPreferTaskBranchServices(t *testing.T) {
+	ws := func(name, branch string, production bool) task_previews.WebServicePreviewSettingsV1 {
+		return task_previews.WebServicePreviewSettingsV1{DeploymentName: name, Branch: branch, ProductionEnvironment: production}
+	}
+	names := func(services []task_previews.WebServicePreviewSettingsV1) string {
+		var out []string
+		for _, s := range services {
+			out = append(out, s.DeploymentName)
+		}
+		return strings.Join(out, ",")
+	}
+	for _, tt := range []struct {
+		name     string
+		services []task_previews.WebServicePreviewSettingsV1
+		base     string
+		want     string
+	}{
+		{"base branch match only", []task_previews.WebServicePreviewSettingsV1{ws("a", "develop", false), ws("b", "main", false), ws("c", "main", false)}, "main", "b,c"},
+		{"Production among branch matches", []task_previews.WebServicePreviewSettingsV1{ws("a", "main", false), ws("b", "develop", true), ws("c", "main", true)}, "main", "c"},
+		{"no branch match: Production among all", []task_previews.WebServicePreviewSettingsV1{ws("a", "main", false), ws("b", "develop", true), ws("c", "main", true)}, "feature", "b,c"},
+		{"nothing to narrow", []task_previews.WebServicePreviewSettingsV1{ws("a", "main", false), ws("b", "develop", false)}, "feature", "a,b"},
+		{"older deployment-server", []task_previews.WebServicePreviewSettingsV1{ws("a", "", false), ws("b", "", false)}, "main", "a,b"},
+		{"base branch empty: only Production", []task_previews.WebServicePreviewSettingsV1{ws("a", "", false), ws("b", "develop", true), ws("c", "main", true)}, "", "b,c"},
+	} {
+		if got := names(preferTaskBranchServices(tt.services, tt.base)); got != tt.want {
+			t.Errorf("%s: got %s, want %s", tt.name, got, tt.want)
+		}
+	}
+	site := func(name, branch string, production bool) task_previews.StaticSiteBuildSettingsV1 {
+		return task_previews.StaticSiteBuildSettingsV1{DeploymentName: name, Branch: branch, ProductionEnvironment: production}
+	}
+	got := preferTaskBranchServices([]task_previews.StaticSiteBuildSettingsV1{site("a", "main", false), site("b", "main", true), site("c", "develop", true)}, "main")
+	if len(got) != 1 || got[0].DeploymentName != "b" {
+		t.Errorf("static sites: got %+v, want b", got)
 	}
 }
 
