@@ -372,9 +372,11 @@ func webPreviewServiceKey(repoDir, root string) (string, bool) {
 }
 
 // chooseWebService picks the web service to preview from settings: the one whose
-// root directory is rootDirectory (when given) and whose region is region. Of
-// several there, the one preferTaskBranchServices leaves: deploying baseBranch (the
-// Task repository's base branch), in a Production environment. Every other outcome
+// root directory is rootDirectory (when given) and whose region is region. Several
+// there with different root directories are different services: the agent passes
+// root_directory. Several with the same one are copies of one service (Staging and
+// Production): the one preferTaskBranchServices leaves, deploying baseBranch (the
+// Task repository's base branch) in a Production environment. Every other outcome
 // is the refusal the agent sees.
 func chooseWebService(settings task_previews.WebServicePreviewSettingsReplyV1, repository string, rootDirectory *string, region, baseBranch string) (task_previews.WebServicePreviewSettingsV1, error) {
 	if len(settings.Services) == 0 {
@@ -412,16 +414,19 @@ func chooseWebService(settings task_previews.WebServicePreviewSettingsReplyV1, r
 	case 1:
 		return inRegion[0], nil
 	}
-	remaining := preferTaskBranchServices(inRegion, baseBranch)
-	if len(remaining) == 1 {
-		return remaining[0], nil
-	}
-	if rootDirectory == nil && !sameWebServiceRoot(remaining) {
-		names := make([]string, 0, len(remaining))
-		for _, s := range remaining {
+	// Different services of the repository (different root directories): the agent
+	// chooses one with root_directory. The branch and environment only choose
+	// between copies of one service, never between services.
+	if rootDirectory == nil && !sameWebServiceRoot(inRegion) {
+		names := make([]string, 0, len(inRegion))
+		for _, s := range inRegion {
 			names = append(names, s.DeploymentName)
 		}
 		return task_previews.WebServicePreviewSettingsV1{}, fmt.Errorf("%s is deployed as several web services here (%s); pass root_directory to choose one.", repository, strings.Join(names, ", "))
+	}
+	remaining := preferTaskBranchServices(inRegion, baseBranch)
+	if len(remaining) == 1 {
+		return remaining[0], nil
 	}
 	described := make([]string, 0, len(remaining))
 	for _, s := range remaining {

@@ -240,33 +240,37 @@ func resolveTaskRepository(entries []tasks.RepositoryEntry, repository string) (
 	return "", tasks.RepositoryEntry{}, fmt.Errorf("unknown repository %q — pass one of the Task's repositories: %s", repository, strings.Join(dirs, ", "))
 }
 
-// chooseStaticSite picks the site to build. The sites are first narrowed by
-// preferTaskBranchServices (deploying baseBranch, the Task repository's base branch,
-// in a Production environment); of those left, the first when all build the same
-// way, else the one (or the identically-built ones) whose root directory is
-// rootDirectory — nil when the agent didn't pass it; "" or "." is the repository
-// root. Otherwise the error lists each site's root directory. A rootDirectory that
-// leaves the repository is an error, never the repository root.
+// chooseStaticSite picks the site to build: the first when all sites build the same
+// way; else, of the sites whose root directory is rootDirectory (all of them when
+// the agent didn't pass it — nil; "" or "." is the repository root), when they share
+// one root directory — copies of one site, such as Staging and Production — the one
+// preferTaskBranchServices leaves (deploying baseBranch, the Task repository's base
+// branch, in a Production environment), or the first of those left when they build
+// the same way. The branch and environment never choose between sites with
+// different root directories. Otherwise the error lists each site's root directory.
+// A rootDirectory that leaves the repository is an error, never the repository root.
 func chooseStaticSite(sites []task_previews.StaticSiteBuildSettingsV1, rootDirectory *string, baseBranch string) (task_previews.StaticSiteBuildSettingsV1, error) {
 	if rootDirectory != nil {
 		if _, err := cleanRelativeDir(*rootDirectory); err != nil {
 			return task_previews.StaticSiteBuildSettingsV1{}, fmt.Errorf("root_directory: %w", err)
 		}
 	}
-	sites = preferTaskBranchServices(sites, baseBranch)
 	if sameBuild(sites) {
 		return sites[0], nil
 	}
+	candidates := sites
 	if rootDirectory != nil {
 		want, _ := cleanRelativeDir(*rootDirectory) // validated above
-		var matches []task_previews.StaticSiteBuildSettingsV1
+		candidates = nil
 		for _, s := range sites {
 			if root, _ := cleanRelativeDir(s.RootDirectory); root == want {
-				matches = append(matches, s)
+				candidates = append(candidates, s)
 			}
 		}
-		if len(matches) > 0 && sameBuild(matches) {
-			return matches[0], nil
+	}
+	if len(candidates) > 0 && sameSiteRoot(candidates) {
+		if left := preferTaskBranchServices(candidates, baseBranch); sameBuild(left) {
+			return left[0], nil
 		}
 	}
 	var b strings.Builder
@@ -279,6 +283,17 @@ func chooseStaticSite(sites []task_previews.StaticSiteBuildSettingsV1, rootDirec
 		}
 	}
 	return task_previews.StaticSiteBuildSettingsV1{}, errors.New(b.String())
+}
+
+// sameSiteRoot reports whether every site has the same root directory.
+func sameSiteRoot(sites []task_previews.StaticSiteBuildSettingsV1) bool {
+	first, _ := cleanRelativeDir(sites[0].RootDirectory)
+	for _, s := range sites[1:] {
+		if root, _ := cleanRelativeDir(s.RootDirectory); root != first {
+			return false
+		}
+	}
+	return true
 }
 
 // sameBuild reports whether every site builds the same way: same root directory,

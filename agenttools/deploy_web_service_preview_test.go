@@ -83,8 +83,10 @@ func TestChooseWebService(t *testing.T) {
 				"A preview uses the one that deploys the Task's base branch (release) and, among those, one in an environment classified Production."},
 		{name: "same root, root directory passed, can't choose", reply: readyReply(shopStaging, shopQA), root: strPtr("services/shop"), base: "release",
 			wantErr: "1-acme/api is deployed as several web services here that a preview can't choose between"},
-		{name: "different roots left, no root directory", reply: readyReply(shopStaging, workerStaging, shopStagingDevelop), base: "main",
-			wantErr: "1-acme/api is deployed as several web services here (shop-staging, worker-staging); pass root_directory to choose one."},
+		{name: "different services, no root directory: never chosen by branch or environment", reply: readyReply(shop, workerStaging), base: "main",
+			wantErr: "1-acme/api is deployed as several web services here (shop, worker-staging); pass root_directory to choose one."},
+		{name: "different services, root directory of the one not in Production", reply: readyReply(shop, workerStaging), root: strPtr("services/worker"), base: "main", want: "worker-staging"},
+		{name: "copies of two services, root directory passed", reply: readyReply(shopStaging, workerStaging, shop), root: strPtr("services/shop"), base: "main", want: "shop"},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			got, err := chooseWebService(tt.reply, repo, tt.root, "us-east-1", tt.base)

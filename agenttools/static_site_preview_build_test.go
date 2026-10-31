@@ -107,12 +107,21 @@ func TestChooseStaticSiteTaskBranch(t *testing.T) {
 		!strings.Contains(err.Error(), "web-staging") || !strings.Contains(err.Error(), "web-qa") {
 		t.Errorf("no Production: got %v, want the refusal listing both", err)
 	}
-	// The refusal lists only the sites left: the one off the base branch is gone.
-	other := site("docs", "apps/docs", "npm run docs", "out", false)
-	other.Branch = "develop"
-	_, err := chooseStaticSite([]task_previews.StaticSiteBuildSettingsV1{staging, staging2, other}, nil, "main")
-	if err == nil || strings.Contains(err.Error(), "docs") {
-		t.Errorf("refusal: got %v, want it without docs", err)
+	// Different sites (different root directories) are never chosen by branch or
+	// environment: without root_directory the refusal lists every site.
+	docs := site("docs", "apps/docs", "npm run docs", "out", false)
+	docs.Branch = "main"
+	_, err := chooseStaticSite([]task_previews.StaticSiteBuildSettingsV1{prod, docs}, nil, "main")
+	if err == nil || !strings.Contains(err.Error(), "docs") || !strings.Contains(err.Error(), "pass root_directory") {
+		t.Errorf("different sites: got %v, want the refusal listing docs", err)
+	}
+	// root_directory picks its site even when another site is in Production.
+	if got, err := chooseStaticSite([]task_previews.StaticSiteBuildSettingsV1{prod, docs}, strPtr("apps/docs"), "main"); err != nil || got.DeploymentName != "docs" {
+		t.Errorf("root_directory apps/docs: got %+v, %v; want docs", got, err)
+	}
+	// Copies of two sites, root_directory passed: the Production copy of that site.
+	if got, err := chooseStaticSite([]task_previews.StaticSiteBuildSettingsV1{staging, docs, prod}, strPtr("apps/web"), "main"); err != nil || got.DeploymentName != "web" {
+		t.Errorf("root_directory apps/web: got %+v, %v; want web", got, err)
 	}
 }
 
