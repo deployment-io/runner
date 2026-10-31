@@ -192,6 +192,10 @@ func TestDeployWebServicePreviewWithWiredVariables(t *testing.T) {
 	if v["CORS_ORIGINS"] != "https://d1.cloudfront.net" || v["KEEP"] != "1" {
 		t.Errorf("variables = %v", v)
 	}
+	// Build secrets come from the configuration's own variables, never the wired ones.
+	if c := got.ConfigurationVariables; len(c) != 2 || c["CORS_ORIGINS"] != "https://staging.example" || c["KEEP"] != "1" {
+		t.Errorf("configuration variables = %v", c)
+	}
 	if fmt.Sprint(got.WiredNames) != "[CORS_ORIGINS DATABASE_URL]" {
 		t.Errorf("wired names = %v", got.WiredNames)
 	}

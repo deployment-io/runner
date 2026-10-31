@@ -257,8 +257,9 @@ func buildDockerImageParameters(secrets map[string]string) map[string]interface{
 	return parameters
 }
 
-// A Job without build secrets (absent or empty) builds with the classic
-// builder; one with them with BuildKit.
+// A Job without the build secrets parameter builds with the classic builder;
+// one with it, even empty (a preview whose secret mounts are optional), with
+// BuildKit.
 func TestBuildDockerImageChoosesTheBuilder(t *testing.T) {
 	origClassic, origBuildkit := classicImageBuild, buildkitImageBuild
 	t.Cleanup(func() { classicImageBuild, buildkitImageBuild = origClassic, origBuildkit })
@@ -278,7 +279,7 @@ func TestBuildDockerImageChoosesTheBuilder(t *testing.T) {
 		want    string
 	}{
 		{"absent", nil, "classic"},
-		{"empty", map[string]string{}, "classic"},
+		{"empty", map[string]string{}, "buildkit"},
 		{"present", map[string]string{"NPM_TOKEN": "v"}, "buildkit"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -321,6 +322,32 @@ func TestBuildImageWithBuildkitStartLine(t *testing.T) {
 		if !strings.Contains(cmd, want) {
 			t.Errorf("build argv %q lacks %q", cmd, want)
 		}
+	}
+}
+
+// The start line names every offered secret, however long the names, without a
+// line longer than the job log's line scanner takes.
+func TestBuildImageWithBuildkitStartLineIsBroken(t *testing.T) {
+	d := &fakeBuildkitDocker{present: true}
+	orig := runnerBuildkitBuilder
+	t.Cleanup(func() { runnerBuildkitBuilder = orig })
+	runnerBuildkitBuilder = newTestBuildkitBuilder(t, d)
+	req := testBuildkitRequest()
+	req.secrets = map[string]string{}
+	for _, c := range "ABCDE" {
+		req.secrets[strings.Repeat(string(c), 30000)] = "v"
+	}
+	var logs bytes.Buffer
+	if err := buildImageWithBuildkit(buildDockerImageParameters(nil), req, &logs); err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range strings.Split(logs.String(), "\n") {
+		if len(line) > buildLogMaxLine {
+			t.Fatalf("a log line has %d bytes", len(line))
+		}
+	}
+	if !strings.Contains(strings.ReplaceAll(logs.String(), "\n", ""), strings.Repeat("E", 30000)+")") {
+		t.Error("the start line doesn't name every secret in full")
 	}
 }
 
