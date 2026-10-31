@@ -180,11 +180,14 @@ func (b *BuildDockerImage) Run(parameters map[string]interface{}, logsWriter io.
 	// job log says how much room there was going in — the alternative is
 	// finding out from an ENOSPC with no context.
 	reclaim.LogFreeDisk("before build", logsWriter)
-	// Build secrets need BuildKit (RUN --mount=type=secret); every other
-	// build stays on the classic builder. A Task preview's parameters never
-	// carry them.
-	buildSecrets, _ := jobs.GetParameterValue[map[string]string](parameters, parameters_enums.BuildSecrets)
-	if len(buildSecrets) > 0 {
+	// Build secrets need BuildKit (RUN --mount=type=secret): a build with the
+	// BuildSecrets parameter present — even empty — uses BuildKit; every other
+	// build stays on the classic builder. deployment-server sets it for a
+	// production build only with at least one secret. A Task preview sets it
+	// (to its Preview configuration variables, possibly none) only when its
+	// Dockerfile mounts a secret, so a mount that is optional still builds.
+	buildSecrets, secretsErr := jobs.GetParameterValue[map[string]string](parameters, parameters_enums.BuildSecrets)
+	if secretsErr == nil {
 		var deploymentID string
 		deploymentID, err = jobs.GetParameterValue[string](parameters, parameters_enums.DeploymentID)
 		if err != nil {

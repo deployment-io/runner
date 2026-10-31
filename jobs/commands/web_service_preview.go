@@ -226,6 +226,9 @@ type webPreviewSteps struct {
 	// database deploys the preview's own database (when it has one) in the stack
 	// group before the API's steps, and returns what the API's parameters point at.
 	database func(stackGroupID string, apiParameters map[string]interface{}, in agenttools.WebServicePreviewDeployInput) (webPreviewDatabase, error)
+	// buildkitContext makes the build directory readable by rootless BuildKit
+	// (the agentbox user) before a BuildKit build; nil leaves it as it is.
+	buildkitContext func(dir string) error
 	// loadBalancerDNS reads the DNS name of the load balancer the deploy created or
 	// reused.
 	loadBalancerDNS func(parameters map[string]interface{}) (string, error)
@@ -240,6 +243,9 @@ func productionWebPreviewSteps() webPreviewSteps {
 		stack:       ensureWebPreviewStack,
 		removeStack: removeWebPreviewStack,
 		database:    deployWebPreviewDatabase,
+		// The build directory is the runner's root-owned 0700 copy; rootless
+		// BuildKit reads it as the agentbox user.
+		buildkitContext: chownTreeToAgentbox,
 		loadBalancerDNS: func(parameters map[string]interface{}) (string, error) {
 			elbClient, err := cloud_api_clients.GetElbClient(parameters)
 			if err != nil {
@@ -285,6 +291,10 @@ func (d webPreviewDeployer) deploy(ctx context.Context, in agenttools.WebService
 	if info, err := os.Stat(dockerFilePath); err != nil || info.IsDir() || agenttools.CheckInside(repoDir, dockerFilePath) != nil {
 		return agenttools.WebServicePreviewDeployOutput{}, fmt.Errorf("%s's Dockerfile %s isn't in its root directory %q, so its backend preview can't be built", in.Service.DeploymentName, dockerFile, in.RootDirectory)
 	}
+	// A Dockerfile that mounts build secrets is built with BuildKit and offered the
+	// Preview configuration's own variables (never production's build secrets, nor
+	// QA's wired values).
+	setWebPreviewBuildSecrets(parameters, dockerFilePath, in.ConfigurationVariables, in.BuildLogs)
 	// The Step log only (BuildLogs never reaches the agent), and names only.
 	if _, left := webPreviewBuildArgs(in.Service.DockerBuildArgs, in.Settings.Variables); len(left) > 0 && in.BuildLogs != nil {
 		io.WriteString(in.BuildLogs, fmt.Sprintf("Backend preview: build args left out, with no usable Preview configuration variable of the same name: %s\n", strings.Join(left, ", ")))
@@ -292,6 +302,12 @@ func (d webPreviewDeployer) deploy(ctx context.Context, in agenttools.WebService
 	if in.Settings.ConfigurationSet {
 		if err := agenttools.WritePreviewFiles(repoDir, in.Settings.Files); err != nil {
 			return agenttools.WebServicePreviewDeployOutput{}, err
+		}
+	}
+	// After the secret files: BuildKit reads the whole context, them included.
+	if _, err := jobs.GetParameterValue[map[string]string](parameters, parameters_enums.BuildSecrets); err == nil && d.steps.buildkitContext != nil {
+		if err := d.steps.buildkitContext(in.BuildDir); err != nil {
+			return agenttools.WebServicePreviewDeployOutput{}, fmt.Errorf("preparing the backend preview's build directory for BuildKit: %w", err)
 		}
 	}
 	return d.deployInStack(ctx, parameters, in)

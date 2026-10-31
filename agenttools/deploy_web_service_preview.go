@@ -136,6 +136,10 @@ type WebServicePreviewDeployInput struct {
 	// Settings is the reply Service came from: the preview configuration, the
 	// network and the preview namespace.
 	Settings task_previews.WebServicePreviewSettingsReplyV1
+	// ConfigurationVariables are the Preview configuration's own variables, before
+	// the QA stage's wired ones replaced or joined Settings.Variables: the build
+	// secrets a preview whose Dockerfile mounts secrets is offered.
+	ConfigurationVariables map[string]string
 	// Existing is what EnsurePreview returned: the handles a prior deploy persisted.
 	Existing PreviewState
 	// Database is the preview's own database, deployed before the API, which
@@ -493,10 +497,12 @@ func runWebServicePreview(ctx context.Context, deps DeployWebServicePreviewDeps,
 		Service:       p.service,
 		Settings:      settings,
 		Existing:      existing,
-		Database:      database,
-		WiredNames:    wiredNames(p.wired),
-		BuildLogs:     deps.LogsWriter,
-		Logs:          logs,
+		// The configuration's own, never QA's wired values.
+		ConfigurationVariables: p.settings.Variables,
+		Database:               database,
+		WiredNames:             wiredNames(p.wired),
+		BuildLogs:              deps.LogsWriter,
+		Logs:                   logs,
 	})
 	if err != nil {
 		return WebServicePreviewDeployed{}, webPreviewDeployFailure(err, database, deps.LogsWriter, tail.Bytes())
