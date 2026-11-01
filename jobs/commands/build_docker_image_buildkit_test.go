@@ -502,6 +502,42 @@ func TestBuildkitRedactsBuildOutput(t *testing.T) {
 	assertNoSecretValue(t, "the log", logs.String(), req)
 }
 
+// A multi-line value (a private key) the build prints, a line at a time with a
+// BuildKit step prefix and split across writes, has none of its lines in the job
+// log.
+func TestBuildkitRedactsMultiLineBuildOutput(t *testing.T) {
+	var key strings.Builder
+	key.WriteString("-----BEGIN PRIVATE KEY-----\n")
+	for i := 0; i < 6; i++ {
+		key.WriteString(strings.Repeat(string(rune('A'+i)), 60) + "a1b2\n")
+	}
+	key.WriteString("-----END PRIVATE KEY-----")
+	req := testBuildkitRequest()
+	req.secrets["SSH_KEY"] = key.String()
+	d := &fakeBuildkitDocker{present: true}
+	d.build = func(_ context.Context, cmd []string, out io.Writer) (int, error) {
+		for i, line := range strings.Split(key.String(), "\n") {
+			printed := fmt.Sprintf("#18 52.%02d %s\n", i, line)
+			io.WriteString(out, printed[:len(printed)/2])
+			io.WriteString(out, printed[len(printed)/2:])
+		}
+		return writeFakeTar(cmd)
+	}
+	var logs bytes.Buffer
+	if err := newTestBuildkitBuilder(t, d).build(req, &logs); err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range strings.Split(key.String(), "\n") {
+		if len(line) >= 8 && strings.Contains(logs.String(), line) {
+			t.Errorf("the log contains a line of the key %q", line)
+		}
+	}
+	if !strings.Contains(logs.String(), "#18 52.01 <SSH_KEY>\n") {
+		t.Errorf("log = %q", logs.String())
+	}
+	assertNoSecretValue(t, "the log", logs.String(), req)
+}
+
 func TestBuildkitNeedsUserNamespaces(t *testing.T) {
 	d := &fakeBuildkitDocker{present: true, userns: 0, usernsOK: true}
 	err := newTestBuildkitBuilder(t, d).build(testBuildkitRequest(), io.Discard)
