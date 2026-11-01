@@ -317,11 +317,17 @@ func (s *qaStage) readGoMod(dir string) (module string, required map[string]bool
 // goModMaxBytes bounds a go.mod read host-side.
 const goModMaxBytes = 4 << 20
 
-// readGoModFile reads path when it is a regular file of at most goModMaxBytes:
+// readGoModFile reads path when it is a regular file of at most goModMaxBytes
+// (readBoundedRegularFile).
+func readGoModFile(path string) ([]byte, error) {
+	return readBoundedRegularFile(path, goModMaxBytes)
+}
+
+// readBoundedRegularFile reads path when it is a regular file of at most max bytes:
 // never through a symlink, never a FIFO or device (opened non-blocking, so a
 // FIFO can't hang it). A missing file is fs.ErrNotExist; anything else that
 // isn't such a file is another error.
-func readGoModFile(path string) ([]byte, error) {
+func readBoundedRegularFile(path string, max int64) ([]byte, error) {
 	info, err := os.Lstat(path)
 	if err != nil {
 		return nil, err
@@ -340,12 +346,12 @@ func readGoModFile(path string) ([]byte, error) {
 	} else if !info.Mode().IsRegular() {
 		return nil, fmt.Errorf("not a regular file (%s)", info.Mode().Type())
 	}
-	data, err := io.ReadAll(io.LimitReader(f, goModMaxBytes+1))
+	data, err := io.ReadAll(io.LimitReader(f, max+1))
 	if err != nil {
 		return nil, err
 	}
-	if len(data) > goModMaxBytes {
-		return nil, fmt.Errorf("larger than %d bytes", goModMaxBytes)
+	if int64(len(data)) > max {
+		return nil, fmt.Errorf("larger than %d bytes", max)
 	}
 	return data, nil
 }

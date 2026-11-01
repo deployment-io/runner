@@ -218,7 +218,9 @@ func buildImageWithBuildkit(parameters map[string]interface{}, req buildkitReque
 		return err
 	}
 	req.buildArgs = buildArgs
-	io.WriteString(logsWriter, fmt.Sprintf("Building docker image with BuildKit (build secrets: %s)\n", strings.Join(sortedNames(req.secrets), ", ")))
+	// Through buildLogWriter: the names, unbounded, can run past the job log's
+	// line limit.
+	io.WriteString(&buildLogWriter{w: logsWriter}, fmt.Sprintf("Building docker image with BuildKit (build secrets: %s)\n", strings.Join(sortedNames(req.secrets), ", ")))
 	return runnerBuildkitBuilder.build(req, logsWriter)
 }
 
