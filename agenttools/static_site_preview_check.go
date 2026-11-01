@@ -34,7 +34,7 @@ func CheckRunnerBuiltPreview(deps DeployStaticSitePreviewDeps, repository string
 	if err != nil {
 		return RunnerBuiltPreviewCheck{LookupErr: fmt.Errorf("look up how deployment.io deploys %s: %w", repoDir, err)}
 	}
-	plan, ok, err := planFromBuildSettings(deps, repoDir, nil, settings)
+	plan, ok, err := planFromBuildSettings(deps, repoDir, nil, entry.BaseBranch, settings)
 	if err != nil {
 		return RunnerBuiltPreviewCheck{Reason: err.Error()}
 	}
