@@ -3,6 +3,7 @@ package commands
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
+	"github.com/deployment-io/deployment-runner-kit/task_previews"
 )
 
 func TestDockerfileSecretMounts(t *testing.T) {
@@ -41,9 +43,12 @@ func TestDockerfileSecretMounts(t *testing.T) {
 }
 
 // deployWebPreviewWithDockerfile deploys a preview whose Dockerfile is dockerfile
-// (written by write, or as a regular file when write is nil) with variables as its
-// Preview configuration, and returns the build's parameters and the Step log.
-func deployWebPreviewWithDockerfile(t *testing.T, variables map[string]string, write func(path string)) (map[string]interface{}, string) {
+// (written by write, or as a regular file when write is nil) built like a
+// Production service whose preview build secrets are secrets, and returns the
+// build's parameters and the Step log. The reply also carries a Staging service
+// with its own NPM_TOKEN, and Preview configuration and QA's wiring have one too:
+// none of them is ever offered.
+func deployWebPreviewWithDockerfile(t *testing.T, secrets map[string]string, write func(path string)) (map[string]interface{}, string) {
 	t.Helper()
 	buildDir, org := webPreviewBuildDir(t)
 	if write != nil {
@@ -55,15 +60,15 @@ func deployWebPreviewWithDockerfile(t *testing.T, variables map[string]string, w
 	}
 	fake := &fakeWebPreviewSteps{}
 	in := testWebPreviewInput(buildDir)
-	in.ConfigurationVariables = variables
-	// QA's wired values (in Settings.Variables) are never offered.
-	in.Settings.Variables = map[string]string{"CORS_ORIGINS": "https://wired.example"}
-	for k, v := range variables {
-		in.Settings.Variables[k] = v
-	}
-	if _, ok := variables["NPM_TOKEN"]; ok {
-		in.Settings.Variables["NPM_TOKEN"] = "wired-npm-value"
-	}
+	in.Service.ProductionEnvironment = true
+	in.Service.BuildSecrets = secrets
+	staging := in.Service
+	staging.DeploymentName, staging.EnvironmentName, staging.ProductionEnvironment = "api-staging", "staging", false
+	staging.BuildSecrets = map[string]string{"NPM_TOKEN": "staging-preview", "CORS_ORIGINS": "staging-cors"}
+	in.Settings.Services = []task_previews.WebServicePreviewSettingsV1{staging, in.Service}
+	// Preview configuration's and QA's wired values (in Settings.Variables) are
+	// never offered.
+	in.Settings.Variables = map[string]string{"CORS_ORIGINS": "https://wired.example", "NPM_TOKEN": "wired-npm-value", "OK": "config-ok"}
 	in.WiredNames = []string{"CORS_ORIGINS", "NPM_TOKEN"}
 	in.Service.DockerBuildArgs = nil
 	var buildLogs, logs bytes.Buffer
@@ -89,9 +94,23 @@ func deployWebPreviewWithDockerfile(t *testing.T, variables map[string]string, w
 	if strings.Contains(logs.String(), "build secret") {
 		t.Errorf("build secret lines reached the deploy log: %q", logs.String())
 	}
-	for _, value := range in.Settings.Variables {
-		if value != "" && strings.Contains(buildLogs.String(), value) {
-			t.Errorf("a value reached the Step log: %q", buildLogs.String())
+	var values []string
+	for _, m := range []map[string]string{in.Settings.Variables, staging.BuildSecrets, secrets} {
+		for _, value := range m {
+			if value != "" {
+				values = append(values, value)
+			}
+		}
+	}
+	for _, value := range values {
+		if strings.Contains(buildLogs.String(), value) || strings.Contains(logs.String(), value) {
+			t.Errorf("a value reached a log: %q / %q", buildLogs.String(), logs.String())
+		}
+	}
+	// Another service's preview build secrets reach nothing the build is given.
+	for _, value := range staging.BuildSecrets {
+		if strings.Contains(fmt.Sprint(fake.seen[0]), value) {
+			t.Errorf("the build parameters carry api-staging's value %q", value)
 		}
 	}
 	return fake.seen[0], buildLogs.String()
@@ -107,24 +126,24 @@ func writeDockerfile(contents string) func(string) {
 
 const npmTokenDockerfile = "FROM node\nRUN --mount=type=secret,id=NPM_TOKEN,env=NPM_TOKEN npm ci\n"
 
-func TestWebPreviewOffersPreviewVariablesAsBuildSecrets(t *testing.T) {
-	variables := map[string]string{"NPM_TOKEN": "npm-preview-value", "API_URL": "https://preview.example"}
-	parameters, buildLogs := deployWebPreviewWithDockerfile(t, variables, writeDockerfile(npmTokenDockerfile))
+func TestWebPreviewOffersTheChosenServicesPreviewBuildSecrets(t *testing.T) {
+	previewSecrets := map[string]string{"NPM_TOKEN": "prod-preview"}
+	parameters, buildLogs := deployWebPreviewWithDockerfile(t, previewSecrets, writeDockerfile(npmTokenDockerfile))
 	secrets, err := jobs.GetParameterValue[map[string]string](parameters, parameters_enums.BuildSecrets)
-	if err != nil || !reflect.DeepEqual(secrets, variables) {
-		t.Errorf("BuildSecrets = %v (%v), want %v", secrets, err, variables)
+	if err != nil || !reflect.DeepEqual(secrets, map[string]string{"NPM_TOKEN": "prod-preview"}) {
+		t.Errorf("BuildSecrets names %v (%v), want the chosen service's NPM_TOKEN", reflect.ValueOf(secrets).MapKeys(), err)
 	}
-	want := "Backend preview: the Dockerfile mounts build secrets (NPM_TOKEN), so the preview is built with BuildKit and offered its Preview configuration variables as build secrets\n"
+	want := "Backend preview: the Dockerfile mounts build secrets (NPM_TOKEN), so the preview is built with BuildKit and offered api's preview build secrets\n"
 	if !strings.Contains(buildLogs, want) {
 		t.Errorf("Step log %q, want it to contain %q", buildLogs, want)
 	}
-	if strings.Contains(buildLogs, "no preview value") {
+	if strings.Contains(buildLogs, "no preview build secret") {
 		t.Errorf("Step log %q names a missing value", buildLogs)
 	}
-	// A copy: the build's map isn't the Preview configuration's.
+	// A copy: the build's map isn't the service's.
 	secrets["NPM_TOKEN"] = "changed"
-	if variables["NPM_TOKEN"] != "npm-preview-value" {
-		t.Error("BuildSecrets shares the Preview configuration's map")
+	if previewSecrets["NPM_TOKEN"] != "prod-preview" {
+		t.Error("BuildSecrets shares the service's map")
 	}
 }
 
@@ -134,7 +153,7 @@ func TestWebPreviewBuildSecretWithNoPreviewValue(t *testing.T) {
 	if err != nil || len(secrets) != 0 {
 		t.Errorf("BuildSecrets = %v (%v), want present and empty", secrets, err)
 	}
-	want := "Preview build: no preview value for build secret NPM_TOKEN; add a read-only one in Preview configuration.\n"
+	want := "Preview build: no preview build secret NPM_TOKEN; add it on api's Previews tab.\n"
 	if !strings.Contains(buildLogs, want) {
 		t.Errorf("Step log %q, want it to contain %q", buildLogs, want)
 	}
@@ -149,15 +168,15 @@ func TestWebPreviewBuildSecretsWithoutIds(t *testing.T) {
 }
 
 func TestWebPreviewBuildSecretsLeaveOutUnusableNames(t *testing.T) {
-	variables := map[string]string{"A,B": "comma-value", "X=Y": "equals-value", "OK": "ok-value"}
-	parameters, buildLogs := deployWebPreviewWithDockerfile(t, variables, writeDockerfile("RUN --mount=type=secret,id=A,B --mount=type=secret,id=X=Y true\n"))
+	previewSecrets := map[string]string{"A,B": "comma-value", "X=Y": "equals-value", "OK": "ok-value"}
+	parameters, buildLogs := deployWebPreviewWithDockerfile(t, previewSecrets, writeDockerfile("RUN --mount=type=secret,id=A,B --mount=type=secret,id=X=Y true\n"))
 	secrets, _ := jobs.GetParameterValue[map[string]string](parameters, parameters_enums.BuildSecrets)
 	if !reflect.DeepEqual(secrets, map[string]string{"OK": "ok-value"}) {
 		t.Errorf("BuildSecrets = %v, want only OK", secrets)
 	}
 	// "id=A,B" is the mount id A (B is another option); "id=X=Y" is X=Y.
 	for _, id := range []string{"A", "X=Y"} {
-		want := "Preview build: no preview value for build secret " + id + ";"
+		want := "Preview build: no preview build secret " + id + ";"
 		if !strings.Contains(buildLogs, want) {
 			t.Errorf("Step log %q, want it to contain %q", buildLogs, want)
 		}
@@ -165,7 +184,7 @@ func TestWebPreviewBuildSecretsLeaveOutUnusableNames(t *testing.T) {
 }
 
 func TestWebPreviewWithoutSecretMountsBuildsAsBefore(t *testing.T) {
-	variables := map[string]string{"NPM_TOKEN": "npm-preview-value"}
+	previewSecrets := map[string]string{"NPM_TOKEN": "prod-preview"}
 	for _, tt := range []struct {
 		name  string
 		write func(string)
@@ -181,7 +200,7 @@ func TestWebPreviewWithoutSecretMountsBuildsAsBefore(t *testing.T) {
 		{"oversized Dockerfile", writeDockerfile(npmTokenDockerfile + strings.Repeat("#", webPreviewDockerFileMaxBytes))},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			parameters, buildLogs := deployWebPreviewWithDockerfile(t, variables, tt.write)
+			parameters, buildLogs := deployWebPreviewWithDockerfile(t, previewSecrets, tt.write)
 			if _, err := jobs.GetParameterValue[map[string]string](parameters, parameters_enums.BuildSecrets); err == nil {
 				t.Error("BuildSecrets is set")
 			}
@@ -193,12 +212,13 @@ func TestWebPreviewWithoutSecretMountsBuildsAsBefore(t *testing.T) {
 }
 
 func TestWebPreviewBuildSecretsOfferNoWiredValue(t *testing.T) {
-	parameters, buildLogs := deployWebPreviewWithDockerfile(t, map[string]string{"NPM_TOKEN": "npm-preview-value"}, writeDockerfile(npmTokenDockerfile+"RUN --mount=type=secret,id=CORS_ORIGINS true\n"))
+	parameters, buildLogs := deployWebPreviewWithDockerfile(t, map[string]string{"NPM_TOKEN": "prod-preview"}, writeDockerfile(npmTokenDockerfile+"RUN --mount=type=secret,id=CORS_ORIGINS --mount=type=secret,id=OK true\n"))
 	secrets, _ := jobs.GetParameterValue[map[string]string](parameters, parameters_enums.BuildSecrets)
-	if !reflect.DeepEqual(secrets, map[string]string{"NPM_TOKEN": "npm-preview-value"}) {
-		t.Errorf("BuildSecrets = %v, want the configuration's NPM_TOKEN only", secrets)
+	if !reflect.DeepEqual(secrets, map[string]string{"NPM_TOKEN": "prod-preview"}) {
+		t.Errorf("BuildSecrets names %v, want the chosen service's NPM_TOKEN only", reflect.ValueOf(secrets).MapKeys())
 	}
-	if !strings.Contains(buildLogs, "no preview value for build secret CORS_ORIGINS;") {
+	if !strings.Contains(buildLogs, "Preview build: no preview build secret CORS_ORIGINS; add it on api's Previews tab.\n") ||
+		!strings.Contains(buildLogs, "Preview build: no preview build secret OK; add it on api's Previews tab.\n") {
 		t.Errorf("Step log %q, want CORS_ORIGINS named as missing", buildLogs)
 	}
 }
@@ -231,6 +251,24 @@ func TestWebPreviewBuildSecretLinesNameEveryID(t *testing.T) {
 		}
 		if !strings.Contains(joined, "build secret "+id+";") {
 			t.Errorf("no missing-value line for %s", id)
+		}
+	}
+}
+
+// A multiline value, such as a PEM key, is offered as it is.
+func TestWebPreviewBuildSecretWithALineBreakIsOffered(t *testing.T) {
+	previewSecrets := map[string]string{"NPM_TOKEN": "prod-preview", "KEY": "alpha\nbeta", "CR": "gamma\rdelta"}
+	parameters, buildLogs := deployWebPreviewWithDockerfile(t, previewSecrets, writeDockerfile(npmTokenDockerfile+"RUN --mount=type=secret,id=KEY true\n"))
+	secrets, err := jobs.GetParameterValue[map[string]string](parameters, parameters_enums.BuildSecrets)
+	if err != nil || !reflect.DeepEqual(secrets, previewSecrets) {
+		t.Errorf("BuildSecrets names %v (%v), want NPM_TOKEN, KEY and CR with their values", reflect.ValueOf(secrets).MapKeys(), err)
+	}
+	if strings.Contains(buildLogs, "Preview build:") {
+		t.Errorf("Step log %q reports a missing secret", buildLogs)
+	}
+	for _, value := range []string{"alpha", "beta", "gamma", "delta", "prod-preview"} {
+		if strings.Contains(buildLogs, value) {
+			t.Errorf("Step log contains a value")
 		}
 	}
 }

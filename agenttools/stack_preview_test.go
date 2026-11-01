@@ -173,9 +173,14 @@ func TestDeployWebServicePreviewWithWiredVariables(t *testing.T) {
 	deps.DatabaseStore = &fakeWebStore{}
 	service := webService("api", "us-east-1", "services/api")
 	service.PreviewDatabase = &task_previews.PreviewDatabaseV1{Mode: task_previews.PreviewDatabaseModeUse, Engine: "postgres", Version: "16", Variables: []string{"DATABASE_URL"}}
+	service.ProductionEnvironment = true
+	service.BuildSecrets = map[string]string{"NPM_TOKEN": "prod-preview"}
+	staging := webService("api-staging", "us-east-1", "services/api")
+	staging.EnvironmentName = "staging"
+	staging.BuildSecrets = map[string]string{"NPM_TOKEN": "staging-preview"}
 	deps.Settings = func(string) (task_previews.WebServicePreviewSettingsReplyV1, error) {
-		reply := readyReply(service)
-		reply.Variables = map[string]string{"CORS_ORIGINS": "https://staging.example", "KEEP": "1"}
+		reply := readyReply(staging, service)
+		reply.Variables = map[string]string{"CORS_ORIGINS": "https://staging.example", "KEEP": "1", "NPM_TOKEN": "config-npm"}
 		return reply, nil
 	}
 	plan, err := PlanWebServicePreview(deps, "1-acme/api")
@@ -189,12 +194,14 @@ func TestDeployWebServicePreviewWithWiredVariables(t *testing.T) {
 	v := got.Settings.Variables
 	// The deployer puts the database's DATABASE_URL over the wired one, in the
 	// environment and the build args (WiredNames).
-	if v["CORS_ORIGINS"] != "https://d1.cloudfront.net" || v["KEEP"] != "1" {
+	if v["CORS_ORIGINS"] != "https://d1.cloudfront.net" || v["KEEP"] != "1" || v["NPM_TOKEN"] != "config-npm" {
 		t.Errorf("variables = %v", v)
 	}
-	// Build secrets come from the configuration's own variables, never the wired ones.
-	if c := got.ConfigurationVariables; len(c) != 2 || c["CORS_ORIGINS"] != "https://staging.example" || c["KEEP"] != "1" {
-		t.Errorf("configuration variables = %v", c)
+	// The deploy input carries the chosen service, whose preview build secrets are
+	// a preview build's only source — never another service's, Preview
+	// configuration's or the wired values.
+	if got.Service.DeploymentName != "api" || len(got.Service.BuildSecrets) != 1 || got.Service.BuildSecrets["NPM_TOKEN"] != "prod-preview" {
+		t.Errorf("deploy input service = %s with build secret names %v", got.Service.DeploymentName, sortedKeys(got.Service.BuildSecrets))
 	}
 	if fmt.Sprint(got.WiredNames) != "[CORS_ORIGINS DATABASE_URL]" {
 		t.Errorf("wired names = %v", got.WiredNames)
@@ -204,6 +211,11 @@ func TestDeployWebServicePreviewWithWiredVariables(t *testing.T) {
 	}
 	if !strings.Contains(logs.String(), "the preview database's DATABASE_URL replaces the value QA set for it") {
 		t.Errorf("the log doesn't name the replaced variable:\n%s", logs.String())
+	}
+	for _, value := range []string{"prod-preview", "staging-preview"} {
+		if strings.Contains(logs.String(), value) {
+			t.Errorf("the log carries a preview build secret's value:\n%s", logs.String())
+		}
 	}
 	if strings.Contains(logs.String(), "d1.cloudfront.net") {
 		t.Errorf("the log carries a wired value:\n%s", logs.String())

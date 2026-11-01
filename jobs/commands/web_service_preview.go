@@ -292,9 +292,10 @@ func (d webPreviewDeployer) deploy(ctx context.Context, in agenttools.WebService
 		return agenttools.WebServicePreviewDeployOutput{}, fmt.Errorf("%s's Dockerfile %s isn't in its root directory %q, so its backend preview can't be built", in.Service.DeploymentName, dockerFile, in.RootDirectory)
 	}
 	// A Dockerfile that mounts build secrets is built with BuildKit and offered the
-	// Preview configuration's own variables (never production's build secrets, nor
-	// QA's wired values).
-	setWebPreviewBuildSecrets(parameters, dockerFilePath, in.ConfigurationVariables, in.BuildLogs)
+	// chosen service's own preview build secrets — never another service's, never
+	// Preview configuration variables, QA's wired values or production's build
+	// secrets.
+	setWebPreviewBuildSecrets(parameters, dockerFilePath, in.Service, in.BuildLogs)
 	// The Step log only (BuildLogs never reaches the agent), and names only.
 	if _, left := webPreviewBuildArgs(in.Service.DockerBuildArgs, in.Settings.Variables); len(left) > 0 && in.BuildLogs != nil {
 		io.WriteString(in.BuildLogs, fmt.Sprintf("Backend preview: build args left out, with no usable Preview configuration variable of the same name: %s\n", strings.Join(left, ", ")))

@@ -184,7 +184,7 @@ func (b *BuildDockerImage) Run(parameters map[string]interface{}, logsWriter io.
 	// BuildSecrets parameter present — even empty — uses BuildKit; every other
 	// build stays on the classic builder. deployment-server sets it for a
 	// production build only with at least one secret. A Task preview sets it
-	// (to its Preview configuration variables, possibly none) only when its
+	// (to its service's preview build secrets, possibly none) only when its
 	// Dockerfile mounts a secret, so a mount that is optional still builds.
 	buildSecrets, secretsErr := jobs.GetParameterValue[map[string]string](parameters, parameters_enums.BuildSecrets)
 	if secretsErr == nil {
