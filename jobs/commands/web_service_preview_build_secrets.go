@@ -1,8 +1,9 @@
 package commands
 
 // web_service_preview_build_secrets.go: a backend preview whose Dockerfile mounts
-// build secrets (RUN --mount=type=secret,…) is built with BuildKit and offered its
-// Preview configuration variables as build secrets — never production's: the agent
+// build secrets (RUN --mount=type=secret,…) is built with BuildKit and offered the
+// service's preview build secrets (set on its Previews tab) — never production's
+// build secrets, another service's, or Preview configuration variables: the agent
 // writes the Dockerfile, so anything a preview build is given is agent-visible.
 
 import (
@@ -15,6 +16,7 @@ import (
 
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
+	"github.com/deployment-io/deployment-runner-kit/task_previews"
 )
 
 // webPreviewDockerFileMaxBytes bounds the Dockerfile read for secret mounts.
@@ -66,12 +68,12 @@ func dockerfileSecretMounts(dockerfile []byte) (mounts bool, ids []string) {
 	return mounts, ids
 }
 
-// webPreviewBuildSecrets is the build secrets a preview is offered: a copy of its
-// Preview configuration variables, only those whose names follow the build-secret
+// webPreviewBuildSecrets is the build secrets a preview is offered: a copy of the
+// service's preview build secrets, only those whose names follow the build-secret
 // name rule.
-func webPreviewBuildSecrets(variables map[string]string) map[string]string {
+func webPreviewBuildSecrets(previewBuildSecrets map[string]string) map[string]string {
 	secrets := map[string]string{}
-	for name, value := range variables {
+	for name, value := range previewBuildSecrets {
 		if buildSecretName.MatchString(name) {
 			secrets[name] = value
 		}
@@ -81,10 +83,11 @@ func webPreviewBuildSecrets(variables map[string]string) map[string]string {
 
 // setWebPreviewBuildSecrets reads the preview's Dockerfile and, when it mounts
 // build secrets, sets the BuildSecrets parameter (so BuildDockerImage builds with
-// BuildKit) to the Preview configuration variables, and writes names only to
-// buildLogs (when not nil). A Dockerfile that can't be read as a bounded regular
-// file counts as mounting none: the preview builds as before.
-func setWebPreviewBuildSecrets(parameters map[string]interface{}, dockerFilePath string, variables map[string]string, buildLogs io.Writer) {
+// BuildKit) to the service's preview build secrets (service.BuildSecrets, and
+// nothing else), and writes names only to buildLogs (when not nil), naming the
+// service whose Previews tab holds them. A Dockerfile that can't be read as a
+// bounded regular file counts as mounting none: the preview builds as before.
+func setWebPreviewBuildSecrets(parameters map[string]interface{}, dockerFilePath string, service task_previews.WebServicePreviewSettingsV1, buildLogs io.Writer) {
 	data, err := readBoundedRegularFile(dockerFilePath, webPreviewDockerFileMaxBytes)
 	if err != nil {
 		return
@@ -93,7 +96,7 @@ func setWebPreviewBuildSecrets(parameters map[string]interface{}, dockerFilePath
 	if !mounts {
 		return
 	}
-	secrets := webPreviewBuildSecrets(variables)
+	secrets := webPreviewBuildSecrets(service.BuildSecrets)
 	jobs.SetParameterValue(parameters, parameters_enums.BuildSecrets, secrets)
 	if buildLogs == nil {
 		return
@@ -105,10 +108,10 @@ func setWebPreviewBuildSecrets(parameters map[string]interface{}, dockerFilePath
 	if len(ids) > 0 {
 		named = fmt.Sprintf(" (%s)", strings.Join(ids, ", "))
 	}
-	io.WriteString(logs, fmt.Sprintf("Backend preview: the Dockerfile mounts build secrets%s, so the preview is built with BuildKit and offered its Preview configuration variables as build secrets\n", named))
+	io.WriteString(logs, fmt.Sprintf("Backend preview: the Dockerfile mounts build secrets%s, so the preview is built with BuildKit and offered %s's preview build secrets\n", named, service.DeploymentName))
 	for _, id := range ids {
 		if _, ok := secrets[id]; !ok {
-			io.WriteString(logs, fmt.Sprintf("Preview build: no preview value for build secret %s; add a read-only one in Preview configuration.\n", id))
+			io.WriteString(logs, fmt.Sprintf("Preview build: no preview build secret %s; add it on %s's Previews tab.\n", id, service.DeploymentName))
 		}
 	}
 }
