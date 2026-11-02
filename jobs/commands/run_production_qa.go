@@ -24,7 +24,8 @@ import (
 // RunProductionQA is the only command of a production QA Job: once a Deployed
 // Task's deliveries have all ended, ONE report-only agentbox QA run checks the
 // Task's acceptance criteria against the deployed repositories' production
-// URLs.
+// URLs. A web service target's health is checked first by the runner itself
+// (run_production_qa_health.go); one with no https URL gets only that check.
 //
 // It is blind like the QA stage — no checkout, no diff, no context, no deploy
 // and no fix round — and production is real: the run's tool socket serves only
@@ -50,11 +51,14 @@ type RunProductionQA struct {
 func (rp *RunProductionQA) SetStopSignal(stop <-chan struct{}) { rp.stopSignal = stop }
 
 // productionQATarget is one entry of the ProductionQATargets parameter (kit's
-// job_creation_utils.ProductionQATarget).
+// job_creation_utils.ProductionQATarget). URL is the https address the QA
+// browser opens, empty when the target is only health checked; HealthURL is
+// the http(s) address the runner GETs to check a web service's health.
 type productionQATarget struct {
 	Repository string   `json:"repository"`
 	URL        string   `json:"url"`
 	Hosts      []string `json:"hosts,omitempty"`
+	HealthURL  string   `json:"health_url"`
 }
 
 // productionQADirName is appended to the Task's base dir for the run's /work:
@@ -80,7 +84,12 @@ func (rp *RunProductionQA) Run(parameters map[string]interface{}, logsWriter io.
 }
 
 // check runs the production check and returns its "qa" record: one round when
-// the QA run was started, none when it was refused before.
+// the checks were started, none when they were refused before.
+//
+// The health checks run first, one per target with a HealthURL. The QA agent
+// then checks the acceptance criteria on the targets with a URL; when no
+// target has one there is no agent run, and the round is the health checks
+// with every acceptance criterion not checked.
 func (rp *RunProductionQA) check(parameters map[string]interface{}, logsWriter io.Writer) *qaOutput {
 	targets, err := parseProductionQATargets(parameters)
 	out := &qaOutput{Repositories: productionQARepositories(targets)}
@@ -96,28 +105,55 @@ func (rp *RunProductionQA) check(parameters map[string]interface{}, logsWriter i
 	if orgID == "" || taskID == "" {
 		return couldntRun("the production check has no organization or task id")
 	}
+	var round qaRoundOutput
+	if len(productionQABrowserTargets(targets)) == 0 {
+		health, stopped := rp.healthChecks(targets, logsWriter)
+		if stopped {
+			return couldntRun(productionQAStoppedReason)
+		}
+		round = healthOnlyRound(parameters, targets, health)
+	} else {
+		var reason string
+		round, reason = rp.agentRound(parameters, logsWriter, commandUtils.GetTaskRepositoriesBaseDir(orgID, taskID), targets)
+		if reason != "" {
+			return couldntRun(reason)
+		}
+	}
+	out.Rounds = []qaRoundOutput{round}
+	out.Status, out.StatusReason, out.NoCriteria = round.Status, round.StatusReason, round.NoCriteria
+	return out
+}
+
+// agentRound runs the health checks and the QA agent on the targets with a
+// URL, and returns the agent's round with the health checks appended — or,
+// when the agent can't be started, why.
+func (rp *RunProductionQA) agentRound(parameters map[string]interface{}, logsWriter io.Writer, workDirHost string,
+	targets []productionQATarget) (qaRoundOutput, string) {
 	qaParams, qaFailure := qaParameters(parameters)
 	if qaFailure != "" {
-		return couldntRun(qaFailure)
+		return qaRoundOutput{}, qaFailure
 	}
 	if reason := productionQAImageRefusal(parameters); reason != "" {
-		return couldntRun(reason)
+		return qaRoundOutput{}, reason
 	}
 	release, reason := rp.holdImage(parameters)
 	defer release()
 	if reason != "" {
-		return couldntRun(reason)
+		return qaRoundOutput{}, reason
 	}
 	prefetchVerifyBrowserImage(rp.prefetchBrowser, parameters, logsWriter)
+	// A stop during the health checks reaches the QA run, which ends as stopped.
+	health, _ := rp.healthChecks(targets, logsWriter)
+	browserTargets := productionQABrowserTargets(targets)
 	stage := &qaStage{
 		parameters:   parameters,
-		workDirHost:  commandUtils.GetTaskRepositoriesBaseDir(orgID, taskID),
+		workDirHost:  workDirHost,
 		logsWriter:   logsWriter,
 		qaParams:     qaParams,
-		repositories: out.Repositories,
+		repositories: productionQARepositories(browserTargets),
 	}
-	io.WriteString(logsWriter, fmt.Sprintf("Production QA: checking the acceptance criteria on %s\n", strings.Join(productionQAURLs(targets), ", ")))
-	run := rp.runQA(stage, targets)
+	io.WriteString(logsWriter, fmt.Sprintf("Production QA: checking the acceptance criteria on %s\n", strings.Join(productionQAURLs(browserTargets), ", ")))
+	run := rp.runQA(stage, browserTargets)
 	stage.accumulateQARun(1, run.result)
 	round := stage.roundOutput(1, run.result, run.err)
 	switch {
@@ -126,9 +162,15 @@ func (rp *RunProductionQA) check(parameters map[string]interface{}, logsWriter i
 	case errors.Is(run.err, types.ErrJobStoppedByUser):
 		round.Status, round.StatusReason = tasks.QAStatusCouldNotRun, productionQAStoppedReason
 	}
-	out.Rounds = []qaRoundOutput{round}
-	out.Status, out.StatusReason, out.NoCriteria = round.Status, round.StatusReason, round.NoCriteria
-	return out
+	round.Criteria = withHealthCriteria(round.Criteria, health)
+	return round, ""
+}
+
+// withHealthCriteria appends the health checks to the agent's criteria. None
+// is dropped: app-server counts and shows every acceptance criterion plus a
+// health check per repository.
+func withHealthCriteria(criteria, health []qaCriterion) []qaCriterion {
+	return append(criteria, health...)
 }
 
 // productionQAImageRefusal names why this run can't use its images, or "":
@@ -243,8 +285,9 @@ func productionQARecord(targets []productionQATarget) *agenttools.PreviewRecord 
 }
 
 // parseProductionQATargets reads and checks the ProductionQATargets parameter:
-// at least one target, each naming a repository and an https URL. A custom
-// domain must be a bare host name.
+// at least one target, each naming a repository and an https URL, a health
+// URL (productionQAHealthURLValid), or both. A custom domain must be a bare
+// host name.
 func parseProductionQATargets(parameters map[string]interface{}) ([]productionQATarget, error) {
 	raw, err := jobs.GetParameterValue[string](parameters, parameters_enums.ProductionQATargets)
 	if err != nil || strings.TrimSpace(raw) == "" {
@@ -261,9 +304,14 @@ func parseProductionQATargets(parameters map[string]interface{}) ([]productionQA
 		if strings.TrimSpace(t.Repository) == "" || strings.ContainsAny(t.Repository, ",=") {
 			return targets, fmt.Errorf("invalid production target repository %q", t.Repository)
 		}
-		u, err := url.Parse(t.URL)
-		if err != nil || u.Scheme != "https" || u.Hostname() == "" || strings.Contains(t.URL, ",") {
-			return targets, fmt.Errorf("the production URL %q of %s is not an https URL", t.URL, t.Repository)
+		if t.URL != "" || t.HealthURL == "" {
+			u, err := url.Parse(t.URL)
+			if err != nil || u.Scheme != "https" || u.Hostname() == "" || strings.Contains(t.URL, ",") {
+				return targets, fmt.Errorf("the production URL %q of %s is not an https URL", t.URL, t.Repository)
+			}
+		}
+		if t.HealthURL != "" && !productionQAHealthURLValid(t.HealthURL) {
+			return targets, fmt.Errorf("the health check URL %q of %s is not an http or https URL", t.HealthURL, t.Repository)
 		}
 		for _, host := range t.Hosts {
 			if host == "" || strings.ContainsAny(host, "/:@?# ") {
@@ -272,6 +320,38 @@ func parseProductionQATargets(parameters map[string]interface{}) ([]productionQA
 		}
 	}
 	return targets, nil
+}
+
+// productionQAHealthURLValid reports whether raw is a health URL the runner
+// GETs: http or https, with a host, no user info, no "," and no port but the
+// scheme's default.
+func productionQAHealthURLValid(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" ||
+		u.User != nil || strings.Contains(raw, ",") {
+		return false
+	}
+	switch u.Port() {
+	case "":
+		return !strings.HasSuffix(u.Host, ":")
+	case "80":
+		return u.Scheme == "http"
+	case "443":
+		return u.Scheme == "https"
+	}
+	return false
+}
+
+// productionQABrowserTargets is the targets the QA browser opens: those with
+// a URL.
+func productionQABrowserTargets(targets []productionQATarget) []productionQATarget {
+	var out []productionQATarget
+	for _, t := range targets {
+		if t.URL != "" {
+			out = append(out, t)
+		}
+	}
+	return out
 }
 
 func productionQARepositories(targets []productionQATarget) []string {
