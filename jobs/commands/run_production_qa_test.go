@@ -264,6 +264,18 @@ func TestProductionQACompleted(t *testing.T) {
 	}
 }
 
+// With no health check (static sites only) the agent's smoke check keeps
+// the round NoCriteria.
+func TestProductionQASmokeCheckWithoutHealthCheck(t *testing.T) {
+	qa, _ := runProductionQA(t, productionQAParameters(t), func(agentboxSpawnSpec, io.Writer) (agentResult, error) {
+		return agentResult{Status: "success", QAResult: &qaResult{Status: tasks.QAStatusCompleted, NoCriteria: true}}, nil
+	})
+	if qa.Status != tasks.QAStatusCompleted || !qa.NoCriteria || len(qa.Rounds) != 1 || !qa.Rounds[0].NoCriteria ||
+		len(qa.Rounds[0].Criteria) != 0 {
+		t.Errorf("qa = %+v, want completed with no criteria", qa)
+	}
+}
+
 func TestProductionQACouldntRunPaths(t *testing.T) {
 	for _, tc := range []struct {
 		name  string

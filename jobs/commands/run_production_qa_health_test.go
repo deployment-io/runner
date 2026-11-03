@@ -197,15 +197,50 @@ func TestProductionQAHealthOnly(t *testing.T) {
 	}
 }
 
-func TestProductionQAHealthOnlyFailedAndNoCriteria(t *testing.T) {
-	startHealthTestServer(t, func(string) int { return 503 })
-	qa, _ := runProductionQAWith(t, noAgentRun(t), healthOnlyParameters(t, `{"Title":"Pricing"}`))
-	if qa.Status != tasks.QAStatusCompleted || !qa.NoCriteria || len(qa.Rounds) != 1 || !qa.Rounds[0].NoCriteria {
-		t.Fatalf("qa = %+v, want completed with no criteria", qa)
+// A health check is a criterion: a health-only round of a Task with no
+// acceptance criteria is never NoCriteria, whether the check passed or failed.
+func TestProductionQAHealthOnlyNoAcceptanceCriteria(t *testing.T) {
+	for _, tc := range []struct {
+		status int
+		state  string
+	}{
+		{200, tasks.QACriterionPassed},
+		{503, tasks.QACriterionFailed},
+	} {
+		t.Run(tc.state, func(t *testing.T) {
+			startHealthTestServer(t, func(string) int { return tc.status })
+			qa, _ := runProductionQAWith(t, noAgentRun(t), healthOnlyParameters(t, `{"Title":"Pricing"}`))
+			if qa.Status != tasks.QAStatusCompleted || qa.NoCriteria || len(qa.Rounds) != 1 || qa.Rounds[0].NoCriteria {
+				t.Fatalf("qa = %+v, want completed with criteria", qa)
+			}
+			want := qaCriterion{Criterion: "1-acme/api: GET /ping answers with a status from 200 to 400", State: tc.state,
+				Reason: fmt.Sprintf("answered %d", tc.status)}
+			if got := qa.Rounds[0].Criteria; len(got) != 1 || got[0] != want {
+				t.Errorf("criteria = %+v, want only %+v", got, want)
+			}
+		})
 	}
-	got := qa.Rounds[0].Criteria
-	if len(got) != 1 || got[0].State != tasks.QACriterionFailed || got[0].Reason != "answered 503" {
-		t.Errorf("criteria = %+v, want only the failed health check", got)
+}
+
+// A smoke check (the agent's NoCriteria) beside a health check is not
+// NoCriteria: the health check is counted.
+func TestProductionQAMixedSmokeCheckWithHealthCheck(t *testing.T) {
+	startHealthTestServer(t, func(string) int { return 503 })
+	parameters := productionQAParameters(t)
+	jobs.SetParameterValue[string](parameters, parameters_enums.ReviewSpec, `{"Title":"Pricing"}`)
+	setProductionTargets(t, parameters, []productionQATarget{
+		{Repository: "0-acme/site", URL: "https://www.acme.com", Hosts: []string{"d111.cloudfront.net"}},
+		{Repository: "1-acme/api", HealthURL: "http://lb-1.elb.amazonaws.com/ping"},
+	})
+	qa, _ := runProductionQA(t, parameters, func(agentboxSpawnSpec, io.Writer) (agentResult, error) {
+		return agentResult{Status: "success", QAResult: &qaResult{Status: tasks.QAStatusCompleted, NoCriteria: true}}, nil
+	})
+	if qa.Status != tasks.QAStatusCompleted || qa.NoCriteria || len(qa.Rounds) != 1 || qa.Rounds[0].NoCriteria {
+		t.Fatalf("qa = %+v, want completed with criteria", qa)
+	}
+	want := qaCriterion{Criterion: "1-acme/api: GET /ping answers with a status from 200 to 400", State: tasks.QACriterionFailed, Reason: "answered 503"}
+	if got := qa.Rounds[0].Criteria; len(got) != 1 || got[0] != want {
+		t.Errorf("criteria = %+v, want only %+v", got, want)
 	}
 }
 

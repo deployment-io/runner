@@ -186,7 +186,8 @@ func healthCheckError(err error) string {
 
 // healthOnlyRound is the round of a production check with no target to open
 // in a browser: the health checks, then every acceptance criterion not
-// checked. NoCriteria is true only when the Task has none.
+// checked. NoCriteria is true only when the round has no criterion at all: no
+// acceptance criteria and no health check.
 func healthOnlyRound(parameters map[string]interface{}, targets []productionQATarget, health []qaCriterion) qaRoundOutput {
 	acceptance := readAcceptanceCriteria(parameters)
 	var services []string
@@ -202,7 +203,7 @@ func healthOnlyRound(parameters map[string]interface{}, targets []productionQATa
 	return qaRoundOutput{
 		Round:      1,
 		Status:     tasks.QAStatusCompleted,
-		NoCriteria: len(acceptance) == 0,
+		NoCriteria: len(acceptance) == 0 && len(health) == 0,
 		Criteria:   criteria,
 	}
 }
