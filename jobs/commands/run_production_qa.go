@@ -126,7 +126,9 @@ func (rp *RunProductionQA) check(parameters map[string]interface{}, logsWriter i
 
 // agentRound runs the health checks and the QA agent on the targets with a
 // URL, and returns the agent's round with the health checks appended — or,
-// when the agent can't be started, why.
+// when the agent can't be started, why. A health check makes the round's
+// NoCriteria false: the agent's NoCriteria (a smoke check) is kept only when
+// no health check ran.
 func (rp *RunProductionQA) agentRound(parameters map[string]interface{}, logsWriter io.Writer, workDirHost string,
 	targets []productionQATarget) (qaRoundOutput, string) {
 	qaParams, qaFailure := qaParameters(parameters)
@@ -163,6 +165,9 @@ func (rp *RunProductionQA) agentRound(parameters map[string]interface{}, logsWri
 		round.Status, round.StatusReason = tasks.QAStatusCouldNotRun, productionQAStoppedReason
 	}
 	round.Criteria = withHealthCriteria(round.Criteria, health)
+	if len(health) > 0 {
+		round.NoCriteria = false
+	}
 	return round, ""
 }
 
