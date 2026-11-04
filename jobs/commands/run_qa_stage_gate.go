@@ -193,7 +193,7 @@ func (s *qaStage) buildableRepositories(changed []string) ([]string, string) {
 		case result.OK:
 			buildable = append(buildable, dir)
 		default:
-			io.WriteString(s.logsWriter, fmt.Sprintf("QA stage: %s has no preview the runner can build (%s)\n", dir, result.Reason))
+			io.WriteString(s.logsWriter, fmt.Sprintf("QA stage: %s has no static-site preview (%s)\n", dir, result.Reason))
 		}
 	}
 	if lookupErrs < len(changed) {

@@ -78,6 +78,7 @@ func TestQAGateClassifiesStaticSitesAndBackends(t *testing.T) {
 		{
 			name: "backend only", dirs: []string{"0-site", "1-api"}, backend: []string{"1-api"},
 			wantBackends: []string{"1-api"},
+			wantLogs:     []string{"QA stage: 0-site has no static-site preview (not a static site)"},
 		},
 		{
 			name: "both in one repository", dirs: []string{"0-app"}, static: []string{"0-app"}, backend: []string{"0-app"},
