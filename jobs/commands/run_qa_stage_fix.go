@@ -126,13 +126,13 @@ func (s *qaStage) reviewFix() error {
 	rs.reportStage(tasks.StageReview)
 	io.WriteString(s.logsWriter, fmt.Sprintf("Review round %d: reviewing the fix QA sent back\n", round))
 	rs.stageFixDiffs(round)
-	result, err := rs.reviewRound(round)
+	result, reason, err := rs.reviewRoundRetryingBusyModel(round)
 	rs.clearFixDiffs()
 	rs.accumulateReviewRun(round, result)
 	if errors.Is(err, types.ErrJobStoppedByUser) {
 		return err
 	}
-	if reason := reviewRoundFailure(result, err); reason != "" {
+	if reason != "" {
 		io.WriteString(s.logsWriter, fmt.Sprintf("Review round %d did not complete: %s — continuing without it\n", round, reason))
 		// A round that did not complete asserts nothing — including that the
 		// findings the review left open were fixed.

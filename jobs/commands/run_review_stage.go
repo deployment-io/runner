@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -360,6 +361,9 @@ type reviewStage struct {
 	runShadow  func(env []string) (agentResult, error)
 	copyTree   copyTreeFunc
 	restoreDir restoreDirFunc
+	// retryWait, when set, stands in for the wait before a busy-model retry
+	// and reports whether a stop ended it. Nil means the real wait. Tests only.
+	retryWait func(d time.Duration) (stopped bool)
 }
 
 func (s *reviewStage) reviewRound(round int) (agentResult, error) {
@@ -367,6 +371,96 @@ func (s *reviewStage) reviewRound(round int) (agentResult, error) {
 		return s.runReview(round)
 	}
 	return s.runReviewRound(round)
+}
+
+// busyModelRetryWaits are the waits before each retry of a review round whose
+// model was busy: one entry per retry, so a round is tried len+1 times in all.
+var busyModelRetryWaits = []time.Duration{30 * time.Second, 90 * time.Second}
+
+// reviewRoundRetryingBusyModel runs a review round and, when the reviewer's
+// model answered that it was busy (isBusyModelFailure), runs the same round
+// again — same reviewer, effort and staged diffs — after a wait. A capacity or
+// rate-limit answer usually clears within a minute; one of them must not cost
+// the pull request its review.
+//
+// It never switches to another agent or model: the record names the reviewer
+// that reviewed (see reviewerFailure in run).
+//
+// It returns the last attempt's result for the caller to accumulate, and the
+// round's failure reason ("" when it completed). Every attempt it discards is
+// accumulated here, so each attempt's usage is counted exactly once. A stop
+// during a wait returns the attempt before it with types.ErrJobStoppedByUser,
+// for the caller's stop path to count.
+func (s *reviewStage) reviewRoundRetryingBusyModel(round int) (agentResult, string, error) {
+	result, err := s.reviewRound(round)
+	tries := 1
+	for isBusyModelFailure(result, err) && tries <= len(busyModelRetryWaits) {
+		wait := busyModelRetryWaits[tries-1]
+		if !s.canAfford(wait + reviewRunTimeout) {
+			break
+		}
+		io.WriteString(s.logsWriter, fmt.Sprintf("Review round %d: the reviewer's model is busy (%s) — trying again in %ds (attempt %d of %d)\n",
+			round, reviewRoundFailure(result, err), int(wait/time.Second), tries+1, len(busyModelRetryWaits)+1))
+		if s.waitBeforeRetry(wait) {
+			return result, reviewRoundFailure(result, err), types.ErrJobStoppedByUser
+		}
+		s.accumulateReviewRun(round, result)
+		result, err = s.reviewRound(round)
+		tries++
+	}
+	reason := reviewRoundFailure(result, err)
+	if reason != "" && tries > 1 && isBusyModelFailure(result, err) {
+		reason += fmt.Sprintf(" — tried %d times", tries)
+	}
+	return result, reason, err
+}
+
+// waitBeforeRetry waits d, or until the user stops the Job; it reports whether
+// a stop ended the wait.
+func (s *reviewStage) waitBeforeRetry(d time.Duration) bool {
+	if s.retryWait != nil {
+		return s.retryWait(d)
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-s.stopSignal:
+		return true
+	case <-timer.C:
+		return s.stopRequested()
+	}
+}
+
+// busyModelPhrases are the error texts of a model that is busy for now — at
+// capacity, overloaded or rate-limited — as opposed to one that will not answer
+// for a while. Lower-case.
+var busyModelPhrases = []string{
+	"at capacity", "overloaded", "rate limit", "rate_limit",
+	"too many requests", "temporarily unavailable",
+}
+
+// busyModelStatusCode matches 429 or 529 as a whole number, not inside a
+// longer one.
+var busyModelStatusCode = regexp.MustCompile(`(^|[^0-9])(429|529)([^0-9]|$)`)
+
+// isBusyModelFailure reports whether a review run failed because its model was
+// busy, which usually clears within a minute. Read from the error text agentbox
+// reports: its exit code covers auth and rate-limit failures together. A usage
+// limit or quota is not busy — it does not clear in minutes.
+func isBusyModelFailure(result agentResult, err error) bool {
+	if err != nil || result.Status == "success" || isOlderAgentboxRejection(result) {
+		return false
+	}
+	message := strings.ToLower(result.Error)
+	if strings.Contains(message, "usage limit") || strings.Contains(message, "quota") {
+		return false
+	}
+	for _, phrase := range busyModelPhrases {
+		if strings.Contains(message, phrase) {
+			return true
+		}
+	}
+	return busyModelStatusCode.MatchString(message)
 }
 
 func (s *reviewStage) fixRound(mustFix []reviewFindingOutput) error {
@@ -418,7 +512,7 @@ func (s *reviewStage) run() (map[string]interface{}, error) {
 		s.reportStage(tasks.StageReview)
 		io.WriteString(s.logsWriter, fmt.Sprintf("Review round %d: reviewing the change against the Task's spec\n", round))
 		s.stageFixDiffs(round)
-		result, err := s.reviewRound(round)
+		result, reason, err := s.reviewRoundRetryingBusyModel(round)
 		s.clearFixDiffs()
 		if errors.Is(err, types.ErrJobStoppedByUser) {
 			// A user stop is not a failed review. Attribute what the round
@@ -427,7 +521,7 @@ func (s *reviewStage) run() (map[string]interface{}, error) {
 			return s.parameters, err
 		}
 		s.accumulateReviewRun(round, result)
-		if reason := reviewRoundFailure(result, err); reason != "" {
+		if reason != "" {
 			io.WriteString(s.logsWriter, fmt.Sprintf("Review round %d did not complete: %s — continuing without it\n", round, reason))
 			s.recordFailedRound(round, reason, result)
 			break
@@ -1074,6 +1168,10 @@ func (s *reviewStage) logFullReview(out *reviewOutput) {
 			if f.StillPresentNote != "" {
 				b.WriteString(fmt.Sprintf("      still present: %s\n", f.StillPresentNote))
 			}
+		}
+		if reason, ok := sharedNotCheckedReason(round.Coverage); ok {
+			b.WriteString(fmt.Sprintf("  coverage: every parameter — not checked (%s)\n", reason))
+			continue
 		}
 		for _, c := range round.Coverage {
 			line := fmt.Sprintf("  coverage: %s — %s", c.Parameter, c.State)

@@ -82,7 +82,10 @@ func (opr *taskOpenPR) reviewSection() string {
 	if failed != nil {
 		// Fail-open, said out loud. A review that could not complete must not
 		// leave a body that reads as a clean review.
-		sb.WriteString(fmt.Sprintf("The review did not complete: %s. The change was committed and this pull request opened anyway; nothing here has been gated on a review verdict.\n\n", failed.Error))
+		// The reason is often an agent's own sentence, full stop included;
+		// this sentence adds its own.
+		reason := strings.TrimRight(failed.Error, ". ")
+		sb.WriteString(fmt.Sprintf("The review did not complete: %s. The change was committed and this pull request opened anyway; nothing here has been gated on a review verdict.\n\n", reason))
 	}
 	if latest == nil {
 		sb.WriteString(coverageBlock(opr.review.Rounds[len(opr.review.Rounds)-1].Coverage))
@@ -399,9 +402,15 @@ func passesLine(coverage []reviewCoverageOutput) string {
 // line. Eight short answers beat a table nobody reads, and the point is that a
 // parameter nothing ran for is visibly different from one that came back
 // clean.
+//
+// A round that examined nothing (notCheckedCoverage) has eight entries saying
+// the same thing; that reads as one line naming the reason once.
 func coverageLine(coverage []reviewCoverageOutput) string {
 	if len(coverage) == 0 {
 		return ""
+	}
+	if reason, ok := sharedNotCheckedReason(coverage); ok {
+		return "Coverage — every parameter not checked (" + reason + ")\n"
 	}
 	parts := make([]string, 0, len(coverage))
 	for _, c := range coverage {
@@ -412,6 +421,25 @@ func coverageLine(coverage []reviewCoverageOutput) string {
 		parts = append(parts, part)
 	}
 	return "Coverage — " + strings.Join(parts, "; ") + "\n"
+}
+
+// sharedNotCheckedReason reports the one reason when every coverage entry is
+// "not checked" with the same, non-empty reason — the record of a round that
+// examined nothing.
+func sharedNotCheckedReason(coverage []reviewCoverageOutput) (string, bool) {
+	if len(coverage) < 2 {
+		return "", false
+	}
+	reason := strings.TrimSpace(coverage[0].Reason)
+	if reason == "" {
+		return "", false
+	}
+	for _, c := range coverage {
+		if !strings.EqualFold(strings.TrimSpace(c.State), "not checked") || strings.TrimSpace(c.Reason) != reason {
+			return "", false
+		}
+	}
+	return reason, true
 }
 
 // splitFindings separates a round's findings into the ones that must be fixed
