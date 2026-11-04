@@ -95,14 +95,14 @@ func TestProductionQAHealthCheck(t *testing.T) {
 			if stopped {
 				t.Fatal("stopped")
 			}
-			want := qaCriterion{Criterion: "1-acme/api: GET " + tc.path + " answers with a status from 200 to 400", State: tc.state, Reason: tc.reason}
+			want := qaCriterion{Criterion: "acme/api: GET " + tc.path + " answers with a status from 200 to 400", State: tc.state, Reason: tc.reason}
 			if c != want {
 				t.Errorf("criterion = %+v, want %+v", c, want)
 			}
 			if n := h.count(tc.path); n != tc.attempts {
 				t.Errorf("%d attempts, want %d", n, tc.attempts)
 			}
-			wantLog := "Production QA: health check of 1-acme/api GET http://api.acme.test" + tc.path + " → " + strings.TrimPrefix(tc.reason, "answered ") + "\n"
+			wantLog := "Production QA: health check of acme/api GET http://api.acme.test" + tc.path + " → " + strings.TrimPrefix(tc.reason, "answered ") + "\n"
 			if logs.String() != wantLog {
 				t.Errorf("logs = %q, want %q", logs.String(), wantLog)
 			}
@@ -183,9 +183,9 @@ func TestProductionQAHealthOnly(t *testing.T) {
 	if len(qa.Rounds) != 1 || qa.Rounds[0].Status != tasks.QAStatusCompleted || qa.Rounds[0].NoCriteria {
 		t.Fatalf("rounds = %+v", qa.Rounds)
 	}
-	notChecked := "Not checked: no https address to open it in a browser — add a custom domain to 1-acme/api's service."
+	notChecked := "Not checked: no https address to open it in a browser — add a custom domain to acme/api's service."
 	want := []qaCriterion{
-		{Criterion: "1-acme/api: GET /ping answers with a status from 200 to 400", State: tasks.QACriterionPassed, Reason: "answered 200"},
+		{Criterion: "acme/api: GET /ping answers with a status from 200 to 400", State: tasks.QACriterionPassed, Reason: "answered 200"},
 		{Criterion: "The pricing page lists three plans", State: tasks.QACriterionNotChecked, Reason: notChecked},
 		{Criterion: "The API answers /plans", State: tasks.QACriterionNotChecked, Reason: notChecked},
 	}
@@ -213,7 +213,7 @@ func TestProductionQAHealthOnlyNoAcceptanceCriteria(t *testing.T) {
 			if qa.Status != tasks.QAStatusCompleted || qa.NoCriteria || len(qa.Rounds) != 1 || qa.Rounds[0].NoCriteria {
 				t.Fatalf("qa = %+v, want completed with criteria", qa)
 			}
-			want := qaCriterion{Criterion: "1-acme/api: GET /ping answers with a status from 200 to 400", State: tc.state,
+			want := qaCriterion{Criterion: "acme/api: GET /ping answers with a status from 200 to 400", State: tc.state,
 				Reason: fmt.Sprintf("answered %d", tc.status)}
 			if got := qa.Rounds[0].Criteria; len(got) != 1 || got[0] != want {
 				t.Errorf("criteria = %+v, want only %+v", got, want)
@@ -238,7 +238,7 @@ func TestProductionQAMixedSmokeCheckWithHealthCheck(t *testing.T) {
 	if qa.Status != tasks.QAStatusCompleted || qa.NoCriteria || len(qa.Rounds) != 1 || qa.Rounds[0].NoCriteria {
 		t.Fatalf("qa = %+v, want completed with criteria", qa)
 	}
-	want := qaCriterion{Criterion: "1-acme/api: GET /ping answers with a status from 200 to 400", State: tasks.QACriterionFailed, Reason: "answered 503"}
+	want := qaCriterion{Criterion: "acme/api: GET /ping answers with a status from 200 to 400", State: tasks.QACriterionFailed, Reason: "answered 503"}
 	if got := qa.Rounds[0].Criteria; len(got) != 1 || got[0] != want {
 		t.Errorf("criteria = %+v, want only %+v", got, want)
 	}
@@ -273,8 +273,8 @@ func TestProductionQAMixedTargets(t *testing.T) {
 	got := qa.Rounds[0].Criteria
 	want := []qaCriterion{
 		signUpPassed, pricingPassed,
-		{Criterion: "1-acme/api: GET /ping answers with a status from 200 to 400", State: tasks.QACriterionPassed, Reason: "answered 200"},
-		{Criterion: "2-acme/app: GET /healthz answers with a status from 200 to 400", State: tasks.QACriterionPassed, Reason: "answered 200"},
+		{Criterion: "acme/api: GET /ping answers with a status from 200 to 400", State: tasks.QACriterionPassed, Reason: "answered 200"},
+		{Criterion: "acme/app: GET /healthz answers with a status from 200 to 400", State: tasks.QACriterionPassed, Reason: "answered 200"},
 	}
 	if len(got) != len(want) {
 		t.Fatalf("criteria = %+v, want %+v", got, want)
@@ -379,5 +379,39 @@ func TestProductionQAHealthCriteriaAreNeverCut(t *testing.T) {
 	if len(round.Criteria) != 51 || round.Criteria[0] != health[0] ||
 		round.Criteria[50].Criterion != "criterion 49" || round.Criteria[50].State != tasks.QACriterionNotChecked {
 		t.Errorf("%d criteria, want the health check then 50 not_checked", len(round.Criteria))
+	}
+}
+
+func TestProductionQARepositoryName(t *testing.T) {
+	for label, want := range map[string]string{
+		"0-acme/api":       "acme/api",
+		"12-acme/api":      "acme/api",
+		"0-3-d-studio/app": "3-d-studio/app",
+		"acme/api":         "acme/api",
+		"0-":               "0-",
+		"-acme/api":        "-acme/api",
+		"":                 "",
+	} {
+		if got := productionQARepositoryName(label); got != want {
+			t.Errorf("productionQARepositoryName(%q) = %q, want %q", label, got, want)
+		}
+	}
+}
+
+func TestHealthOnlyRoundNamesRepositoriesWithoutIndex(t *testing.T) {
+	parameters := map[string]interface{}{}
+	jobs.SetParameterValue[string](parameters, parameters_enums.ReviewSpec, taskSpecJSON(t, []string{"criterion"}))
+	for _, tc := range []struct {
+		targets []productionQATarget
+		want    string
+	}{
+		{[]productionQATarget{{Repository: "1-acme/api"}}, "acme/api's"},
+		{[]productionQATarget{{Repository: "1-acme/api"}, {Repository: "2-acme/app"}}, "acme/api's or acme/app's"},
+	} {
+		round := healthOnlyRound(parameters, tc.targets, nil)
+		want := "Not checked: no https address to open it in a browser — add a custom domain to " + tc.want + " service."
+		if len(round.Criteria) != 1 || round.Criteria[0].Reason != want {
+			t.Errorf("criteria %+v, want one with reason %q", round.Criteria, want)
+		}
 	}
 }

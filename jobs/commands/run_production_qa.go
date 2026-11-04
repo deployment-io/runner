@@ -359,6 +359,22 @@ func productionQABrowserTargets(targets []productionQATarget) []productionQATarg
 	return out
 }
 
+// productionQARepositoryName is the repository's name in a target label,
+// which app-server builds as "<index>-<owner/name>": it strips one leading
+// run of ASCII digits and the "-" after it, and returns any other label
+// unchanged. Use it only in text people read; the indexed label is the
+// repository's working directory.
+func productionQARepositoryName(label string) string {
+	i := 0
+	for i < len(label) && label[i] >= '0' && label[i] <= '9' {
+		i++
+	}
+	if i == 0 || i+1 >= len(label) || label[i] != '-' {
+		return label
+	}
+	return label[i+1:]
+}
+
 func productionQARepositories(targets []productionQATarget) []string {
 	out := make([]string, 0, len(targets))
 	for _, t := range targets {
