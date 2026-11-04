@@ -87,7 +87,8 @@ type preDeployLogsAPI interface {
 // registerTaskDefinition.
 func deployEcsServiceAfterPreDeploy(parameters map[string]interface{}, ecsClient *ecs.Client, logsClient preDeployLogsAPI,
 	ecsClusterArn, targetGroupArn, taskDefinitionArn string, logsWriter io.Writer, opts ecsServiceDeployOptions) error {
-	err := runPreDeployCommand(parameters, preDeployEcsClient(ecsClient), logsClient, ecsClusterArn, taskDefinitionArn, logsWriter)
+	err := runPreDeployCommand(parameters, preDeployEcsClient(ecsClient), logsClient, ecsClusterArn, taskDefinitionArn, logsWriter,
+		opts.previewStack)
 	if err != nil {
 		return err
 	}
@@ -101,11 +102,21 @@ func deployEcsServiceAfterPreDeploy(parameters map[string]interface{}, ecsClient
 	return nil
 }
 
+// preDeployCommandName is what the deploy logs and errors call the command: a
+// Task's backend preview runs its service's preview migrate command here.
+func preDeployCommandName(preview bool) string {
+	if preview {
+		return "preview migrate command"
+	}
+	return "pre-deploy command"
+}
+
 // runPreDeployCommand runs the deployment's pre-deploy command, if the Job has
 // one and isn't a restart, and returns an error the deploy shows as is when it
-// doesn't exit with 0.
+// doesn't exit with 0. preview is true for a Task's backend preview, whose
+// command is the preview migrate command.
 func runPreDeployCommand(parameters map[string]interface{}, ecsClient preDeployEcsAPI, logsClient preDeployLogsAPI,
-	ecsClusterArn, taskDefinitionArn string, logsWriter io.Writer) error {
+	ecsClusterArn, taskDefinitionArn string, logsWriter io.Writer, preview bool) error {
 	command, err := jobs.GetParameterValue[string](parameters, parameters_enums.PreDeployCommand)
 	if err != nil || len(command) == 0 {
 		return nil
@@ -121,31 +132,32 @@ func runPreDeployCommand(parameters map[string]interface{}, ecsClient preDeployE
 	if err != nil {
 		return err
 	}
-	logs, err := newPreDeployLogReader(parameters, logsClient, containerName, logsWriter)
+	name := preDeployCommandName(preview)
+	logs, err := newPreDeployLogReader(parameters, logsClient, containerName, logsWriter, name)
 	if err != nil {
 		return err
 	}
 
 	// Never the command itself: it may carry a secret (DATABASE_URL=… inline).
-	logs.write("Running the pre-deploy command\n")
+	logs.write("Running the " + name + "\n")
 	preDeployTaskDefinitionArn, err := registerPreDeployTaskDefinition(parameters, ecsClient, taskDefinitionArn, containerName)
 	if err != nil {
 		return preDeployFailure(parameters, ecsClient, ecsClusterArn,
-			fmt.Sprintf("The pre-deploy command couldn't start: %s.", err))
+			fmt.Sprintf("The %s couldn't start: %s.", name, err))
 	}
 	defer deregisterPreDeployTaskDefinition(ecsClient, preDeployTaskDefinitionArn, logs)
 	runTaskInput.TaskDefinition = aws.String(preDeployTaskDefinitionArn)
 
 	start := preDeployNow()
-	taskArn, failure := startPreDeployTask(ecsClient, runTaskInput)
+	taskArn, failure := startPreDeployTask(ecsClient, runTaskInput, name)
 	if len(failure) > 0 {
 		return preDeployFailure(parameters, ecsClient, ecsClusterArn, failure)
 	}
 	logs.follow(taskArn)
-	stoppedTask, stopErr := waitForPreDeployTask(ecsClient, ecsClusterArn, taskArn, logs, start)
+	stoppedTask, stopErr := waitForPreDeployTask(ecsClient, ecsClusterArn, taskArn, logs, start, name)
 	// Read once more after the task stops, for its last lines.
 	if !logs.read(math.MaxInt, preDeployNow().Add(preDeployFinalLogReadTimeout)) {
-		logs.write("The pre-deploy command's output is incomplete: the rest couldn't be read in time.\n")
+		logs.write("The " + name + "'s output is incomplete: the rest couldn't be read in time.\n")
 	}
 
 	outcome := getPreDeployOutcome(stoppedTask, containerName)
@@ -153,10 +165,10 @@ func runPreDeployCommand(parameters map[string]interface{}, ecsClient preDeployE
 		outcome.stopError = stopErr.Error()
 	}
 	if outcome.exitCode != nil {
-		logs.write(fmt.Sprintf("Pre-deploy command finished (exit code %d) in %s\n",
+		logs.write(fmt.Sprintf("%s%s finished (exit code %d) in %s\n", strings.ToUpper(name[:1]), name[1:],
 			*outcome.exitCode, preDeployNow().Sub(start).Round(time.Second)))
 	}
-	if message, ok := outcome.message(); !ok {
+	if message, ok := outcome.message(name); !ok {
 		return preDeployFailure(parameters, ecsClient, ecsClusterArn, message)
 	}
 	return nil
@@ -164,19 +176,19 @@ func runPreDeployCommand(parameters map[string]interface{}, ecsClient preDeployE
 
 // startPreDeployTask returns the started task's ARN, or the first sentence of
 // the deploy's error when ECS started none.
-func startPreDeployTask(ecsClient preDeployEcsAPI, runTaskInput *ecs.RunTaskInput) (taskArn string, failure string) {
+func startPreDeployTask(ecsClient preDeployEcsAPI, runTaskInput *ecs.RunTaskInput, name string) (taskArn string, failure string) {
 	ctx, cancel := context.WithTimeout(context.Background(), preDeployEcsCallTimeout)
 	defer cancel()
 	runTaskOutput, err := ecsClient.RunTask(ctx, runTaskInput)
 	if err != nil {
-		return "", fmt.Sprintf("The pre-deploy command couldn't start: %s.", err)
+		return "", fmt.Sprintf("The %s couldn't start: %s.", name, err)
 	}
 	if len(runTaskOutput.Tasks) == 0 {
 		reason := "ECS started no task"
 		if len(runTaskOutput.Failures) > 0 && len(aws.ToString(runTaskOutput.Failures[0].Reason)) > 0 {
 			reason = aws.ToString(runTaskOutput.Failures[0].Reason)
 		}
-		return "", fmt.Sprintf("The pre-deploy command couldn't start: %s.", reason)
+		return "", fmt.Sprintf("The %s couldn't start: %s.", name, reason)
 	}
 	return aws.ToString(runTaskOutput.Tasks[0].TaskArn), ""
 }
@@ -185,7 +197,7 @@ func startPreDeployTask(ecsClient preDeployEcsAPI, runTaskInput *ecs.RunTaskInpu
 // stops and returns the stopped task, or stops it and returns nil when it
 // doesn't finish in time, with StopTask's error if it couldn't be stopped.
 func waitForPreDeployTask(ecsClient preDeployEcsAPI, ecsClusterArn, taskArn string, logs *preDeployLogReader,
-	start time.Time) (*ecsTypes.Task, error) {
+	start time.Time, name string) (*ecsTypes.Task, error) {
 	deadline := start.Add(preDeployCommandTimeout)
 	for {
 		logs.read(preDeployLogPagesPerPoll, deadline)
@@ -202,7 +214,7 @@ func waitForPreDeployTask(ecsClient preDeployEcsAPI, ecsClusterArn, taskArn stri
 			return &describeTasksOutput.Tasks[0], nil
 		}
 		if !preDeployNow().Before(deadline) {
-			return nil, stopPreDeployTask(ecsClient, ecsClusterArn, taskArn)
+			return nil, stopPreDeployTask(ecsClient, ecsClusterArn, taskArn, name)
 		}
 		preDeploySleep(preDeployPollInterval)
 	}
@@ -210,14 +222,14 @@ func waitForPreDeployTask(ecsClient preDeployEcsAPI, ecsClusterArn, taskArn stri
 
 // stopPreDeployTask stops the timed-out task, trying a few times since a task
 // left running could go on changing the database.
-func stopPreDeployTask(ecsClient preDeployEcsAPI, ecsClusterArn, taskArn string) error {
+func stopPreDeployTask(ecsClient preDeployEcsAPI, ecsClusterArn, taskArn, name string) error {
 	var err error
 	for attempt := 1; attempt <= preDeployStopTaskAttempts; attempt++ {
 		ctx, cancel := context.WithTimeout(context.Background(), preDeployEcsCallTimeout)
 		_, err = ecsClient.StopTask(ctx, &ecs.StopTaskInput{
 			Cluster: aws.String(ecsClusterArn),
 			Task:    aws.String(taskArn),
-			Reason:  aws.String("The pre-deploy command didn't finish within 30 minutes"),
+			Reason:  aws.String("The " + name + " didn't finish within 30 minutes"),
 		})
 		cancel()
 		if err == nil {
@@ -378,22 +390,23 @@ func getPreDeployOutcome(stoppedTask *ecsTypes.Task, containerName string) preDe
 	return outcome
 }
 
-// message is the first sentence of the deploy's error; ok means exit code 0.
-func (o preDeployOutcome) message() (message string, ok bool) {
+// message is the first sentence of the deploy's error, naming the command
+// name; ok means exit code 0.
+func (o preDeployOutcome) message(name string) (message string, ok bool) {
 	switch {
 	case o.timedOut && len(o.stopError) > 0:
-		return fmt.Sprintf("The pre-deploy command didn't finish within 30 minutes and couldn't be stopped: %s.",
-			strings.TrimSuffix(o.stopError, ".")), false
+		return fmt.Sprintf("The %s didn't finish within 30 minutes and couldn't be stopped: %s.",
+			name, strings.TrimSuffix(o.stopError, ".")), false
 	case o.timedOut:
-		return "The pre-deploy command didn't finish within 30 minutes and was stopped.", false
+		return "The " + name + " didn't finish within 30 minutes and was stopped.", false
 	case o.exitCode == nil:
 		reason := o.stoppedReason
 		if len(reason) == 0 {
 			reason = "ECS gave no reason"
 		}
-		return fmt.Sprintf("The pre-deploy command couldn't run: %s.", strings.TrimSuffix(reason, ".")), false
+		return fmt.Sprintf("The %s couldn't run: %s.", name, strings.TrimSuffix(reason, ".")), false
 	case *o.exitCode != 0:
-		return fmt.Sprintf("The pre-deploy command failed with exit code %d.", *o.exitCode), false
+		return fmt.Sprintf("The %s failed with exit code %d.", name, *o.exitCode), false
 	}
 	return "", true
 }
@@ -447,15 +460,16 @@ type preDeployLogReader struct {
 	containerName   string
 	logStreamName   string
 	logsWriter      io.Writer
+	commandName     string // what the deploy logs call the command
 	nextToken       *string
 	reportedError   bool
 	writeFailed     bool
 }
 
 // newPreDeployLogReader reads from the task definition's awslogs group and
-// stream prefix.
+// stream prefix; commandName is what its messages call the command.
 func newPreDeployLogReader(parameters map[string]interface{}, client preDeployLogsAPI, containerName string,
-	logsWriter io.Writer) (*preDeployLogReader, error) {
+	logsWriter io.Writer, commandName string) (*preDeployLogReader, error) {
 	logGroupName, err := commandUtils.GetLogGroupName(parameters)
 	if err != nil {
 		return nil, err
@@ -470,6 +484,7 @@ func newPreDeployLogReader(parameters map[string]interface{}, client preDeployLo
 		logStreamPrefix: logStreamPrefix,
 		containerName:   containerName,
 		logsWriter:      logsWriter,
+		commandName:     commandName,
 	}, nil
 }
 
@@ -506,7 +521,7 @@ func (r *preDeployLogReader) read(maxPages int, deadline time.Time) (complete bo
 			if !r.reportedError {
 				// The output is best-effort; the exit code decides the deploy.
 				r.reportedError = true
-				r.write(fmt.Sprintf("Couldn't read the pre-deploy command's output: %s\n", err))
+				r.write(fmt.Sprintf("Couldn't read the %s's output: %s\n", r.commandName, err))
 			}
 			return false
 		}

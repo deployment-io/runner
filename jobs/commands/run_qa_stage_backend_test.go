@@ -143,6 +143,42 @@ func TestQABackendOnlyChangeRunsQA(t *testing.T) {
 	}
 }
 
+// The QA stage's log names the site repositories QA'd only when there are any;
+// a backend-only QA run has just the backend previews line.
+func TestQALogNamesWhatWasQAd(t *testing.T) {
+	for _, tt := range []struct {
+		name             string
+		dirs, static     []string
+		backend          []string
+		want, wantAbsent []string
+	}{
+		{name: "backend previews only", dirs: []string{"0-api"}, backend: []string{"0-api"},
+			want: []string{"Backend previews QA'd: 0-api\n"}, wantAbsent: []string{"Repositories QA'd:"}},
+		{name: "sites and backend previews", dirs: []string{"0-acme-site", "1-api"}, static: []string{"0-acme-site"},
+			backend: []string{"1-api"},
+			want:    []string{"Repositories QA'd: 0-acme-site\n", "Backend previews QA'd: 1-api\n"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var logs strings.Builder
+			stage := backendGateStage(t, &logs, tt.dirs, tt.static, tt.backend)
+			stage.runQA = func(int) (agentResult, error) { return qaCompleted(signUpPassed), nil }
+			if _, err := stage.run(); err != nil {
+				t.Fatal(err)
+			}
+			for _, want := range tt.want {
+				if !strings.Contains(logs.String(), want) {
+					t.Errorf("the log lacks %q:\n%s", want, logs.String())
+				}
+			}
+			for _, absent := range tt.wantAbsent {
+				if strings.Contains(logs.String(), absent) {
+					t.Errorf("the log has %q:\n%s", absent, logs.String())
+				}
+			}
+		})
+	}
+}
+
 // --- the round's backend deploys ----------------------------------------------
 
 // backendRoundStage is a stage ready for deployAndSpawnQA, with repositories
