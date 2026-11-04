@@ -70,7 +70,7 @@ func (rp *RunProductionQA) healthCheck(t productionQATarget, logsWriter io.Write
 		path = u.RequestURI()
 	}
 	c := qaCriterion{Criterion: fmt.Sprintf("%s: GET %s answers with a status from %d to %d",
-		t.Repository, path, productionQAHealthMinStatus, productionQAHealthMaxStatus)}
+		productionQARepositoryName(t.Repository), path, productionQAHealthMinStatus, productionQAHealthMaxStatus)}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go func() {
@@ -121,7 +121,7 @@ func (rp *RunProductionQA) healthCheck(t productionQATarget, logsWriter io.Write
 			return c, true
 		}
 	}
-	io.WriteString(logsWriter, fmt.Sprintf("Production QA: health check of %s GET %s → %s\n", t.Repository, t.HealthURL, answer))
+	io.WriteString(logsWriter, fmt.Sprintf("Production QA: health check of %s GET %s → %s\n", productionQARepositoryName(t.Repository), t.HealthURL, answer))
 	return c, false
 }
 
@@ -192,7 +192,7 @@ func healthOnlyRound(parameters map[string]interface{}, targets []productionQATa
 	acceptance := readAcceptanceCriteria(parameters)
 	var services []string
 	for _, t := range targets {
-		services = append(services, t.Repository+"'s")
+		services = append(services, productionQARepositoryName(t.Repository)+"'s")
 	}
 	reason := fmt.Sprintf("Not checked: no https address to open it in a browser — add a custom domain to %s service.",
 		strings.Join(services, " or "))
