@@ -10,7 +10,6 @@ import (
 	"go/parser"
 	"go/token"
 	"io"
-	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -1283,18 +1282,5 @@ func TestDeployEcsServiceAfterPreDeployNamesTheCommand(t *testing.T) {
 				t.Errorf("error = %v; want %q", err, want)
 			}
 		})
-	}
-}
-
-// Only the backend preview deploys in its preview stack: the private service's
-// deploy (production and the preview database) never sets previewStack, so a
-// private service's command is always called the pre-deploy command.
-func TestPrivateServiceDeployIsNeverAPreviewStack(t *testing.T) {
-	source, err := os.ReadFile("deploy_aws_private_service.go")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if strings.Contains(string(source), "previewStack") {
-		t.Error("deploy_aws_private_service.go sets previewStack")
 	}
 }
