@@ -426,8 +426,9 @@ func TestVerifyAPIRequestRefusedLogLines(t *testing.T) {
 	}
 }
 
-// Headers Go's parser takes out of resp.Header (Transfer-Encoding, Trailer,
-// Connection: close) are still in the result.
+// Headers Go's parser takes out of resp.Header (Transfer-Encoding, Trailer)
+// are still in the result; Connection never is (it would be the runner's own
+// "close").
 func TestVerifyAPIRequestParsedResponseHeaders(t *testing.T) {
 	probeServer(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Trailer", "X-Checksum")
@@ -442,12 +443,58 @@ func TestVerifyAPIRequestParsedResponseHeaders(t *testing.T) {
 	if res.Body != "chunk one, chunk two" {
 		t.Errorf("body = %q", res.Body)
 	}
-	for name, want := range map[string]string{"Transfer-Encoding": "chunked", "Trailer": "X-Checksum", "Connection": "close"} {
+	for name, want := range map[string]string{"Transfer-Encoding": "chunked", "Trailer": "X-Checksum"} {
 		if got := res.Headers[name]; got != want {
 			t.Errorf("%s = %q, want %q (headers %v)", name, got, want, res.Headers)
 		}
 	}
+	if got, ok := res.Headers["Connection"]; ok {
+		t.Errorf("Connection = %q, want it left out", got)
+	}
 	if res.HeadersTruncated {
 		t.Error("headers_truncated without a cut")
+	}
+}
+
+// A body delimited by the connection closing (no Content-Length, not chunked)
+// reports no Connection header the backend didn't send.
+func TestVerifyAPIRequestNoInventedConnectionHeader(t *testing.T) {
+	probeServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		conn, buf, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			t.Errorf("hijack: %v", err)
+			return
+		}
+		defer conn.Close()
+		buf.WriteString("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nuntil close")
+		buf.Flush()
+	})
+	res, _ := apiCall(t, apiTestTool(nil), map[string]any{"url": apiTestURL + "/"})
+	if res.Status != 200 || res.Body != "until close" {
+		t.Fatalf("status %d, body %q", res.Status, res.Body)
+	}
+	if got, ok := res.Headers["Connection"]; ok {
+		t.Errorf("Connection = %q, want it left out (headers %v)", got, res.Headers)
+	}
+}
+
+// A trailer the backend sends without declaring it isn't reported as a
+// Trailer header it never sent.
+func TestVerifyAPIRequestNoInventedTrailerHeader(t *testing.T) {
+	probeServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		io.WriteString(w, "body")
+		w.(http.Flusher).Flush() // chunked, not a Content-Length
+		w.Header().Set(http.TrailerPrefix+"X-Undeclared", "late")
+	})
+	res, _ := apiCall(t, apiTestTool(nil), map[string]any{"url": apiTestURL + "/"})
+	if res.Status != 200 || res.Body != "body" {
+		t.Fatalf("status %d, body %q", res.Status, res.Body)
+	}
+	if res.Headers["Transfer-Encoding"] != "chunked" {
+		t.Fatalf("want a chunked response, headers %v", res.Headers)
+	}
+	if got, ok := res.Headers["Trailer"]; ok {
+		t.Errorf("Trailer = %q, want it left out (headers %v)", got, res.Headers)
 	}
 }
