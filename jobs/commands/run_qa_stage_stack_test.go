@@ -224,10 +224,14 @@ func TestQAStackPathOnlyFrom1937(t *testing.T) {
 				if !hasPreviews || hasBackends || env["QA_REPOSITORIES"] != "" || f.wiringCalls != 1 {
 					t.Errorf("env %v, wiring calls %d; want QA_PREVIEWS, no QA_BACKENDS, blank QA_REPOSITORIES", env, f.wiringCalls)
 				}
-				if tools != "ping,verify_preview_reachable,verify_preview_rendered" {
-					t.Errorf("tools = %s", tools)
+				// Its backend deployed, so the round has verify_api_request too.
+				if tools != "ping,verify_preview_reachable,verify_preview_rendered,verify_api_request" || env["QA_API_REQUEST_TOOL"] != "1" {
+					t.Errorf("tools = %s, QA_API_REQUEST_TOOL = %q", tools, env["QA_API_REQUEST_TOOL"])
 				}
 				return
+			}
+			if _, set := env["QA_API_REQUEST_TOOL"]; set || strings.Contains(tools, "verify_api_request") {
+				t.Errorf("the older path serves verify_api_request: tools = %s", tools)
 			}
 			if hasPreviews || f.wiringCalls != 0 || len(f.events) != 0 || env["QA_REPOSITORIES"] != "0-web" || hasBackends != tc.wantBackends {
 				t.Errorf("env %v, stack events %v; want today's", env, f.events)
