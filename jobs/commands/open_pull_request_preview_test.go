@@ -18,7 +18,7 @@ func (s stubPreviewLister) ListTaskPreviews(string, string) ([]task_previews.Tas
 	return s.previews, s.err
 }
 
-const previewFootnote = "A preview shows the code as of the agent's last deploy to it, which can be earlier than this pull request's final commit. Previews are removed once all of this Task's pull requests are merged or closed, about 72 hours after its last preview deploy, or when the Task is deleted — whichever comes first."
+const previewFootnote = "A preview shows the code as of its last deploy, which can be earlier than this pull request's final commit. Previews are removed once all of this Task's pull requests are merged or closed, about 72 hours after its last preview deploy, or when the Task is deleted — whichever comes first."
 
 func previewOpener(lister stubPreviewLister) *taskOpenPR {
 	opr := reviewTestOpener(completedReview(false))
@@ -31,7 +31,7 @@ func TestPreviewSection_OnePreview(t *testing.T) {
 		{ServiceName: "acme-web-dist", ServiceType: task_previews.ServiceTypeStaticSite, URL: "https://d1abc.cloudfront.net"},
 	}}).buildPRTitleAndBody()
 	want := "**Preview**\n\n" +
-		"The agent deployed this Task's change to a preview while working on it:\n\n" +
+		"Previews of this Task's change:\n\n" +
 		"- acme-web-dist: https://d1abc.cloudfront.net\n\n" +
 		previewFootnote
 	if !strings.Contains(body, want) {
@@ -54,7 +54,7 @@ func TestPreviewSection_SixPreviews(t *testing.T) {
 	}
 	got := formatPreviewSection(previews)
 	want := "**Preview**\n\n" +
-		"The agent deployed this Task's change to a preview while working on it:\n\n" +
+		"Previews of this Task's change:\n\n" +
 		"- svc-1: https://d1.cloudfront.net\n" +
 		"- svc-2: https://d2.cloudfront.net\n" +
 		"- svc-3: https://d3.cloudfront.net\n" +
@@ -85,7 +85,7 @@ func TestPreviewSection_AbsentWithoutPreviews(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, body := previewOpener(lister).buildPRTitleAndBody()
-			if strings.Contains(body, "**Preview**") || strings.Contains(body, "preview while working") {
+			if strings.Contains(body, "**Preview**") || strings.Contains(body, "Previews of this Task's change") {
 				t.Fatalf("Preview part should be absent:\n%s", body)
 			}
 		})
@@ -119,5 +119,29 @@ func TestPreviewSection_BackendSentence(t *testing.T) {
 				t.Fatalf("removal sentence changed:\n%s", got)
 			}
 		})
+	}
+}
+
+// The whole section with a backend preview: the intro and the "code as of"
+// sentence don't say who deployed the previews, since the QA stage builds
+// backend previews too.
+func TestPreviewSection_WithBackendPreview(t *testing.T) {
+	got := formatPreviewSection([]task_previews.TaskPreviewV1{
+		{ServiceName: "acme-web-dist", ServiceType: task_previews.ServiceTypeStaticSite, URL: "https://d1abc.cloudfront.net"},
+		{ServiceName: "acme-api", ServiceType: task_previews.ServiceTypeWebService, URL: "https://api-preview.example.com"},
+	})
+	want := "**Preview**\n\n" +
+		"Previews of this Task's change:\n\n" +
+		"- acme-web-dist: https://d1abc.cloudfront.net\n" +
+		"- acme-api: https://api-preview.example.com\n\n" +
+		"A preview shows the code as of its last deploy, which can be earlier than this pull request's final commit. " +
+		"Previews are removed once all of this Task's pull requests are merged or closed, about 72 hours after its last preview deploy, " +
+		"or when the Task is deleted — whichever comes first." +
+		" Backend previews are removed sooner, about 4 hours after the Task's last preview deploy.\n"
+	if got != want {
+		t.Fatalf("got:\n%q\nwant:\n%q", got, want)
+	}
+	if strings.Contains(got, "agent") {
+		t.Errorf("the section says the agent deployed the previews:\n%s", got)
 	}
 }

@@ -383,7 +383,7 @@ func formatPreviewSection(previews []task_previews.TaskPreviewV1) string {
 	}
 	var sb strings.Builder
 	sb.WriteString("**Preview**\n\n")
-	sb.WriteString("The agent deployed this Task's change to a preview while working on it:\n\n")
+	sb.WriteString("Previews of this Task's change:\n\n")
 	shown := previews
 	if len(shown) > prBodyPreviewMaxItems {
 		shown = shown[:prBodyPreviewMaxItems]
@@ -398,7 +398,7 @@ func formatPreviewSection(previews []task_previews.TaskPreviewV1) string {
 	if omitted := len(previews) - len(shown); omitted > 0 {
 		sb.WriteString(fmt.Sprintf("- and %d more under Resources → Previews in the dashboard\n", omitted))
 	}
-	sb.WriteString("\nA preview shows the code as of the agent's last deploy to it, which can be earlier than this pull request's final commit. ")
+	sb.WriteString("\nA preview shows the code as of its last deploy, which can be earlier than this pull request's final commit. ")
 	sb.WriteString("Previews are removed once all of this Task's pull requests are merged or closed, about 72 hours after its last preview deploy, or when the Task is deleted — whichever comes first.")
 	if hasBackendPreview(previews) {
 		sb.WriteString(" Backend previews are removed sooner, about 4 hours after the Task's last preview deploy.")

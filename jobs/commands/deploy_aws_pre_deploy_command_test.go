@@ -10,6 +10,7 @@ import (
 	"go/parser"
 	"go/token"
 	"io"
+	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -277,7 +278,7 @@ func runPreDeploy(t *testing.T, parameters map[string]interface{}, ecsClient *fa
 	logsClient *fakePreDeployLogs) (string, error) {
 	t.Helper()
 	var logs bytes.Buffer
-	err := runPreDeployCommand(parameters, ecsClient, logsClient, testClusterArn, testTaskDefinitionArn, &logs)
+	err := runPreDeployCommand(parameters, ecsClient, logsClient, testClusterArn, testTaskDefinitionArn, &logs, false)
 	if strings.Contains(logs.String(), testCommand) || strings.Contains(logs.String(), "hunter2") {
 		t.Errorf("the deploy logs carry the command itself:\n%s", logs.String())
 	}
@@ -729,7 +730,7 @@ func TestPreDeployTimeoutNotHeldOffByEndlessOutput(t *testing.T) {
 	ecsClient := &fakePreDeployEcs{describeTasks: []ecsTypes.Task{runningTask()}}
 	logsClient := &endlessPreDeployLogs{}
 	var logs bytes.Buffer
-	err := runPreDeployCommand(preDeployParameters(testCommand), ecsClient, logsClient, testClusterArn, testTaskDefinitionArn, &logs)
+	err := runPreDeployCommand(preDeployParameters(testCommand), ecsClient, logsClient, testClusterArn, testTaskDefinitionArn, &logs, false)
 	if err == nil || !strings.HasPrefix(err.Error(), "The pre-deploy command didn't finish within 30 minutes and was stopped.") {
 		t.Fatalf("error = %v; want the timeout", err)
 	}
@@ -771,7 +772,7 @@ func TestPreDeployLogsReadToTheEndAfterTheTaskStops(t *testing.T) {
 	ecsClient := &fakePreDeployEcs{describeTasks: []ecsTypes.Task{stoppedTask(aws.Int32(1), "")}}
 	logsClient := &finitePreDeployLogs{pages: 5000}
 	var logs bytes.Buffer
-	runPreDeployCommand(preDeployParameters(testCommand), ecsClient, logsClient, testClusterArn, testTaskDefinitionArn, &logs)
+	runPreDeployCommand(preDeployParameters(testCommand), ecsClient, logsClient, testClusterArn, testTaskDefinitionArn, &logs, false)
 	if !strings.Contains(logs.String(), "line 4999\n") || strings.Contains(logs.String(), "incomplete") {
 		t.Errorf("the last lines are missing or reported missing:\n%s", logs.String()[logs.Len()-200:])
 	}
@@ -809,7 +810,7 @@ func TestPreDeployTimeoutNotHeldOffByStalledLogs(t *testing.T) {
 	ecsClient := &fakePreDeployEcs{describeTasks: []ecsTypes.Task{runningTask()}}
 	var logs bytes.Buffer
 	err := runPreDeployCommand(preDeployParameters(testCommand), ecsClient, &stalledPreDeployLogs{}, testClusterArn,
-		testTaskDefinitionArn, &logs)
+		testTaskDefinitionArn, &logs, false)
 	if err == nil || !strings.HasPrefix(err.Error(), timedOut) || len(ecsClient.stopTaskInputs) != 1 {
 		t.Errorf("a stalled log read: error = %v after %d StopTask calls; want the timeout after 1", err,
 			len(ecsClient.stopTaskInputs))
@@ -819,7 +820,7 @@ func TestPreDeployTimeoutNotHeldOffByStalledLogs(t *testing.T) {
 	ecsClient = &fakePreDeployEcs{describeTasks: []ecsTypes.Task{runningTask()}}
 	writer := &blockedWriter{release: make(chan struct{})}
 	err = runPreDeployCommand(preDeployParameters(testCommand), ecsClient, &endlessPreDeployLogs{}, testClusterArn,
-		testTaskDefinitionArn, writer)
+		testTaskDefinitionArn, writer, false)
 	close(writer.release)
 	if err == nil || !strings.HasPrefix(err.Error(), timedOut) || len(ecsClient.stopTaskInputs) != 1 {
 		t.Errorf("a blocked deploy log: error = %v after %d StopTask calls; want the timeout after 1", err,
@@ -839,7 +840,7 @@ func TestPreDeployFinishLineNotHeldByBlockedLogs(t *testing.T) {
 	writer := &blockedWriter{release: make(chan struct{})}
 	defer close(writer.release)
 	err := runPreDeployCommand(preDeployParameters(testCommand), ecsClient,
-		&fakePreDeployLogs{pages: [][]string{{"migrated"}}}, testClusterArn, testTaskDefinitionArn, writer)
+		&fakePreDeployLogs{pages: [][]string{{"migrated"}}}, testClusterArn, testTaskDefinitionArn, writer, false)
 	if err != nil {
 		t.Errorf("exit 0 behind a blocked deploy log: error = %v; want nil", err)
 	}
@@ -858,7 +859,7 @@ func TestPreDeployNotHeldByStalledEcsCalls(t *testing.T) {
 	stalledAfterStart := &stalledAfterRunTask{fakePreDeployEcs: ecsClient}
 	var logs bytes.Buffer
 	err := runPreDeployCommand(parameters, stalledAfterStart, &fakePreDeployLogs{}, testClusterArn,
-		testTaskDefinitionArn, &logs)
+		testTaskDefinitionArn, &logs, false)
 	if err == nil || !strings.HasPrefix(err.Error(), "The pre-deploy command didn't finish within 30 minutes and couldn't be stopped: ") ||
 		len(ecsClient.stopTaskInputs) != preDeployStopTaskAttempts {
 		t.Errorf("stalled ECS calls: error = %v after %d StopTask calls; want it couldn't be stopped after %d",
@@ -919,7 +920,7 @@ func TestPreDeployLogsStopCopyingWhenTheDeployLogsClose(t *testing.T) {
 	ecsClient := &fakePreDeployEcs{describeTasks: []ecsTypes.Task{runningTask(), stoppedTask(aws.Int32(0), "")}}
 	logsClient := &fakePreDeployLogs{pages: [][]string{{"a", "b"}, {"c"}}}
 	writer := &failingWriter{}
-	err := runPreDeployCommand(preDeployParameters(testCommand), ecsClient, logsClient, testClusterArn, testTaskDefinitionArn, writer)
+	err := runPreDeployCommand(preDeployParameters(testCommand), ecsClient, logsClient, testClusterArn, testTaskDefinitionArn, writer, false)
 	if err != nil {
 		t.Fatalf("the exit code decides the deploy, not the logs: %v", err)
 	}
@@ -1101,5 +1102,199 @@ func TestPreDeployTaskDefinitionErrorsFailToStart(t *testing.T) {
 				t.Errorf("deregistered %d task definitions; none was registered", len(tt.ecsClient.deregisterInputs))
 			}
 		})
+	}
+}
+
+// failingPreDeployLogs can't read the stream at all.
+type failingPreDeployLogs struct{}
+
+func (failingPreDeployLogs) GetLogEvents(context.Context, *cloudwatchlogs.GetLogEventsInput, ...func(*cloudwatchlogs.Options)) (*cloudwatchlogs.GetLogEventsOutput, error) {
+	return nil, errors.New("AccessDeniedException: logs")
+}
+
+// A Task's backend preview runs its preview migrate command through the
+// pre-deploy command's code: every message names it as such, and production
+// deploys keep theirs as they were.
+func TestPreDeployMessagesNameTheCommand(t *testing.T) {
+	const kept = " The deploy was stopped; the previous version keeps running."
+	for _, tt := range []struct {
+		name                        string
+		ecsClient                   func() *fakePreDeployEcs
+		logsClient                  preDeployLogsAPI
+		wantProduction, wantPreview string // the error, or "" for exit code 0
+		wantProductionLogs          []string
+		wantPreviewLogs             []string
+		wantStopReason              [2]string // production, preview
+	}{
+		{
+			name: "exit 0",
+			ecsClient: func() *fakePreDeployEcs {
+				return &fakePreDeployEcs{describeTasks: []ecsTypes.Task{stoppedTask(aws.Int32(0), "")}}
+			},
+			logsClient:         &fakePreDeployLogs{pages: [][]string{{"migrated"}}},
+			wantProductionLogs: []string{"Running the pre-deploy command\n", "migrated\n", "Pre-deploy command finished (exit code 0) in "},
+			wantPreviewLogs:    []string{"Running the preview migrate command\n", "migrated\n", "Preview migrate command finished (exit code 0) in "},
+		},
+		{
+			name: "exit 1",
+			ecsClient: func() *fakePreDeployEcs {
+				return &fakePreDeployEcs{describeTasks: []ecsTypes.Task{stoppedTask(aws.Int32(1), "")}}
+			},
+			logsClient:         &fakePreDeployLogs{},
+			wantProduction:     "The pre-deploy command failed with exit code 1." + kept,
+			wantPreview:        "The preview migrate command failed with exit code 1." + kept,
+			wantProductionLogs: []string{"Pre-deploy command finished (exit code 1) in "},
+			wantPreviewLogs:    []string{"Preview migrate command finished (exit code 1) in "},
+		},
+		{
+			name: "output unreadable",
+			ecsClient: func() *fakePreDeployEcs {
+				return &fakePreDeployEcs{describeTasks: []ecsTypes.Task{stoppedTask(aws.Int32(0), "")}}
+			},
+			logsClient: failingPreDeployLogs{},
+			wantProductionLogs: []string{
+				"Couldn't read the pre-deploy command's output: AccessDeniedException: logs\n",
+				"The pre-deploy command's output is incomplete: the rest couldn't be read in time.\n",
+			},
+			wantPreviewLogs: []string{
+				"Couldn't read the preview migrate command's output: AccessDeniedException: logs\n",
+				"The preview migrate command's output is incomplete: the rest couldn't be read in time.\n",
+			},
+		},
+		{
+			name: "task definition not registered",
+			ecsClient: func() *fakePreDeployEcs {
+				return &fakePreDeployEcs{registerErr: errors.New("ClientException: too many revisions")}
+			},
+			logsClient:     &fakePreDeployLogs{},
+			wantProduction: "The pre-deploy command couldn't start: ClientException: too many revisions." + kept,
+			wantPreview:    "The preview migrate command couldn't start: ClientException: too many revisions." + kept,
+		},
+		{
+			name: "RunTask error",
+			ecsClient: func() *fakePreDeployEcs {
+				return &fakePreDeployEcs{runTaskErr: errors.New("AccessDeniedException: not authorized")}
+			},
+			logsClient:     &fakePreDeployLogs{},
+			wantProduction: "The pre-deploy command couldn't start: AccessDeniedException: not authorized." + kept,
+			wantPreview:    "The preview migrate command couldn't start: AccessDeniedException: not authorized." + kept,
+		},
+		{
+			name: "RunTask started no task",
+			ecsClient: func() *fakePreDeployEcs {
+				return &fakePreDeployEcs{runTaskOutput: &ecs.RunTaskOutput{Failures: []ecsTypes.Failure{{Reason: aws.String("RESOURCE:ENI")}}}}
+			},
+			logsClient:     &fakePreDeployLogs{},
+			wantProduction: "The pre-deploy command couldn't start: RESOURCE:ENI." + kept,
+			wantPreview:    "The preview migrate command couldn't start: RESOURCE:ENI." + kept,
+		},
+		{
+			name: "no exit code",
+			ecsClient: func() *fakePreDeployEcs {
+				return &fakePreDeployEcs{describeTasks: []ecsTypes.Task{stoppedTask(nil, "CannotPullContainerError")}}
+			},
+			logsClient:     &fakePreDeployLogs{},
+			wantProduction: "The pre-deploy command couldn't run: CannotPullContainerError." + kept,
+			wantPreview:    "The preview migrate command couldn't run: CannotPullContainerError." + kept,
+		},
+		{
+			name: "timeout",
+			ecsClient: func() *fakePreDeployEcs {
+				return &fakePreDeployEcs{describeTasks: []ecsTypes.Task{runningTask()}}
+			},
+			logsClient:     &fakePreDeployLogs{},
+			wantProduction: "The pre-deploy command didn't finish within 30 minutes and was stopped." + kept,
+			wantPreview:    "The preview migrate command didn't finish within 30 minutes and was stopped." + kept,
+			wantStopReason: [2]string{"The pre-deploy command didn't finish within 30 minutes",
+				"The preview migrate command didn't finish within 30 minutes"},
+		},
+		{
+			name: "timeout, not stopped",
+			ecsClient: func() *fakePreDeployEcs {
+				return &fakePreDeployEcs{describeTasks: []ecsTypes.Task{runningTask()}, stopTaskErrs: 100}
+			},
+			logsClient: &fakePreDeployLogs{},
+			wantProduction: "The pre-deploy command didn't finish within 30 minutes and couldn't be stopped: ServerException: try again." +
+				kept,
+			wantPreview: "The preview migrate command didn't finish within 30 minutes and couldn't be stopped: ServerException: try again." +
+				kept,
+			wantStopReason: [2]string{"The pre-deploy command didn't finish within 30 minutes",
+				"The preview migrate command didn't finish within 30 minutes"},
+		},
+	} {
+		for _, preview := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/preview=%v", tt.name, preview), func(t *testing.T) {
+				fakePreDeployClock(t, 4*time.Minute)
+				ecsClient := tt.ecsClient()
+				var logs bytes.Buffer
+				err := runPreDeployCommand(preDeployParameters(testCommand), ecsClient, tt.logsClient, testClusterArn,
+					testTaskDefinitionArn, &logs, preview)
+				wantErr, wantLogs, wantStopReason := tt.wantProduction, tt.wantProductionLogs, tt.wantStopReason[0]
+				if preview {
+					wantErr, wantLogs, wantStopReason = tt.wantPreview, tt.wantPreviewLogs, tt.wantStopReason[1]
+				}
+				if gotErr := fmt.Sprint(err); (err == nil) != (wantErr == "") || (err != nil && gotErr != wantErr) {
+					t.Errorf("error = %v; want %q", err, wantErr)
+				}
+				for _, line := range wantLogs {
+					if !strings.Contains(logs.String(), line) {
+						t.Errorf("deploy logs lack %q:\n%s", line, logs.String())
+					}
+				}
+				for _, in := range ecsClient.stopTaskInputs {
+					if got := aws.ToString(in.Reason); got != wantStopReason {
+						t.Errorf("StopTask reason = %q; want %q", got, wantStopReason)
+					}
+				}
+				if preview {
+					for what, text := range map[string]string{"deploy logs": logs.String(), "error": fmt.Sprint(err)} {
+						if strings.Contains(strings.ToLower(text), "pre-deploy command") {
+							t.Errorf("the preview's %s name the pre-deploy command:\n%s", what, text)
+						}
+					}
+				}
+			})
+		}
+	}
+}
+
+// deployEcsServiceAfterPreDeploy names the command after the deploy's stack:
+// the backend preview's (previewStack) is its preview migrate command.
+func TestDeployEcsServiceAfterPreDeployNamesTheCommand(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		opts ecsServiceDeployOptions
+		want string
+	}{
+		{"production web service", ecsServiceDeployOptions{}, "The pre-deploy command failed with exit code 1."},
+		{"private service", ecsServiceDeployOptions{registerDnsName: true}, "The pre-deploy command failed with exit code 1."},
+		{"backend preview", ecsServiceDeployOptions{skipServiceStableWait: true, previewStack: true, noCircuitBreaker: true},
+			"The preview migrate command failed with exit code 1."},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			fakePreDeployClock(t, time.Second)
+			steps := &fakeServiceSteps{preDeployEcsClient: &fakePreDeployEcs{describeTasks: []ecsTypes.Task{stoppedTask(aws.Int32(1), "")}}}
+			stubServiceSteps(t, steps)
+			var logs bytes.Buffer
+			err := deployEcsServiceAfterPreDeploy(preDeployParameters(testCommand), nil, &fakePreDeployLogs{},
+				testClusterArn, "", testTaskDefinitionArn, &logs, tt.opts)
+			want := tt.want + " The deploy was stopped; the previous version keeps running."
+			if err == nil || err.Error() != want {
+				t.Errorf("error = %v; want %q", err, want)
+			}
+		})
+	}
+}
+
+// Only the backend preview deploys in its preview stack: the private service's
+// deploy (production and the preview database) never sets previewStack, so a
+// private service's command is always called the pre-deploy command.
+func TestPrivateServiceDeployIsNeverAPreviewStack(t *testing.T) {
+	source, err := os.ReadFile("deploy_aws_private_service.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(source), "previewStack") {
+		t.Error("deploy_aws_private_service.go sets previewStack")
 	}
 }
