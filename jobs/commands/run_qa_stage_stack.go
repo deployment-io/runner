@@ -111,7 +111,8 @@ type qaStackRound struct {
 
 // deployStackAndSpawnQA is a stack-path QA round once its directory is ready: it
 // deploys every preview, adds QA_PREVIEWS to env and spawns the QA run with the
-// verify tools alone.
+// verify tools alone — and, when a backend preview deployed, verify_api_request
+// with QA_API_REQUEST_TOOL=1.
 func (s *qaStage) deployStackAndSpawnQA(round int, imageRef, qaDir string, env []string) (agentResult, error) {
 	previewDeps := buildStaticSitePreviewDeps(s.ctx, s.parameters, s.workDirHost, s.logsWriter)
 	mergeResults := s.newQAMergeResults()
@@ -131,7 +132,21 @@ func (s *qaStage) deployStackAndSpawnQA(round int, imageRef, qaDir string, env [
 	}
 	spec := s.qaSpawnSpec(imageRef, qaDir, withQAPreviews(env, previews), previewDeps)
 	spec.verifyToolsOnly = true
+	if hasDeployedBackend(previews) {
+		spec.apiRequestTool = true
+		spec.env = append(spec.env, "QA_API_REQUEST_TOOL=1")
+	}
 	return s.spawnQARound(label, spec)
+}
+
+// hasDeployedBackend reports whether previews has a backend preview with a URL.
+func hasDeployedBackend(previews []qaPreview) bool {
+	for _, p := range previews {
+		if p.Kind == qaPreviewBackend && p.URL != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // deployStack deploys the round's previews and records how they connect
