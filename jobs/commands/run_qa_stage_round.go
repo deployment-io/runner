@@ -184,7 +184,8 @@ func qaFirstErrorLine(err error, max int) string {
 }
 
 // roundWebPreviewDeps is a round's backend deploy deps: the tool's, around the
-// round's preview record, with its merge results and the stage's distributions.
+// round's preview record, with its merge results and the stage's distributions
+// and test users.
 func (s *qaStage) roundWebPreviewDeps(previewDeps *agenttools.DeployStaticSitePreviewDeps) *agenttools.DeployWebServicePreviewDeps {
 	var deps *agenttools.DeployWebServicePreviewDeps
 	if s.webPreviewDeps != nil {
@@ -197,6 +198,10 @@ func (s *qaStage) roundWebPreviewDeps(previewDeps *agenttools.DeployStaticSitePr
 		s.webDistributions = agenttools.NewWebPreviewDistributions()
 	}
 	deps.Distributions = s.webDistributions
+	if s.testUsers == nil {
+		s.testUsers = agenttools.NewPreviewTestUsers()
+	}
+	deps.TestUsers = s.testUsers
 	return deps
 }
 

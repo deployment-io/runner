@@ -19,6 +19,7 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
 	"github.com/deployment-io/deployment-runner/utils/aws_utils"
+	"github.com/deployment-io/deployment-runner/utils/redact"
 )
 
 // The pre-deploy command (e.g. database migrations) runs once per deploy of
@@ -83,7 +84,8 @@ type preDeployLogsAPI interface {
 
 // deployEcsServiceAfterPreDeploy runs the pre-deploy command with the newly
 // registered task definition and, only when it succeeds, creates or updates
-// the service with it. Both deploy commands call it right after
+// the service with it. A backend preview runs its preview seed command in
+// between, whose failure doesn't stop the deploy. Both deploy commands call it right after
 // registerTaskDefinition.
 func deployEcsServiceAfterPreDeploy(parameters map[string]interface{}, ecsClient *ecs.Client, logsClient preDeployLogsAPI,
 	ecsClusterArn, targetGroupArn, taskDefinitionArn string, logsWriter io.Writer, opts ecsServiceDeployOptions) error {
@@ -91,6 +93,10 @@ func deployEcsServiceAfterPreDeploy(parameters map[string]interface{}, ecsClient
 		opts.previewStack)
 	if err != nil {
 		return err
+	}
+	if opts.previewStack {
+		runPreviewSeedCommand(parameters, preDeployEcsClient(ecsClient), logsClient, ecsClusterArn, taskDefinitionArn, logsWriter,
+			opts.previewSeed)
 	}
 	_, shouldUpdateService, err := createEcsServiceStep(parameters, ecsClient, ecsClusterArn, targetGroupArn, taskDefinitionArn, logsWriter, opts)
 	if err != nil {
@@ -124,26 +130,66 @@ func runPreDeployCommand(parameters map[string]interface{}, ecsClient preDeployE
 	if restartOnly, _ := jobs.GetParameterValue[bool](parameters, parameters_enums.RestartOnly); restartOnly {
 		return nil
 	}
+	failure, err := runOneOffTask(parameters, ecsClient, logsClient, oneOffTask{
+		ecsClusterArn:     ecsClusterArn,
+		taskDefinitionArn: taskDefinitionArn,
+		command:           command,
+		name:              preDeployCommandName(preview),
+		logsWriter:        logsWriter,
+	})
+	if err != nil {
+		return err
+	}
+	if len(failure) > 0 {
+		return preDeployFailure(parameters, ecsClient, ecsClusterArn, failure)
+	}
+	return nil
+}
+
+// oneOffTask is a command run once, as a one-off Fargate task, from the
+// pre-deploy sibling of the task definition the deploy rolls out.
+type oneOffTask struct {
+	ecsClusterArn     string
+	taskDefinitionArn string
+	command           string
+	// name is what the deploy logs and messages call the command; never the
+	// command itself, which may carry a secret (DATABASE_URL=… inline).
+	name string
+	// environment is added to the container's for this task only: never to a
+	// task definition.
+	environment []ecsTypes.KeyValuePair
+	// hidden are values (by name) the task's output shows as <NAME>.
+	hidden     map[string]string
+	logsWriter io.Writer
+}
+
+// runOneOffTask runs t, copying its output into t.logsWriter, and returns the
+// first sentence of the failure message when it didn't exit with 0 ("" when it
+// did). err is set when the task couldn't be set up, before anything was logged.
+func runOneOffTask(parameters map[string]interface{}, ecsClient preDeployEcsAPI, logsClient preDeployLogsAPI,
+	t oneOffTask) (failure string, err error) {
 	containerName, err := getContainerName(parameters)
 	if err != nil {
-		return err
+		return "", err
 	}
-	runTaskInput, err := getPreDeployRunTaskInput(parameters, ecsClusterArn, containerName, command)
+	runTaskInput, err := getPreDeployRunTaskInput(parameters, t.ecsClusterArn, containerName, t.command)
 	if err != nil {
-		return err
+		return "", err
 	}
-	name := preDeployCommandName(preview)
-	logs, err := newPreDeployLogReader(parameters, logsClient, containerName, logsWriter, name)
+	if len(t.environment) > 0 {
+		runTaskInput.Overrides.ContainerOverrides[0].Environment = t.environment
+	}
+	name := t.name
+	logs, err := newPreDeployLogReader(parameters, logsClient, containerName, t.logsWriter, name)
 	if err != nil {
-		return err
+		return "", err
 	}
+	logs.hidden = t.hidden
 
-	// Never the command itself: it may carry a secret (DATABASE_URL=… inline).
 	logs.write("Running the " + name + "\n")
-	preDeployTaskDefinitionArn, err := registerPreDeployTaskDefinition(parameters, ecsClient, taskDefinitionArn, containerName)
+	preDeployTaskDefinitionArn, err := registerPreDeployTaskDefinition(parameters, ecsClient, t.taskDefinitionArn, containerName)
 	if err != nil {
-		return preDeployFailure(parameters, ecsClient, ecsClusterArn,
-			fmt.Sprintf("The %s couldn't start: %s.", name, err))
+		return fmt.Sprintf("The %s couldn't start: %s.", name, err), nil
 	}
 	defer deregisterPreDeployTaskDefinition(ecsClient, preDeployTaskDefinitionArn, logs)
 	runTaskInput.TaskDefinition = aws.String(preDeployTaskDefinitionArn)
@@ -151,10 +197,10 @@ func runPreDeployCommand(parameters map[string]interface{}, ecsClient preDeployE
 	start := preDeployNow()
 	taskArn, failure := startPreDeployTask(ecsClient, runTaskInput, name)
 	if len(failure) > 0 {
-		return preDeployFailure(parameters, ecsClient, ecsClusterArn, failure)
+		return failure, nil
 	}
 	logs.follow(taskArn)
-	stoppedTask, stopErr := waitForPreDeployTask(ecsClient, ecsClusterArn, taskArn, logs, start, name)
+	stoppedTask, stopErr := waitForPreDeployTask(ecsClient, t.ecsClusterArn, taskArn, logs, start, name)
 	// Read once more after the task stops, for its last lines.
 	if !logs.read(math.MaxInt, preDeployNow().Add(preDeployFinalLogReadTimeout)) {
 		logs.write("The " + name + "'s output is incomplete: the rest couldn't be read in time.\n")
@@ -168,10 +214,8 @@ func runPreDeployCommand(parameters map[string]interface{}, ecsClient preDeployE
 		logs.write(fmt.Sprintf("%s%s finished (exit code %d) in %s\n", strings.ToUpper(name[:1]), name[1:],
 			*outcome.exitCode, preDeployNow().Sub(start).Round(time.Second)))
 	}
-	if message, ok := outcome.message(name); !ok {
-		return preDeployFailure(parameters, ecsClient, ecsClusterArn, message)
-	}
-	return nil
+	message, _ := outcome.message(name)
+	return message, nil
 }
 
 // startPreDeployTask returns the started task's ARN, or the first sentence of
@@ -461,6 +505,7 @@ type preDeployLogReader struct {
 	logStreamName   string
 	logsWriter      io.Writer
 	commandName     string // what the deploy logs call the command
+	hidden          map[string]string
 	nextToken       *string
 	reportedError   bool
 	writeFailed     bool
@@ -527,7 +572,8 @@ func (r *preDeployLogReader) read(maxPages int, deadline time.Time) (complete bo
 		}
 		var lines strings.Builder
 		for _, event := range output.Events {
-			lines.WriteString(splitLongLogLines(aws.ToString(event.Message)))
+			// Hidden before the split, which could break a value in two.
+			lines.WriteString(splitLongLogLines(redactText(aws.ToString(event.Message), r.hidden)))
 		}
 		if lines.Len() > 0 {
 			r.write(lines.String())
@@ -548,20 +594,38 @@ func (r *preDeployLogReader) write(text string) {
 	if r.writeFailed {
 		return
 	}
+	r.writeFailed = !writePreDeployLog(r.logsWriter, text)
+}
+
+// writePreDeployLog copies text into logsWriter, waiting at most
+// preDeployLogWriteTimeout; false when the write failed (the deploy logs are
+// closed) or didn't finish in time.
+func writePreDeployLog(logsWriter io.Writer, text string) bool {
 	done := make(chan error, 1)
 	go func() {
-		_, err := io.WriteString(r.logsWriter, text)
+		_, err := io.WriteString(logsWriter, text)
 		done <- err
 	}()
 	timer := time.NewTimer(preDeployLogWriteTimeout)
 	defer timer.Stop()
 	select {
 	case err := <-done:
-		// A failed write means the deploy logs are closed.
-		r.writeFailed = err != nil
+		return err == nil
 	case <-timer.C:
-		r.writeFailed = true
+		return false
 	}
+}
+
+// redactText is text with each value of hidden replaced by <NAME>.
+func redactText(text string, hidden map[string]string) string {
+	if len(hidden) == 0 {
+		return text
+	}
+	var b strings.Builder
+	w, flush := redact.NewWriter(&b, hidden)
+	io.WriteString(w, text)
+	flush()
+	return b.String()
 }
 
 // splitLongLogLines ends message with a newline and breaks any line longer

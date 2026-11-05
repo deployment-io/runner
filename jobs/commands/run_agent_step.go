@@ -2141,13 +2141,13 @@ type implementPreviewTools struct {
 	web    *agenttools.DeployWebServicePreviewDeps
 }
 
-// buildImplementPreviewTools builds an implement or fix run's preview tools' deps.
+// buildImplementPreviewTools builds an implement or fix run's preview tools' deps,
+// with test users of the run's own.
 func buildImplementPreviewTools(ctx commandUtils.TaskJobContext, parameters map[string]interface{}, workDirHost string, logsWriter io.Writer) implementPreviewTools {
 	static := buildStaticSitePreviewDeps(ctx, parameters, workDirHost, logsWriter)
-	return implementPreviewTools{
-		static: static,
-		web:    buildWebServicePreviewDeps(ctx, parameters, workDirHost, logsWriter, static.Record),
-	}
+	web := buildWebServicePreviewDeps(ctx, parameters, workDirHost, logsWriter, static.Record)
+	web.TestUsers = agenttools.NewPreviewTestUsers()
+	return implementPreviewTools{static: static, web: web}
 }
 
 // implementSpawnSpec is an implement run's container configuration.

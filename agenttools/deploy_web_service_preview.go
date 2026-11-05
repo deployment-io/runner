@@ -82,6 +82,11 @@ type DeployWebServicePreviewDeps struct {
 	// it: RegisterDeployWebServicePreview makes one per agent run when unset, and
 	// the QA stage passes one to every round.
 	Distributions *WebPreviewDistributions
+
+	// TestUsers are the test users of the previews these deploys seed, shared as
+	// Distributions is: RegisterDeployWebServicePreview makes one per agent run
+	// when unset, and the QA stage passes one to every round.
+	TestUsers *PreviewTestUsers
 }
 
 // WebPreviewDistributions are the CloudFront distributions created by the deploys
@@ -142,6 +147,9 @@ type WebServicePreviewDeployInput struct {
 	// then runs against it (and the preview migrate command, if set, with it). Nil: none, and
 	// the API deploys exactly as without one.
 	Database *PreviewDatabaseDeploy
+	// Seed is the preview seed command the API's deploy runs right after the
+	// preview migrate command, and its test users. Nil: none.
+	Seed *WebServicePreviewSeed
 	// WiredNames are the names of Settings.Variables the QA stage set (sorted; nil
 	// for the tool). The database's value of such a name replaces it in the build
 	// args as well as the environment.
@@ -156,6 +164,8 @@ type WebServicePreviewDeployInput struct {
 // returns.
 type WebServicePreviewDeployOutput struct {
 	LoadBalancerDNS string
+	// Seed is how the preview seed command ended.
+	Seed PreviewSeedOutcome
 }
 
 // WebServicePreviewDeployed is a backend preview deploy that finished: the ECS
@@ -168,7 +178,10 @@ type WebServicePreviewDeployed struct {
 	// DatabaseNote says why it has none.
 	database     *previewDatabaseResult
 	DatabaseNote string
-	LogTail      string
+	// TestUsers is previewTestUsersSummary: the roles and how the seed ended, ""
+	// when the service sets neither.
+	TestUsers string
+	LogTail   string
 }
 
 // WebPreviewDeployFailed is the error of a failed step of a backend preview deploy.
@@ -191,7 +204,10 @@ type deployWebServicePreviewResult struct {
 	// Database is the preview's own database; DatabaseNote says why it has none.
 	Database     *previewDatabaseResult `json:"database,omitempty"`
 	DatabaseNote string                 `json:"database_note,omitempty"`
-	LogTail      string                 `json:"log_tail,omitempty"`
+	// TestUsers says which test users the preview seed command created; never an
+	// email or a password.
+	TestUsers string `json:"test_users,omitempty"`
+	LogTail   string `json:"log_tail,omitempty"`
 }
 
 const deployWebServicePreviewInputSchema = `{
@@ -217,6 +233,9 @@ func RegisterDeployWebServicePreview(s *agentmcp.Server, deps DeployWebServicePr
 	if deps.Distributions == nil {
 		deps.Distributions = NewWebPreviewDistributions()
 	}
+	if deps.TestUsers == nil {
+		deps.TestUsers = NewPreviewTestUsers()
+	}
 	s.Register(agentmcp.Tool{
 		Name: "deploy_web_service_preview",
 		Description: "Deploy the backend preview of a repository deployment.io deploys as a web service built from a " +
@@ -231,7 +250,8 @@ func RegisterDeployWebServicePreview(s *agentmcp.Server, deps DeployWebServicePr
 			"service's database variables at it and, when a person set a preview migrate command for the service, runs it " +
 			"against the database first: " +
 			"`database` in the result says which, from which files, and whether migrations ran; `database_note` says why " +
-			"there is none.",
+			"there is none. When a person set a preview seed command, it runs after the migrations on every deploy; " +
+			"`test_users` says which test users it created.",
 		InputSchema: json.RawMessage(deployWebServicePreviewInputSchema),
 		Handler: func(ctx context.Context, args json.RawMessage) (string, error) {
 			return handleDeployWebServicePreview(ctx, deps, builds, args)
@@ -292,6 +312,7 @@ func handleDeployWebServicePreview(ctx context.Context, deps DeployWebServicePre
 				"health_url until it is live — a new preview takes a few minutes to start and for CloudFront to propagate.",
 			Database:     deployed.database,
 			DatabaseNote: deployed.DatabaseNote,
+			TestUsers:    deployed.TestUsers,
 			LogTail:      deployed.LogTail,
 		})
 	}, previewBuildCallWait-time.Since(started))
@@ -516,6 +537,10 @@ func runWebServicePreview(ctx context.Context, deps DeployWebServicePreviewDeps,
 		return WebServicePreviewDeployed{}, err
 	}
 	settings := withWiredVariables(p.settings, p.wired, database, deps.LogsWriter)
+	seed, err := planPreviewSeed(deps, previewID, p.service)
+	if err != nil {
+		return WebServicePreviewDeployed{}, err
+	}
 
 	var tail bytes.Buffer
 	logs := io.MultiWriter(deps.LogsWriter, &tail)
@@ -529,6 +554,7 @@ func runWebServicePreview(ctx context.Context, deps DeployWebServicePreviewDeps,
 		Settings:      settings,
 		Existing:      existing,
 		Database:      database,
+		Seed:          seed,
 		WiredNames:    wiredNames(p.wired),
 		BuildLogs:     deps.LogsWriter,
 		Logs:          logs,
@@ -547,6 +573,9 @@ func runWebServicePreview(ctx context.Context, deps DeployWebServicePreviewDeps,
 	if err != nil {
 		return WebServicePreviewDeployed{}, webPreviewFailureWithDetails(err, databaseResult, tail.Bytes())
 	}
+	// Only once nothing more can fail the deploy.
+	testUsers := previewTestUsersSummary(p.service, out.Seed)
+	logPreviewTestUsers(deps.LogsWriter, testUsers)
 
 	previewURL := "https://" + domain
 	deps.Record.AddURL(previewURL)
@@ -556,6 +585,7 @@ func runWebServicePreview(ctx context.Context, deps DeployWebServicePreviewDeps,
 		Deployment:   webServiceDeploymentName(p.service),
 		database:     databaseResult,
 		DatabaseNote: databaseNote,
+		TestUsers:    testUsers,
 		LogTail:      tailString(tail.Bytes(), logTailMaxBytes),
 	}, nil
 }

@@ -320,6 +320,10 @@ type fakeWebPreviewSteps struct {
 	// stackCreated says the stack group is new to this deploy; stackErr fails it.
 	stackCreated bool
 	stackErr     error
+	// seeds are the seeds the deploy step was given; seedOutcome is the outcome
+	// it records.
+	seeds       []*previewSeedRun
+	seedOutcome agenttools.PreviewSeedOutcome
 }
 
 func (f *fakeWebPreviewSteps) step(name string) webPreviewStep {
@@ -339,10 +343,25 @@ func (f *fakeWebPreviewSteps) step(name string) webPreviewStep {
 	}
 }
 
+// deployStep is step("deploy"), recording the seed it was given; seedOutcome is
+// what it records as the seed's outcome.
+func (f *fakeWebPreviewSteps) deployStep() webPreviewDeployStep {
+	step := f.step("deploy")
+	return func(p map[string]interface{}, logs io.Writer, seed *previewSeedRun) (map[string]interface{}, error) {
+		f.mu.Lock()
+		f.seeds = append(f.seeds, seed)
+		if seed != nil {
+			seed.outcome = f.seedOutcome
+		}
+		f.mu.Unlock()
+		return step(p, logs)
+	}
+}
+
 func (f *fakeWebPreviewSteps) steps() webPreviewSteps {
 	f.logs = map[string]io.Writer{}
 	return webPreviewSteps{
-		build: f.step("build"), upload: f.step("upload"), deploy: f.step("deploy"),
+		build: f.step("build"), upload: f.step("upload"), deploy: f.deployStep(),
 		stack: func(taskID string, _ map[string]interface{}, _ agenttools.WebServicePreviewDeployInput, port int64) (string, bool, error) {
 			f.mu.Lock()
 			defer f.mu.Unlock()
@@ -561,6 +580,30 @@ func TestDescribeLoadBalancerDNSByName(t *testing.T) {
 	}
 }
 
+// The deploy step gets the input's seed, and its outcome comes back on the output.
+func TestWebPreviewDeployPassesTheSeed(t *testing.T) {
+	buildDir, org := webPreviewBuildDir(t)
+	fake := &fakeWebPreviewSteps{seedOutcome: agenttools.PreviewSeedFailed}
+	in := testWebPreviewInput(buildDir)
+	in.Seed = &agenttools.WebServicePreviewSeed{Command: "npm run seed", Users: []agenttools.PreviewTestUser{{Role: "owner"}}}
+	out, err := testWebPreviewDeployer(org, fake.steps()).deploy(context.Background(), in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(fake.seeds) != 1 || fake.seeds[0] == nil || !reflect.DeepEqual(fake.seeds[0].seed, *in.Seed) {
+		t.Errorf("the deploy step got seeds %+v; want the input's", fake.seeds)
+	}
+	if out.Seed != agenttools.PreviewSeedFailed {
+		t.Errorf("output seed = %v; want the deploy's outcome", out.Seed)
+	}
+
+	fake = &fakeWebPreviewSteps{}
+	out, err = testWebPreviewDeployer(org, fake.steps()).deploy(context.Background(), testWebPreviewInput(buildDir))
+	if err != nil || len(fake.seeds) != 1 || fake.seeds[0] != nil || out.Seed != agenttools.PreviewSeedNotRun {
+		t.Errorf("no seed: seeds %+v, output %+v, %v", fake.seeds, out, err)
+	}
+}
+
 // --- the skip-wait option -----------------------------------------------------
 
 func TestWebServiceDeployEntryPointsOptions(t *testing.T) {
@@ -574,10 +617,15 @@ func TestWebServiceDeployEntryPointsOptions(t *testing.T) {
 	if _, err := (&DeployAwsWebService{}).Run(map[string]interface{}{}, io.Discard); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := deployAwsWebServicePreview(map[string]interface{}{}, io.Discard); err != nil {
+	if _, err := deployAwsWebServicePreview(map[string]interface{}{}, io.Discard, nil); err != nil {
 		t.Fatal(err)
 	}
-	want := []ecsServiceDeployOptions{{}, {skipServiceStableWait: true, previewStack: true, noCircuitBreaker: true}}
+	seed := &previewSeedRun{}
+	if _, err := deployAwsWebServicePreview(map[string]interface{}{}, io.Discard, seed); err != nil {
+		t.Fatal(err)
+	}
+	want := []ecsServiceDeployOptions{{}, {skipServiceStableWait: true, previewStack: true, noCircuitBreaker: true},
+		{skipServiceStableWait: true, previewStack: true, noCircuitBreaker: true, previewSeed: seed}}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("options = %+v, want production waiting in the default group and the preview not waiting, in its stack group", got)
 	}

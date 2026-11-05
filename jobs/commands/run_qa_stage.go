@@ -134,6 +134,7 @@ func (rq *RunQAStage) Run(parameters map[string]interface{}, logsWriter io.Write
 		// One memo for every round, as the tool keeps one per agent run.
 		webDistributions:    agenttools.NewWebPreviewDistributions(),
 		staticDistributions: agenttools.NewWebPreviewDistributions(),
+		testUsers:           agenttools.NewPreviewTestUsers(),
 		stopSignal:          rq.stopSignal,
 		progressSink:        rq.progressSink,
 	}
@@ -202,6 +203,9 @@ type qaStage struct {
 	// CloudFront distributions, shared by every round's deploys so a
 	// re-deploy keeps its URL (see agenttools.WebPreviewDistributions).
 	webDistributions *agenttools.WebPreviewDistributions
+	// testUsers are the backend previews' test users, shared by every round's
+	// deploys as webDistributions is, so a re-seed sets the same passwords.
+	testUsers *agenttools.PreviewTestUsers
 
 	// stack is the stack path (minPreviewsQAAgentboxVersion): the runner deploys
 	// every site and backend preview itself and the QA run gets QA_PREVIEWS.
