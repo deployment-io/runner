@@ -145,9 +145,9 @@ func TestSetMissingRetentionRefusesEmptyOrganization(t *testing.T) {
 	}
 }
 
-func TestCreateLogGroupSetsRetention(t *testing.T) {
+func TestEnsureLogGroupSetsRetention(t *testing.T) {
 	f := newFakeClient()
-	if err := createLogGroup(context.Background(), f, "org/dep"); err != nil {
+	if err := EnsureLogGroup(context.Background(), f, "org/dep"); err != nil {
 		t.Fatal(err)
 	}
 	if len(f.createCalls) != 1 || f.putCalls["org/dep"] != 90 {
@@ -155,10 +155,10 @@ func TestCreateLogGroupSetsRetention(t *testing.T) {
 	}
 }
 
-func TestCreateLogGroupExistingKeepsRetention(t *testing.T) {
+func TestEnsureLogGroupExistingKeepsRetention(t *testing.T) {
 	f := newFakeClient()
 	f.createErr = &types.ResourceAlreadyExistsException{Message: aws.String("exists")}
-	if err := createLogGroup(context.Background(), f, "org/dep"); err != nil {
+	if err := EnsureLogGroup(context.Background(), f, "org/dep"); err != nil {
 		t.Fatal(err)
 	}
 	if len(f.putCallsInSeq) != 0 {
@@ -166,16 +166,16 @@ func TestCreateLogGroupExistingKeepsRetention(t *testing.T) {
 	}
 }
 
-func TestCreateLogGroupErrors(t *testing.T) {
+func TestEnsureLogGroupErrors(t *testing.T) {
 	f := newFakeClient()
 	f.putErrFor["org/dep"] = errors.New("denied")
-	if err := createLogGroup(context.Background(), f, "org/dep"); err == nil {
+	if err := EnsureLogGroup(context.Background(), f, "org/dep"); err == nil {
 		t.Error("want error when PutRetentionPolicy fails")
 	}
 
 	f = newFakeClient()
 	f.createErr = errors.New("denied")
-	if err := createLogGroup(context.Background(), f, "org/dep"); err == nil {
+	if err := EnsureLogGroup(context.Background(), f, "org/dep"); err == nil {
 		t.Error("want error when CreateLogGroup fails")
 	}
 	if len(f.putCallsInSeq) != 0 {
