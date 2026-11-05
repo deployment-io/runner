@@ -1356,6 +1356,11 @@ type ecsServiceDeployOptions struct {
 	// preview rolls out stop-then-start and must never fall back to its previous
 	// revision; a preview database keeps ECS's defaults.
 	noCircuitBreaker bool
+	// previewSeed is the preview seed command a backend preview (previewStack)
+	// runs after its preview migrate command, before its service is created or
+	// updated; the deploy records its outcome there. Nil: none. Ignored without
+	// previewStack.
+	previewSeed *previewSeedRun
 }
 
 // productionServiceDeploymentConfiguration turns on ECS's deployment circuit
@@ -1797,9 +1802,10 @@ func (d *DeployAwsWebService) Run(parameters map[string]interface{}, logsWriter 
 
 // deployAwsWebServicePreview is DeployAwsWebService's steps for a Task's
 // backend preview: the same deploy, without waiting for the ECS service to
-// settle.
-func deployAwsWebServicePreview(parameters map[string]interface{}, logsWriter io.Writer) (map[string]interface{}, error) {
-	return runAwsWebServiceDeploy(parameters, logsWriter, ecsServiceDeployOptions{skipServiceStableWait: true, previewStack: true, noCircuitBreaker: true})
+// settle, running seed (nil: none) after the preview migrate command.
+func deployAwsWebServicePreview(parameters map[string]interface{}, logsWriter io.Writer, seed *previewSeedRun) (map[string]interface{}, error) {
+	return runAwsWebServiceDeploy(parameters, logsWriter, ecsServiceDeployOptions{skipServiceStableWait: true, previewStack: true,
+		noCircuitBreaker: true, previewSeed: seed})
 }
 
 // runAwsWebServiceDeploy is deployAwsWebService; tests replace it to see the

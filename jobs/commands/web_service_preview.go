@@ -210,12 +210,16 @@ func checkWebPreviewBuildDir(parameters map[string]interface{}, buildDir string)
 // webPreviewStep is one command's Run.
 type webPreviewStep func(parameters map[string]interface{}, logsWriter io.Writer) (map[string]interface{}, error)
 
+// webPreviewDeployStep is the web-service deploy's Run, given the preview seed
+// command to run (nil: none) and recording its outcome there.
+type webPreviewDeployStep func(parameters map[string]interface{}, logsWriter io.Writer, seed *previewSeedRun) (map[string]interface{}, error)
+
 // webPreviewSteps are the commands a backend preview deploy runs, in order. Tests
 // replace them to deploy nowhere.
 type webPreviewSteps struct {
 	build  webPreviewStep
 	upload webPreviewStep
-	deploy webPreviewStep
+	deploy webPreviewDeployStep
 	// stack finds or creates the Task's preview stack security group, admitting
 	// port (the database's; 0 without one) from itself: its id, and whether this
 	// call created it. Every backend preview runs in it alone.
@@ -367,10 +371,18 @@ func (d webPreviewDeployer) deployDatabase(ctx context.Context, stackGroupID str
 // runSteps runs the deploy's commands on parameters, stopping between them once ctx
 // is cancelled (a command itself runs to its end).
 func (d webPreviewDeployer) runSteps(ctx context.Context, parameters map[string]interface{}, in agenttools.WebServicePreviewDeployInput) (agenttools.WebServicePreviewDeployOutput, error) {
+	// Only the API's own deploy runs the seed: never the preview database's.
+	var seed *previewSeedRun
+	if in.Seed != nil {
+		seed = &previewSeedRun{seed: *in.Seed}
+	}
+	deploy := func(parameters map[string]interface{}, logsWriter io.Writer) (map[string]interface{}, error) {
+		return d.steps.deploy(parameters, logsWriter, seed)
+	}
 	for _, step := range []struct {
 		run  webPreviewStep
 		logs io.Writer
-	}{{d.steps.build, in.BuildLogs}, {d.steps.upload, in.Logs}, {d.steps.deploy, in.Logs}} {
+	}{{d.steps.build, in.BuildLogs}, {d.steps.upload, in.Logs}, {deploy, in.Logs}} {
 		if err := ctx.Err(); err != nil {
 			return agenttools.WebServicePreviewDeployOutput{}, errors.New("the backend preview's deploy was cancelled")
 		}
@@ -386,7 +398,11 @@ func (d webPreviewDeployer) runSteps(ctx context.Context, parameters map[string]
 	if err != nil {
 		return agenttools.WebServicePreviewDeployOutput{}, agenttools.WebPreviewDeployFailed(err)
 	}
-	return agenttools.WebServicePreviewDeployOutput{LoadBalancerDNS: dns}, nil
+	out := agenttools.WebServicePreviewDeployOutput{LoadBalancerDNS: dns}
+	if seed != nil {
+		out.Seed = seed.outcome
+	}
+	return out, nil
 }
 
 // elbLoadBalancersAPI is the part of the ELB client describeLoadBalancerDNS uses.

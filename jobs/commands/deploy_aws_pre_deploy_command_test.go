@@ -12,6 +12,7 @@ import (
 	"io"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -787,13 +788,12 @@ func (f *stalledPreDeployLogs) GetLogEvents(ctx context.Context, _ *cloudwatchlo
 
 // blockedWriter is a deploy log pipe nobody reads any more, after the first write.
 type blockedWriter struct {
-	writes  int
+	writes  atomic.Int32
 	release chan struct{}
 }
 
 func (w *blockedWriter) Write(p []byte) (int, error) {
-	w.writes++
-	if w.writes > 1 {
+	if w.writes.Add(1) > 1 {
 		<-w.release
 	}
 	return len(p), nil
