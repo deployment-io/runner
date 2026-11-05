@@ -20,16 +20,18 @@ import (
 // build logs shown in the dashboard.
 const logGroupRetentionDays int32 = 90
 
-type logGroupCreator interface {
+// LogGroupCreator is the part of the CloudWatch Logs API EnsureLogGroup uses; *cloudwatchlogs.Client
+// satisfies it.
+type LogGroupCreator interface {
 	CreateLogGroup(ctx context.Context, params *cloudwatchlogs.CreateLogGroupInput,
 		optFns ...func(*cloudwatchlogs.Options)) (*cloudwatchlogs.CreateLogGroupOutput, error)
 	PutRetentionPolicy(ctx context.Context, params *cloudwatchlogs.PutRetentionPolicyInput,
 		optFns ...func(*cloudwatchlogs.Options)) (*cloudwatchlogs.PutRetentionPolicyOutput, error)
 }
 
-// createLogGroup creates the log group and sets its retention. A group that already exists keeps
+// EnsureLogGroup creates the log group and sets its retention. A group that already exists keeps
 // whatever retention it has.
-func createLogGroup(ctx context.Context, client logGroupCreator, logGroupName string) error {
+func EnsureLogGroup(ctx context.Context, client LogGroupCreator, logGroupName string) error {
 	_, err := client.CreateLogGroup(ctx, &cloudwatchlogs.CreateLogGroupInput{
 		LogGroupName: aws.String(logGroupName),
 	})
@@ -77,7 +79,7 @@ func New(parameters map[string]interface{}) (*Logger, error) {
 		return nil, err
 	}
 
-	err = createLogGroup(context.TODO(), cloudwatchClient, logGroupName)
+	err = EnsureLogGroup(context.TODO(), cloudwatchClient, logGroupName)
 	if err != nil {
 		return nil, err
 	}

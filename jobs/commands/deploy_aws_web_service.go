@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"regexp"
 	"strings"
 	"time"
@@ -35,6 +36,7 @@ import (
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
 	"github.com/deployment-io/deployment-runner/utils"
 	"github.com/deployment-io/deployment-runner/utils/aws_utils"
+	cloudwatchLogger "github.com/deployment-io/deployment-runner/utils/loggers/cloudwatch"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 )
 
@@ -902,6 +904,31 @@ func allowUnprivilegedPorts(def *ecsTypes.ContainerDefinition, osFamily ecsTypes
 	}}
 }
 
+// taskLogConfiguration is the awslogs configuration of the deployment's container. It keeps
+// awslogs-create-group so ECS still creates the group if ensureTaskLogGroup couldn't.
+func taskLogConfiguration(logGroupName, region, logsStreamPrefix string) *ecsTypes.LogConfiguration {
+	return &ecsTypes.LogConfiguration{
+		LogDriver: ecsTypes.LogDriverAwslogs,
+		Options: map[string]string{
+			"awslogs-create-group":  "true",
+			"awslogs-group":         logGroupName,
+			"awslogs-region":        region,
+			"awslogs-stream-prefix": logsStreamPrefix,
+		},
+	}
+}
+
+// ensureTaskLogGroup creates the log group the container logs to, with the runner's retention,
+// before the task definition naming it is registered; otherwise ECS creates it without retention
+// (backend previews have no build logger to create it first). A failure doesn't fail the deploy:
+// it's logged, ECS creates the group, and the runner-start sweep sets its retention later.
+func ensureTaskLogGroup(ctx context.Context, client cloudwatchLogger.LogGroupCreator, logConfiguration *ecsTypes.LogConfiguration) {
+	logGroupName := logConfiguration.Options["awslogs-group"]
+	if err := cloudwatchLogger.EnsureLogGroup(ctx, client, logGroupName); err != nil {
+		log.Printf("log group retention: couldn't create %s before registering the task definition: %s", logGroupName, err)
+	}
+}
+
 // registerTaskDefinition registers the deployment's task definition; customize,
 // when given, adjusts its container before it's registered (the preview MongoDB's
 // replica set).
@@ -962,22 +989,21 @@ func registerTaskDefinition(parameters map[string]interface{}, ecsClient *ecs.Cl
 		return "", err
 	}
 
+	logConfiguration := taskLogConfiguration(logGroupName, region_enums.Type(region).String(), logsStreamPrefix)
+	if logsClient, err := cloud_api_clients.GetCloudwatchLogsClient(parameters); err != nil {
+		log.Printf("log group retention: couldn't create %s before registering the task definition: %s", logGroupName, err)
+	} else {
+		ensureTaskLogGroup(context.TODO(), logsClient, logConfiguration)
+	}
+
 	containerDefinition := ecsTypes.ContainerDefinition{
 		DisableNetworking: aws.Bool(false),
 		Environment:       envVariablesKeyValuePair,
 		Essential:         aws.Bool(true),
 		Image:             aws.String(ecrRepositoryUriWithTag),
 		Interactive:       aws.Bool(false),
-		LogConfiguration: &ecsTypes.LogConfiguration{
-			LogDriver: ecsTypes.LogDriverAwslogs,
-			Options: map[string]string{
-				"awslogs-create-group":  "true",
-				"awslogs-group":         logGroupName,
-				"awslogs-region":        region_enums.Type(region).String(),
-				"awslogs-stream-prefix": logsStreamPrefix,
-			},
-		},
-		Name: aws.String(containerName),
+		LogConfiguration:  logConfiguration,
+		Name:              aws.String(containerName),
 		PortMappings: []ecsTypes.PortMapping{
 			containerPortMapping,
 		},
