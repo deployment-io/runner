@@ -712,18 +712,29 @@ func verifyStepEntry(s verifyStep) string {
 // marker is re-applied, once, only when this attempt still has an open
 // must-fix finding (see openOne).
 func (opr *taskOpenPR) subjectAndLeadIn() (string, string) {
-	if len(opr.agentPRTitle) > 0 {
-		return capTitle(stripNeedsFixesPrefix(opr.agentPRTitle), prTitleMaxRunes), strings.TrimSpace(opr.agentSummary)
+	return taskSubjectAndBody(opr.agentPRTitle, opr.agentSummary, opr.ctx.StepIndex, opr.ctx.TaskTitle)
+}
+
+// taskSubjectAndBody is the one choice of subject + body shared by the pull
+// request (title + lead-in) and the commit (subject + body), so a one-commit
+// pull request's squash-merge title matches the pull request's title. Cases
+// as documented on subjectAndLeadIn. A pr_title that is empty after trimming
+// and stripping "[Needs fixes] " counts as absent, and the summary is trimmed
+// before its first line is taken, so the subject is never empty.
+func taskSubjectAndBody(prTitle, summary string, stepIndex int64, taskTitle string) (string, string) {
+	summary = strings.TrimSpace(summary)
+	if title := stripNeedsFixesPrefix(prTitle); len(title) > 0 {
+		return capTitle(title, prTitleMaxRunes), summary
 	}
-	if len(opr.agentSummary) > 0 {
-		first, rest := splitFirstLine(opr.agentSummary)
+	if len(summary) > 0 {
+		first, rest := splitFirstLine(summary)
 		first = stripNeedsFixesPrefix(first)
 		if utf8.RuneCountInString(first) <= prTitleMaxRunes {
 			return first, rest
 		}
-		return capTitle(first, prTitleMaxRunes), strings.TrimSpace(opr.agentSummary)
+		return capTitle(first, prTitleMaxRunes), summary
 	}
-	return fmt.Sprintf("Tasks Step %d: %s", opr.ctx.StepIndex+1, opr.ctx.TaskTitle), ""
+	return fmt.Sprintf("Tasks Step %d: %s", stepIndex+1, taskTitle), ""
 }
 
 // prTitleMaxRunes is the defensive cap on PR title length. Matches the
