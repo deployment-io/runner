@@ -52,6 +52,7 @@ func (cap *CommitAndPush) Run(parameters map[string]interface{}, logsWriter io.W
 		tokenCache:   make(map[string]string),
 		logsWriter:   logsWriter,
 		agentSummary: readAgentSummaryFromJobOutput(parameters),
+		agentPRTitle: readAgentPRTitleFromJobOutput(parameters),
 	}
 	repoOutputs, err := tcp.commitAndPushAll()
 	if err != nil {
@@ -73,12 +74,15 @@ func (cap *CommitAndPush) Run(parameters map[string]interface{}, logsWriter io.W
 // agentSummary is the agent's changes_summary from /result.json, snapshot
 // at command-Run time (RunAgentStep has already written it into JobOutput
 // by then). Cached on the struct so each per-repo commit gets the same
-// subject/body without repeatedly parsing JobOutput.
+// subject/body without repeatedly parsing JobOutput. agentPRTitle is the
+// agent's pr_title, read the same way; it becomes the commit subject so the
+// commit and the pull request share a title.
 type taskCommitPush struct {
 	ctx          commandUtils.TaskJobContext
 	tokenCache   map[string]string
 	logsWriter   io.Writer
 	agentSummary string
+	agentPRTitle string
 }
 
 func (tcp *taskCommitPush) getToken(installationID string) (string, error) {
@@ -208,8 +212,8 @@ func (tcp *taskCommitPush) commitAndPushOne(repoDir string, entry tasks.Reposito
 }
 
 // commit creates the commit with the deployment.io Tasks author identity.
-// Message is the agent's changes_summary when present (Phase 5+) or a
-// generic Phase 4 fallback. Trailer block is uniform across both cases.
+// Message is built by buildCommitMessage; the trailer block is uniform
+// across every subject source.
 func (tcp *taskCommitPush) commit(worktree *git.Worktree) (string, error) {
 	hash, err := worktree.Commit(tcp.buildCommitMessage(), &git.CommitOptions{
 		Author: &object.Signature{
@@ -225,8 +229,7 @@ func (tcp *taskCommitPush) commit(worktree *git.Worktree) (string, error) {
 }
 
 // buildCommitMessage assembles subject + optional body + trailer. The
-// subject prefers the agent's changes_summary first line; without it,
-// falls back to "Tasks Step <N>: <title>".
+// subject and body come from subjectAndBody.
 func (tcp *taskCommitPush) buildCommitMessage() string {
 	subject, body := tcp.subjectAndBody()
 	var sb strings.Builder
@@ -247,20 +250,14 @@ func (tcp *taskCommitPush) buildCommitMessage() string {
 	return sb.String()
 }
 
-// subjectAndBody returns (subject, body) for the commit message.
-// Uses the agent's changes_summary when present — split at the first
-// newline, with the first line as subject and remainder as body.
-// Falls back to "Tasks Step <N>: <title>" with no body when the
-// summary is absent (Step ran but didn't produce one, or runtime
-// older than the Phase-5 RunAgentStep producer).
+// subjectAndBody returns (subject, body) for the commit message — the same
+// choice as the pull request's title and lead-in (taskSubjectAndBody): the
+// agent's pr_title capped at 72 runes with the summary as body; without it,
+// the summary's first line; without either, "Tasks Step <N>: <title>". The
+// "[Needs fixes] " marker the pull request title may carry never reaches the
+// commit subject.
 func (tcp *taskCommitPush) subjectAndBody() (string, string) {
-	if len(tcp.agentSummary) > 0 {
-		if idx := strings.Index(tcp.agentSummary, "\n"); idx > 0 {
-			return strings.TrimSpace(tcp.agentSummary[:idx]), strings.TrimSpace(tcp.agentSummary[idx+1:])
-		}
-		return strings.TrimSpace(tcp.agentSummary), ""
-	}
-	return fmt.Sprintf("Tasks Step %d: %s", tcp.ctx.StepIndex+1, tcp.ctx.TaskTitle), ""
+	return taskSubjectAndBody(tcp.agentPRTitle, tcp.agentSummary, tcp.ctx.StepIndex, tcp.ctx.TaskTitle)
 }
 
 // detectOrphanedChanges fails the Step when the agent reported changed files but
