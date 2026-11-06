@@ -289,88 +289,140 @@ func (s *APISessions) redactor() apiRedactor {
 }
 
 // apiRedactor replaces every secret it has with "<redacted>"; the zero value
-// replaces nothing.
+// replaces nothing. It finds every occurrence of every secret in the text as
+// given — overlapping ones too, of the same secret or of two — and replaces
+// each run of overlapping or adjacent occurrences once, so redacting one secret
+// can never leave part of another showing.
 type apiRedactor struct {
-	r       *strings.Replacer
-	secrets []string
+	secrets [][]byte
 }
 
-// newAPIRedactor redacts secrets, the longest first, so a secret that contains
-// another is redacted whole.
 func newAPIRedactor(secrets []string) apiRedactor {
-	var sorted []string
+	var out [][]byte
 	for _, s := range secrets {
 		if s != "" {
-			sorted = append(sorted, s)
+			out = append(out, []byte(s))
 		}
 	}
-	if len(sorted) == 0 {
-		return apiRedactor{}
-	}
-	sort.SliceStable(sorted, func(i, j int) bool { return len(sorted[i]) > len(sorted[j]) })
-	pairs := make([]string, 0, 2*len(sorted))
-	for _, s := range sorted {
-		pairs = append(pairs, s, apiRedacted)
-	}
-	return apiRedactor{r: strings.NewReplacer(pairs...), secrets: sorted}
+	return apiRedactor{secrets: out}
 }
 
 func (r apiRedactor) text(s string) string {
-	if r.r == nil {
+	if len(r.secrets) == 0 {
 		return s
 	}
-	return r.r.Replace(s)
+	return string(r.redact([]byte(s), false, false))
 }
 
 func (r apiRedactor) bytes(b []byte) []byte {
-	if r.r == nil {
-		return b
-	}
-	return []byte(r.r.Replace(string(b)))
+	return r.redact(b, false, false)
 }
 
-// cutBytes is b, as read and cut at its end, redacted: a secret the cut
-// split (its start at b's end) and every secret that runs into that start
-// become "<redacted>" whole, so the cut can't show half of a secret. It
-// looks at b before any secret is replaced, so a replacement can't hide where
-// a secret starts.
+// cutBytes is b, as read and cut at its end, redacted: a secret the cut split
+// (the start of one at b's end) is redacted too, so the cut can't show half of
+// a secret.
 func (r apiRedactor) cutBytes(b []byte) []byte {
-	cut := len(b)
-	for moved := true; moved; {
-		moved = false
-		for _, secret := range r.secrets {
-			for start := max(0, cut-len(secret)+1); start < cut; start++ {
-				rest := b[start:]
-				if bytes.HasPrefix(rest, []byte(secret)) || (len(rest) < len(secret) && bytes.HasPrefix([]byte(secret), rest)) {
-					cut, moved = start, true
-					break
-				}
-			}
-		}
-	}
-	head := r.bytes(b[:cut])
-	if cut == len(b) {
-		return head
-	}
-	return append(head[:len(head):len(head)], apiRedacted...)
+	return r.redact(b, false, true)
 }
 
 // name is a header or cookie name redacted of every secret in any letter case:
 // Go's HTTP parser changes a header name's case, so an exact match could miss
-// a secret sent as one.
+// a secret sent as one. The rest of the name keeps its case.
 func (r apiRedactor) name(s string) string {
 	if len(r.secrets) == 0 {
 		return s
 	}
-	lower := strings.ToLower(s)
-	pairs := make([]string, 0, 2*len(r.secrets))
+	return string(r.redact([]byte(s), true, false))
+}
+
+// redact is b with every occurrence of every secret replaced: with fold, in any
+// ASCII letter case; with cut, also the start of a secret at b's end.
+func (r apiRedactor) redact(b []byte, fold, cut bool) []byte {
+	if len(r.secrets) == 0 {
+		return b
+	}
+	text := b
+	if fold {
+		text = asciiLower(b)
+	}
+	var spans [][2]int
 	for _, secret := range r.secrets {
-		pairs = append(pairs, strings.ToLower(secret), apiRedacted)
+		if fold {
+			secret = asciiLower(secret)
+		}
+		spans = append(spans, secretSpans(text, secret, cut)...)
 	}
-	if redacted := strings.NewReplacer(pairs...).Replace(lower); redacted != lower {
-		return redacted
+	if len(spans) == 0 {
+		return b
 	}
-	return s
+	sort.Slice(spans, func(i, j int) bool { return spans[i][0] < spans[j][0] })
+	out := make([]byte, 0, len(b))
+	pos := 0
+	for i := 0; i < len(spans); {
+		start, end := spans[i][0], spans[i][1]
+		for i++; i < len(spans) && spans[i][0] <= end; i++ {
+			end = max(end, spans[i][1])
+		}
+		out = append(out, b[pos:start]...)
+		out = append(out, apiRedacted...)
+		pos = end
+	}
+	return append(out, b[pos:]...)
+}
+
+// secretSpans is where secret occurs in text, overlapping occurrences merged
+// into one span, and with cut also the end of text that begins secret. It runs
+// in time linear in len(text)+len(secret) (Knuth–Morris–Pratt), so a long
+// secret that repeats can't make a response slow to redact.
+func secretSpans(text, secret []byte, cut bool) [][2]int {
+	fail := make([]int, len(secret))
+	for i, k := 1, 0; i < len(secret); i++ {
+		for k > 0 && secret[i] != secret[k] {
+			k = fail[k-1]
+		}
+		if secret[i] == secret[k] {
+			k++
+		}
+		fail[i] = k
+	}
+	var spans [][2]int
+	add := func(start, end int) {
+		if n := len(spans); n > 0 && start <= spans[n-1][1] {
+			spans[n-1][1] = max(spans[n-1][1], end)
+			return
+		}
+		spans = append(spans, [2]int{start, end})
+	}
+	k := 0
+	for i := 0; i < len(text); i++ {
+		for k > 0 && text[i] != secret[k] {
+			k = fail[k-1]
+		}
+		if text[i] == secret[k] {
+			k++
+		}
+		if k == len(secret) {
+			add(i+1-k, i+1)
+			k = fail[k-1]
+		}
+	}
+	if cut && k > 0 {
+		add(len(text)-k, len(text))
+	}
+	return spans
+}
+
+// asciiLower is b with A–Z turned into a–z; its length doesn't change, so a
+// span found in it is a span of b.
+func asciiLower(b []byte) []byte {
+	out := make([]byte, len(b))
+	for i, c := range b {
+		if c >= 'A' && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		out[i] = c
+	}
+	return out
 }
 
 // redactSetCookie is a Set-Cookie value with its cookie's value redacted:
@@ -458,10 +510,16 @@ func (t *verifyAPISignIn) handle(ctx context.Context, rawArgs json.RawMessage) (
 	}
 	var reason string
 	var session *apiSession
+	var cookieNames []string
 	res := sendAPIRequest(ctx, request, time.Duration(verifyAPIRequestDefaultTimeoutSeconds)*time.Second, t.sessions,
 		func(resp *http.Response, read []byte) {
 			session, reason = judgeSignIn(signIn, resp, read)
 			if session != nil {
+				// Read before keep shares the session: from then on its cookies
+				// change only under the sessions' lock (updateCookies).
+				for _, c := range session.cookies {
+					cookieNames = append(cookieNames, c.name)
+				}
 				t.sessions.keep(u.Hostname(), args.Role, session)
 			}
 		})
@@ -483,8 +541,8 @@ func (t *verifyAPISignIn) handle(ctx context.Context, rawArgs json.RawMessage) (
 		out.SignedIn, out.Session = true, session.kind
 		// A name is redacted too: a preview could name a cookie after a password.
 		redact := t.sessions.redactor()
-		for _, c := range session.cookies {
-			out.Cookies = append(out.Cookies, redact.name(c.name))
+		for _, name := range cookieNames {
+			out.Cookies = append(out.Cookies, redact.name(name))
 		}
 	}
 	var buf bytes.Buffer

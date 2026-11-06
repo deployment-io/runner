@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/deployment-io/deployment-runner-kit/task_previews"
 	agentmcp "github.com/deployment-io/deployment-runner/agent_mcp"
@@ -543,7 +544,7 @@ func TestVerifyAPIRequestRedactsHeaderNames(t *testing.T) {
 	signIn, request := signInTools(cookieSignIn, nil)
 	signIn.sessions.keep("dother.cloudfront.net", "viewer", &apiSession{kind: apiSessionBearer, token: signInTestToken})
 	res, raw := apiCall(t, request, map[string]any{"url": apiTestURL + "/"})
-	if res.Headers[apiRedacted] != "1" || res.Headers["x-"+apiRedacted] != "2" || res.Headers["X-Plain"] != "3" {
+	if res.Headers[apiRedacted] != "1" || res.Headers["X-"+apiRedacted] != "2" || res.Headers["X-Plain"] != "3" {
 		t.Errorf("headers = %v", res.Headers)
 	}
 	for _, secret := range []string{signInTestToken, signInTestUser.Password} {
@@ -586,4 +587,107 @@ func TestVerifyAPIRequestAsSendsQuotedCookiesQuoted(t *testing.T) {
 	if want := `session="abc defghijk"; lang=en`; cookie != want {
 		t.Errorf("Cookie = %q, want %q", cookie, want)
 	}
+}
+
+// Overlapping secrets are redacted as one: a session cookie that runs into the
+// password's start doesn't leave the password's end showing, and a secret that
+// overlaps itself is redacted whole.
+func TestAPIRedactorMergesOverlappingSecrets(t *testing.T) {
+	password := signInTestUser.Password
+	cookie := "prefix-" + password[:8]
+	r := newAPIRedactor([]string{password, cookie, "abab"})
+	for in, want := range map[string]string{
+		"x prefix-" + password + " y": "x " + apiRedacted + " y",
+		password + " and " + password: apiRedacted + " and " + apiRedacted,
+		cookie + password:             apiRedacted,
+		"[ababab]":                    "[" + apiRedacted + "]",
+		"no secret here":              "no secret here",
+	} {
+		if got := r.text(in); got != want {
+			t.Errorf("text(%q) = %q, want %q", in, got, want)
+		}
+		if got := string(r.bytes([]byte(in))); got != want {
+			t.Errorf("bytes(%q) = %q, want %q", in, got, want)
+		}
+	}
+	if got := r.name("X-" + strings.ToUpper(password) + "-Id"); got != "X-"+apiRedacted+"-Id" {
+		t.Errorf("name = %q", got)
+	}
+	// The cut: the start of a secret at the end is redacted; without a cut it stays.
+	if got := string(r.cutBytes([]byte("ok " + password[:5]))); got != "ok "+apiRedacted {
+		t.Errorf("cutBytes = %q", got)
+	}
+	if got := r.text("ok " + password[:5]); got != "ok "+password[:5] {
+		t.Errorf("text without a cut = %q", got)
+	}
+}
+
+// The same response through the tool: a cookie value overlapping the password
+// doesn't expose the password's end.
+func TestVerifyAPIRequestRedactsOverlappingSecrets(t *testing.T) {
+	cookie := "prefix-" + signInTestUser.Password[:8]
+	probeServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		io.WriteString(w, "prefix-"+signInTestUser.Password)
+	})
+	signIn, request := signInTools(cookieSignIn, nil)
+	signIn.sessions.keep("dother.cloudfront.net", "member", &apiSession{kind: apiSessionCookie, cookies: []apiSessionCookieValue{{name: "s", value: cookie}}})
+	res, raw := apiCall(t, request, map[string]any{"url": apiTestURL + "/"})
+	if res.Body != apiRedacted {
+		t.Errorf("body = %q", res.Body)
+	}
+	if strings.Contains(raw, signInTestUser.Password[8:]) {
+		t.Errorf("the password's end shows: %s", raw)
+	}
+}
+
+// A session token equal to "Set-Cookie" redacts that header's name, but its
+// values are still redacted as Set-Cookie values.
+func TestVerifyAPIRequestRedactsSetCookieWhenItsNameIsASecret(t *testing.T) {
+	const other = "another-cookie-secret"
+	probeServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Add("Set-Cookie", "sid="+other+"; Path=/")
+	})
+	signIn, request := signInTools(cookieSignIn, nil)
+	signIn.sessions.keep("dother.cloudfront.net", "viewer", &apiSession{kind: apiSessionBearer, token: "Set-Cookie"})
+	res, raw := apiCall(t, request, map[string]any{"url": apiTestURL + "/"})
+	if strings.Contains(raw, other) {
+		t.Errorf("the cookie's value shows: %s", raw)
+	}
+	if got := res.Headers[apiRedacted]; got != "sid="+apiRedacted+"; Path=/" {
+		t.Errorf("headers = %v", res.Headers)
+	}
+}
+
+// A secret that repeats, in a long response made of it, is redacted in linear
+// time: this would take minutes with a search that restarts at every byte.
+func TestAPIRedactorIsLinearOnARepeatingSecret(t *testing.T) {
+	secret := strings.Repeat("T", 64*1024)
+	body := []byte(strings.Repeat("T", verifyAPIRequestReadLimitBytes))
+	r := newAPIRedactor([]string{secret})
+	if got := string(r.cutBytes(body)); got != apiRedacted {
+		t.Errorf("got %d bytes, want just %q", len(got), apiRedacted)
+	}
+}
+
+// Sign-ins while "as" requests rotate the same role's cookies: run with -race.
+func TestVerifyAPISignInWhileCookiesRotate(t *testing.T) {
+	probeServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Add("Set-Cookie", "session="+signInTestCookie)
+		w.Header().Add("Set-Cookie", fmt.Sprintf("rot=%s-rotating-value", r.URL.Path))
+	})
+	signIn, _ := signInTools(cookieSignIn, nil)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 200; i++ {
+			signIn.sessions.updateCookies("dapi.cloudfront.net", "admin",
+				[]*http.Cookie{{Name: fmt.Sprintf("c%d", i%5), Value: "rotated-value-1234"}}, time.Now())
+		}
+	}()
+	for i := 0; i < 5; i++ {
+		if res, _ := signInCall(t, signIn, map[string]any{"role": "admin", "url": apiTestURL}); !res.SignedIn {
+			t.Fatalf("not signed in: %+v", res)
+		}
+	}
+	<-done
 }

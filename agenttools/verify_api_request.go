@@ -573,9 +573,12 @@ func sentResponseHeaders(resp *http.Response) http.Header {
 func apiResponseHeaders(h http.Header, redact apiRedactor) (headers map[string]string, truncated bool) {
 	canonical := map[string][]string{}
 	for name, values := range h {
-		key := redact.name(http.CanonicalHeaderKey(name))
+		// Which header it is is decided on the name as sent: a secret equal to
+		// "Set-Cookie" redacts the name, never the rule for its values.
+		canonicalName := http.CanonicalHeaderKey(name)
+		key := redact.name(canonicalName)
 		for _, value := range values {
-			if key == "Set-Cookie" {
+			if canonicalName == "Set-Cookie" {
 				value = redactSetCookie(value)
 			}
 			canonical[key] = append(canonical[key], redact.text(value))
