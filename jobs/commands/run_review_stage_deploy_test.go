@@ -433,3 +433,70 @@ func TestPRBodyStaysUnderTheCapWithTwentyRequirements(t *testing.T) {
 		t.Errorf("%d links, want %d", strings.Count(body, "[Add it]("), maxDeployRequirements)
 	}
 }
+
+// --- names deployment.io sets on the preview seed task --------------------------
+
+func TestPlatformPreviewVariable(t *testing.T) {
+	for name, want := range map[string]bool{
+		"QA_ROLES":                       true,
+		"QA_ROLE_OWNER_EMAIL":            true,
+		"QA_ROLE_BILLING_ADMIN_PASSWORD": true,
+		"QA_ROLE_OWNER":                  false,
+		"QA_ROLE__EMAIL":                 false,
+		"qa_roles":                       false,
+		"QA_ROLES_X":                     false,
+		"QA_ROLE_OWNER_TOKEN":            false,
+		"DATABASE_URL":                   false,
+	} {
+		if got := platformPreviewVariable(name); got != want {
+			t.Errorf("platformPreviewVariable(%q) = %v, want %v", name, got, want)
+		}
+	}
+}
+
+func TestResolveDeployRequirementsDropsPreviewSeedVariables(t *testing.T) {
+	reqs := []reviewDeployRequirement{
+		deployReq("QA_ROLES", "api", "staging"),
+		deployReq("QA_ROLE_OWNER_PASSWORD", "api", "staging"),
+		deployReq("API_KEY", "api", "staging"),
+	}
+	for name, resolve := range map[string]func(io.Writer) []resolvedDeployRequirement{
+		"with a copy": func(w io.Writer) []resolvedDeployRequirement {
+			return resolveDeployRequirements(reqs, fixtureRows(t), w)
+		},
+		"without a copy": func(w io.Writer) []resolvedDeployRequirement {
+			return resolveDeployRequirementsFrom(reqs, "", w)
+		},
+	} {
+		var logs strings.Builder
+		got := resolve(&logs)
+		if len(got) != 1 || got[0].Variable != "API_KEY" {
+			t.Errorf("%s: got %+v, want only API_KEY", name, got)
+		}
+		for _, line := range []string{
+			"Review stage: deploy requirement QA_ROLES for api in staging: set by deployment.io for the preview seed command, dropped\n",
+			"Review stage: deploy requirement QA_ROLE_OWNER_PASSWORD for api in staging: set by deployment.io for the preview seed command, dropped\n",
+		} {
+			if !strings.Contains(logs.String(), line) {
+				t.Errorf("%s: the log lacks %q:\n%s", name, line, logs.String())
+			}
+		}
+	}
+}
+
+// Dropped preview seed names don't count towards the 20.
+func TestPreviewSeedVariablesDoNotCountTowardsTheCap(t *testing.T) {
+	var reqs []reviewDeployRequirement
+	for i := 0; i < maxDeployRequirements+5; i++ {
+		reqs = append(reqs, deployReq(fmt.Sprintf("QA_ROLE_R%d_EMAIL", i), "api", "staging"))
+	}
+	reqs = append(reqs, deployReq("API_KEY", "api", "staging"))
+	for name, got := range map[string][]resolvedDeployRequirement{
+		"with a copy":    resolveDeployRequirements(reqs, fixtureRows(t), io.Discard),
+		"without a copy": resolveDeployRequirementsFrom(reqs, "", io.Discard),
+	} {
+		if len(got) != 1 || got[0].Variable != "API_KEY" {
+			t.Errorf("%s: got %+v, want only API_KEY", name, got)
+		}
+	}
+}

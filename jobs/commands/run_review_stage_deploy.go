@@ -162,6 +162,27 @@ const maxDeployRequirements = 20
 // the pull request and into a link.
 var deployVariableName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,127}$`)
 
+// platformPreviewRoleVariable is a per-role name of the preview seed task,
+// QA_ROLE_<KEY>_EMAIL or QA_ROLE_<KEY>_PASSWORD with a non-empty <KEY>.
+var platformPreviewRoleVariable = regexp.MustCompile(`^QA_ROLE_[A-Z0-9_]+_(EMAIL|PASSWORD)$`)
+
+// platformPreviewVariable reports whether name is one deployment.io sets
+// itself, on the preview seed command's task only
+// (deploy_aws_preview_seed_command.go) and never on a production deploy: a
+// seed script reading it is no deploy requirement. Case-sensitive, like
+// environment variable names. A later variable the platform adds to that task
+// belongs here too.
+func platformPreviewVariable(name string) bool {
+	return name == "QA_ROLES" || platformPreviewRoleVariable.MatchString(name)
+}
+
+// logPlatformPreviewVariable logs a requirement dropped by
+// platformPreviewVariable.
+func logPlatformPreviewVariable(logsWriter io.Writer, req reviewDeployRequirement) {
+	logDeployRequirement(logsWriter, resolvedDeployRequirement{Variable: req.Variable, Service: req.Service, Environment: req.Environment},
+		"set by deployment.io for the preview seed command, dropped")
+}
+
 // deployServiceRow is the part of a services.json row the resolution reads.
 type deployServiceRow struct {
 	Service       string   `json:"service"`
@@ -224,6 +245,10 @@ func resolveDeployRequirementsFrom(reqs []reviewDeployRequirement, contextDir st
 		if !deployVariableName.MatchString(req.Variable) || strings.TrimSpace(req.Service) == "" {
 			continue
 		}
+		if platformPreviewVariable(req.Variable) {
+			logPlatformPreviewVariable(logsWriter, req)
+			continue
+		}
 		if len(out) == maxDeployRequirements {
 			break
 		}
@@ -249,6 +274,10 @@ func resolveDeployRequirements(reqs []reviewDeployRequirement, rows []deployServ
 	seen := map[[3]string]bool{}
 	for _, req := range reqs {
 		if !deployVariableName.MatchString(req.Variable) || strings.TrimSpace(req.Service) == "" {
+			continue
+		}
+		if platformPreviewVariable(req.Variable) {
+			logPlatformPreviewVariable(logsWriter, req)
 			continue
 		}
 		for _, r := range resolveDeployRequirement(req, rows, logsWriter) {

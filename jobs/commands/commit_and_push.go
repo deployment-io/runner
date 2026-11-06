@@ -674,7 +674,9 @@ type reviewOutput struct {
 	FinalTreeReviewed bool `json:"final_tree_reviewed,omitempty"`
 	// DeployRequirements is the latest completed round's deploy requirements,
 	// resolved against the stage's copy of services.json at finish(). The pull
-	// request lists them under "Before deploying"; nothing else reads them.
+	// request lists them under "Before deploying"; app-server reads them from
+	// the job output for the board, the Task drawer and the deploy-after-merge
+	// gate.
 	DeployRequirements []resolvedDeployRequirement `json:"deploy_requirements,omitempty"`
 }
 
