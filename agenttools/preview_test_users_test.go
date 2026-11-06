@@ -248,3 +248,39 @@ func TestDeployWebServicePreviewDistributionFailureHasNoTestUsers(t *testing.T) 
 		t.Errorf("err = %v, log:\n%s", err, stepLog.String())
 	}
 }
+
+// The deploy's result carries what QA's sign-in needs: the preview id, how the
+// seed ended, the roles and the sign-in request.
+func TestDeployWebServicePreviewResultCarriesTheSignIn(t *testing.T) {
+	deps := webDeps(t, &fakeWebStore{}, &fakeWebCloudFront{}, func(context.Context, WebServicePreviewDeployInput) (WebServicePreviewDeployOutput, error) {
+		return WebServicePreviewDeployOutput{LoadBalancerDNS: "alb-x.elb.amazonaws.com", Seed: PreviewSeedSucceeded}, nil
+	})
+	service := webService("api", "us-east-1", "services/api")
+	signIn := &task_previews.PreviewSignInV1{Path: "/login", BodyFormat: "form", EmailField: "email", PasswordField: "password", Session: "cookie"}
+	service.PreviewSeedCommand, service.PreviewRoles, service.PreviewSignIn = "npm run seed", testPreviewRoles, signIn
+	deps.Settings = func(string) (task_previews.WebServicePreviewSettingsReplyV1, error) { return readyReply(service), nil }
+	deps.TestUsers = NewPreviewTestUsers()
+	plan, err := PlanWebServicePreview(deps, "1-acme/api")
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, err := DeployWebServicePreviewWith(context.Background(), deps, plan, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d.PreviewID == "" || d.Seed != PreviewSeedSucceeded || len(d.Roles) != 2 || d.Roles[1].Name != "billing-admin" || d.SignIn != signIn {
+		t.Errorf("deployed = %+v", d)
+	}
+	users := deps.TestUsers.Users(d.PreviewID)
+	if len(users) != 2 {
+		t.Fatalf("users = %d", len(users))
+	}
+	passwords := deps.TestUsers.Passwords()
+	if len(passwords) != 2 || (passwords[0] != users[0].Password && passwords[0] != users[1].Password) {
+		t.Errorf("passwords = %v", passwords)
+	}
+	var none *PreviewTestUsers
+	if none.Passwords() != nil {
+		t.Error("a nil holder has passwords")
+	}
+}

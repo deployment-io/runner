@@ -182,6 +182,16 @@ type WebServicePreviewDeployed struct {
 	// when the service sets neither.
 	TestUsers string
 	LogTail   string
+	// PreviewID is the preview Deployment's id: its test users' key in
+	// DeployWebServicePreviewDeps.TestUsers.
+	PreviewID string
+	// Seed is how the preview seed command ended.
+	Seed PreviewSeedOutcome
+	// Roles are the service's roles in their saved order, and SignIn its
+	// sign-in request (nil: none): with a seed that succeeded, QA can sign in
+	// as each role's test user.
+	Roles  []task_previews.PreviewRoleV1
+	SignIn *task_previews.PreviewSignInV1
 }
 
 // WebPreviewDeployFailed is the error of a failed step of a backend preview deploy.
@@ -587,6 +597,10 @@ func runWebServicePreview(ctx context.Context, deps DeployWebServicePreviewDeps,
 		DatabaseNote: databaseNote,
 		TestUsers:    testUsers,
 		LogTail:      tailString(tail.Bytes(), logTailMaxBytes),
+		PreviewID:    previewID,
+		Seed:         out.Seed,
+		Roles:        p.service.PreviewRoles,
+		SignIn:       p.service.PreviewSignIn,
 	}, nil
 }
 

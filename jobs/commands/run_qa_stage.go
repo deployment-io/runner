@@ -206,6 +206,9 @@ type qaStage struct {
 	// testUsers are the backend previews' test users, shared by every round's
 	// deploys as webDistributions is, so a re-seed sets the same passwords.
 	testUsers *agenttools.PreviewTestUsers
+	// roundSignIns are, in the stack path, the last round's backends QA may
+	// sign in at (qaStackRound.signIns).
+	roundSignIns []agenttools.APISignInPreview
 
 	// stack is the stack path (minPreviewsQAAgentboxVersion): the runner deploys
 	// every site and backend preview itself and the QA run gets QA_PREVIEWS.

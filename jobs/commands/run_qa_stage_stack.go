@@ -73,7 +73,16 @@ type qaPreview struct {
 	HealthURL           string   `json:"health_url,omitempty"`
 	ConnectedBackends   []string `json:"connected_backends,omitempty"`
 	UnconnectedBackends []string `json:"unconnected_backends,omitempty"`
-	Error               string   `json:"error,omitempty"`
+	// Roles are a backend's roles QA may sign in as (qaStackPreview.roles),
+	// absent when it has none. Never an email or a password.
+	Roles []qaPreviewRole `json:"roles,omitempty"`
+	Error string          `json:"error,omitempty"`
+}
+
+// qaPreviewRole is a role of a backend's QA_PREVIEWS entry.
+type qaPreviewRole struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
 }
 
 // qaStackPreview is one preview of a stack-path round: its plan, then what its
@@ -94,6 +103,13 @@ type qaStackPreview struct {
 	// origin is a site's reserved address, https://<distribution domain>.
 	origin         string
 	url, healthURL string
+	// roles, signIn and users are a deployed backend's roles, sign-in request
+	// and its roles' test users (in the roles' order) when QA may sign in as
+	// them: its seed command ran and exited 0, it has a role and a sign-in
+	// request (signInRoles).
+	roles  []task_previews.PreviewRoleV1
+	signIn *task_previews.PreviewSignInV1
+	users  []agenttools.PreviewTestUser
 }
 
 // qaStackRound is one stack-path round's deploys.
@@ -112,7 +128,8 @@ type qaStackRound struct {
 // deployStackAndSpawnQA is a stack-path QA round once its directory is ready: it
 // deploys every preview, adds QA_PREVIEWS to env and spawns the QA run with the
 // verify tools alone — and, when a backend preview deployed, verify_api_request
-// with QA_API_REQUEST_TOOL=1.
+// with QA_API_REQUEST_TOOL=1, and beside it, when a backend has roles,
+// verify_api_sign_in with QA_API_SIGN_IN_TOOL=1.
 func (s *qaStage) deployStackAndSpawnQA(round int, imageRef, qaDir string, env []string) (agentResult, error) {
 	previewDeps := buildStaticSitePreviewDeps(s.ctx, s.parameters, s.workDirHost, s.logsWriter)
 	mergeResults := s.newQAMergeResults()
@@ -135,6 +152,12 @@ func (s *qaStage) deployStackAndSpawnQA(round int, imageRef, qaDir string, env [
 	if hasDeployedBackend(previews) {
 		spec.apiRequestTool = true
 		spec.env = append(spec.env, "QA_API_REQUEST_TOOL=1")
+		spec.apiPasswords = s.testUsers.Passwords()
+		if len(s.roundSignIns) > 0 {
+			spec.apiSignIns = s.roundSignIns
+			spec.apiSignInTool = true
+			spec.env = append(spec.env, "QA_API_SIGN_IN_TOOL=1")
+		}
 	}
 	return s.spawnQARound(label, spec)
 }
@@ -163,6 +186,7 @@ func (s *qaStage) deployStack(label string, previewDeps *agenttools.DeployStatic
 		return nil, err
 	}
 	s.roundWiring = r.wiringOutputs()
+	s.roundSignIns = r.signIns()
 	for _, w := range s.roundWiring {
 		io.WriteString(s.logsWriter, fmt.Sprintf("%s: %s\n", label, qaWiringLine(w, s.roundWiring)))
 	}
@@ -332,6 +356,7 @@ func (r *qaStackRound) deployBackends() error {
 			continue
 		}
 		backend.url, backend.healthURL = d.URL, d.HealthURL
+		r.signInRoles(backend, d)
 		r.webDeps.Record.AddURL(d.URL)
 		io.WriteString(r.stage.logsWriter, fmt.Sprintf("%s: the backend preview of %s is deployed at %s (health check %s)\n", r.label, backend.repository, d.URL, d.HealthURL))
 	}
@@ -410,8 +435,44 @@ func (r *qaStackRound) previews() []qaPreview {
 			entry := qaPreview{Repository: repository, Kind: qaPreviewBackend, Error: backend.err}
 			if backend.err == "" {
 				entry.URL, entry.HealthURL = backend.url, backend.healthURL
+				for _, role := range backend.roles {
+					entry.Roles = append(entry.Roles, qaPreviewRole{Name: role.Name, Description: role.Description})
+				}
 			}
 			out = append(out, entry)
+		}
+	}
+	return out
+}
+
+// signInRoles records on backend the roles QA may sign in as after its deploy
+// d: all of them when its seed command ran and exited 0, it has a role and a
+// sign-in request, and the round's holder has each role's test user; else none.
+func (r *qaStackRound) signInRoles(backend *qaStackPreview, d agenttools.WebServicePreviewDeployed) {
+	if d.Seed != agenttools.PreviewSeedSucceeded || len(d.Roles) == 0 || d.SignIn == nil || r.webDeps.TestUsers == nil {
+		return
+	}
+	byRole := map[string]agenttools.PreviewTestUser{}
+	for _, user := range r.webDeps.TestUsers.Users(d.PreviewID) {
+		byRole[user.Role] = user
+	}
+	users := make([]agenttools.PreviewTestUser, 0, len(d.Roles))
+	for _, role := range d.Roles {
+		user, ok := byRole[role.Name]
+		if !ok {
+			return
+		}
+		users = append(users, user)
+	}
+	backend.roles, backend.signIn, backend.users = d.Roles, d.SignIn, users
+}
+
+// signIns are the round's backends QA may sign in at.
+func (r *qaStackRound) signIns() []agenttools.APISignInPreview {
+	var out []agenttools.APISignInPreview
+	for _, backend := range r.backends {
+		if backend.err == "" && len(backend.roles) > 0 {
+			out = append(out, agenttools.APISignInPreview{URL: backend.url, SignIn: *backend.signIn, Users: backend.users})
 		}
 	}
 	return out
