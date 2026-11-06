@@ -1913,6 +1913,14 @@ type agentboxSpawnSpec struct {
 	// deployed backend preview, also serves verify_api_request over the same
 	// record.
 	apiRequestTool bool
+	// apiPasswords are, beside apiRequestTool, the passwords of the test users
+	// of the round's previews: redacted from every API tool result.
+	apiPasswords []string
+	// apiSignIns are the backend previews the round may sign in at, and
+	// apiSignInTool, set beside apiRequestTool when there is one, also serves
+	// verify_api_sign_in over them.
+	apiSignIns    []agenttools.APISignInPreview
+	apiSignInTool bool
 }
 
 // productionQATools is what a production QA run's tool socket serves: only
@@ -1929,7 +1937,8 @@ type productionQATools struct {
 // registerAgentTools registers the tools a spawn's socket serves and returns
 // what stops them. A production QA run gets only its two read-only checks;
 // a stack-path QA round gets ping and the two verify tools (and
-// verify_api_request when apiRequestTool is set); every other run
+// verify_api_request when apiRequestTool is set, and verify_api_sign_in beside
+// it when apiSignInTool is too); every other run
 // gets ping and, with previewDeps, the three preview tools —
 // and deploy_web_service_preview when webPreviewDeps is set too (implement and
 // fix runs). The returned stop stops both deploy tools.
@@ -1947,7 +1956,12 @@ func registerAgentTools(mcpSrv *agentmcp.Server, spec agentboxSpawnSpec) func() 
 		agenttools.RegisterVerifyPreviewReachable(mcpSrv, spec.previewDeps.Record, spec.previewDeps.LogsWriter)
 		agenttools.RegisterVerifyPreviewRendered(mcpSrv, spec.previewDeps.Record, spec.previewDeps.VerifyBrowser, spec.previewDeps.LogsWriter)
 		if spec.apiRequestTool {
-			agenttools.RegisterVerifyAPIRequest(mcpSrv, spec.previewDeps.Record, spec.previewDeps.LogsWriter)
+			// One state per agent run: the sessions its sign-ins get.
+			sessions := agenttools.NewAPISessions(spec.apiPasswords, spec.apiSignIns)
+			agenttools.RegisterVerifyAPIRequest(mcpSrv, spec.previewDeps.Record, sessions, spec.previewDeps.LogsWriter)
+			if spec.apiSignInTool {
+				agenttools.RegisterVerifyAPISignIn(mcpSrv, spec.previewDeps.Record, sessions, spec.previewDeps.LogsWriter)
+			}
 		}
 		return func() {}
 	}

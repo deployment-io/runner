@@ -85,6 +85,23 @@ func (u *PreviewTestUsers) Users(previewID string) []PreviewTestUser {
 	return out
 }
 
+// Passwords returns every password the holder has, of every preview, in no
+// particular order: what the API tools redact.
+func (u *PreviewTestUsers) Passwords() []string {
+	if u == nil {
+		return nil
+	}
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	var out []string
+	for _, users := range u.byPreview {
+		for _, user := range users {
+			out = append(out, user.Password)
+		}
+	}
+	return out
+}
+
 // previewTestUserEmail is "qa-<role>-<the preview id's last 8 characters>@example.com".
 func previewTestUserEmail(previewID, role string) string {
 	suffix := previewID

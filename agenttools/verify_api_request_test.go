@@ -53,7 +53,7 @@ func apiCallErr(t *testing.T, tool *verifyAPIRequest, args map[string]any) error
 
 func TestVerifyAPIRequestRegistered(t *testing.T) {
 	srv := agentmcp.New("test", "0")
-	RegisterVerifyAPIRequest(srv, NewPreviewRecord(nil, nil), nil)
+	RegisterVerifyAPIRequest(srv, NewPreviewRecord(nil, nil), nil, nil)
 	if got := strings.Join(srv.ToolNames(), ","); got != "verify_api_request" {
 		t.Errorf("tools = %s", got)
 	}

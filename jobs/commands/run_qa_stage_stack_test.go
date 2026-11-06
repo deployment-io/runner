@@ -38,6 +38,10 @@ type fakeStackOps struct {
 	reserveErr      map[string]error // by repository
 	links           []task_previews.StackLinkV1
 	wiringErr       error
+	// seeds are what a backend's deploy reports of its test users, by
+	// repository: a seed that succeeded creates its roles' users in the deps'
+	// holder, as the real deploy does.
+	seeds map[string]agenttools.WebServicePreviewDeployed
 
 	events      []string
 	wiringCalls int
@@ -100,7 +104,14 @@ func (f *fakeStackOps) ops() *qaStackOps {
 				return agenttools.WebServicePreviewDeployed{}, err
 			}
 			url := stackHost("b", p.Repository)
-			return agenttools.WebServicePreviewDeployed{URL: url, HealthURL: url + "/healthz"}, nil
+			d := f.seeds[p.Repository]
+			if d.Seed == agenttools.PreviewSeedSucceeded && deps.TestUsers != nil {
+				if _, err := deps.TestUsers.For(d.PreviewID, d.Roles); err != nil {
+					return agenttools.WebServicePreviewDeployed{}, err
+				}
+			}
+			d.URL, d.HealthURL = url, url+"/healthz"
+			return d, nil
 		},
 		wiring: func(repos []task_previews.StackRepositoryV1) (task_previews.StackWiringReplyV1, error) {
 			f.event("wiring")
