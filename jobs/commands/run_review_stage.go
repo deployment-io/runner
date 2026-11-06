@@ -748,7 +748,9 @@ func (s *reviewStage) finish() (map[string]interface{}, error) {
 		DeclinedExplanation: s.declinedExplanation,
 		FinalTreeReviewed:   s.finalTreeReviewed,
 		// Never findings: resolved for the "Before deploying" part of the
-		// pull request and nothing else — see resolveDeployRequirementsFrom.
+		// pull request, and read by app-server from the job output for the
+		// board, the Task drawer and the deploy-after-merge gate — see
+		// resolveDeployRequirementsFrom.
 		DeployRequirements: resolveDeployRequirementsFrom(
 			latestCompletedDeployRequirements(s.rounds), s.contextCopyDir, s.logsWriter),
 	}
