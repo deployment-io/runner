@@ -76,7 +76,14 @@ func (s *qaStage) deployAndSpawnQA(round int, imageRef, qaDir string, env []stri
 		return agentResult{}, err
 	}
 	env = withQABackends(env, backends)
-	return s.spawnQARound(label, s.qaSpawnSpec(imageRef, qaDir, env, previewDeps))
+	spec := s.qaSpawnSpec(imageRef, qaDir, env, previewDeps)
+	spec.onSiteDeployed = func(repository, url string, err error) {
+		// A repository outside the Task is refused by the tool: no preview.
+		if name, ok := s.taskEntryName(repository); ok {
+			s.emitPreviewDeploy(previewDeployResult{repo: name, kind: qaPreviewSite, url: url, err: err})
+		}
+	}
+	return s.spawnQARound(label, spec)
 }
 
 // spawnQARound runs a round's QA container once its previews are deployed.
@@ -126,10 +133,12 @@ func (s *qaStage) deployBackends(label string, previewDeps *agenttools.DeploySta
 	deployed := 0
 	for _, repository := range s.backends {
 		io.WriteString(s.logsWriter, fmt.Sprintf("%s: deploying the backend preview of %s\n", label, repository))
-		d, err := deploy(ctx, *deps, repository)
+		repositoryDeps, facts := recordPreviewDeploy(*deps)
+		d, err := deploy(ctx, repositoryDeps, repository)
 		if s.stopped() {
 			return nil, types.ErrJobStoppedByUser
 		}
+		s.emitPreviewDeploy(previewDeployResult{repo: s.entryName(repository), kind: qaPreviewBackend, url: d.URL, err: err, details: facts.result(d)})
 		if err != nil {
 			io.WriteString(s.logsWriter, fmt.Sprintf("%s: the backend preview of %s failed to deploy: %s\n", label, repository, err))
 			out = append(out, qaBackend{Repository: repository, Error: qaBackendError(err)})
@@ -146,6 +155,11 @@ func (s *qaStage) deployBackends(label string, previewDeps *agenttools.DeploySta
 		return out, fmt.Errorf("the backend preview failed to deploy: %s", firstErr)
 	}
 	return out, nil
+}
+
+// emitPreviewDeploy queues the running round's preview_deploy_finished event.
+func (s *qaStage) emitPreviewDeploy(r previewDeployResult) {
+	s.emitEvent(previewDeployFinishedEvent(s.eventRound, r))
 }
 
 // qaBackendErrorMax caps a failed backend's error in QA_BACKENDS.

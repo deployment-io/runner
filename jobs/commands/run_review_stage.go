@@ -130,6 +130,9 @@ func (rs *RunReviewStage) Run(parameters map[string]interface{}, logsWriter io.W
 	}()
 	participation := readReviewParticipation(parameters, logsWriter)
 	if participation == participationOff {
+		if ctx, err := commandUtils.ParseTaskJobContext(parameters); err == nil {
+			emitTaskEvent(parameters, ctx, logsWriter, stageFinishedEvent(tasks.TaskEventStageReview, reviewOffOutcome))
+		}
 		return parameters, nil
 	}
 	// The review rounds and fix runs spawn the same agentbox image RunAgentStep
@@ -326,6 +329,9 @@ type reviewStage struct {
 	// fix run finished, and always nil for a fix run supplied by a test seam
 	// that does not set it.
 	finishedFix *agentResult
+	// lastFixRun is the latest fix run's result, finished or not, for its
+	// fix_round_finished progress event. Nil when no fix run returned one.
+	lastFixRun *agentResult
 	// finalTreeReviewed tracks whether the latest completed review round
 	// reviewed the tree as it now stands. ONE RULE, not a list of exits: set
 	// when a review round completes, cleared when a fix run's work is kept; a
@@ -511,6 +517,7 @@ func (s *reviewStage) run() (map[string]interface{}, error) {
 		}
 		s.reportStage(tasks.StageReview)
 		io.WriteString(s.logsWriter, fmt.Sprintf("Review round %d: reviewing the change against the Task's spec\n", round))
+		s.emitEvent(reviewRoundStartedEvent(round))
 		s.stageFixDiffs(round)
 		result, reason, err := s.reviewRoundRetryingBusyModel(round)
 		s.clearFixDiffs()
@@ -530,6 +537,7 @@ func (s *reviewStage) run() (map[string]interface{}, error) {
 		s.recordRound(round, findings, result)
 		s.finalTreeReviewed = true
 		io.WriteString(s.logsWriter, fmt.Sprintf("Review round %d completed: %d finding(s), %d agent turn(s) reported (cap: %s model responses)\n", round, len(findings), result.Turns, s.lastTurnCap))
+		s.emitEvent(reviewRoundFinishedEvent(round, findings, reviewEarlierKeys(s.rounds[:len(s.rounds)-1]), result))
 		if round == 1 {
 			// Before anything moves the tree or the loop's state, so the shadow
 			// review sees exactly what round 1 saw.
@@ -554,7 +562,9 @@ func (s *reviewStage) run() (map[string]interface{}, error) {
 			break
 		}
 		s.reportStage(tasks.StageImplement)
+		s.emitEvent(reviewFixStartedEvent(round))
 		ran, err := s.attemptFix(round, sentBack)
+		s.emitEvent(fixRoundFinishedEvent(tasks.TaskEventStageReview, round, sentBack, s.lastFixRun))
 		if err != nil {
 			// A user stop, or a restore that did not work. Nothing else here
 			// fails the Step.
@@ -613,8 +623,10 @@ func (s *reviewStage) accumulateReviewRun(round int, result agentResult) {
 //	             did not work, which leaves a tree nobody can describe.
 func (s *reviewStage) attemptFix(round int, mustFix []reviewFindingOutput) (bool, error) {
 	// Only a kept fix leaves diffs for the next round; nothing from an
-	// earlier one may survive into it.
+	// earlier one may survive into it — nor, for its progress event, an earlier
+	// fix run's result on a path that runs none.
 	s.pendingFixDiffs = nil
+	s.lastFixRun = nil
 	// The copy can take a while on a large checkout and cannot be interrupted,
 	// so a stop is honoured on both sides of it rather than after a fix run
 	// that was never going to be wanted.
@@ -643,6 +655,9 @@ func (s *reviewStage) attemptFix(round int, mustFix []reviewFindingOutput) (bool
 	defer trees.remove()
 	s.finishedFix = nil
 	fixErr := s.fixRound(mustFix)
+	if s.lastFixRun == nil && s.finishedFix != nil {
+		s.lastFixRun = s.finishedFix
+	}
 	if fixErr == nil {
 		// THE UNDO COPY IS ALSO THE ANSWER TO "DID THIS RUN CHANGE ANYTHING",
 		// so the comparison happens before the copy is dropped.
@@ -759,7 +774,23 @@ func (s *reviewStage) finish() (map[string]interface{}, error) {
 		io.WriteString(s.logsWriter, fmt.Sprintf("warning: could not record the review on the job output: %s\n", err))
 	}
 	s.reportReviewResult(out)
+	// Also when the QA stage's review round on its fix finishes: that round's
+	// record is then the reported review.
+	s.emitEvent(stageFinishedEvent(tasks.TaskEventStageReview, reviewStageOutcome(out, reviewNoRoundReason)))
 	return s.parameters, nil
+}
+
+// reviewOffOutcome is the Review stage's outcome when its participation is
+// off, in the words of the participation warnings.
+const reviewOffOutcome = "Skipped: running this Step without the Review stage"
+
+// reviewNoRoundReason is the Review stage's outcome when the budget left room
+// for no round at all, as its log line says.
+const reviewNoRoundReason = "not enough of the stage budget left for another review round"
+
+// emitEvent queues one of the stage's progress events on the Step's sender.
+func (s *reviewStage) emitEvent(e tasks.TaskEventV1) {
+	emitTaskEvent(s.parameters, s.ctx, s.logsWriter, e)
 }
 
 // classify turns one round's raw findings into the Step's record: each finding

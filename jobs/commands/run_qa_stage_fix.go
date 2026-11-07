@@ -26,9 +26,11 @@ func (s *qaStage) fixRound(round1 qaRoundOutput) (bool, error) {
 	reportTaskStepStage(s.parameters, s.ctx, tasks.StageImplement, s.logsWriter)
 	failed := failedCriteria(round1)
 	io.WriteString(s.logsWriter, fmt.Sprintf("QA: sending %d failed acceptance criteria back to the implementer\n", len(failed)))
+	emitTaskEvent(s.parameters, s.ctx, s.logsWriter, qaFixStartedEvent(round1.Round))
 	rs := s.newFixStage(failed, round1.Findings)
 	s.fixStage = rs
 	ran, err := rs.attemptFix(1, nil)
+	emitTaskEvent(s.parameters, s.ctx, s.logsWriter, fixRoundFinishedEvent(tasks.TaskEventStageQA, round1.Round, round1.Findings, rs.lastFixRun))
 	if err != nil {
 		return false, err
 	}
@@ -72,6 +74,7 @@ func (s *qaStage) newFixStage(failed []qaCriterion, findings []reviewFindingOutp
 		rs.runFix = func([]reviewFindingOutput) error {
 			stepPrompt, _ := jobs.GetParameterValue[string](s.parameters, parameters_enums.StepPrompt)
 			result, err := s.runFix(rs.fixRunPrompt(stepPrompt, readAgentSummaryFromJobOutput(s.parameters), nil))
+			rs.lastFixRun = &result
 			if err := recordFailedFixRun(s.parameters, result, err, s.logsWriter); err != nil {
 				return err
 			}
@@ -125,6 +128,7 @@ func (s *qaStage) reviewFix() error {
 	}
 	rs.reportStage(tasks.StageReview)
 	io.WriteString(s.logsWriter, fmt.Sprintf("Review round %d: reviewing the fix QA sent back\n", round))
+	rs.emitEvent(reviewRoundStartedEvent(round))
 	rs.stageFixDiffs(round)
 	result, reason, err := rs.reviewRoundRetryingBusyModel(round)
 	rs.clearFixDiffs()
@@ -145,6 +149,7 @@ func (s *qaStage) reviewFix() error {
 		rs.finalTreeReviewed = true
 		rs.rememberOpenSentBack(sentBackOnly(findings))
 		io.WriteString(s.logsWriter, fmt.Sprintf("Review round %d completed: %d finding(s), %d agent turn(s) reported (cap: %s model responses)\n", round, len(findings), result.Turns, rs.lastTurnCap))
+		rs.emitEvent(reviewRoundFinishedEvent(round, findings, reviewEarlierKeys(rs.rounds[:len(rs.rounds)-1]), result))
 	}
 	_, _ = rs.finish()
 	return nil

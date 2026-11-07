@@ -43,6 +43,7 @@ func runPreviewSeedCommand(parameters map[string]interface{}, ecsClient preDeplo
 	var err error
 	if len(clash) > 0 {
 		failure = fmt.Sprintf("The %s didn't run: %s.", previewSeedCommandName, clash)
+		recordPreviewCommandNotRun(logsWriter, previewSeedCommandName, failure)
 	} else {
 		failure, err = runOneOffTask(parameters, ecsClient, logsClient, oneOffTask{
 			ecsClusterArn:     ecsClusterArn,
@@ -57,6 +58,7 @@ func runPreviewSeedCommand(parameters map[string]interface{}, ecsClient preDeplo
 	}
 	if err != nil {
 		failure = fmt.Sprintf("The %s couldn't start: %s.", previewSeedCommandName, err)
+		recordPreviewCommandNotRun(logsWriter, previewSeedCommandName, failure)
 	}
 	if len(failure) > 0 {
 		seed.outcome = agenttools.PreviewSeedFailed

@@ -70,6 +70,12 @@ func (s *Server) Register(t Tool) {
 	s.tools[t.Name] = t
 }
 
+// Lookup returns the registered tool named name.
+func (s *Server) Lookup(name string) (Tool, bool) {
+	t, ok := s.tools[name]
+	return t, ok
+}
+
 // ToolNames returns the registered tools' names in tools/list order.
 func (s *Server) ToolNames() []string {
 	return append([]string(nil), s.order...)

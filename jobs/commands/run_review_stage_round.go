@@ -823,6 +823,7 @@ func (s *reviewStage) runMustFixRound(mustFix []reviewFindingOutput) error {
 	}
 	impl := &RunAgentStep{stopSignal: s.stopSignal, progressSink: s.progressSink}
 	result, err := impl.spawnAgentboxAndWait(s.fixSpawnSpec(imageRef, workDirHost, env, previewTools), s.logsWriter)
+	s.lastFixRun = &result
 	if err := recordFailedFixRun(s.parameters, result, err, s.logsWriter); err != nil {
 		return err
 	}

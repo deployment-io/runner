@@ -4,6 +4,7 @@ import (
 	"net"
 	"net/rpc"
 	"testing"
+	"time"
 
 	"github.com/deployment-io/deployment-runner-kit/tasks"
 )
@@ -55,5 +56,50 @@ func TestUpdateTaskStepQACallsTheQAMethod(t *testing.T) {
 func TestUpdateTaskStepQAWhenDisconnected(t *testing.T) {
 	if err := (&RunnerClient{}).UpdateTaskStepQA("org", tasks.UpdateTaskStepQADtoV1{}); err != ErrConnection {
 		t.Errorf("err = %v, want ErrConnection", err)
+	}
+}
+
+// fakeJobsEvents is a Jobs service whose events method never answers.
+type fakeJobsEvents struct {
+	called chan struct{}
+	block  chan struct{}
+}
+
+func (f *fakeJobsEvents) AppendTaskEventsV1(args *tasks.AppendTaskEventsArgsV1, reply *tasks.AppendTaskEventsReplyV1) error {
+	f.called <- struct{}{}
+	<-f.block
+	reply.Done = true
+	return nil
+}
+
+// AppendTaskEvents gives up on a server that never answers, so no sender
+// waits on it for good.
+func TestAppendTaskEventsGivesUpOnAServerThatNeverAnswers(t *testing.T) {
+	original := appendTaskEventsTimeout
+	appendTaskEventsTimeout = 50 * time.Millisecond
+	defer func() { appendTaskEventsTimeout = original }()
+	f := &fakeJobsEvents{called: make(chan struct{}, 1), block: make(chan struct{})}
+	defer close(f.block)
+	srv := rpc.NewServer()
+	if err := srv.RegisterName("Jobs", f); err != nil {
+		t.Fatal(err)
+	}
+	clientConn, serverConn := net.Pipe()
+	go srv.ServeConn(serverConn)
+	r := &RunnerClient{c: rpc.NewClient(clientConn), isConnected: true, token: "tok"}
+	defer r.c.Close()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- r.AppendTaskEvents("org", tasks.AppendTaskEventsArgsV1{TaskID: "task", JobID: "job", BatchID: "b"})
+	}()
+	<-f.called
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("AppendTaskEvents succeeded without an answer")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("AppendTaskEvents is still waiting for an answer")
 	}
 }

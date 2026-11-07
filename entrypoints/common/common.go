@@ -242,6 +242,11 @@ func executeJobs(jobsStream <-chan pendingJobType, noOfWorkers int, mode runner_
 						logger, err := loggers.Get(parameters)
 						if err != nil {
 							result := getJobResult(pendingJob, err.Error(), nil)
+							// A Task Step's cleanup — its progress events included —
+							// finishes before its result is sent.
+							if commandUtils.IsTasksMode(parameters) && !commandUtils.IsSessionMode(parameters) {
+								<-commands.MarkStepDone(parameters, err)
+							}
 							resultsStream <- result
 							loggers.AddJobLogsPipeline.Add(pendingJob.jobID, loggers.JobLog{
 								Logger:         nil,
@@ -250,12 +255,10 @@ func executeJobs(jobsStream <-chan pendingJobType, noOfWorkers int, mode runner_
 								OrganizationID: pendingJob.organizationID,
 							})
 							//if job is a build type it will be marked done; if it's a Task
-							//Step Job the per-Task working dir is cleaned up instead
+							//Step Job the per-Task working dir was cleaned up above
 							if commandUtils.IsSessionMode(parameters) {
 								cleanupSessionWorkDir(parameters)
-							} else if commandUtils.IsTasksMode(parameters) {
-								<-commands.MarkStepDone(parameters, err)
-							} else {
+							} else if !commandUtils.IsTasksMode(parameters) {
 								<-commands.MarkDeploymentDone(parameters, err)
 							}
 							return
@@ -288,14 +291,17 @@ func executeJobs(jobsStream <-chan pendingJobType, noOfWorkers int, mode runner_
 								// block with token usage / cost — is persisted for the
 								// stopped Job rather than silently dropped.
 								result := getJobResult(pendingJob, errStoppedByUser.Error(), parameters)
+								// A Task Step's cleanup — its progress events included —
+								// finishes before its result is sent.
+								if commandUtils.IsTasksMode(parameters) && !commandUtils.IsSessionMode(parameters) {
+									<-commands.MarkStepDone(parameters, errStoppedByUser)
+								}
 								resultsStream <- result
 								//if job is a deployment/build/preview type, this will be marked them done;
-								//if it's a Task Step Job, the per-Task working dir is cleaned up instead
+								//if it's a Task Step Job, the per-Task working dir was cleaned up above
 								if commandUtils.IsSessionMode(parameters) {
 									cleanupSessionWorkDir(parameters)
-								} else if commandUtils.IsTasksMode(parameters) {
-									<-commands.MarkStepDone(parameters, errStoppedByUser)
-								} else {
+								} else if !commandUtils.IsTasksMode(parameters) {
 									<-commands.MarkDeploymentDone(parameters, errStoppedByUser)
 								}
 								return
@@ -304,15 +310,18 @@ func executeJobs(jobsStream <-chan pendingJobType, noOfWorkers int, mode runner_
 								if err != nil {
 									handleLogEnd(err, pendingJob.jobID, logsWriter)
 									result := getJobResult(pendingJob, err.Error(), parameters)
+									// A Task Step's cleanup — its progress events included —
+									// finishes before its result is sent.
+									if commandUtils.IsTasksMode(parameters) && !commandUtils.IsSessionMode(parameters) {
+										<-commands.MarkStepDone(parameters, err)
+									}
 									resultsStream <- result
 									//no command ran to do its own failure bookkeeping (e.g. a
 									//removed command after CheckoutRepo), so mark the
 									//deployment/build/preview done or clean up the working dir here
 									if commandUtils.IsSessionMode(parameters) {
 										cleanupSessionWorkDir(parameters)
-									} else if commandUtils.IsTasksMode(parameters) {
-										<-commands.MarkStepDone(parameters, err)
-									} else {
+									} else if !commandUtils.IsTasksMode(parameters) {
 										<-commands.MarkDeploymentDone(parameters, err)
 									}
 									return
