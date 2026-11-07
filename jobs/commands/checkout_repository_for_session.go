@@ -102,7 +102,7 @@ func cloneSessionRepoReadOnly(ctx context.Context, repoDir string, req sessionCl
 	if err := checkoutSessionBaseBranch(repository, entry.BaseBranch); err != nil {
 		return err
 	}
-	if err := scrubRemoteToken(repository, entry.CloneURL); err != nil {
+	if err := commandUtils.ScrubRemoteToken(repository, entry.CloneURL); err != nil {
 		return err
 	}
 	return chownTreeToAgentbox(repoDir)
@@ -137,29 +137,6 @@ func checkoutSessionBaseBranch(repository *git.Repository, baseBranch string) er
 	return nil
 }
 
-// scrubRemoteToken resets origin's URL to the tokenless clone URL, removing the
-// installation token go-git persists into .git/config from a tokenized clone.
-// Call it at the end of a checkout, after the runner's own clone/fetch, so the
-// in-container agent never sees a credential it doesn't need. Safe for both
-// flows: a session never pushes, and a Task pushes via commit_and_push, which
-// authenticates with its own freshly-minted token through PushOptions.Auth —
-// independent of the remote URL. Best-effort: a missing origin is not an error.
-func scrubRemoteToken(repository *git.Repository, tokenlessURL string) error {
-	cfg, err := repository.Config()
-	if err != nil {
-		return fmt.Errorf("error reading repo config to scrub token: %s", err)
-	}
-	remote, ok := cfg.Remotes["origin"]
-	if !ok {
-		return nil
-	}
-	remote.URLs = []string{tokenlessURL}
-	if err := repository.Storer.SetConfig(cfg); err != nil {
-		return fmt.Errorf("error setting scrubbed remote config: %s", err)
-	}
-	return nil
-}
-
 // sessionToken returns a token for the installation, minting + caching on a miss
 // so repos sharing one installation don't re-hit the refresh RPC.
 func sessionToken(cache map[string]string, installationID, orgID string) (string, error) {
@@ -180,17 +157,12 @@ func sessionToken(cache map[string]string, installationID, orgID string) (string
 // Returns the (possibly-refreshed) token used for the successful clone.
 //
 // It goes through commandUtils.CloneRepositoryWithContext rather than
-// CloneRepository so the mid-session add can impose a deadline;
-// CloneRepository's signature and behaviour are untouched for Tasks and
-// deployments, and an unbounded ctx here behaves exactly as it did before.
+// CloneRepository so the mid-session add can impose a deadline; an unbounded
+// ctx here behaves exactly as CloneRepository.
 func cloneSessionWithRetry(ctx context.Context, repoDir string, req sessionCloneRequest, token string) (*git.Repository, string, error) {
 	entry := req.entry
-	cloneURL, err := commandUtils.GetRepoUrlWithToken(entry.Provider, token, entry.CloneURL)
-	if err != nil {
-		return nil, token, err
-	}
 	opts := commandUtils.CloneOptions{
-		CloneURLWithToken: cloneURL, Token: token, Provider: entry.Provider, LogsWriter: req.logsWriter,
+		CloneURL: entry.CloneURL, Token: token, Provider: entry.Provider, LogsWriter: req.logsWriter,
 	}
 	repository, err := commandUtils.CloneRepositoryWithContext(ctx, repoDir, opts)
 	if err == nil {
@@ -204,11 +176,7 @@ func cloneSessionWithRetry(ctx context.Context, repoDir string, req sessionClone
 		return nil, token, err
 	}
 	req.tokenCache[entry.InstallationID] = token
-	cloneURL, err = commandUtils.GetRepoUrlWithToken(entry.Provider, token, entry.CloneURL)
-	if err != nil {
-		return nil, token, err
-	}
-	opts.CloneURLWithToken, opts.Token = cloneURL, token
+	opts.Token = token
 	repository, err = commandUtils.CloneRepositoryWithContext(ctx, repoDir, opts)
 	return repository, token, err
 }

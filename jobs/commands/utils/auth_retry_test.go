@@ -42,11 +42,7 @@ func TestIsErrorAuthenticationRequired(t *testing.T) {
 // does) yields an error the retry recognises.
 func TestCloneRepository_401WithBodyIsAuthenticationRequired(t *testing.T) {
 	srv := gittest.New(t, "good-token")
-	urlWithToken, err := GetRepoUrlWithToken("GitHub", "bad-token", srv.URL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = CloneRepository(filepath.Join(t.TempDir(), "repo"), urlWithToken, "bad-token", "GitHub", io.Discard)
+	_, err := CloneRepository(filepath.Join(t.TempDir(), "repo"), srv.URL, "bad-token", "GitHub", io.Discard)
 	if err == nil {
 		t.Fatal("clone with a rejected token succeeded")
 	}
@@ -55,8 +51,7 @@ func TestCloneRepository_401WithBodyIsAuthenticationRequired(t *testing.T) {
 	}
 
 	// And with the accepted token the same server serves the repository.
-	urlWithToken, _ = GetRepoUrlWithToken("GitHub", "good-token", srv.URL)
-	if _, err := CloneRepository(filepath.Join(t.TempDir(), "repo"), urlWithToken, "good-token", "GitHub", io.Discard); err != nil {
+	if _, err := CloneRepository(filepath.Join(t.TempDir(), "repo"), srv.URL, "good-token", "GitHub", io.Discard); err != nil {
 		t.Fatalf("clone with the accepted token: %v", err)
 	}
 }

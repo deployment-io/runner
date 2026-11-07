@@ -340,8 +340,11 @@ func (tcp *taskCommitPush) pushWithRetry(repository *git.Repository, entry tasks
 }
 
 func (tcp *taskCommitPush) push(repository *git.Repository, entry tasks.RepositoryEntry, token string, refSpec config.RefSpec) error {
+	// RemoteURL, not origin's URL: the agent owns .git/config and could point
+	// origin (or a url.<x>.insteadOf rule) at another host.
 	return repository.Push(&git.PushOptions{
 		RemoteName: "origin",
+		RemoteURL:  entry.CloneURL,
 		RefSpecs:   []config.RefSpec{refSpec},
 		Auth: &http.BasicAuth{
 			Username: commandUtils.GetUsernameForProvider(entry.Provider),
