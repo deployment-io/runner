@@ -237,12 +237,11 @@ func (tc *taskCheckout) checkoutOne(repoDir string, entry tasks.RepositoryEntry)
 			return err
 		}
 	}
-	// Strip the installation token from .git/config before the agent runs:
-	// the runner's own git ops (clone, and the Step>0 fetch above) are done,
-	// and commit_and_push later authenticates with its own freshly-minted
-	// token via PushOptions.Auth — so the embedded credential is not needed
-	// downstream, and the RunAgentStep container shouldn't be able to read it.
-	if err := scrubRemoteToken(repository, entry.CloneURL); err != nil {
+	// Make sure .git/config holds no installation token before the agent
+	// runs: clones no longer embed it, but a reused repository directory may
+	// still carry one. commit_and_push authenticates with its own token via
+	// PushOptions.Auth and names its URL, so origin's URL isn't relied on.
+	if err := commandUtils.ScrubRemoteToken(repository, entry.CloneURL); err != nil {
 		return err
 	}
 	// go-git's PlainClone + Checkout ran as the runner process (root inside
@@ -270,11 +269,7 @@ func chownTreeToAgentbox(root string) error {
 // token used for the successful clone so the caller can pass it to the
 // subsequent fetch.
 func (tc *taskCheckout) cloneWithRetry(repoDir string, entry tasks.RepositoryEntry, token string) (*git.Repository, string, error) {
-	cloneURL, err := commandUtils.GetRepoUrlWithToken(entry.Provider, token, entry.CloneURL)
-	if err != nil {
-		return nil, token, err
-	}
-	repository, err := commandUtils.CloneRepository(repoDir, cloneURL, token, entry.Provider, tc.logsWriter)
+	repository, err := commandUtils.CloneRepository(repoDir, entry.CloneURL, token, entry.Provider, tc.logsWriter)
 	if err == nil {
 		return repository, token, nil
 	}
@@ -285,11 +280,7 @@ func (tc *taskCheckout) cloneWithRetry(repoDir string, entry tasks.RepositoryEnt
 	if err != nil {
 		return nil, token, err
 	}
-	cloneURL, err = commandUtils.GetRepoUrlWithToken(entry.Provider, token, entry.CloneURL)
-	if err != nil {
-		return nil, token, err
-	}
-	repository, err = commandUtils.CloneRepository(repoDir, cloneURL, token, entry.Provider, tc.logsWriter)
+	repository, err = commandUtils.CloneRepository(repoDir, entry.CloneURL, token, entry.Provider, tc.logsWriter)
 	return repository, token, err
 }
 
@@ -326,7 +317,7 @@ func (tc *taskCheckout) fetchAndCheckoutTaskBranch(repository *git.Repository, w
 // fetchWithRetry runs FetchRepository, refreshes the token + retries once on
 // "authentication required". Mirrors the clone retry shape.
 func (tc *taskCheckout) fetchWithRetry(repository *git.Repository, entry tasks.RepositoryEntry, token string) error {
-	if err := commandUtils.FetchRepository(repository, token, entry.Provider, tc.logsWriter); err == nil {
+	if err := commandUtils.FetchRepository(repository, entry.CloneURL, token, entry.Provider, tc.logsWriter); err == nil {
 		return nil
 	} else if !commandUtils.IsErrorAuthenticationRequired(err) {
 		return err
@@ -335,7 +326,7 @@ func (tc *taskCheckout) fetchWithRetry(repository *git.Repository, entry tasks.R
 	if err != nil {
 		return err
 	}
-	return commandUtils.FetchRepository(repository, token, entry.Provider, tc.logsWriter)
+	return commandUtils.FetchRepository(repository, entry.CloneURL, token, entry.Provider, tc.logsWriter)
 }
 
 // checkoutBaseBranchAndCreateTaskBranch is the StepIndex==0 path: position

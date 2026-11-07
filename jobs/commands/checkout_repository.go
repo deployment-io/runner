@@ -118,6 +118,11 @@ func (cr *CheckoutRepository) Run(parameters map[string]interface{}, logsWriter 
 	if err != nil {
 		return parameters, err
 	}
+	// A repository directory reused from an older runner still holds a
+	// tokenized origin; every build sees .git.
+	if err = commandUtils.ScrubRemoteToken(repository, repoCloneUrl); err != nil {
+		return parameters, err
+	}
 
 	var worktree *git.Worktree
 	worktree, err = repository.Worktree()
@@ -125,8 +130,11 @@ func (cr *CheckoutRepository) Run(parameters map[string]interface{}, logsWriter 
 		return parameters, err
 	}
 
-	repoProviderToken, err = fetchDeployRepositoryWithRetry(parameters, repository, repoProviderToken, repoGitProvider, logsWriter)
+	repoProviderToken, err = fetchDeployRepositoryWithRetry(parameters, repository, repoCloneUrl, repoProviderToken, repoGitProvider, logsWriter)
 	if err != nil {
+		return parameters, err
+	}
+	if err = commandUtils.ScrubRemoteToken(repository, repoCloneUrl); err != nil {
 		return parameters, err
 	}
 	isPreview := isPreview(parameters)
@@ -163,7 +171,7 @@ func (cr *CheckoutRepository) Run(parameters map[string]interface{}, logsWriter 
 		}
 		username := commandUtils.GetUsernameForProvider(repoGitProvider)
 		// Ensure submodules are updated after the checkout
-		err = commandUtils.UpdateSubmodules(repository, username, repoProviderToken, logsWriter)
+		err = commandUtils.UpdateSubmodules(repository, repoCloneUrl, username, repoProviderToken, logsWriter)
 		if err != nil {
 			return parameters, err
 		}
@@ -190,7 +198,7 @@ func (cr *CheckoutRepository) Run(parameters map[string]interface{}, logsWriter 
 		}
 		username := commandUtils.GetUsernameForProvider(repoGitProvider)
 		// Ensure submodules are updated after the checkout
-		err = commandUtils.UpdateSubmodules(repository, username, repoProviderToken, logsWriter)
+		err = commandUtils.UpdateSubmodules(repository, repoCloneUrl, username, repoProviderToken, logsWriter)
 		if err != nil {
 			return parameters, err
 		}
@@ -252,11 +260,7 @@ func (cr *CheckoutRepository) Run(parameters map[string]interface{}, logsWriter 
 // it in parameters. Returns the token the successful clone used.
 func cloneDeployRepositoryWithRetry(parameters map[string]interface{}, repoDirectoryPath, repoCloneUrl, repoProviderToken, repoGitProvider string,
 	logsWriter io.Writer) (*git.Repository, string, error) {
-	repoCloneUrlWithToken, err := commandUtils.GetRepoUrlWithToken(repoGitProvider, repoProviderToken, repoCloneUrl)
-	if err != nil {
-		return nil, repoProviderToken, err
-	}
-	repository, err := commandUtils.CloneRepository(repoDirectoryPath, repoCloneUrlWithToken, repoProviderToken, repoGitProvider, logsWriter)
+	repository, err := commandUtils.CloneRepository(repoDirectoryPath, repoCloneUrl, repoProviderToken, repoGitProvider, logsWriter)
 	if err == nil {
 		return repository, repoProviderToken, nil
 	}
@@ -267,11 +271,7 @@ func cloneDeployRepositoryWithRetry(parameters map[string]interface{}, repoDirec
 	if err != nil {
 		return nil, repoProviderToken, err
 	}
-	repoCloneUrlWithToken, err = commandUtils.GetRepoUrlWithToken(repoGitProvider, repoProviderToken, repoCloneUrl)
-	if err != nil {
-		return nil, repoProviderToken, err
-	}
-	repository, err = commandUtils.CloneRepository(repoDirectoryPath, repoCloneUrlWithToken, repoProviderToken, repoGitProvider, logsWriter)
+	repository, err = commandUtils.CloneRepository(repoDirectoryPath, repoCloneUrl, repoProviderToken, repoGitProvider, logsWriter)
 	if err != nil {
 		return nil, repoProviderToken, err
 	}
@@ -281,9 +281,9 @@ func cloneDeployRepositoryWithRetry(parameters map[string]interface{}, repoDirec
 
 // fetchDeployRepositoryWithRetry is cloneDeployRepositoryWithRetry for the
 // fetch that follows the clone. Returns the token the successful fetch used.
-func fetchDeployRepositoryWithRetry(parameters map[string]interface{}, repository *git.Repository, repoProviderToken, repoGitProvider string,
+func fetchDeployRepositoryWithRetry(parameters map[string]interface{}, repository *git.Repository, repoCloneUrl, repoProviderToken, repoGitProvider string,
 	logsWriter io.Writer) (string, error) {
-	err := commandUtils.FetchRepository(repository, repoProviderToken, repoGitProvider, logsWriter)
+	err := commandUtils.FetchRepository(repository, repoCloneUrl, repoProviderToken, repoGitProvider, logsWriter)
 	if err == nil {
 		return repoProviderToken, nil
 	}
@@ -294,7 +294,7 @@ func fetchDeployRepositoryWithRetry(parameters map[string]interface{}, repositor
 	if err != nil {
 		return repoProviderToken, err
 	}
-	if err := commandUtils.FetchRepository(repository, repoProviderToken, repoGitProvider, logsWriter); err != nil {
+	if err := commandUtils.FetchRepository(repository, repoCloneUrl, repoProviderToken, repoGitProvider, logsWriter); err != nil {
 		return repoProviderToken, err
 	}
 	jobs.SetParameterValue(parameters, parameters_enums.RepoProviderToken, repoProviderToken)

@@ -35,9 +35,13 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/oauth"
 	"github.com/deployment-io/deployment-runner/client"
 	"github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/config"
 	"github.com/go-git/go-git/v5/plumbing/transport"
 	"github.com/go-git/go-git/v5/plumbing/transport/http"
 	"io"
+	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -96,8 +100,13 @@ func IsErrorAuthenticationRequired(err error) bool {
 	return err != nil && errors.Is(err, transport.ErrAuthenticationRequired)
 }
 
-// FetchRepository fetches the latest changes of the provided repository using the given authentication tokens and logs progress.
-func FetchRepository(repository *git.Repository, repoProviderToken, repoGitProvider string, logsWriter io.Writer) error {
+// FetchRepository fetches the latest changes of the provided repository from
+// cloneURL (the plain clone URL the job carries) and updates its submodules.
+// The fetch names its URL instead of using origin's: .git/config may have been
+// changed since the clone (a Task's agent owns the repository), and go-git's
+// url.<x>.insteadOf rules apply only to a remote's configured URLs, not to
+// FetchOptions.RemoteURL.
+func FetchRepository(repository *git.Repository, cloneURL, repoProviderToken, repoGitProvider string, logsWriter io.Writer) error {
 	username := GetUsernameForProvider(repoGitProvider)
 
 	err := repository.Fetch(&git.FetchOptions{
@@ -106,6 +115,8 @@ func FetchRepository(repository *git.Repository, repoProviderToken, repoGitProvi
 			Password: repoProviderToken,
 		},
 		RemoteName: "origin",
+		RemoteURL:  cloneURL,
+		RefSpecs:   []config.RefSpec{"+refs/heads/*:refs/remotes/origin/*"},
 		Force:      true,
 	})
 
@@ -114,7 +125,7 @@ func FetchRepository(repository *git.Repository, repoProviderToken, repoGitProvi
 	}
 
 	// Update submodules
-	err = UpdateSubmodules(repository, username, repoProviderToken, logsWriter)
+	err = UpdateSubmodules(repository, cloneURL, username, repoProviderToken, logsWriter)
 	if err != nil {
 		return err
 	}
@@ -205,121 +216,73 @@ func RefreshGitTokenForInstallationContext(ctx context.Context, installationID, 
 	}
 }
 
-// UpdateSubmodules initializes and updates all submodules in a given Git repository.
-// repository: the Git repository containing submodules to update.
-// username: the username for authentication with the repository provider.
-// repoProviderToken: the token used for authentication with the repository provider.
-// logsWriter: the writer where log messages will be output.
-// Returns an error if it fails to initialize or update any submodule.
-func UpdateSubmodules(repository *git.Repository, username, repoProviderToken string, logsWriter io.Writer) error {
-	wt, err := repository.Worktree()
-	if err != nil {
-		return fmt.Errorf("error updating submodules: %s", err)
+// errCloneURLNotHTTPS is returned for a clone URL whose scheme isn't https:
+// the token is only ever sent over https.
+var errCloneURLNotHTTPS = errors.New("the repository's clone URL must be https")
+
+func requireHTTPSCloneURL(cloneURL string) error {
+	u, err := url.Parse(cloneURL)
+	if err != nil || !strings.EqualFold(u.Scheme, "https") {
+		return errCloneURLNotHTTPS
 	}
-
-	// Get the submodules
-	submodules, err := wt.Submodules()
-	if err != nil {
-		return fmt.Errorf("error updating submodules: %s", err)
-	}
-
-	for _, submodule := range submodules {
-		// ignore err if submodule is already initialized
-		err = submodule.Init()
-		if err != nil {
-			// Handle specific error if needed
-			if errors.Is(err, git.ErrSubmoduleAlreadyInitialized) {
-				//io.WriteString(logsWriter, fmt.Sprintf("Submodule %s is already initialized\n", submodule.Config().Path))
-			} else {
-				return fmt.Errorf("error updating submodules: %s", err)
-			}
-		}
-
-		// Update each submodule
-		err = submodule.Update(&git.SubmoduleUpdateOptions{
-			RecurseSubmodules: git.DefaultSubmoduleRecursionDepth,
-			Auth: &http.BasicAuth{
-				Username: username,
-				Password: repoProviderToken,
-			},
-		})
-		if err != nil {
-			return fmt.Errorf("error updating submodule: %s: %s", submodule.Config().Path, err)
-		}
-
-		io.WriteString(logsWriter, fmt.Sprintf("Submodule %s updated successfully\n", submodule.Config().Path))
-	}
-
 	return nil
 }
 
-// CloneRepository clones a Git repository to the specified directory path.
-// It supports authentication using a provided token and handles submodule initialization and updating.
+// CloneRepository clones a Git repository to the specified directory path and
+// updates its submodules. cloneURL is the plain clone URL (no credentials): the
+// token authenticates only through the clone's Auth, so it never lands in
+// .git/config. Submodules are fetched by UpdateSubmodules alone, which decides
+// per submodule whether it may see the token.
 // If the repository already exists locally, it opens the existing repository instead of cloning it.
-func CloneRepository(repoDirectoryPath, repoCloneUrlWithToken, repoProviderToken, repoGitProvider string, logsWriter io.Writer) (*git.Repository, error) {
-	username := GetUsernameForProvider(repoGitProvider)
-
-	repository, err := git.PlainClone(repoDirectoryPath, false, &git.CloneOptions{
-		URL: repoCloneUrlWithToken,
-		Auth: &http.BasicAuth{
-			Username: username,
-			Password: repoProviderToken,
-		},
-		RecurseSubmodules: git.DefaultSubmoduleRecursionDepth, // Ensure submodules are initialized
+func CloneRepository(repoDirectoryPath, cloneURL, repoProviderToken, repoGitProvider string, logsWriter io.Writer) (*git.Repository, error) {
+	return CloneRepositoryWithContext(context.Background(), repoDirectoryPath, CloneOptions{
+		CloneURL:   cloneURL,
+		Token:      repoProviderToken,
+		Provider:   repoGitProvider,
+		LogsWriter: logsWriter,
 	})
-
-	if err != nil {
-		if err == git.ErrRepositoryAlreadyExists {
-			repository, err = git.PlainOpen(repoDirectoryPath)
-			if err != nil {
-				return nil, err
-			}
-		} else {
-			return nil, err
-		}
-	}
-
-	// Initialize and update submodules
-	err = UpdateSubmodules(repository, username, repoProviderToken, logsWriter)
-	if err != nil {
-		return nil, err
-	}
-
-	return repository, nil
 }
 
 // CloneOptions groups what a clone needs besides its destination directory
-// (Rule 2.3). CloneURLWithToken already carries the credential; Token is passed
-// separately because submodule updates authenticate on their own.
+// (Rule 2.3). CloneURL is the plain https clone URL; Token authenticates the
+// clone and the submodules on the same host.
 type CloneOptions struct {
-	CloneURLWithToken string
-	Token             string
-	Provider          string
-	LogsWriter        io.Writer
+	CloneURL   string
+	Token      string
+	Provider   string
+	LogsWriter io.Writer
 }
 
 // CloneRepositoryWithContext is CloneRepository bounded by ctx: PlainCloneContext
 // aborts the fetch when ctx is cancelled or its deadline passes, instead of
 // hanging on a huge or unreachable repository.
 //
-// It exists alongside CloneRepository rather than replacing it because only ONE
-// caller wants a deadline — the mid-session repository add, where a stuck clone
-// would hold back every later turn in a live conversation. Tasks, deployments
-// and session-START clones keep CloneRepository's unbounded behaviour
-// unchanged; the session path reaches this through a context with no deadline.
+// Only ONE caller wants a deadline — the mid-session repository add, where a
+// stuck clone would hold back every later turn in a live conversation. Tasks,
+// deployments and session-START clones go through CloneRepository, which
+// passes a context with no deadline.
 func CloneRepositoryWithContext(ctx context.Context, repoDirectoryPath string, opts CloneOptions) (*git.Repository, error) {
+	if err := requireHTTPSCloneURL(opts.CloneURL); err != nil {
+		return nil, err
+	}
 	username := GetUsernameForProvider(opts.Provider)
+	cleanup, err := cloneCleanup(repoDirectoryPath)
+	if err != nil {
+		return nil, err
+	}
 
+	cloned := true
 	repository, err := git.PlainCloneContext(ctx, repoDirectoryPath, false, &git.CloneOptions{
-		URL: opts.CloneURLWithToken,
+		URL: opts.CloneURL,
 		Auth: &http.BasicAuth{
 			Username: username,
 			Password: opts.Token,
 		},
-		RecurseSubmodules: git.DefaultSubmoduleRecursionDepth,
+		RecurseSubmodules: git.NoRecurseSubmodules,
 	})
 	if err != nil {
 		if err == git.ErrRepositoryAlreadyExists {
+			cloned = false
 			repository, err = git.PlainOpen(repoDirectoryPath)
 			if err != nil {
 				return nil, err
@@ -329,10 +292,44 @@ func CloneRepositoryWithContext(ctx context.Context, repoDirectoryPath string, o
 		}
 	}
 
-	if err := UpdateSubmodules(repository, username, opts.Token, opts.LogsWriter); err != nil {
+	if err := updateSubmodules(ctx, repository, opts.CloneURL, username, opts.Token, opts.LogsWriter); err != nil {
+		// A fresh clone whose submodules failed is removed, as PlainCloneContext
+		// removed it when it fetched them itself: a directory left behind would
+		// pass for a finished checkout.
+		if cloned {
+			_ = cleanup()
+		}
 		return nil, err
 	}
 	return repository, nil
+}
+
+// cloneCleanup returns what undoes a clone into dir, as PlainCloneContext
+// does on a failed clone: remove dir if it didn't exist, empty it if it was
+// empty, and nothing otherwise.
+func cloneCleanup(dir string) (func() error, error) {
+	entries, err := os.ReadDir(dir)
+	switch {
+	case os.IsNotExist(err):
+		return func() error { return os.RemoveAll(dir) }, nil
+	case err != nil:
+		return nil, err
+	case len(entries) == 0:
+		return func() error {
+			entries, err := os.ReadDir(dir)
+			if err != nil {
+				return err
+			}
+			for _, e := range entries {
+				if err := os.RemoveAll(filepath.Join(dir, e.Name())); err != nil {
+					return err
+				}
+			}
+			return nil
+		}, nil
+	default:
+		return func() error { return nil }, nil
+	}
 }
 
 // GetUsernameForProvider returns the appropriate username for the specified Git provider.

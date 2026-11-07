@@ -25,10 +25,10 @@ func TestCloneRepositoryWithContext_ExpiredContextReturnsInsteadOfHanging(t *tes
 	done := make(chan error, 1)
 	go func() {
 		_, err := CloneRepositoryWithContext(ctx, dir, CloneOptions{
-			CloneURLWithToken: "https://token@github.invalid/owner/repo.git",
-			Token:             "token",
-			Provider:          "GitHub",
-			LogsWriter:        io.Discard,
+			CloneURL:   "https://github.invalid/owner/repo.git",
+			Token:      "token",
+			Provider:   "GitHub",
+			LogsWriter: io.Discard,
 		})
 		done <- err
 	}()

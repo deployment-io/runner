@@ -95,11 +95,7 @@ func deployParameters(t *testing.T, token string) map[string]interface{} {
 func cloneAccepted(t *testing.T, srv *gittest.Server, token string) (*git.Repository, string) {
 	t.Helper()
 	dir := filepath.Join(t.TempDir(), "repo")
-	url, err := commandUtils.GetRepoUrlWithToken("GitHub", token, srv.URL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	repository, err := commandUtils.CloneRepository(dir, url, token, "GitHub", io.Discard)
+	repository, err := commandUtils.CloneRepository(dir, srv.URL, token, "GitHub", io.Discard)
 	if err != nil {
 		t.Fatalf("setup clone: %v", err)
 	}
@@ -132,7 +128,7 @@ func TestDeployCheckout_FetchRetrySendsRejectedTokenHash(t *testing.T) {
 	calls := fakeRefresh(t, "second")
 	params := deployParameters(t, "first")
 
-	token, err := fetchDeployRepositoryWithRetry(params, repository, "first", "GitHub", io.Discard)
+	token, err := fetchDeployRepositoryWithRetry(params, repository, srv.URL, "first", "GitHub", io.Discard)
 	if err != nil {
 		t.Fatalf("fetch: %v", err)
 	}
