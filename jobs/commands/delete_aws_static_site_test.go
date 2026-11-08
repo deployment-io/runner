@@ -45,6 +45,8 @@ type fakeStaticSiteAWS struct {
 	listOACsErr  error // returned by ListOriginAccessControls
 	deleteOACErr error // returned by DeleteOriginAccessControl
 	oacGone      bool  // GetOriginAccessControl finds no OAC
+
+	deletedOACs []string // OACs DeleteOriginAccessControl deleted
 }
 
 func (f *fakeStaticSiteAWS) call(operation, argument string) {
@@ -150,6 +152,12 @@ func (f *fakeStaticSiteAWS) DeleteOriginAccessControl(_ context.Context, in *clo
 	if f.deleteOACErr != nil {
 		return nil, f.deleteOACErr
 	}
+	for _, d := range f.distributions {
+		if d.oacID == aws.ToString(in.Id) {
+			return nil, &cloudfrontTypes.OriginAccessControlInUse{Message: aws.String("in use")}
+		}
+	}
+	f.deletedOACs = append(f.deletedOACs, aws.ToString(in.Id))
 	return &cloudfront.DeleteOriginAccessControlOutput{}, nil
 }
 
@@ -260,7 +268,7 @@ func checkStaticSiteDelete(t *testing.T, fake *fakeStaticSiteAWS, cloudfrontID s
 // policy, the functions, its OAC, the bucket.
 func TestDeleteStaticSiteSavedID(t *testing.T) {
 	fake := &fakeStaticSiteAWS{distributions: map[string]fakeStaticDistribution{"E1": {comment: "anything", oacID: "oac-1"}}}
-	checkStaticSiteDelete(t, fake, "E1", joinCalls(distributionDeleteCalls("E1"), staticSiteFunctionCalls,
+	checkStaticSiteDelete(t, fake, "E1", joinCalls([]string{"ListDistributions "}, distributionDeleteCalls("E1"), staticSiteFunctionCalls,
 		[]string{"GetOriginAccessControl oac-1", "DeleteOriginAccessControl oac-1"}, staticSiteBucketCalls))
 }
 
@@ -291,7 +299,41 @@ func TestDeleteStaticSiteNoIDTwoMatchingDistributions(t *testing.T) {
 	}
 	checkStaticSiteDelete(t, fake, "", joinCalls([]string{"ListDistributions ", "ListDistributions 1"},
 		distributionDeleteCalls("E1"), distributionDeleteCalls("E2"), staticSiteFunctionCalls,
-		[]string{"GetOriginAccessControl oac-1", "DeleteOriginAccessControl oac-1", "GetOriginAccessControl oac-1", "DeleteOriginAccessControl oac-1"},
+		[]string{"GetOriginAccessControl oac-1", "DeleteOriginAccessControl oac-1"}, staticSiteBucketCalls))
+}
+
+// A saved ID beside a distribution an earlier deploy created and never saved, both
+// on the preview's OAC: the Comment lookup runs anyway, both distributions go, and
+// then the shared OAC, once.
+func TestDeleteStaticSiteSavedIDBesideUnsavedDistribution(t *testing.T) {
+	fake := &fakeStaticSiteAWS{
+		distributions: map[string]fakeStaticDistribution{
+			"E1": {comment: "Preview distribution for d1", oacID: "oac-1"},
+			"E2": {comment: "Preview distribution for d1", oacID: "oac-1"},
+		},
+		distributionOrder: []string{"E1", "E2"},
+	}
+	checkStaticSiteDelete(t, fake, "E2", joinCalls([]string{"ListDistributions ", "ListDistributions 1"},
+		distributionDeleteCalls("E1"), distributionDeleteCalls("E2"), staticSiteFunctionCalls,
+		[]string{"GetOriginAccessControl oac-1", "DeleteOriginAccessControl oac-1"}, staticSiteBucketCalls))
+	if len(fake.distributions) != 0 || !reflect.DeepEqual(fake.deletedOACs, []string{"oac-1"}) {
+		t.Errorf("left distributions %v, deleted OACs %v", fake.distributions, fake.deletedOACs)
+	}
+}
+
+// A saved ID the Comment lookup doesn't find (a production site, or a preview
+// distribution under another Comment) is still deleted, first.
+func TestDeleteStaticSiteSavedIDNotListed(t *testing.T) {
+	fake := &fakeStaticSiteAWS{
+		distributions: map[string]fakeStaticDistribution{
+			"E1": {comment: "Preview distribution for d1", oacID: "oac-1"},
+			"E9": {comment: "anything", oacID: "oac-9"},
+		},
+		distributionOrder: []string{"E1"},
+	}
+	checkStaticSiteDelete(t, fake, "E9", joinCalls([]string{"ListDistributions "},
+		distributionDeleteCalls("E9"), distributionDeleteCalls("E1"), staticSiteFunctionCalls,
+		[]string{"GetOriginAccessControl oac-9", "DeleteOriginAccessControl oac-9", "GetOriginAccessControl oac-1", "DeleteOriginAccessControl oac-1"},
 		staticSiteBucketCalls))
 }
 
@@ -322,7 +364,7 @@ func TestDeleteStaticSiteNothingLeft(t *testing.T) {
 // skipped, the OAC is deleted by name and the bucket is deleted.
 func TestDeleteStaticSiteSavedIDGone(t *testing.T) {
 	fake := &fakeStaticSiteAWS{oacs: map[string]string{"preview-d1": "oac-1"}, oacOrder: []string{"preview-d1"}}
-	logs := checkStaticSiteDelete(t, fake, "E1", joinCalls([]string{"GetDistributionConfig E1"}, staticSiteFunctionCalls,
+	logs := checkStaticSiteDelete(t, fake, "E1", joinCalls([]string{"ListDistributions ", "GetDistributionConfig E1"}, staticSiteFunctionCalls,
 		[]string{"ListOriginAccessControls ", "GetOriginAccessControl oac-1", "DeleteOriginAccessControl oac-1"}, staticSiteBucketCalls))
 	if !strings.Contains(logs, "CloudFront distribution E1 was already gone") {
 		t.Errorf("logs = %q", logs)

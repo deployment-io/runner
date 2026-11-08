@@ -40,6 +40,10 @@ type fakeCloudfront struct {
 	createOACErr error                                          // returned by CreateOriginAccessControl
 	oacPages     [][]cloudfrontTypes.OriginAccessControlSummary // what ListOriginAccessControls returns, page by page
 	oacLists     int
+
+	distPages [][]cloudfrontTypes.DistributionSummary // what ListDistributions returns, page by page
+	listErr   error                                   // returned by ListDistributions
+	distLists int
 }
 
 func (f *fakeCloudfront) summary() *cloudfrontTypes.FunctionSummary {
@@ -106,6 +110,26 @@ func (f *fakeCloudfront) ListOriginAccessControls(_ context.Context, in *cloudfr
 		list.NextMarker = aws.String(strconv.Itoa(page + 1))
 	}
 	return &cloudfront.ListOriginAccessControlsOutput{OriginAccessControlList: list}, nil
+}
+
+func (f *fakeCloudfront) ListDistributions(_ context.Context, in *cloudfront.ListDistributionsInput, _ ...func(*cloudfront.Options)) (*cloudfront.ListDistributionsOutput, error) {
+	f.distLists++
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	page := 0
+	if in.Marker != nil {
+		page, _ = strconv.Atoi(aws.ToString(in.Marker))
+	}
+	list := &cloudfrontTypes.DistributionList{IsTruncated: aws.Bool(false)}
+	if page < len(f.distPages) {
+		list.Items = f.distPages[page]
+	}
+	if page+1 < len(f.distPages) {
+		list.IsTruncated = aws.Bool(true)
+		list.NextMarker = aws.String(strconv.Itoa(page + 1))
+	}
+	return &cloudfront.ListDistributionsOutput{DistributionList: list}, nil
 }
 
 func (f *fakeCloudfront) CreateDistribution(_ context.Context, in *cloudfront.CreateDistributionInput, _ ...func(*cloudfront.Options)) (*cloudfront.CreateDistributionOutput, error) {
@@ -465,4 +489,62 @@ func TestPreviewDistributionArn(t *testing.T) {
 			t.Fatal("err = nil, want the lookup error")
 		}
 	})
+}
+
+// A preview with no saved distribution adopts the one an earlier deploy created
+// (found by its Comment, on a later page): in now reuses it, OnDistributionCreated
+// saves it, and the deploy creates no second distribution and no OAC.
+func TestAdoptPreviewDistribution(t *testing.T) {
+	fake := &fakeCloudfront{distETag: "etag-7", distConfig: distConfig(nil, spaErrorResponses()),
+		createOACErr: errors.New("no OAC may be created"),
+		distPages: [][]cloudfrontTypes.DistributionSummary{
+			{{Id: aws.String("E0"), Comment: aws.String("Preview distribution for p10")}},
+			{{Id: aws.String("E7"), ARN: aws.String("arn:E7"), DomainName: aws.String("d7.cloudfront.net"), Comment: aws.String("Preview distribution for p1")}},
+		}}
+	var saved []string
+	in := StaticPreviewDeployInput{OrgID: "o", PreviewID: "p1", Region: "us-east-1", IsSPA: true,
+		OnDistributionCreated: func(id, arn, domain string) { saved = append(saved, id+" "+arn+" "+domain) }}
+	var logs bytes.Buffer
+	domain, err := adoptPreviewDistribution(fake, &in, &logs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if domain != "d7.cloudfront.net" || in.ExistingDistID != "E7" || in.ExistingDistArn != "arn:E7" {
+		t.Errorf("adopted domain %q, ExistingDistID %q, ExistingDistArn %q", domain, in.ExistingDistID, in.ExistingDistArn)
+	}
+	if len(saved) != 1 || saved[0] != "E7 arn:E7 d7.cloudfront.net" {
+		t.Errorf("OnDistributionCreated calls = %q", saved)
+	}
+	if !strings.Contains(logs.String(), "Reusing the preview's CloudFront distribution E7") {
+		t.Errorf("logs = %q", logs.String())
+	}
+	if _, err := deployPreviewDistribution(fake, in, aws.String("o-p1.s3.amazonaws.com"), io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	if fake.createdDist != nil {
+		t.Error("created a second distribution for the preview")
+	}
+}
+
+// Nothing to adopt: a preview with a saved distribution doesn't look, and one
+// whose Comment matches nothing is left as it was; a failed lookup fails.
+func TestAdoptPreviewDistribution_NothingToAdopt(t *testing.T) {
+	fake := &fakeCloudfront{distPages: [][]cloudfrontTypes.DistributionSummary{
+		{{Id: aws.String("E7"), Comment: aws.String("Preview distribution for p1")}}}}
+	in := StaticPreviewDeployInput{PreviewID: "p1", ExistingDistID: "E1"}
+	if domain, err := adoptPreviewDistribution(fake, &in, io.Discard); err != nil || domain != "" || in.ExistingDistID != "E1" || fake.distLists != 0 {
+		t.Errorf("saved distribution: domain %q, err %v, ExistingDistID %q, lists %d", domain, err, in.ExistingDistID, fake.distLists)
+	}
+
+	called := false
+	in = StaticPreviewDeployInput{PreviewID: "p2", OnDistributionCreated: func(string, string, string) { called = true }}
+	if domain, err := adoptPreviewDistribution(fake, &in, io.Discard); err != nil || domain != "" || in.ExistingDistID != "" || called {
+		t.Errorf("no match: domain %q, err %v, ExistingDistID %q, saved %v", domain, err, in.ExistingDistID, called)
+	}
+
+	fake = &fakeCloudfront{listErr: errors.New("boom")}
+	in = StaticPreviewDeployInput{PreviewID: "p1"}
+	if _, err := adoptPreviewDistribution(fake, &in, io.Discard); err == nil || !strings.Contains(err.Error(), "boom") {
+		t.Errorf("failed lookup: err %v", err)
+	}
 }

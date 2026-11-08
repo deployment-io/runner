@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/cloudfront"
@@ -130,8 +131,9 @@ func previewOriginAccessControlName(deploymentID string) string {
 // deleteStaticSiteResources deletes what a static site deploy creates: its
 // CloudFront distribution, the distribution's cache policy, the CloudFront
 // functions, the origin access controls and the S3 bucket. It deletes what
-// exists: without a saved CloudFront ID it deletes the distributions a preview
-// deploy created for this deployment (found by their Comment), else the preview's
+// exists: the saved CloudFront distribution and every distribution a preview
+// deploy created for this deployment (found by their Comment — one whose id was
+// never saved can sit beside the saved one, sharing its OAC), else the preview's
 // OAC by name; a distribution or bucket that doesn't exist counts as deleted.
 func deleteStaticSiteResources(parameters map[string]interface{}, clients deleteStaticSiteClients, logsWriter io.Writer) error {
 	deploymentID, err := jobs.GetParameterValue[string](parameters, parameters_enums.DeploymentID)
@@ -141,13 +143,15 @@ func deleteStaticSiteResources(parameters map[string]interface{}, clients delete
 	cloudfrontClient := clients.cloudfront
 	//delete cloudfront distribution
 	cloudfrontDistributionId, _ := jobs.GetParameterValue[string](parameters, parameters_enums.CloudfrontID)
-	distributionIDs := []string{cloudfrontDistributionId}
-	if len(cloudfrontDistributionId) == 0 {
-		// A preview deploy that failed before its distribution's ID was saved.
-		distributionIDs, err = listDistributionsWithComment(cloudfrontClient, previewDistributionComment(deploymentID))
-		if err != nil {
-			return err
-		}
+	// Always looked up, not only without a saved ID: a preview deploy whose id
+	// was never saved left a distribution that a later deploy's saved one may sit
+	// beside, and their shared OAC can't go while either does.
+	distributionIDs, err := listDistributionsWithComment(cloudfrontClient, previewDistributionComment(deploymentID))
+	if err != nil {
+		return err
+	}
+	if len(cloudfrontDistributionId) > 0 && !slices.Contains(distributionIDs, cloudfrontDistributionId) {
+		distributionIDs = append([]string{cloudfrontDistributionId}, distributionIDs...)
 	}
 	distributionConfigs, err := deleteStaticSiteDistributions(cloudfrontClient, distributionIDs, logsWriter)
 	if err != nil {
@@ -160,13 +164,18 @@ func deleteStaticSiteResources(parameters map[string]interface{}, clients delete
 		return err
 	}
 
-	//delete origin access for each origin if needed
+	//delete origin access for each origin if needed, once each: distributions
+	//of one preview share its OAC
+	deletedOACs := map[string]bool{}
 	for _, distributionConfig := range distributionConfigs {
 		if distributionConfig.Origins != nil {
 			for _, origin := range distributionConfig.Origins.Items {
-				if origin.OriginAccessControlId != nil {
-					_ = deleteOriginAccessControl(origin.OriginAccessControlId, cloudfrontClient, logsWriter)
+				oacID := aws.ToString(origin.OriginAccessControlId)
+				if oacID == "" || deletedOACs[oacID] {
+					continue
 				}
+				deletedOACs[oacID] = true
+				_ = deleteOriginAccessControl(origin.OriginAccessControlId, cloudfrontClient, logsWriter)
 			}
 		}
 	}
