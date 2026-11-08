@@ -62,14 +62,20 @@ type previewFunctions interface {
 // previewDistributions is the CloudFront distribution API the preview deploy uses.
 type previewDistributions interface {
 	CreateDistribution(ctx context.Context, params *cloudfront.CreateDistributionInput, optFns ...func(*cloudfront.Options)) (*cloudfront.CreateDistributionOutput, error)
+	GetDistribution(ctx context.Context, params *cloudfront.GetDistributionInput, optFns ...func(*cloudfront.Options)) (*cloudfront.GetDistributionOutput, error)
 	GetDistributionConfig(ctx context.Context, params *cloudfront.GetDistributionConfigInput, optFns ...func(*cloudfront.Options)) (*cloudfront.GetDistributionConfigOutput, error)
 	UpdateDistribution(ctx context.Context, params *cloudfront.UpdateDistributionInput, optFns ...func(*cloudfront.Options)) (*cloudfront.UpdateDistributionOutput, error)
+}
+
+type previewOriginAccessControls interface {
+	ListOriginAccessControls(ctx context.Context, params *cloudfront.ListOriginAccessControlsInput, optFns ...func(*cloudfront.Options)) (*cloudfront.ListOriginAccessControlsOutput, error)
 }
 
 // previewCloudfront is the subset of *cloudfront.Client the preview deploy uses,
 // so tests can fake it.
 type previewCloudfront interface {
 	aws_utils.OriginAccessControlCreator
+	previewOriginAccessControls
 	previewFunctions
 	previewDistributions
 }

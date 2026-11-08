@@ -480,7 +480,7 @@ func CreateDefaultCacheBehavior(bucketLocation, cachePolicyId *string) *cloudfro
 	return defaultCacheBehavior
 }
 
-func listAllS3Objects(s3Client *s3.Client, bucketName string) ([]s3Types.Object, error) {
+func listAllS3Objects(s3Client s3.ListObjectsV2APIClient, bucketName string) ([]s3Types.Object, error) {
 	params := &s3.ListObjectsV2Input{
 		Bucket: aws.String(bucketName),
 	}
@@ -493,7 +493,7 @@ func listAllS3Objects(s3Client *s3.Client, bucketName string) ([]s3Types.Object,
 		i++
 		page, err := listObjectsPaginator.NextPage(context.TODO())
 		if err != nil {
-			return nil, fmt.Errorf("failed to get page %v, %v", i, err)
+			return nil, fmt.Errorf("failed to get page %v, %w", i, err)
 		}
 		for _, obj := range page.Contents {
 			objects = append(objects, obj)
@@ -514,7 +514,7 @@ const s3DeleteObjectsLimit = 1000
 // deleteS3ObjectsInBatches deletes the given keys, respecting the per-request
 // limit. Only teardown deletes now (DeleteAllS3Files) — the deploy path marks
 // instead, see MarkStaleS3Files.
-func deleteS3ObjectsInBatches(s3Client *s3.Client, bucketName string, objectIds []s3Types.ObjectIdentifier) error {
+func deleteS3ObjectsInBatches(s3Client S3FilesDeleter, bucketName string, objectIds []s3Types.ObjectIdentifier) error {
 	for start := 0; start < len(objectIds); start += s3DeleteObjectsLimit {
 		end := start + s3DeleteObjectsLimit
 		if end > len(objectIds) {
@@ -525,18 +525,25 @@ func deleteS3ObjectsInBatches(s3Client *s3.Client, bucketName string, objectIds 
 			Delete: &s3Types.Delete{Objects: objectIds[start:end]},
 		})
 		if err != nil {
-			return fmt.Errorf("error deleting objects from bucket %s : %s", bucketName, err)
+			return fmt.Errorf("error deleting objects from bucket %s : %w", bucketName, err)
 		}
 	}
 	return nil
 }
 
-// DeleteAllS3Files empties an S3 bucket.
+// S3FilesDeleter is the part of *s3.Client DeleteAllS3Files uses.
+type S3FilesDeleter interface {
+	s3.ListObjectsV2APIClient
+	DeleteObjects(ctx context.Context, params *s3.DeleteObjectsInput, optFns ...func(*s3.Options)) (*s3.DeleteObjectsOutput, error)
+}
+
+// DeleteAllS3Files empties an S3 bucket. Errors wrap the S3 one (a bucket that
+// doesn't exist fails with the "NoSuchBucket" smithy.APIError).
 //
 // Still used by teardown (delete_aws_static_site), where emptying is the point
 // and nothing is left to keep serving. The DEPLOY path no longer deletes at all
 // — see MarkStaleS3Files.
-func DeleteAllS3Files(s3Client *s3.Client, bucketName string) error {
+func DeleteAllS3Files(s3Client S3FilesDeleter, bucketName string) error {
 	allS3Objects, err := listAllS3Objects(s3Client, bucketName)
 	if err != nil {
 		return err

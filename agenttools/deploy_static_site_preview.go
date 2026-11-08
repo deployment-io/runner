@@ -317,9 +317,17 @@ func deployPreviewDirectory(ctx context.Context, deps DeployStaticSitePreviewDep
 		Region:           deps.Region,
 		IsSPA:            isSPA,
 		ExistingDistID:   existing.CloudFrontDistributionID,
+		ExistingDistArn:  existing.CloudFrontDistributionArn,
 		S3Client:         s3Client,
 		CloudfrontClient: cfClient,
 		SkipDeployWait:   true, // return promptly; the CDN propagates async (verify_preview_reachable polls)
+		// A new distribution's id is saved the moment it exists, so a deploy that
+		// fails after it still leaves the preview deletable and redeployable.
+		OnDistributionCreated: func(id, arn, domain string) {
+			saved := PreviewState{CloudFrontDistributionID: id, CloudFrontDistributionArn: arn, CloudFrontDomainName: domain}
+			deps.Distributions.remember(previewID, saved)
+			deps.Store.SavePreview(previewID, saved)
+		},
 	}, logs)
 	if err != nil {
 		return deployStaticSitePreviewResult{}, fmt.Errorf("deploy preview: %w", err)
