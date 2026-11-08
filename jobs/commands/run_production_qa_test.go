@@ -129,14 +129,14 @@ func TestProductionQAEnvIsBlindAndTargetsProduction(t *testing.T) {
 
 func TestProductionQASocketServesOnlyTheTwoChecks(t *testing.T) {
 	srv := agentmcp.New("test", "0")
-	stop := registerAgentTools(srv, agentboxSpawnSpec{productionTools: &productionQATools{record: productionQARecord(productionTestTargets)}})
-	defer stop()
+	tools := registerAgentTools(srv, agentboxSpawnSpec{productionTools: &productionQATools{record: productionQARecord(productionTestTargets)}})
+	defer tools.stop()
 	if got := strings.Join(srv.ToolNames(), ","); got != "verify_preview_reachable,verify_preview_rendered" {
 		t.Errorf("tools = %s", got)
 	}
 	// Every other spawn is unchanged.
 	srv = agentmcp.New("test", "0")
-	registerAgentTools(srv, agentboxSpawnSpec{})()
+	registerAgentTools(srv, agentboxSpawnSpec{}).stop()
 	if got := strings.Join(srv.ToolNames(), ","); got != "ping" {
 		t.Errorf("tools without preview deps = %s", got)
 	}

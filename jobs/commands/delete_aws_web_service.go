@@ -197,7 +197,7 @@ func logAlreadyGone(logsWriter io.Writer, resource, nameOrID string) {
 
 func deleteWebServiceCloudfrontDistribution(parameters map[string]interface{}, cloudfrontClient deleteCloudfrontDistributionAPI, cloudfrontID string, logsWriter io.Writer) error {
 	// The CloudFront actions are in the static-site policy a preview deploy grants.
-	ensurePreviewDeployAccess(parameters, logsWriter)
+	_ = ensurePreviewDeployAccess(context.Background(), parameters, logsWriter)
 	_, err := deleteCloudfrontDistribution(cloudfrontClient, cloudfrontID, logsWriter)
 	var noSuchDistribution *cloudfrontTypes.NoSuchDistribution
 	if errors.As(err, &noSuchDistribution) {

@@ -130,12 +130,12 @@ func TestPreviewURLCheck(t *testing.T) {
 		"https://",
 	}
 	for _, u := range allowed {
-		if !newPreviewURLCheck(record).allowedRaw(u) {
+		if !newPreviewURLCheck(context.Background(), record).allowedRaw(u) {
 			t.Errorf("expected allowed: %s", u)
 		}
 	}
 	for _, u := range blocked {
-		if newPreviewURLCheck(record).allowedRaw(u) {
+		if newPreviewURLCheck(context.Background(), record).allowedRaw(u) {
 			t.Errorf("expected BLOCKED: %s", u)
 		}
 	}
@@ -144,7 +144,7 @@ func TestPreviewURLCheck(t *testing.T) {
 func TestPreviewRecord_EmptyHostNotAdded(t *testing.T) {
 	record := NewPreviewRecord(nil, nil)
 	record.AddURL("https://")
-	if newPreviewURLCheck(record).allowedRaw("https:///") {
+	if newPreviewURLCheck(context.Background(), record).allowedRaw("https:///") {
 		t.Fatal("an empty host must never be recorded")
 	}
 }
@@ -155,7 +155,7 @@ func TestPreviewURLCheck_ListsTaskPreviewsOncePerCall(t *testing.T) {
 		[]string{"https://dearlier.cloudfront.net"},
 		nil,
 	)
-	check := newPreviewURLCheck(record)
+	check := newPreviewURLCheck(context.Background(), record)
 	if !check.allowedRaw("https://dthisrun.cloudfront.net/") || *calls != 0 {
 		t.Fatalf("a recorded host must not list; calls=%d", *calls)
 	}
@@ -169,7 +169,7 @@ func TestPreviewURLCheck_ListsTaskPreviewsOncePerCall(t *testing.T) {
 		t.Fatalf("expected one list per call, got %d", *calls)
 	}
 	// The listed host stays recorded for later calls.
-	if !newPreviewURLCheck(record).allowedRaw("https://dearlier.cloudfront.net/") || *calls != 1 {
+	if !newPreviewURLCheck(context.Background(), record).allowedRaw("https://dearlier.cloudfront.net/") || *calls != 1 {
 		t.Fatalf("listed host should now be recorded; calls=%d", *calls)
 	}
 }
@@ -180,7 +180,7 @@ func TestPreviewURLCheck_ListErrorFallsBackToRecord(t *testing.T) {
 		return nil, errors.New("rpc: can't find method TaskPreviews.ListV1")
 	}, &logs)
 	record.AddURL("https://dthisrun.cloudfront.net")
-	check := newPreviewURLCheck(record)
+	check := newPreviewURLCheck(context.Background(), record)
 	if check.allowedRaw("https://dother.cloudfront.net/") {
 		t.Fatal("an unrecorded host must be refused when listing fails")
 	}
@@ -204,7 +204,7 @@ func TestHandleVerifyPreviewReachable_RefusesUnrecordedURL(t *testing.T) {
 
 func TestPreviewRedirectPolicy(t *testing.T) {
 	record, _ := recordWith([]string{"https://dthisrun.cloudfront.net"}, nil, nil)
-	check := newPreviewURLCheck(record)
+	check := newPreviewURLCheck(context.Background(), record)
 	var blocked *redirectBlockedError
 	policy := previewRedirectPolicy(check.allowed, func(e *redirectBlockedError) { blocked = e })
 	req := func(raw string) *http.Request {

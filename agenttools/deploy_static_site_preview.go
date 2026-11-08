@@ -32,6 +32,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/cloudfront"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/smithy-go"
 	"github.com/deployment-io/deployment-runner-kit/task_previews"
 	"github.com/deployment-io/deployment-runner-kit/tasks"
 	agentmcp "github.com/deployment-io/deployment-runner/agent_mcp"
@@ -53,8 +54,10 @@ type DeployStaticSitePreviewDeps struct {
 	WorkDirHost string    // host path of the bind-mounted /work; publish_dir resolves under it
 	LogsWriter  io.Writer // the Step Job's log writer; deploy progress streams here
 
-	// BuildClients lazily constructs the AWS clients (runner IAM role + region).
-	BuildClients func() (*s3.Client, *cloudfront.Client, error)
+	// BuildClients lazily constructs the AWS clients (runner IAM role + region). It
+	// returns ctx's error once ctx is cancelled, without waiting for work it can't
+	// cancel.
+	BuildClients func(ctx context.Context) (*s3.Client, *cloudfront.Client, error)
 
 	// Store find-or-creates the persisted preview record and saves resources back onto
 	// it — the control-plane seam. Bound to one serviceType by the commands layer, so a
@@ -232,7 +235,7 @@ func handleDeployStaticSitePreview(ctx context.Context, deps DeployStaticSitePre
 		if out, err, ok := builds.attach(ctx, request, previewBuildCallWait); ok {
 			return out, err
 		}
-		plan, ok, err := planRunnerBuiltPreview(deps, args.Repository, args.RootDirectory)
+		plan, ok, err := planRunnerBuiltPreview(ctx, deps, args.Repository, args.RootDirectory)
 		if err != nil {
 			return "", err
 		}
@@ -272,8 +275,10 @@ func handleDeployStaticSitePreview(ctx context.Context, deps DeployStaticSitePre
 			return "", fmt.Errorf("publish_dir %q resolves outside %s through a symlink", args.PublishDir, containerWorkDir)
 		}
 	}
-	// Not cancelled with the call: as before, an agent-built deploy runs to its end.
-	out, err := deployPreviewDir(context.Background(), deps, serviceName, distDir, args.IsSPA)
+	// Not cancelled when the agent run ends: an agent-built deploy runs to its end
+	// (the run's teardown waits for it, like any tool call), so it never leaves a
+	// half-made preview — a partial upload, or a distribution whose ID was never saved.
+	out, err := deployPreviewDir(context.WithoutCancel(ctx), deps, serviceName, distDir, args.IsSPA)
 	if err != nil {
 		return "", err
 	}
@@ -357,7 +362,7 @@ var deployStaticPreview = DeployStaticSitePreview
 // previewClients builds the preview's cloud clients, their requests cancelled with
 // ctx when it can be.
 func previewClients(ctx context.Context, deps DeployStaticSitePreviewDeps) (*s3.Client, *cloudfront.Client, error) {
-	s3Client, cfClient, err := deps.BuildClients()
+	s3Client, cfClient, err := deps.BuildClients(ctx)
 	if err != nil {
 		return nil, nil, fmt.Errorf("build cloud clients: %w", err)
 	}
@@ -411,7 +416,8 @@ const abortUploadTimeout = 30 * time.Second
 // their own context — the shared upload and CloudFront helpers take no context.
 // The one exception is the uploader's AbortMultipartUpload, its cleanup after a
 // failed upload: it is sent even after ctx is cancelled, within abortUploadTimeout,
-// so a cancelled upload doesn't strand its parts in the bucket.
+// so a cancelled upload doesn't strand its parts in the bucket — but once ctx is
+// cancelled nothing waits for it.
 type ctxHTTPClient struct {
 	ctx  context.Context
 	next interface {
@@ -430,17 +436,10 @@ func newCtxHTTPClient(ctx context.Context, next interface {
 
 func (c ctxHTTPClient) Do(req *http.Request) (*http.Response, error) {
 	if isAbortMultipartUpload(req) {
-		reqCtx, cancel := context.WithTimeout(req.Context(), abortUploadTimeout)
-		resp, err := c.next.Do(req.WithContext(reqCtx))
-		if err != nil {
-			cancel()
-			return nil, err
-		}
-		resp.Body = &releasingBody{ReadCloser: resp.Body, release: cancel}
-		return resp, nil
+		return c.abortMultipartUpload(req)
 	}
 	if err := c.ctx.Err(); err != nil {
-		return nil, err
+		return nil, canceledRequest(err)
 	}
 	reqCtx, cancel := context.WithCancel(req.Context())
 	stopAfter := context.AfterFunc(c.ctx, cancel)
@@ -451,10 +450,69 @@ func (c ctxHTTPClient) Do(req *http.Request) (*http.Response, error) {
 	resp, err := c.next.Do(req.WithContext(reqCtx))
 	if err != nil {
 		release()
+		if ctxErr := c.ctx.Err(); ctxErr != nil {
+			return nil, canceledRequest(ctxErr)
+		}
 		return nil, err
 	}
 	resp.Body = &releasingBody{ReadCloser: resp.Body, release: release}
 	return resp, nil
+}
+
+// canceledRequest is the error of a request refused or cut short because ctx was
+// cancelled: a smithy.CanceledError, the one error the AWS SDK's retryer never
+// retries. The shared helpers send their requests with context.TODO(), so the SDK
+// can't see the cancellation itself and would retry a bare context.Canceled as a
+// connection error, with backoff — for every file left in an upload.
+func canceledRequest(err error) error {
+	return &smithy.CanceledError{Err: err}
+}
+
+// abortMultipartUpload sends the abort within abortUploadTimeout, cancelled or not.
+// Once ctx is cancelled the caller stops waiting for it: the abort finishes in the
+// background and the caller gets ctx's error. Reading the reply's body also stops
+// when ctx is cancelled.
+func (c ctxHTTPClient) abortMultipartUpload(req *http.Request) (*http.Response, error) {
+	type reply struct {
+		resp *http.Response
+		err  error
+	}
+	reqCtx, cancel := context.WithTimeout(context.WithoutCancel(req.Context()), abortUploadTimeout)
+	// Unbuffered: a reply is handed over only to a caller still waiting for it, so
+	// a reply nobody takes is always cleaned up here.
+	done := make(chan reply)
+	waiting := make(chan struct{})
+	go func() {
+		resp, err := c.next.Do(req.WithContext(reqCtx))
+		select {
+		case <-waiting:
+			// Nobody reads the reply any more.
+			if err == nil {
+				_, _ = io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+			}
+			cancel()
+		case done <- reply{resp, err}:
+		}
+	}()
+	select {
+	case r := <-done:
+		if r.err != nil {
+			cancel()
+			return nil, r.err
+		}
+		// The abort has been answered; reading its body stops when ctx ends.
+		stopAfter := context.AfterFunc(c.ctx, cancel)
+		release := func() {
+			stopAfter()
+			cancel()
+		}
+		r.resp.Body = &releasingBody{ReadCloser: r.resp.Body, release: release}
+		return r.resp, nil
+	case <-c.ctx.Done():
+		close(waiting)
+		return nil, canceledRequest(c.ctx.Err())
+	}
 }
 
 // isAbortMultipartUpload reports whether req is S3's AbortMultipartUpload

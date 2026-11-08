@@ -12,9 +12,13 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/smithy-go"
 	"github.com/deployment-io/deployment-runner-kit/task_previews"
 	"github.com/deployment-io/deployment-runner-kit/tasks"
 )
@@ -188,7 +192,7 @@ func planDeps(reply task_previews.StaticSiteBuildSettingsReplyV1, gotURL *string
 
 func TestPlanRunnerBuiltPreview(t *testing.T) {
 	var gotURL string
-	_, ok, err := planRunnerBuiltPreview(planDeps(task_previews.StaticSiteBuildSettingsReplyV1{}, &gotURL), "0-acme/web", nil)
+	_, ok, err := planRunnerBuiltPreview(context.Background(), planDeps(task_previews.StaticSiteBuildSettingsReplyV1{}, &gotURL), "0-acme/web", nil)
 	if err != nil || ok {
 		t.Errorf("no sites: ok=%v err=%v; want the agent-built path", ok, err)
 	}
@@ -197,7 +201,7 @@ func TestPlanRunnerBuiltPreview(t *testing.T) {
 	}
 
 	reply := task_previews.StaticSiteBuildSettingsReplyV1{Sites: []task_previews.StaticSiteBuildSettingsV1{site("web", "apps/web", "npm run build", "dist", true)}}
-	p, ok, err := planRunnerBuiltPreview(planDeps(reply, nil), "0-acme/web", nil)
+	p, ok, err := planRunnerBuiltPreview(context.Background(), planDeps(reply, nil), "0-acme/web", nil)
 	if err != nil || !ok {
 		t.Fatalf("one site: ok=%v err=%v", ok, err)
 	}
@@ -206,7 +210,7 @@ func TestPlanRunnerBuiltPreview(t *testing.T) {
 	}
 
 	reply.Sites[0].BuildCommand = " "
-	_, _, err = planRunnerBuiltPreview(planDeps(reply, nil), "0-acme/web", nil)
+	_, _, err = planRunnerBuiltPreview(context.Background(), planDeps(reply, nil), "0-acme/web", nil)
 	if err == nil || err.Error() != "web has no build command, so its preview can't be built" {
 		t.Errorf("empty build command: got %v", err)
 	}
@@ -216,13 +220,13 @@ func TestPlanRunnerBuiltPreview(t *testing.T) {
 	reply.Sites[0].BuildCommand = "npm run build"
 	for _, publish := range []string{"", ".", "./", "/"} {
 		reply.Sites[0].PublishDirectory = publish
-		_, _, err = planRunnerBuiltPreview(planDeps(reply, nil), "0-acme/web", nil)
+		_, _, err = planRunnerBuiltPreview(context.Background(), planDeps(reply, nil), "0-acme/web", nil)
 		if err == nil || err.Error() != "web's publish directory is its root directory, so its preview can't be built" {
 			t.Errorf("publish directory %q: got %v", publish, err)
 		}
 	}
 
-	if _, _, err = planRunnerBuiltPreview(planDeps(reply, nil), "2-acme/nope", nil); err == nil || !strings.Contains(err.Error(), "unknown repository") {
+	if _, _, err = planRunnerBuiltPreview(context.Background(), planDeps(reply, nil), "2-acme/nope", nil); err == nil || !strings.Contains(err.Error(), "unknown repository") {
 		t.Errorf("unknown repository: got %v", err)
 	}
 }
@@ -657,7 +661,7 @@ func TestLookupBuildSettingsGivesUp(t *testing.T) {
 	defer func() { PreviewBuildSettingsTimeout = saved }()
 	block := make(chan struct{})
 	defer close(block)
-	_, err := lookupBuildSettings(func(string) (task_previews.StaticSiteBuildSettingsReplyV1, error) {
+	_, err := lookupBuildSettings(context.Background(), func(string) (task_previews.StaticSiteBuildSettingsReplyV1, error) {
 		<-block
 		return task_previews.StaticSiteBuildSettingsReplyV1{}, nil
 	}, "https://github.com/acme/web.git")
@@ -735,9 +739,11 @@ func TestCtxHTTPClientCancelsInFlightRequests(t *testing.T) {
 }
 
 func TestCtxHTTPClientSendsMultipartAbortAfterCancellation(t *testing.T) {
-	var aborted bool
+	aborted := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		aborted = r.Method == http.MethodDelete && r.URL.Query().Get("uploadId") == "u1"
+		if r.Method == http.MethodDelete && r.URL.Query().Get("uploadId") == "u1" {
+			close(aborted)
+		}
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer srv.Close()
@@ -746,18 +752,227 @@ func TestCtxHTTPClientSendsMultipartAbortAfterCancellation(t *testing.T) {
 	cancel()
 	c := newCtxHTTPClient(ctx, srv.Client())
 	req, _ := http.NewRequest(http.MethodDelete, srv.URL+"/index.html?uploadId=u1", nil)
-	resp, err := c.Do(req)
-	if err != nil {
-		t.Fatalf("the multipart abort must be sent after cancellation: %v", err)
+	if resp, err := c.Do(req); err == nil {
+		resp.Body.Close()
 	}
-	resp.Body.Close()
-	if !aborted {
-		t.Error("the server didn't receive the abort")
+	select {
+	case <-aborted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the multipart abort must be sent after cancellation")
 	}
 	del, _ := http.NewRequest(http.MethodDelete, srv.URL+"/index.html", nil)
 	if _, err := c.Do(del); err == nil {
 		t.Error("any other request after cancellation must be refused")
 	}
+}
+
+// countingHTTPClient counts the requests an AWS client sends through it.
+type countingHTTPClient struct {
+	next interface {
+		Do(*http.Request) (*http.Response, error)
+	}
+	calls atomic.Int32
+}
+
+func (c *countingHTTPClient) Do(req *http.Request) (*http.Response, error) {
+	c.calls.Add(1)
+	return c.next.Do(req)
+}
+
+// A request ctxHTTPClient refuses or cuts short once ctx is cancelled is a
+// smithy.CanceledError, so the SDK sends an operation once and doesn't retry it with
+// backoff, though the operation's own context (context.TODO() in the shared helpers)
+// is never cancelled.
+func TestCtxHTTPClientCancellationIsNotRetried(t *testing.T) {
+	createUpload := func(t *testing.T, ctx context.Context, srv *httptest.Server) (*countingHTTPClient, error, time.Duration) {
+		t.Helper()
+		counting := &countingHTTPClient{next: newCtxHTTPClient(ctx, srv.Client())}
+		client := s3.New(s3.Options{
+			Region:       "eu-west-1",
+			Credentials:  aws.AnonymousCredentials{},
+			BaseEndpoint: aws.String(srv.URL),
+			UsePathStyle: true,
+			HTTPClient:   counting,
+		})
+		started := time.Now()
+		_, err := client.CreateMultipartUpload(context.TODO(), &s3.CreateMultipartUploadInput{
+			Bucket: aws.String("bucket"),
+			Key:    aws.String("index.html"),
+		})
+		return counting, err, time.Since(started)
+	}
+	check := func(t *testing.T, counting *countingHTTPClient, err error, took time.Duration) {
+		t.Helper()
+		var canceled *smithy.CanceledError
+		if !errors.As(err, &canceled) {
+			t.Fatalf("got %v, want a smithy.CanceledError", err)
+		}
+		if n := counting.calls.Load(); n != 1 {
+			t.Errorf("%d attempts, want 1 (no retry)", n)
+		}
+		if took > time.Second {
+			t.Errorf("took %s: the SDK backed off", took)
+		}
+	}
+	t.Run("refused after cancellation", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			t.Error("a request after cancellation must not be sent")
+		}))
+		defer srv.Close()
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		counting, err, took := createUpload(t, ctx, srv)
+		check(t, counting, err, took)
+	})
+	t.Run("cut short in flight", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			cancel() // the agent run ends while the request is in flight
+			<-r.Context().Done()
+		}))
+		defer srv.Close()
+		counting, err, took := createUpload(t, ctx, srv)
+		check(t, counting, err, took)
+	})
+}
+
+// While the run is live the uploader gets the abort's reply.
+func TestCtxHTTPClientReturnsMultipartAbortReply(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+	c := newCtxHTTPClient(context.Background(), srv.Client())
+	req, _ := http.NewRequest(http.MethodDelete, srv.URL+"/index.html?uploadId=u1", nil)
+	resp, err := c.Do(req)
+	if err != nil {
+		t.Fatalf("abort: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Errorf("status %d, want 204", resp.StatusCode)
+	}
+}
+
+// An abort still unanswered when ctx is cancelled is no longer waited for.
+func TestCtxHTTPClientStopsWaitingForAbortOnCancel(t *testing.T) {
+	received := make(chan struct{})
+	unblock := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(received)
+		<-unblock
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+	defer close(unblock)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	c := newCtxHTTPClient(ctx, srv.Client())
+	done := make(chan error, 1)
+	go func() {
+		req, _ := http.NewRequest(http.MethodDelete, srv.URL+"/index.html?uploadId=u1", nil)
+		resp, err := c.Do(req)
+		if err == nil {
+			resp.Body.Close()
+		}
+		done <- err
+	}()
+	<-received
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("err = %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the abort was still waited for after cancellation")
+	}
+}
+
+// Reading an answered abort's body stops once ctx is cancelled.
+func TestCtxHTTPClientStopsReadingAbortReplyOnCancel(t *testing.T) {
+	unblock := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		w.(http.Flusher).Flush()
+		select {
+		case <-r.Context().Done():
+		case <-unblock:
+		}
+	}))
+	defer srv.Close()
+	defer close(unblock)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	c := newCtxHTTPClient(ctx, srv.Client())
+	req, _ := http.NewRequest(http.MethodDelete, srv.URL+"/index.html?uploadId=u1", nil)
+	resp, err := c.Do(req)
+	if err != nil {
+		t.Fatalf("abort: %v", err)
+	}
+	defer resp.Body.Close()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = io.Copy(io.Discard, resp.Body)
+	}()
+	time.Sleep(20 * time.Millisecond)
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("reading the abort's reply didn't stop within 5s of cancellation")
+	}
+}
+
+// An abort answered after the caller stopped waiting has its reply closed, so the
+// connection is released rather than left to the timeout.
+func TestCtxHTTPClientClosesAbandonedAbortReply(t *testing.T) {
+	received := make(chan struct{})
+	unblock := make(chan struct{})
+	closed := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(received)
+		<-unblock
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	c := newCtxHTTPClient(ctx, closeNotifyingDoer{next: srv.Client(), closed: closed})
+	done := make(chan error, 1)
+	go func() {
+		req, _ := http.NewRequest(http.MethodDelete, srv.URL+"/index.html?uploadId=u1", nil)
+		resp, err := c.Do(req)
+		if err == nil {
+			resp.Body.Close()
+		}
+		done <- err
+	}()
+	<-received
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want context.Canceled", err)
+	}
+	close(unblock)
+	select {
+	case <-closed:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the abandoned abort's reply was never closed")
+	}
+}
+
+type closeNotifyingDoer struct {
+	next   *http.Client
+	closed chan struct{}
+}
+
+func (d closeNotifyingDoer) Do(req *http.Request) (*http.Response, error) {
+	resp, err := d.next.Do(req)
+	if err == nil {
+		resp.Body = &releasingBody{ReadCloser: resp.Body, release: func() { close(d.closed) }}
+	}
+	return resp, err
 }
 
 // blockingStore is a PreviewStore whose EnsurePreview waits until release closes.

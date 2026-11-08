@@ -8,6 +8,7 @@ package agenttools
 // so a preview deployed in an earlier run of the Task is accepted too.
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/url"
@@ -165,11 +166,29 @@ func (r *PreviewRecord) has(host string) bool {
 }
 
 // addListed asks the control plane for the Task's previews and records their hosts.
-func (r *PreviewRecord) addListed() {
+// The lookup can't be cancelled, so addListed gives up on it (recording nothing)
+// when ctx is done; the lookup finishes on its own and its answer is dropped.
+func (r *PreviewRecord) addListed(ctx context.Context) {
 	if r == nil || r.listPreviewURLs == nil {
 		return
 	}
-	urls, err := r.listPreviewURLs()
+	type listed struct {
+		urls []string
+		err  error
+	}
+	done := make(chan listed, 1)
+	go func() {
+		urls, err := r.listPreviewURLs()
+		done <- listed{urls, err}
+	}()
+	var urls []string
+	var err error
+	select {
+	case l := <-done:
+		urls, err = l.urls, l.err
+	case <-ctx.Done():
+		return
+	}
 	if err != nil {
 		if r.logsWriter != nil {
 			io.WriteString(r.logsWriter, fmt.Sprintf("verify_preview_reachable: could not list the Task's previews, checking only the previews deployed in this run: %s\n", err))
@@ -184,12 +203,14 @@ func (r *PreviewRecord) addListed() {
 // previewURLCheck is one verify_preview_reachable call's view of the record: it lists
 // the Task's previews at most once, the first time a URL's host isn't recorded.
 type previewURLCheck struct {
+	ctx    context.Context
 	record *PreviewRecord
 	listed bool
 }
 
-func newPreviewURLCheck(record *PreviewRecord) *previewURLCheck {
-	return &previewURLCheck{record: record}
+// newPreviewURLCheck returns a check whose listing gives up when ctx is done.
+func newPreviewURLCheck(ctx context.Context, record *PreviewRecord) *previewURLCheck {
+	return &previewURLCheck{ctx: ctx, record: record}
 }
 
 // allowed is the SSRF guard: u must be https, carry no user info, use the default
@@ -214,7 +235,7 @@ func (c *previewURLCheck) allowed(u *url.URL) bool {
 		return false
 	}
 	c.listed = true
-	c.record.addListed()
+	c.record.addListed(c.ctx)
 	return c.record.has(host)
 }
 

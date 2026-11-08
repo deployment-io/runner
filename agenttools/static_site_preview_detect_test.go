@@ -34,7 +34,7 @@ var viteSite = DetectedSite{Framework: "Vite", BuildCommand: "pnpm run build", P
 func TestPlanDetectedPreview(t *testing.T) {
 	workDir, repoDir := newWorkDir(t)
 	var gotDir string
-	p, ok, err := planRunnerBuiltPreview(detectDeps(workDir, task_previews.StaticSiteBuildSettingsReplyV1{}, &viteSite, "", &gotDir), "0-acme/web", nil)
+	p, ok, err := planRunnerBuiltPreview(context.Background(), detectDeps(workDir, task_previews.StaticSiteBuildSettingsReplyV1{}, &viteSite, "", &gotDir), "0-acme/web", nil)
 	if err != nil || !ok {
 		t.Fatalf("detectable: ok=%v err=%v; want the runner-built path", ok, err)
 	}
@@ -46,7 +46,7 @@ func TestPlanDetectedPreview(t *testing.T) {
 		t.Errorf("plan %+v", p)
 	}
 
-	p, ok, err = planRunnerBuiltPreview(detectDeps(workDir, task_previews.StaticSiteBuildSettingsReplyV1{}, &viteSite, "", &gotDir), "0-acme/web", strPtr("./apps/web/"))
+	p, ok, err = planRunnerBuiltPreview(context.Background(), detectDeps(workDir, task_previews.StaticSiteBuildSettingsReplyV1{}, &viteSite, "", &gotDir), "0-acme/web", strPtr("./apps/web/"))
 	if err != nil || !ok {
 		t.Fatalf("root_directory: ok=%v err=%v", ok, err)
 	}
@@ -56,12 +56,12 @@ func TestPlanDetectedPreview(t *testing.T) {
 
 	// The same refusal as a deployed site's.
 	root := DetectedSite{Framework: "Vite", BuildCommand: "npm run build", PublishDirectory: "."}
-	if _, _, err := planRunnerBuiltPreview(detectDeps(workDir, task_previews.StaticSiteBuildSettingsReplyV1{}, &root, "", nil), "0-acme/web", nil); err == nil ||
+	if _, _, err := planRunnerBuiltPreview(context.Background(), detectDeps(workDir, task_previews.StaticSiteBuildSettingsReplyV1{}, &root, "", nil), "0-acme/web", nil); err == nil ||
 		err.Error() != "0-acme/web's publish directory is its root directory, so its preview can't be built" {
 		t.Errorf("publish directory equal to the root: got %v", err)
 	}
 
-	if _, _, err := planRunnerBuiltPreview(detectDeps(workDir, task_previews.StaticSiteBuildSettingsReplyV1{}, &viteSite, "", nil), "0-acme/web", strPtr("apps/nope")); err == nil ||
+	if _, _, err := planRunnerBuiltPreview(context.Background(), detectDeps(workDir, task_previews.StaticSiteBuildSettingsReplyV1{}, &viteSite, "", nil), "0-acme/web", strPtr("apps/nope")); err == nil ||
 		!strings.Contains(err.Error(), `root_directory "apps/nope" isn't a directory in 0-acme/web`) {
 		t.Errorf("missing root_directory: got %v", err)
 	}
@@ -76,7 +76,7 @@ func TestPlanDetectedPreviewRefusesSymlinkOutOfRepository(t *testing.T) {
 	detected := false
 	deps := detectDeps(workDir, task_previews.StaticSiteBuildSettingsReplyV1{}, &viteSite, "", nil)
 	deps.DetectSite = func(string) (DetectedSite, string, bool) { detected = true; return viteSite, "", true }
-	_, _, err := planRunnerBuiltPreview(deps, "0-acme/web", strPtr("escape"))
+	_, _, err := planRunnerBuiltPreview(context.Background(), deps, "0-acme/web", strPtr("escape"))
 	if err == nil || !strings.Contains(err.Error(), `root_directory "escape" resolves outside 0-acme/web`) {
 		t.Errorf("got %v, want root_directory refused", err)
 	}
@@ -88,7 +88,7 @@ func TestPlanDetectedPreviewRefusesSymlinkOutOfRepository(t *testing.T) {
 func TestPlanNotDetectedTakesAgentPath(t *testing.T) {
 	workDir, _ := newWorkDir(t)
 	deps := detectDeps(workDir, task_previews.StaticSiteBuildSettingsReplyV1{}, nil, `package.json has no "build" script`, nil)
-	p, ok, err := planRunnerBuiltPreview(deps, "0-acme/web", nil)
+	p, ok, err := planRunnerBuiltPreview(context.Background(), deps, "0-acme/web", nil)
 	if err != nil || ok || p.notDetected != `package.json has no "build" script` {
 		t.Fatalf("not detectable: ok=%v err=%v reason %q", ok, err, p.notDetected)
 	}
@@ -116,7 +116,7 @@ func TestDeployedRepositoryIsNotDetected(t *testing.T) {
 	called := false
 	deps := detectDeps(workDir, reply, &viteSite, "", nil)
 	deps.DetectSite = func(string) (DetectedSite, string, bool) { called = true; return viteSite, "", true }
-	p, ok, err := planRunnerBuiltPreview(deps, "0-acme/web", nil)
+	p, ok, err := planRunnerBuiltPreview(context.Background(), deps, "0-acme/web", nil)
 	if err != nil || !ok || called || p.detected != nil || p.publishDir != "build" || p.displayName() != "web" {
 		t.Errorf("deployed: ok=%v err=%v detect called=%v plan %+v", ok, err, called, p)
 	}
@@ -167,7 +167,7 @@ func TestRunDetectedPreview(t *testing.T) {
 			writeTree(t, dir, map[string]string{"dist/index.html": "<html>"})
 			return nil
 		}
-		p, ok, err := planRunnerBuiltPreview(deps, "0-acme/web", strPtr("apps/web"))
+		p, ok, err := planRunnerBuiltPreview(context.Background(), deps, "0-acme/web", strPtr("apps/web"))
 		if err != nil || !ok {
 			t.Fatalf("plan: %v %v", ok, err)
 		}
@@ -195,7 +195,7 @@ func TestRunDetectedPreview(t *testing.T) {
 
 	deps := detectDeps(workDir, task_previews.StaticSiteBuildSettingsReplyV1{}, &viteSite, "", nil)
 	deps.BuildSite = func(context.Context, string, string, []string, io.Writer) error { return nil }
-	p, _, _ := planRunnerBuiltPreview(deps, "0-acme/web", nil)
+	p, _, _ := planRunnerBuiltPreview(context.Background(), deps, "0-acme/web", nil)
 	_, err := runRunnerBuiltPreview(context.Background(), deps, p)
 	want := "the build of 0-acme/web didn't produce 0-acme/web/dist/index.html. If the project writes its build somewhere else, build it yourself and call deploy_static_site_preview with publish_dir and without repository"
 	if err == nil || err.Error() != want {

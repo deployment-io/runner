@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"github.com/deployment-io/deployment-runner/jobs/resources"
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"sort"
@@ -831,20 +832,11 @@ func (rs *RunAgentStep) spawnAgentboxAndWait(spec agentboxSpawnSpec, logsWriter 
 	// never enter the container; torn down on the way out (LIFO defer order runs
 	// this after the container is removed).
 	if spec.mcpSocketHost != "" {
-		mcpSrv := agentmcp.New("deployment-io-runner", agentMCPServerVersion)
-		stopTools := registerAgentTools(mcpSrv, spec)
-		defer stopTools()
-		ln, lerr := mcpSrv.Listen(spec.mcpSocketHost)
-		if lerr != nil {
-			return agentResult{}, fmt.Errorf("error opening agent tool socket: %w", lerr)
+		closeTools, err := serveAgentTools(spec, logsWriter)
+		if err != nil {
+			return agentResult{}, err
 		}
-		mcpCtx, cancelMCP := context.WithCancel(dockerCtx)
-		defer func() {
-			cancelMCP()
-			_ = ln.Close()
-			_ = os.Remove(spec.mcpSocketHost)
-		}()
-		go func() { _ = mcpSrv.ServeListener(mcpCtx, ln) }()
+		defer closeTools()
 	}
 	// Clear the previous run's output BEFORE the container starts, so the
 	// result this function reads can only be the one this container wrote.
@@ -1961,6 +1953,53 @@ type productionQATools struct {
 	onReadOnlyUnsupported func(reason string)
 }
 
+// toolCallsWait is how long a spawn's teardown waits for the tool calls still
+// running once their context is cancelled. A var so tests can shorten it.
+var toolCallsWait = 30 * time.Second
+
+// registerTools is registerAgentTools; tests replace it to serve their own tools.
+var registerTools = registerAgentTools
+
+// serveAgentTools serves spec's tools on the socket at spec.mcpSocketHost and
+// returns what tears it down once the agent container is gone: it cancels the
+// calls' context, stops the tools' background work, waits up to toolCallsWait
+// for the calls to return (logging those that don't), finishes the site deploys
+// the agent never came back for, and removes the socket.
+func serveAgentTools(spec agentboxSpawnSpec, logsWriter io.Writer) (closeTools func(), err error) {
+	mcpSrv := agentmcp.New("deployment-io-runner", agentMCPServerVersion)
+	tools := registerTools(mcpSrv, spec)
+	ln, err := mcpSrv.Listen(spec.mcpSocketHost)
+	if err != nil {
+		tools.stop()
+		return nil, fmt.Errorf("error opening agent tool socket: %w", err)
+	}
+	// The socket file goes last (below), not when the listener is closed.
+	if ul, ok := ln.(*net.UnixListener); ok {
+		ul.SetUnlinkOnClose(false)
+	}
+	mcpCtx, cancelMCP := context.WithCancel(context.Background())
+	go func() { _ = mcpSrv.ServeListener(mcpCtx, ln) }()
+	return func() {
+		cancelMCP()
+		_ = ln.Close()
+		tools.stop()
+		if running := mcpSrv.Wait(toolCallsWait); len(running) > 0 {
+			io.WriteString(logsWriter, fmt.Sprintf("warning: tool call(s) still running after %s: %s; the run goes on without them\n", toolCallsWait, strings.Join(running, ", ")))
+		}
+		tools.finish()
+		_ = os.Remove(spec.mcpSocketHost)
+	}, nil
+}
+
+// agentTools is what registerAgentTools returns: stop stops the tools'
+// background work (cancelling the static-site builds and waiting for them, then
+// waiting for the web-service deploys); finish, called once the tool calls have
+// returned, replays the site deploys the agent never came back for.
+type agentTools struct {
+	stop   func()
+	finish func()
+}
+
 // registerAgentTools registers the tools a spawn's socket serves and returns
 // what stops them. A production QA run gets only its two read-only checks;
 // a stack-path QA round gets ping and the two verify tools (and
@@ -1968,16 +2007,18 @@ type productionQATools struct {
 // it when apiSignInTool is too); every other run
 // gets ping and, with previewDeps, the three preview tools —
 // and deploy_web_service_preview when webPreviewDeps is set too (implement and
-// fix runs). The returned stop stops both deploy tools.
-func registerAgentTools(mcpSrv *agentmcp.Server, spec agentboxSpawnSpec) func() {
+// fix runs). The returned stop stops both deploy tools; finish hears their
+// site deploys the agent left.
+func registerAgentTools(mcpSrv *agentmcp.Server, spec agentboxSpawnSpec) agentTools {
+	none := agentTools{stop: func() {}, finish: func() {}}
 	if t := spec.productionTools; t != nil {
 		agenttools.RegisterVerifyPreviewReachable(mcpSrv, t.record, t.logsWriter)
 		agenttools.RegisterVerifyPreviewRenderedReadOnly(mcpSrv, t.record, t.verifyBrowser, t.logsWriter, t.onReadOnlyUnsupported)
-		return func() {}
+		return none
 	}
 	agentmcp.RegisterPing(mcpSrv)
 	if spec.previewDeps == nil {
-		return func() {}
+		return none
 	}
 	if spec.verifyToolsOnly {
 		agenttools.RegisterVerifyPreviewReachable(mcpSrv, spec.previewDeps.Record, spec.previewDeps.LogsWriter)
@@ -1990,7 +2031,7 @@ func registerAgentTools(mcpSrv *agentmcp.Server, spec agentboxSpawnSpec) func() 
 				agenttools.RegisterVerifyAPISignIn(mcpSrv, spec.previewDeps.Record, sessions, spec.previewDeps.LogsWriter)
 			}
 		}
-		return func() {}
+		return none
 	}
 	// Preview builds still running when the agent run ends are cancelled
 	// and their copies removed.
@@ -2005,10 +2046,12 @@ func registerAgentTools(mcpSrv *agentmcp.Server, spec agentboxSpawnSpec) func() 
 	}
 	agenttools.RegisterVerifyPreviewReachable(mcpSrv, spec.previewDeps.Record, spec.previewDeps.LogsWriter)
 	agenttools.RegisterVerifyPreviewRendered(mcpSrv, spec.previewDeps.Record, spec.previewDeps.VerifyBrowser, spec.previewDeps.LogsWriter)
-	return func() {
-		stopPreviewBuilds()
-		finishSiteDeploys()
-		stopWebPreviews()
+	return agentTools{
+		stop: func() {
+			stopPreviewBuilds()
+			stopWebPreviews()
+		},
+		finish: finishSiteDeploys,
 	}
 }
 
@@ -2178,9 +2221,21 @@ var grantPreviewDeployAccess = func(parameters map[string]interface{}) error {
 // Best-effort: a failure is logged and the deploy carries on, so a runner whose
 // permissions come from elsewhere keeps working, and one that truly lacks them
 // fails at the AWS call exactly as before.
-func ensurePreviewDeployAccess(parameters map[string]interface{}, logsWriter io.Writer) {
-	if err := grantPreviewDeployAccess(parameters); err != nil {
-		io.WriteString(logsWriter, fmt.Sprintf("Preview: could not grant this runner the static-site permissions previews need (%s); continuing\n", err))
+//
+// The grant takes no context and can wait a minute for IAM, so once ctx is
+// cancelled ensurePreviewDeployAccess stops waiting and returns ctx's error; the
+// grant finishes in the background without logging.
+func ensurePreviewDeployAccess(ctx context.Context, parameters map[string]interface{}, logsWriter io.Writer) error {
+	granted := make(chan error, 1)
+	go func() { granted <- grantPreviewDeployAccess(parameters) }()
+	select {
+	case err := <-granted:
+		if err != nil {
+			io.WriteString(logsWriter, fmt.Sprintf("Preview: could not grant this runner the static-site permissions previews need (%s); continuing\n", err))
+		}
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
 }
 
@@ -2196,8 +2251,10 @@ func buildStaticSitePreviewDeps(ctx commandUtils.TaskJobContext, parameters map[
 		Region:      runnerRegion,
 		WorkDirHost: workDirHost,
 		LogsWriter:  logsWriter,
-		BuildClients: func() (*s3.Client, *cloudfront.Client, error) {
-			ensurePreviewDeployAccess(parameters, logsWriter)
+		BuildClients: func(ctx context.Context) (*s3.Client, *cloudfront.Client, error) {
+			if err := ensurePreviewDeployAccess(ctx, parameters, logsWriter); err != nil {
+				return nil, nil, err
+			}
 			s3Client, err := cloud_api_clients.GetS3Client(parameters)
 			if err != nil {
 				return nil, nil, err
@@ -2319,7 +2376,7 @@ func buildWebServicePreviewDeps(ctx commandUtils.TaskJobContext, parameters map[
 		BuildCloudFront: func() (agenttools.WebPreviewCloudFront, error) {
 			// CloudFront is the static-site policy's; the deploy's commands
 			// grant themselves the rest.
-			ensurePreviewDeployAccess(parameters, logsWriter)
+			_ = ensurePreviewDeployAccess(context.Background(), parameters, logsWriter)
 			return cloud_api_clients.GetCloudfrontClient(parameters, cloudfrontRegion)
 		},
 	}

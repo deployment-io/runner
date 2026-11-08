@@ -196,7 +196,7 @@ func (t *verifyAPIRequest) handle(ctx context.Context, rawArgs json.RawMessage) 
 		return "", err
 	}
 	u, err := url.Parse(args.URL)
-	if err != nil || !newPreviewURLCheck(t.record).allowed(u) {
+	if err != nil || !newPreviewURLCheck(ctx, t.record).allowed(u) {
 		t.logf("verify_api_request: %s %s → refused (not a preview this Task deployed)", args.Method, logURL(args.URL))
 		return "", fmt.Errorf("url must be a backend preview URL this Task deployed (https on the default port, no user info, the host of a preview this Task deployed) — got %q", args.URL)
 	}
