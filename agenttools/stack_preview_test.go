@@ -108,6 +108,11 @@ func TestStaticSitePreviewReservedOnceAndReusedAcrossRounds(t *testing.T) {
 	if len(cloud.deploys) != 2 || cloud.deploys[0].ExistingDistID != "E1" || cloud.deploys[1].ExistingDistID != "E1" {
 		t.Errorf("deploys = %+v, want both into E1", cloud.deploys)
 	}
+	for _, d := range cloud.deploys {
+		if d.ExistingDistArn != "arn:E1" {
+			t.Errorf("deploy ExistingDistArn = %q, want arn:E1 (its bucket policy is attached again)", d.ExistingDistArn)
+		}
+	}
 	for _, env := range builds {
 		if got := strings.Join(env, ","); got != "OTHER=kept,VITE_API_URL=https://d9.cloudfront.net/api" {
 			t.Errorf("build env = %s", got)
@@ -260,4 +265,72 @@ func TestStaticSitePreviewBuildOutputHidesWiredValues(t *testing.T) {
 	if !strings.Contains(logs.String(), "VITE_API_URL is <VITE_API_URL>\nlast line <VITE_API_URL>") {
 		t.Errorf("the build's output isn't in the log, redacted:\n%s", logs.String())
 	}
+}
+
+// A first deploy that fails after CloudFront created its distribution (a failing
+// bucket policy) still leaves the distribution's id saved and remembered, through
+// OnDistributionCreated: the reservation and the deploy both.
+func TestStaticPreviewDistributionSavedWhenTheDeployFailsAfterCreatingIt(t *testing.T) {
+	savedReserve, savedDeploy := reservePreviewDist, deployStaticPreview
+	t.Cleanup(func() { reservePreviewDist, deployStaticPreview = savedReserve, savedDeploy })
+	failAfterCreate := func(in StaticPreviewDeployInput, _ io.Writer) (StaticPreviewDeployResult, error) {
+		if in.OnDistributionCreated == nil {
+			t.Fatal("no OnDistributionCreated")
+		}
+		in.OnDistributionCreated("E3", "arn:E3", "d3.cloudfront.net")
+		return StaticPreviewDeployResult{}, fmt.Errorf("attach bucket policy: denied")
+	}
+	reservePreviewDist, deployStaticPreview = failAfterCreate, failAfterCreate
+	want := PreviewState{CloudFrontDistributionID: "E3", CloudFrontDistributionArn: "arn:E3", CloudFrontDomainName: "d3.cloudfront.net"}
+
+	t.Run("deployPreviewDirectory", func(t *testing.T) {
+		store := &fakeWebStore{}
+		var builds [][]string
+		deps := stackSiteDeps(t, store, task_previews.StaticSiteBuildSettingsReplyV1{}, &builds)
+		deps.Distributions = NewWebPreviewDistributions()
+		if _, err := deployPreviewDirectory(context.Background(), deps, "web", t.TempDir(), true); err == nil {
+			t.Fatal("deploy succeeded")
+		}
+		if len(store.saved) != 1 || store.saved[0] != want {
+			t.Errorf("saved = %+v", store.saved)
+		}
+		if got := deps.Distributions.fill("64f0c0ffee0123456789abcd", PreviewState{}); got != want {
+			t.Errorf("remembered = %+v", got)
+		}
+
+		// The next deploy reuses the saved distribution and is given its ARN, so it
+		// attaches the bucket policy the failed deploy didn't.
+		var next StaticPreviewDeployInput
+		deployStaticPreview = func(in StaticPreviewDeployInput, _ io.Writer) (StaticPreviewDeployResult, error) {
+			next = in
+			return StaticPreviewDeployResult{DistributionID: in.ExistingDistID}, nil
+		}
+		t.Cleanup(func() { deployStaticPreview = failAfterCreate })
+		if _, err := deployPreviewDirectory(context.Background(), deps, "web", t.TempDir(), true); err != nil {
+			t.Fatal(err)
+		}
+		if next.ExistingDistID != "E3" || next.ExistingDistArn != "arn:E3" {
+			t.Errorf("next deploy ExistingDistID, ExistingDistArn = %q, %q; want E3, arn:E3", next.ExistingDistID, next.ExistingDistArn)
+		}
+	})
+	t.Run("ReserveStaticSitePreview", func(t *testing.T) {
+		store := &fakeWebStore{}
+		var builds [][]string
+		deps := stackSiteDeps(t, store, task_previews.StaticSiteBuildSettingsReplyV1{}, &builds)
+		deps.Distributions = NewWebPreviewDistributions()
+		deps.Record = NewPreviewRecord(nil, io.Discard)
+		plan, err := PlanStaticSitePreview(deps, "0-acme/web")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ReserveStaticSitePreview(context.Background(), deps, plan); err == nil {
+			t.Fatal("reserve succeeded")
+		}
+		if len(store.saved) != 1 || store.saved[0] != want {
+			t.Errorf("saved = %+v", store.saved)
+		}
+		if got := deps.Distributions.fill("64f0c0ffee0123456789abcd", PreviewState{}); got != want {
+			t.Errorf("remembered = %+v", got)
+		}
+	})
 }

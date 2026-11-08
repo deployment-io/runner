@@ -8,6 +8,7 @@ package agenttools
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -56,6 +57,20 @@ type StaticPreviewDeployInput struct {
 	// reuse (re-upload — the CachingDisabled policy serves it immediately — and
 	// bring the distribution's routing in line with IsSPA if it differs).
 	ExistingDistID string
+
+	// ExistingDistArn is ExistingDistID's ARN. On reuse the bucket policy is
+	// attached again for it: a first deploy saves its distribution before
+	// attaching the policy, so that attach may never have happened. Empty means
+	// it is looked up from CloudFront (the preview record carries only the id).
+	ExistingDistArn string
+
+	// OnDistributionCreated, when set, is called with a new distribution's id,
+	// ARN and domain as soon as CloudFront creates it, before anything else can
+	// fail, so the caller saves the id even when the deploy fails afterwards (a
+	// preview whose id was never saved can't be redeployed or deleted by id).
+	// It is also called for a distribution adopted by adoptPreviewDistribution,
+	// and not when the deploy reuses ExistingDistID.
+	OnDistributionCreated func(id, arn, domain string)
 
 	S3Client         *s3.Client
 	CloudfrontClient *cloudfront.Client
@@ -121,10 +136,12 @@ func pickProbeKey(keys []string) string {
 // map, deployment-server RPCs, and MarkDeploymentDone). It reuses that command's
 // arg-based AWS primitives, now shared via the aws_utils package.
 //
-// Known edge (C1 walking-skeleton scope): a first deploy that fails after creating
-// the OAC but before the distribution would collide on that account-global name when
-// retried — harden later (describe-or-create). The cache policy is the AWS-managed
-// CachingDisabled one, so it's no longer a per-preview resource that can orphan.
+// A first deploy that fails after creating the OAC but before saving the
+// distribution's id leaves the OAC behind, and maybe the distribution: the next
+// first deploy adopts that distribution (adoptPreviewDistribution), or else
+// reuses the OAC by name (findPreviewOriginAccessControl). The cache policy is
+// the AWS-managed CachingDisabled one, so it's no longer a per-preview resource
+// that can orphan.
 func DeployStaticSitePreview(in StaticPreviewDeployInput, logsWriter io.Writer) (StaticPreviewDeployResult, error) {
 	bucketName := previewBucketName(in)
 
@@ -156,6 +173,10 @@ func DeployStaticSitePreview(in StaticPreviewDeployInput, logsWriter io.Writer) 
 	if err != nil {
 		return StaticPreviewDeployResult{}, fmt.Errorf("upload preview: %w", err)
 	}
+	adoptedDomain, err := adoptPreviewDistribution(in.CloudfrontClient, &in, logsWriter)
+	if err != nil {
+		return StaticPreviewDeployResult{}, err
+	}
 	// Not fatal: the preview is already serving the new build, and leftover
 	// files from the previous one do not break it — they just sit there until a
 	// later deploy marks them.
@@ -168,7 +189,16 @@ func DeployStaticSitePreview(in StaticPreviewDeployInput, logsWriter io.Writer) 
 		return StaticPreviewDeployResult{}, err
 	}
 	if dist == nil {
-		return StaticPreviewDeployResult{DistributionID: in.ExistingDistID, UploadedKeys: sortedUploadedKeys(uploadedKeys)}, nil
+		arn, err := previewDistributionArn(in.CloudfrontClient, in)
+		if err != nil {
+			return StaticPreviewDeployResult{}, err
+		}
+		if err = attachPreviewBucketPolicy(in, &cloudfrontTypes.Distribution{ARN: aws.String(arn)}); err != nil {
+			return StaticPreviewDeployResult{}, err
+		}
+		// An adopted distribution's domain goes back with it, for the caller to save;
+		// a reused one's is already on the preview record.
+		return StaticPreviewDeployResult{DistributionID: in.ExistingDistID, DistributionArn: arn, DomainName: adoptedDomain, UploadedKeys: sortedUploadedKeys(uploadedKeys)}, nil
 	}
 	cf := in.CloudfrontClient
 
@@ -206,6 +236,13 @@ func ReservePreviewDistribution(in StaticPreviewDeployInput, logsWriter io.Write
 		return StaticPreviewDeployResult{}, fmt.Errorf("ensure preview bucket: %w", err)
 	}
 	in.ExistingDistID = ""
+	adoptedDomain, err := adoptPreviewDistribution(in.CloudfrontClient, &in, logsWriter)
+	if err != nil {
+		return StaticPreviewDeployResult{}, err
+	}
+	if in.ExistingDistID != "" {
+		return reserveAdoptedPreviewDistribution(in, bucketLocation, adoptedDomain, logsWriter)
+	}
 	dist, err := deployPreviewDistribution(in.CloudfrontClient, in, bucketLocation, logsWriter)
 	if err != nil {
 		return StaticPreviewDeployResult{}, err
@@ -221,13 +258,108 @@ func ReservePreviewDistribution(in StaticPreviewDeployInput, logsWriter io.Write
 	}, nil
 }
 
-// attachPreviewBucketPolicy lets a new preview distribution read its bucket.
+// reserveAdoptedPreviewDistribution is ReservePreviewDistribution for a distribution
+// adoptPreviewDistribution found: its routing is brought in line with IsSPA and the
+// bucket policy attached for it, as for a reused one.
+func reserveAdoptedPreviewDistribution(in StaticPreviewDeployInput, bucketLocation *string, domain string, logsWriter io.Writer) (StaticPreviewDeployResult, error) {
+	if _, err := deployPreviewDistribution(in.CloudfrontClient, in, bucketLocation, logsWriter); err != nil {
+		return StaticPreviewDeployResult{}, err
+	}
+	arn, err := previewDistributionArn(in.CloudfrontClient, in)
+	if err != nil {
+		return StaticPreviewDeployResult{}, err
+	}
+	if err = attachPreviewBucketPolicy(in, &cloudfrontTypes.Distribution{ARN: aws.String(arn)}); err != nil {
+		return StaticPreviewDeployResult{}, err
+	}
+	io.WriteString(logsWriter, fmt.Sprintf("Preview distribution reserved: %s (propagating)\n", in.ExistingDistID))
+	return StaticPreviewDeployResult{DistributionID: in.ExistingDistID, DistributionArn: arn, DomainName: domain}, nil
+}
+
+// previewDistributionComment is the Comment every preview distribution carries
+// (buildPreviewDistributionConfig). A deploy adopts, and the static-site delete
+// finds, a preview's distributions by it.
+func previewDistributionComment(previewID string) string {
+	return "Preview distribution for " + previewID
+}
+
+// adoptPreviewDistribution makes a preview with no saved distribution keep the one
+// an earlier deploy created and never saved (the save failed, or the runner
+// restarted before it was sent), so a preview has one distribution, not one per
+// failed first deploy. When in has no ExistingDistID it looks for a distribution
+// with the preview's Comment; when there is one it sets in's ExistingDistID and
+// ExistingDistArn to it, hands it to OnDistributionCreated (the caller saves it at
+// once) and returns its domain. It returns "" when in already has a distribution
+// or none was found.
+func adoptPreviewDistribution(cf previewDistributions, in *StaticPreviewDeployInput, logsWriter io.Writer) (string, error) {
+	if in.ExistingDistID != "" {
+		return "", nil
+	}
+	found, err := findPreviewDistribution(cf, previewDistributionComment(in.PreviewID))
+	if err != nil {
+		return "", fmt.Errorf("look for the preview's distribution: %w", err)
+	}
+	if found == nil {
+		return "", nil
+	}
+	id, arn, domain := aws.ToString(found.Id), aws.ToString(found.ARN), aws.ToString(found.DomainName)
+	io.WriteString(logsWriter, fmt.Sprintf("Reusing the preview's CloudFront distribution %s (an earlier deploy created it; its id wasn't saved)\n", id))
+	in.ExistingDistID, in.ExistingDistArn = id, arn
+	if in.OnDistributionCreated != nil {
+		in.OnDistributionCreated(id, arn, domain)
+	}
+	return domain, nil
+}
+
+// findPreviewDistribution returns the first distribution whose Comment is exactly
+// comment, or nil when there is none.
+func findPreviewDistribution(cf previewDistributions, comment string) (*cloudfrontTypes.DistributionSummary, error) {
+	var marker *string
+	for {
+		out, err := cf.ListDistributions(context.TODO(), &cloudfront.ListDistributionsInput{Marker: marker})
+		if err != nil {
+			return nil, err
+		}
+		if out == nil || out.DistributionList == nil {
+			return nil, nil
+		}
+		list := out.DistributionList
+		for i := range list.Items {
+			if aws.ToString(list.Items[i].Comment) == comment {
+				return &list.Items[i], nil
+			}
+		}
+		if !aws.ToBool(list.IsTruncated) || aws.ToString(list.NextMarker) == "" {
+			return nil, nil
+		}
+		marker = list.NextMarker
+	}
+}
+
+// attachPreviewBucketPolicy lets a preview distribution read its bucket. It
+// replaces the bucket's policy with the same one each time.
 func attachPreviewBucketPolicy(in StaticPreviewDeployInput, dist *cloudfrontTypes.Distribution) error {
 	if err := aws_utils.AttachPolicyToS3Bucket(dist.ARN, previewBucketName(in),
 		"AllowCloudFrontServicePrincipal-"+in.PreviewID, "PolicyForCloudFrontPrivateContent-"+in.PreviewID, in.S3Client); err != nil {
 		return fmt.Errorf("attach bucket policy: %w", err)
 	}
 	return nil
+}
+
+// previewDistributionArn is the ARN of the reused distribution in.ExistingDistID:
+// in.ExistingDistArn, or CloudFront's when that is empty.
+func previewDistributionArn(cf previewDistributions, in StaticPreviewDeployInput) (string, error) {
+	if in.ExistingDistArn != "" {
+		return in.ExistingDistArn, nil
+	}
+	out, err := cf.GetDistribution(context.TODO(), &cloudfront.GetDistributionInput{Id: aws.String(in.ExistingDistID)})
+	if err != nil {
+		return "", fmt.Errorf("get preview distribution %s: %w", in.ExistingDistID, err)
+	}
+	if out.Distribution == nil || aws.ToString(out.Distribution.ARN) == "" {
+		return "", fmt.Errorf("get preview distribution %s: no ARN", in.ExistingDistID)
+	}
+	return aws.ToString(out.Distribution.ARN), nil
 }
 
 // previewBucketName matches deploy_aws_static_site's <org>-<deploymentID> scheme.
@@ -262,9 +394,9 @@ func deployPreviewDistribution(cf previewCloudfront, in StaticPreviewDeployInput
 
 	// First deploy: stand up the distribution. Uses the managed CachingDisabled
 	// policy (cachingDisabledPolicyID) rather than creating a per-preview one.
-	oacID, err := aws_utils.CreateOriginAccessControl("preview-"+in.PreviewID, cf)
+	oacID, err := ensurePreviewOriginAccessControl(cf, "preview-"+in.PreviewID, logsWriter)
 	if err != nil {
-		return nil, fmt.Errorf("create OAC: %w", err)
+		return nil, err
 	}
 	behavior := aws_utils.CreateDefaultCacheBehavior(bucketLocation, aws.String(cachingDisabledPolicyID))
 	s3Domain := previewBucketName(in) + ".s3." + in.Region + ".amazonaws.com"
@@ -276,7 +408,59 @@ func deployPreviewDistribution(cf previewCloudfront, in StaticPreviewDeployInput
 	if err != nil {
 		return nil, fmt.Errorf("create preview distribution: %w", err)
 	}
+	if in.OnDistributionCreated != nil && out.Distribution != nil {
+		in.OnDistributionCreated(aws.ToString(out.Distribution.Id), aws.ToString(out.Distribution.ARN), aws.ToString(out.Distribution.DomainName))
+	}
 	return out.Distribution, nil
+}
+
+// ensurePreviewOriginAccessControl creates the preview's OAC, or returns the id of
+// the one named name when it already exists: an earlier deploy of this preview
+// created it and failed before its distribution's id was saved. OAC names are
+// unique per account.
+func ensurePreviewOriginAccessControl(cf previewCloudfront, name string, logsWriter io.Writer) (*string, error) {
+	oacID, err := aws_utils.CreateOriginAccessControl(name, cf)
+	if err == nil {
+		return oacID, nil
+	}
+	var alreadyExists *cloudfrontTypes.OriginAccessControlAlreadyExists
+	if !errors.As(err, &alreadyExists) {
+		return nil, fmt.Errorf("create OAC: %w", err)
+	}
+	existingID, err := findPreviewOriginAccessControl(cf, name)
+	if err != nil {
+		return nil, fmt.Errorf("find existing OAC %s: %w", name, err)
+	}
+	if existingID == "" {
+		return nil, fmt.Errorf("create OAC: %s already exists but wasn't found", name)
+	}
+	io.WriteString(logsWriter, fmt.Sprintf("Reusing origin access control %s: %s\n", name, existingID))
+	return aws.String(existingID), nil
+}
+
+// findPreviewOriginAccessControl returns the id of the OAC named exactly name, or
+// "" when there is none.
+func findPreviewOriginAccessControl(cf previewOriginAccessControls, name string) (string, error) {
+	var marker *string
+	for {
+		out, err := cf.ListOriginAccessControls(context.TODO(), &cloudfront.ListOriginAccessControlsInput{Marker: marker})
+		if err != nil {
+			return "", err
+		}
+		if out == nil || out.OriginAccessControlList == nil {
+			return "", nil
+		}
+		list := out.OriginAccessControlList
+		for _, oac := range list.Items {
+			if aws.ToString(oac.Name) == name {
+				return aws.ToString(oac.Id), nil
+			}
+		}
+		if !aws.ToBool(list.IsTruncated) || aws.ToString(list.NextMarker) == "" {
+			return "", nil
+		}
+		marker = list.NextMarker
+	}
 }
 
 // redeployPreviewDistribution updates an existing preview distribution's routing
@@ -319,7 +503,7 @@ func buildPreviewDistributionConfig(bucketLocation, oacID *string, previewID, s3
 
 	return &cloudfrontTypes.DistributionConfig{
 		CallerReference:      aws.String(fmt.Sprintf("preview-%s-%d", previewID, time.Now().Unix())),
-		Comment:              aws.String("Preview distribution for " + previewID),
+		Comment:              aws.String(previewDistributionComment(previewID)),
 		DefaultCacheBehavior: behavior,
 		Enabled:              aws.Bool(true),
 		Origins:              origins,

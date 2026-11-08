@@ -80,6 +80,12 @@ func ReserveStaticSitePreview(ctx context.Context, deps DeployStaticSitePreviewD
 		SkipDeployWait:   true,
 		S3Client:         s3Client,
 		CloudfrontClient: cfClient,
+		// Saved the moment it exists, so a failing bucket policy still leaves it saved.
+		OnDistributionCreated: func(id, arn, domain string) {
+			saved := PreviewState{CloudFrontDistributionID: id, CloudFrontDistributionArn: arn, CloudFrontDomainName: domain}
+			deps.Distributions.remember(previewID, saved)
+			deps.Store.SavePreview(previewID, saved)
+		},
 	}, deps.LogsWriter)
 	if err != nil {
 		return "", fmt.Errorf("reserve the preview's distribution: %w", err)
