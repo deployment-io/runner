@@ -32,16 +32,18 @@ const reviewCommentsBody = "deployment.io review: " + oauth.PullRequestReviewPos
 // description is the complete record; these comments are a view onto it. An
 // RPC error, a provider that cannot post inline reviews, or an older
 // deployment-server without the method is logged and the Job carries on.
-func (opr *taskOpenPR) postReviewComments(idx int, entry tasks.RepositoryEntry, prNumber int) {
+//
+// It returns how many comments were posted: 0 when none were.
+func (opr *taskOpenPR) postReviewComments(idx int, entry tasks.RepositoryEntry, prNumber int) int {
 	plan, ok := opr.reviewComments(idx, entry)
 	if !ok {
-		return
+		return 0
 	}
 	if len(plan.comments) == 0 {
 		if plan.unplaced > 0 {
 			io.WriteString(opr.logsWriter, fmt.Sprintf("No inline review comments for repo %s: %d finding(s) had no line to attach to\n", entry.Name, plan.unplaced))
 		}
-		return
+		return 0
 	}
 	dto, err := opr.rpc().PostPullRequestReview(opr.ctx.OrganizationID, oauth.PostPullRequestReviewArgsV1{
 		InstallationID: entry.InstallationID,
@@ -52,11 +54,11 @@ func (opr *taskOpenPR) postReviewComments(idx int, entry tasks.RepositoryEntry, 
 	})
 	if err != nil {
 		io.WriteString(opr.logsWriter, fmt.Sprintf("Inline review comments not posted: %s (repo %s, PR #%d)\n", err, entry.Name, prNumber))
-		return
+		return 0
 	}
 	if dto.Unsupported {
 		io.WriteString(opr.logsWriter, fmt.Sprintf("Inline review comments not posted: the git provider does not support them (repo %s, PR #%d)\n", entry.Name, prNumber))
-		return
+		return 0
 	}
 	line := fmt.Sprintf("Posted %d inline review comment(s); %d were not on the diff; %d had no line to attach to (repo %s, PR #%d)",
 		dto.Posted, dto.Dropped, plan.unplaced, entry.Name, prNumber)
@@ -64,6 +66,7 @@ func (opr *taskOpenPR) postReviewComments(idx int, entry tasks.RepositoryEntry, 
 		line += fmt.Sprintf("; %d more were over the %d-comment limit", plan.capped, reviewCommentsMax)
 	}
 	io.WriteString(opr.logsWriter, line+"\n")
+	return dto.Posted
 }
 
 // reviewCommentPlan is what one repository's pull request gets: the comments,

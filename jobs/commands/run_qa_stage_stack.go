@@ -123,6 +123,9 @@ type qaStackRound struct {
 	sites    []*qaStackPreview
 	backends []*qaStackPreview
 	pairs    []*qaStackPair
+	// backendDetails is what the failing backend deploy did, for fail's
+	// progress event; nil outside that deploy.
+	backendDetails *previewDeployDetails
 }
 
 // deployStackAndSpawnQA is a stack-path QA round once its directory is ready: it
@@ -283,6 +286,7 @@ func (r *qaStackRound) fail(p *qaStackPreview, kind string, err error) {
 	}
 	io.WriteString(r.stage.logsWriter, fmt.Sprintf("%s: %s failed to deploy: %s\n", r.label, what, err))
 	p.err = qaPreviewError(err)
+	r.stage.emitPreviewDeploy(previewDeployResult{repo: r.stage.entryName(p.repository), kind: kind, err: err, details: r.backendDetails})
 }
 
 // deploy reserves the linked sites' addresses, then deploys the backends, then
@@ -342,12 +346,15 @@ func (r *qaStackRound) deployBackends() error {
 			line += fmt.Sprintf(" (allowing its site previews' origins in %s)", strings.Join(sortedKeys(origins), ", "))
 		}
 		io.WriteString(r.stage.logsWriter, line+"\n")
-		d, err := r.ops.deployBackend(r.ctx, r.webDeps, backend.backend, origins)
+		webDeps, facts := recordPreviewDeploy(r.webDeps)
+		d, err := r.ops.deployBackend(r.ctx, webDeps, backend.backend, origins)
 		if r.stage.stopped() {
 			return types.ErrJobStoppedByUser
 		}
 		if err != nil {
+			r.backendDetails = facts.result(d)
 			r.fail(backend, "backend", err)
+			r.backendDetails = nil
 			for _, p := range r.pairs {
 				if p.backend == backend && p.linked() && (p.reason == "" || p.reason == qaWiringSingleOrigin) {
 					p.reason = qaWiringBackendFailed
@@ -359,6 +366,7 @@ func (r *qaStackRound) deployBackends() error {
 		r.signInRoles(backend, d)
 		r.webDeps.Record.AddURL(d.URL)
 		io.WriteString(r.stage.logsWriter, fmt.Sprintf("%s: the backend preview of %s is deployed at %s (health check %s)\n", r.label, backend.repository, d.URL, d.HealthURL))
+		r.stage.emitPreviewDeploy(previewDeployResult{repo: r.stage.entryName(backend.repository), kind: qaPreviewBackend, url: d.URL, details: facts.result(d)})
 	}
 	return nil
 }
@@ -388,6 +396,7 @@ func (r *qaStackRound) deploySites() error {
 		site.url = url
 		r.siteDeps.Record.AddURL(url)
 		io.WriteString(r.stage.logsWriter, fmt.Sprintf("%s: the preview of %s is deployed at %s\n", r.label, site.repository, url))
+		r.stage.emitPreviewDeploy(previewDeployResult{repo: r.stage.entryName(site.repository), kind: qaPreviewSite, url: url})
 	}
 	return nil
 }
@@ -408,12 +417,21 @@ func (r *qaStackRound) wiringOutputs() []qaWiringOutput {
 // ("<idx>-<name>"), as qaMergeResultOutput.Repository names it; dir itself when
 // no entry has it.
 func (s *qaStage) entryName(dir string) string {
-	for i, e := range s.ctx.Entries {
-		if fmt.Sprintf("%d-%s", i, e.Name) == dir {
-			return e.Name
-		}
+	if name, ok := s.taskEntryName(dir); ok {
+		return name
 	}
 	return dir
+}
+
+// taskEntryName is the full name of the Task repository checked out at dir
+// ("<idx>-<name>"); ok is false for a directory that is none of them.
+func (s *qaStage) taskEntryName(dir string) (string, bool) {
+	for i, e := range s.ctx.Entries {
+		if fmt.Sprintf("%d-%s", i, e.Name) == dir {
+			return e.Name, true
+		}
+	}
+	return "", false
 }
 
 // previews is QA_PREVIEWS: an entry per preview in work-dir order, a

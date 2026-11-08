@@ -56,8 +56,10 @@ func (opr *OpenPullRequest) Run(parameters map[string]interface{}, logsWriter io
 		io.WriteString(logsWriter, fmt.Sprintf("warning: could not read denied_hosts from job output: %s\n", err))
 		deniedHosts = nil
 	}
+	jobID, _ := jobs.GetParameterValue[string](parameters, parameters_enums.JobID)
 	opener := &taskOpenPR{
 		ctx:          ctx,
+		jobID:        jobID,
 		logsWriter:   logsWriter,
 		deniedHosts:  deniedHosts,
 		agentSummary: readAgentSummaryFromJobOutput(parameters),
@@ -89,6 +91,7 @@ func (opr *OpenPullRequest) Run(parameters map[string]interface{}, logsWriter io
 // denies happened during the Step.
 type taskOpenPR struct {
 	ctx          commandUtils.TaskJobContext
+	jobID        string // the Step Job's, for its progress events
 	logsWriter   io.Writer
 	deniedHosts  []string
 	agentSummary string // agent.changes_summary from /result.json; "" when missing
@@ -120,6 +123,9 @@ type taskOpenPR struct {
 	// taskPreviews lists the Task's previews for the body's Preview part. Nil
 	// means the runner client; tests substitute a stub.
 	taskPreviews taskPreviewRPC
+	// prsOpened and prsUpdated count this run's pull requests, for the stage's
+	// outcome.
+	prsOpened, prsUpdated int
 }
 
 // taskPreviewRPC is the part of the runner client that lists a Task's previews.
@@ -154,6 +160,7 @@ func (opr *taskOpenPR) rpc() pullRequestRPC {
 // across a multi-repo Task leaves an inconsistent state and the Step
 // Job is treated as a unit.
 func (opr *taskOpenPR) openAll(hasChangesByIndex map[int]bool) ([]repoOutput, error) {
+	opr.emitEvent(stageStartedEvent(tasks.TaskEventStagePR, 0, prStartedNow))
 	outputs := make([]repoOutput, 0, len(opr.ctx.Entries))
 	for idx, entry := range opr.ctx.Entries {
 		if !hasChangesByIndex[idx] {
@@ -163,11 +170,19 @@ func (opr *taskOpenPR) openAll(hasChangesByIndex map[int]bool) ([]repoOutput, er
 		}
 		out, err := opr.openOne(idx, entry)
 		if err != nil {
-			return nil, fmt.Errorf("error opening PR for repo %s: %s", entry.Name, err)
+			err = fmt.Errorf("error opening PR for repo %s: %s", entry.Name, err)
+			opr.emitEvent(stageFinishedEvent(tasks.TaskEventStagePR, prStageOutcome(0, 0, err)))
+			return nil, err
 		}
 		outputs = append(outputs, out)
 	}
+	opr.emitEvent(stageFinishedEvent(tasks.TaskEventStagePR, prStageOutcome(opr.prsOpened, opr.prsUpdated, nil)))
 	return outputs, nil
+}
+
+// emitEvent queues one of the pull-request stage's progress events.
+func (opr *taskOpenPR) emitEvent(e tasks.TaskEventV1) {
+	emitTaskEventForJob(opr.ctx, opr.jobID, opr.logsWriter, e)
 }
 
 // openOne calls the deployment-server RPC to open one PR/MR. The repo's
@@ -212,7 +227,13 @@ func (opr *taskOpenPR) openOne(idx int, entry tasks.RepositoryEntry) (repoOutput
 	io.WriteString(opr.logsWriter, fmt.Sprintf("Opened PR #%d for repo %s: %s\n", dto.Number, entry.Name, dto.URL))
 	// Never fails the Step: the pull request exists and its description
 	// carries every finding; the inline comments are a view onto it.
-	opr.postReviewComments(idx, entry, dto.Number)
+	inlineComments := opr.postReviewComments(idx, entry, dto.Number)
+	if dto.AlreadyExisted {
+		opr.prsUpdated++
+	} else {
+		opr.prsOpened++
+	}
+	opr.emitEvent(prOpenedEvent(prOpened{repo: entry.Name, reply: dto, title: title, draftRequested: needsFixes, inlineComments: inlineComments}))
 	return repoOutput{
 		Index:      idx,
 		Name:       entry.Name,

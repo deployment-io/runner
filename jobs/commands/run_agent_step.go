@@ -275,6 +275,12 @@ func (rs *RunAgentStep) Run(parameters map[string]interface{}, logsWriter io.Wri
 	// so a Step that later moves to Review has a stage to move FROM — a card
 	// that only ever said "Review" would read as though the agent never ran.
 	reportTaskStepStage(parameters, ctx, tasks.StageImplement, logsWriter)
+	emitTaskEvent(parameters, ctx, logsWriter, stageStartedEvent(tasks.TaskEventStageImplement, 0, implementStartedNow))
+	// Registered after MarkStepDone's defer, so it runs first: the stage's
+	// last event is queued before the Step's sender is closed.
+	defer func() {
+		emitTaskEvent(parameters, ctx, logsWriter, stageFinishedEvent(tasks.TaskEventStageImplement, implementOutcome(err)))
+	}()
 	imageRef, err := jobs.GetParameterValue[string](parameters, parameters_enums.AgentboxImage)
 	if err != nil {
 		return parameters, fmt.Errorf("agentbox image missing: %s", err)
@@ -339,6 +345,11 @@ func (rs *RunAgentStep) Run(parameters map[string]interface{}, logsWriter io.Wri
 	envVars = append(envVars, agentMCPSocketEnvVar+"="+agentboxMCPSocketInContainer)
 	previewTools := buildImplementPreviewTools(ctx, parameters, workDirHost, logsWriter)
 	result, err := rs.spawnAgentboxAndWait(implementSpawnSpec(imageRef, workDirHost, cacheVolume, envVars, previewTools), logsWriter)
+	// A run that ended in an error still reported what it did when it wrote a
+	// result.json (a timeout, a wait error): its status is then set.
+	if err == nil || errors.Is(err, types.ErrJobStoppedByUser) || result.Status != "" {
+		emitImplementRunEvents(parameters, ctx, logsWriter, result)
+	}
 	// User-stop path: agentbox SIGTERM-handled and wrote a partial
 	// /result.json (status="cancelled" with whatever progress it had).
 	// Merge that partial into JobOutput so token usage / denied hosts /
@@ -379,6 +390,15 @@ func (rs *RunAgentStep) Run(parameters map[string]interface{}, logsWriter io.Wri
 		io.WriteString(logsWriter, formatPreExistingVerifyWarning(result.VerifyResult))
 	}
 	return parameters, nil
+}
+
+// emitImplementRunEvents queues the events of an implement run that ended:
+// its self-check, when it reported one, then its usage and summary.
+func emitImplementRunEvents(parameters map[string]interface{}, ctx commandUtils.TaskJobContext, logsWriter io.Writer, result agentResult) {
+	if e, ok := selfCheckEvent(tasks.TaskEventStageImplement, 0, result.VerifyResult); ok {
+		emitTaskEvent(parameters, ctx, logsWriter, e)
+	}
+	emitTaskEvent(parameters, ctx, logsWriter, implementFinishedEvent(result))
 }
 
 // verifyGateDecision is what the commit gate does with an agent's
@@ -1305,8 +1325,11 @@ type verifyResult struct {
 	Passed        bool   `json:"passed"`
 	Command       string `json:"command,omitempty"`
 	SkippedReason string `json:"skipped_reason,omitempty"`
-	StdoutTail    string `json:"stdout_tail,omitempty"`
-	StderrTail    string `json:"stderr_tail,omitempty"`
+	// DurationMs is how long the check ran, read for the self-check progress
+	// event's "passed in Ns". Zero when the image did not report it.
+	DurationMs int64  `json:"duration_ms,omitempty"`
+	StdoutTail string `json:"stdout_tail,omitempty"`
+	StderrTail string `json:"stderr_tail,omitempty"`
 
 	Steps       []verifyStep `json:"steps,omitempty"`
 	PreExisting bool         `json:"pre_existing,omitempty"`
@@ -1921,6 +1944,10 @@ type agentboxSpawnSpec struct {
 	// verify_api_sign_in over them.
 	apiSignIns    []agenttools.APISignInPreview
 	apiSignInTool bool
+	// onSiteDeployed, set by a QA round off the stack path, is told when one of
+	// the agent's deploy_static_site_preview calls ends with a deployed preview
+	// or a failure: the round's progress event for that preview.
+	onSiteDeployed func(repository, url string, err error)
 }
 
 // productionQATools is what a production QA run's tool socket serves: only
@@ -1968,6 +1995,10 @@ func registerAgentTools(mcpSrv *agentmcp.Server, spec agentboxSpawnSpec) func() 
 	// Preview builds still running when the agent run ends are cancelled
 	// and their copies removed.
 	stopPreviewBuilds := agenttools.RegisterDeployStaticSitePreview(mcpSrv, *spec.previewDeps)
+	finishSiteDeploys := func() {}
+	if spec.onSiteDeployed != nil {
+		finishSiteDeploys = observeSiteDeploys(mcpSrv, spec.onSiteDeployed)
+	}
 	stopWebPreviews := func() {}
 	if spec.webPreviewDeps != nil {
 		stopWebPreviews = agenttools.RegisterDeployWebServicePreview(mcpSrv, *spec.webPreviewDeps)
@@ -1976,7 +2007,76 @@ func registerAgentTools(mcpSrv *agentmcp.Server, spec agentboxSpawnSpec) func() 
 	agenttools.RegisterVerifyPreviewRendered(mcpSrv, spec.previewDeps.Record, spec.previewDeps.VerifyBrowser, spec.previewDeps.LogsWriter)
 	return func() {
 		stopPreviewBuilds()
+		finishSiteDeploys()
 		stopWebPreviews()
+	}
+}
+
+// observeSiteDeploys wraps the registered deploy_static_site_preview tool so
+// onDeployed hears how each call for a repository ended: its URL once the
+// preview is deployed, or its error. The repository is as the tool resolves it
+// ("/work/0-acme/web" is "0-acme/web"). The agent's call and answer are
+// unchanged.
+//
+// A "building" answer (or a call the agent gave up waiting on) is not an end:
+// the build goes on in the background and its result waits for the next call
+// with the same arguments. The returned finish, called once the tool is
+// stopped and its builds are over, makes that call for each repository whose
+// end was not heard, so a build the agent never came back for is heard too.
+func observeSiteDeploys(mcpSrv *agentmcp.Server, onDeployed func(repository, url string, err error)) (finish func()) {
+	tool, ok := mcpSrv.Lookup("deploy_static_site_preview")
+	if !ok {
+		return func() {}
+	}
+	handler := tool.Handler
+	var mu sync.Mutex
+	building := map[string]json.RawMessage{}
+	observe := func(ctx context.Context, args json.RawMessage) (string, error) {
+		out, err := handler(ctx, args)
+		var call struct {
+			Repository string `json:"repository"`
+		}
+		_ = json.Unmarshal(args, &call)
+		repository := strings.Trim(strings.TrimPrefix(strings.TrimSpace(call.Repository), agentboxWorkDirInContainer+"/"), "/")
+		if repository == "" {
+			return out, err
+		}
+		var result struct {
+			URL    string `json:"url"`
+			Status string `json:"status"`
+		}
+		waiting := err == nil && json.Unmarshal([]byte(out), &result) == nil && result.Status != "deployed"
+		if err != nil && ctx.Err() != nil {
+			waiting = true
+		}
+		mu.Lock()
+		if waiting {
+			building[repository] = append(json.RawMessage(nil), args...)
+		} else {
+			delete(building, repository)
+		}
+		mu.Unlock()
+		switch {
+		case waiting:
+		case err != nil:
+			onDeployed(repository, "", err)
+		case result.Status == "deployed":
+			onDeployed(repository, result.URL, nil)
+		}
+		return out, err
+	}
+	tool.Handler = observe
+	mcpSrv.Register(tool)
+	return func() {
+		mu.Lock()
+		left := make([]json.RawMessage, 0, len(building))
+		for _, args := range building {
+			left = append(left, args)
+		}
+		mu.Unlock()
+		for _, args := range left {
+			observe(context.Background(), args)
+		}
 	}
 }
 

@@ -2,6 +2,8 @@ package client
 
 import (
 	"fmt"
+	"net/rpc"
+	"time"
 
 	"github.com/deployment-io/deployment-runner-kit/tasks"
 )
@@ -97,6 +99,43 @@ func (r *RunnerClient) UpdateTaskStepQA(organizationID string, update tasks.Upda
 	var reply tasks.UpdateTaskStepQAReplyV1
 	if err := r.c.Call("Jobs.UpdateTaskStepQAV1", args, &reply); err != nil {
 		return err
+	}
+	if !reply.Done {
+		return fmt.Errorf("error receiving done from the server")
+	}
+	return nil
+}
+
+// appendTaskEventsTimeout bounds one AppendTaskEvents call. A var so tests can
+// shorten it.
+var appendTaskEventsTimeout = 30 * time.Second
+
+// AppendTaskEvents sends one batch of a Task run's structured progress events
+// (Jobs.AppendTaskEventsV1), to be bounded, numbered and stored on the Job.
+// The batching, ordering and retries are the caller's — see
+// commandUtils.TaskEvents; this is the one call.
+//
+// Unlike the other calls it gives up after appendTaskEventsTimeout: a stalled
+// events handler must not hold the sender (and its batch) for the rest of the
+// runner's life. net/rpc can't cancel a call, so the reply, if it ever comes,
+// lands in a buffered channel nobody reads.
+func (r *RunnerClient) AppendTaskEvents(organizationID string, args tasks.AppendTaskEventsArgsV1) error {
+	if !r.isConnected {
+		return ErrConnection
+	}
+	args.OrganizationID = r.GetComputedOrganizationID(organizationID)
+	args.Token = r.token
+	var reply tasks.AppendTaskEventsReplyV1
+	call := r.c.Go("Jobs.AppendTaskEventsV1", args, &reply, make(chan *rpc.Call, 1))
+	timer := time.NewTimer(appendTaskEventsTimeout)
+	defer timer.Stop()
+	select {
+	case <-call.Done:
+	case <-timer.C:
+		return fmt.Errorf("deployment.io didn't answer within %s", appendTaskEventsTimeout)
+	}
+	if call.Error != nil {
+		return call.Error
 	}
 	if !reply.Done {
 		return fmt.Errorf("error receiving done from the server")

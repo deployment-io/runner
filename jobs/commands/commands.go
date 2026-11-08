@@ -118,6 +118,12 @@ func MarkStepDone(parameters map[string]interface{}, err error) <-chan struct{} 
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
+		// The Step's progress events go first, so a run's last events are
+		// stored before the Job reports done — and whatever the Job lacks
+		// below, its sender (if it has one) still closes.
+		if jobID, _ := jobs.GetParameterValue[string](parameters, parameters_enums.JobID); len(jobID) > 0 {
+			utils.CloseTaskEvents(jobID, taskEventsCloseTimeout)
+		}
 		orgID, _ := jobs.GetParameterValue[string](parameters, parameters_enums.OrganizationIDNamespace)
 		taskID, _ := jobs.GetParameterValue[string](parameters, parameters_enums.TaskID)
 		if len(orgID) == 0 || len(taskID) == 0 {
@@ -133,6 +139,10 @@ func MarkStepDone(parameters map[string]interface{}, err error) <-chan struct{} 
 	}()
 	return done
 }
+
+// taskEventsCloseTimeout bounds how long MarkStepDone waits for the Step's
+// queued progress events to be sent.
+const taskEventsCloseTimeout = 10 * time.Second
 
 // removeStepCacheVolume removes the Step's cache volume when the Step ends. A
 // var so tests can observe it without a Docker daemon.

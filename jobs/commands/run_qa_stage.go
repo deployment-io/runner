@@ -267,6 +267,12 @@ type qaStage struct {
 	// roundWiring is how the running stack-path round connected its previews,
 	// set when its deploys end.
 	roundWiring []qaWiringOutput
+	// eventRound is the running round's number, for its progress events.
+	eventRound int
+	// pendingRound is round 1 when it is sent back for a fix: whether it is the
+	// reported round is known only once the next round starts or the stage
+	// finishes, so its qa_round_finished event waits until then.
+	pendingRound *qaRoundOutput
 }
 
 // qaView is the parameter view a QA round runs under.
@@ -294,6 +300,7 @@ func (s *qaStage) run() (map[string]interface{}, error) {
 	if g.status == "" && len(g.static) == 0 && len(g.backends) == 0 {
 		// Nothing changed: nothing to check and nothing to report.
 		io.WriteString(s.logsWriter, "QA stage: no repository changed — no QA run\n")
+		s.emitEvent(stageFinishedEvent(tasks.TaskEventStageQA, qaStageOutcome(nil)))
 		return s.parameters, nil
 	}
 	s.repositories = g.static
@@ -318,6 +325,9 @@ func (s *qaStage) run() (map[string]interface{}, error) {
 	}
 	s.prefetchVerifyBrowser()
 	defer s.prepareContextCopy()()
+	// A fix or its review that ends in an error (a user stop, a restore that
+	// did not work) reports no QA result: round 1's held tally goes as not final.
+	defer s.emitPendingRound(false)
 	round1, err := s.qaRound(1)
 	if err != nil {
 		return s.parameters, err
@@ -445,6 +455,9 @@ func (s *qaStage) qaRoundSubject() string {
 func (s *qaStage) qaRound(round int) (qaRoundOutput, error) {
 	reportTaskStepStage(s.parameters, s.ctx, tasks.StageQA, s.logsWriter)
 	io.WriteString(s.logsWriter, fmt.Sprintf("QA round %d: checking the acceptance criteria on %s\n", round, s.qaRoundSubject()))
+	s.emitPendingRound(false)
+	s.eventRound = round
+	s.emitEvent(qaRoundStartedEvent(round))
 	var result agentResult
 	var err error
 	s.roundMergeResults, s.roundWiring = nil, nil
@@ -461,7 +474,37 @@ func (s *qaStage) qaRound(round int) (qaRoundOutput, error) {
 	out.MergeResults = s.roundMergeResults
 	out.Wiring = s.roundWiring
 	s.out.Rounds = append(s.out.Rounds, out)
+	s.emitRoundEvents(out)
 	return out, nil
+}
+
+// emitRoundEvents queues a QA round's verdicts: one per criterion, then the
+// round's tally. A round 1 sent back for a fix may still be the reported round
+// (no time for the fix, or the fix isn't kept), so its tally waits for
+// emitPendingRound.
+func (s *qaStage) emitRoundEvents(out qaRoundOutput) {
+	for _, e := range qaCriterionEvents(out) {
+		s.emitEvent(e)
+	}
+	if out.Round == 1 && s.shouldSendBack(out) {
+		s.pendingRound = &out
+		return
+	}
+	s.emitEvent(qaRoundFinishedEvent(out, true))
+}
+
+// emitPendingRound queues the held round's tally, final as given.
+func (s *qaStage) emitPendingRound(final bool) {
+	if s.pendingRound == nil {
+		return
+	}
+	s.emitEvent(qaRoundFinishedEvent(*s.pendingRound, final))
+	s.pendingRound = nil
+}
+
+// emitEvent queues one of the stage's progress events on the Step's sender.
+func (s *qaStage) emitEvent(e tasks.TaskEventV1) {
+	emitTaskEvent(s.parameters, s.ctx, s.logsWriter, e)
 }
 
 // accumulateQARun folds a QA round's usage and cost into the Step's totals
@@ -505,5 +548,10 @@ func (s *qaStage) finish() (map[string]interface{}, error) {
 		io.WriteString(s.logsWriter, fmt.Sprintf("warning: could not record QA on the job output: %s\n", err))
 	}
 	s.reportQAResult()
+	if s.pendingRound != nil {
+		final := s.out.finalRound()
+		s.emitPendingRound(final != nil && final.Round == s.pendingRound.Round)
+	}
+	s.emitEvent(stageFinishedEvent(tasks.TaskEventStageQA, qaStageOutcome(s.out)))
 	return s.parameters, nil
 }

@@ -56,6 +56,7 @@ func (cr *CheckoutRepository) runForTask(parameters map[string]interface{}, logs
 		}
 		baseCommits = append(baseCommits, recordBaseCommit(idx, entry.Name, repoDir, baseDir, logsWriter))
 	}
+	emitTaskEventForJob(ctx, jobID, logsWriter, checkoutDoneEvent(ctx.Entries))
 	if err := mergeBaseCommitsIntoJobOutput(parameters, baseCommits); err != nil {
 		// Not fatal: the Step's real work is the checkout, which succeeded.
 		// A missing baseline costs the Review stage its diff — it records

@@ -17,6 +17,7 @@ import (
 	ecsTypes "github.com/aws/aws-sdk-go-v2/service/ecs/types"
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
+	"github.com/deployment-io/deployment-runner-kit/tasks"
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
 	"github.com/deployment-io/deployment-runner/utils/aws_utils"
 	"github.com/deployment-io/deployment-runner/utils/redact"
@@ -189,7 +190,9 @@ func runOneOffTask(parameters map[string]interface{}, ecsClient preDeployEcsAPI,
 	logs.write("Running the " + name + "\n")
 	preDeployTaskDefinitionArn, err := registerPreDeployTaskDefinition(parameters, ecsClient, t.taskDefinitionArn, containerName)
 	if err != nil {
-		return fmt.Sprintf("The %s couldn't start: %s.", name, err), nil
+		failure := fmt.Sprintf("The %s couldn't start: %s.", name, err)
+		recordPreviewCommandNotRun(t.logsWriter, name, failure)
+		return failure, nil
 	}
 	defer deregisterPreDeployTaskDefinition(ecsClient, preDeployTaskDefinitionArn, logs)
 	runTaskInput.TaskDefinition = aws.String(preDeployTaskDefinitionArn)
@@ -197,6 +200,7 @@ func runOneOffTask(parameters map[string]interface{}, ecsClient preDeployEcsAPI,
 	start := preDeployNow()
 	taskArn, failure := startPreDeployTask(ecsClient, runTaskInput, name)
 	if len(failure) > 0 {
+		recordPreviewCommandNotRun(t.logsWriter, name, failure)
 		return failure, nil
 	}
 	logs.follow(taskArn)
@@ -211,8 +215,11 @@ func runOneOffTask(parameters map[string]interface{}, ecsClient preDeployEcsAPI,
 		outcome.stopError = stopErr.Error()
 	}
 	if outcome.exitCode != nil {
+		took := preDeployNow().Sub(start).Round(time.Second)
 		logs.write(fmt.Sprintf("%s%s finished (exit code %d) in %s\n", strings.ToUpper(name[:1]), name[1:],
-			*outcome.exitCode, preDeployNow().Sub(start).Round(time.Second)))
+			*outcome.exitCode, took))
+		recordPreviewCommand(t.logsWriter, name, tasks.TaskEventCommandV1{Ran: true, ExitCode: int(*outcome.exitCode),
+			Summary: fmt.Sprintf("finished (exit code %d) in %s", *outcome.exitCode, took)})
 	}
 	message, _ := outcome.message(name)
 	return message, nil
