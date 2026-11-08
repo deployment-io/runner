@@ -12,9 +12,13 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/smithy-go"
 	"github.com/deployment-io/deployment-runner-kit/task_previews"
 	"github.com/deployment-io/deployment-runner-kit/tasks"
 )
@@ -760,6 +764,76 @@ func TestCtxHTTPClientSendsMultipartAbortAfterCancellation(t *testing.T) {
 	if _, err := c.Do(del); err == nil {
 		t.Error("any other request after cancellation must be refused")
 	}
+}
+
+// countingHTTPClient counts the requests an AWS client sends through it.
+type countingHTTPClient struct {
+	next interface {
+		Do(*http.Request) (*http.Response, error)
+	}
+	calls atomic.Int32
+}
+
+func (c *countingHTTPClient) Do(req *http.Request) (*http.Response, error) {
+	c.calls.Add(1)
+	return c.next.Do(req)
+}
+
+// A request ctxHTTPClient refuses or cuts short once ctx is cancelled is a
+// smithy.CanceledError, so the SDK sends an operation once and doesn't retry it with
+// backoff, though the operation's own context (context.TODO() in the shared helpers)
+// is never cancelled.
+func TestCtxHTTPClientCancellationIsNotRetried(t *testing.T) {
+	createUpload := func(t *testing.T, ctx context.Context, srv *httptest.Server) (*countingHTTPClient, error, time.Duration) {
+		t.Helper()
+		counting := &countingHTTPClient{next: newCtxHTTPClient(ctx, srv.Client())}
+		client := s3.New(s3.Options{
+			Region:       "eu-west-1",
+			Credentials:  aws.AnonymousCredentials{},
+			BaseEndpoint: aws.String(srv.URL),
+			UsePathStyle: true,
+			HTTPClient:   counting,
+		})
+		started := time.Now()
+		_, err := client.CreateMultipartUpload(context.TODO(), &s3.CreateMultipartUploadInput{
+			Bucket: aws.String("bucket"),
+			Key:    aws.String("index.html"),
+		})
+		return counting, err, time.Since(started)
+	}
+	check := func(t *testing.T, counting *countingHTTPClient, err error, took time.Duration) {
+		t.Helper()
+		var canceled *smithy.CanceledError
+		if !errors.As(err, &canceled) {
+			t.Fatalf("got %v, want a smithy.CanceledError", err)
+		}
+		if n := counting.calls.Load(); n != 1 {
+			t.Errorf("%d attempts, want 1 (no retry)", n)
+		}
+		if took > time.Second {
+			t.Errorf("took %s: the SDK backed off", took)
+		}
+	}
+	t.Run("refused after cancellation", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			t.Error("a request after cancellation must not be sent")
+		}))
+		defer srv.Close()
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		counting, err, took := createUpload(t, ctx, srv)
+		check(t, counting, err, took)
+	})
+	t.Run("cut short in flight", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			cancel() // the agent run ends while the request is in flight
+			<-r.Context().Done()
+		}))
+		defer srv.Close()
+		counting, err, took := createUpload(t, ctx, srv)
+		check(t, counting, err, took)
+	})
 }
 
 // While the run is live the uploader gets the abort's reply.

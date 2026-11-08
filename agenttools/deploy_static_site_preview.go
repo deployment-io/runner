@@ -32,6 +32,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/service/cloudfront"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/smithy-go"
 	"github.com/deployment-io/deployment-runner-kit/task_previews"
 	"github.com/deployment-io/deployment-runner-kit/tasks"
 	agentmcp "github.com/deployment-io/deployment-runner/agent_mcp"
@@ -274,8 +275,10 @@ func handleDeployStaticSitePreview(ctx context.Context, deps DeployStaticSitePre
 			return "", fmt.Errorf("publish_dir %q resolves outside %s through a symlink", args.PublishDir, containerWorkDir)
 		}
 	}
-	// Cancelled only when the agent run ends: the call's context is the run's.
-	out, err := deployPreviewDir(ctx, deps, serviceName, distDir, args.IsSPA)
+	// Not cancelled when the agent run ends: an agent-built deploy runs to its end
+	// (the run's teardown waits for it, like any tool call), so it never leaves a
+	// half-made preview — a partial upload, or a distribution whose ID was never saved.
+	out, err := deployPreviewDir(context.WithoutCancel(ctx), deps, serviceName, distDir, args.IsSPA)
 	if err != nil {
 		return "", err
 	}
@@ -436,7 +439,7 @@ func (c ctxHTTPClient) Do(req *http.Request) (*http.Response, error) {
 		return c.abortMultipartUpload(req)
 	}
 	if err := c.ctx.Err(); err != nil {
-		return nil, err
+		return nil, canceledRequest(err)
 	}
 	reqCtx, cancel := context.WithCancel(req.Context())
 	stopAfter := context.AfterFunc(c.ctx, cancel)
@@ -447,10 +450,22 @@ func (c ctxHTTPClient) Do(req *http.Request) (*http.Response, error) {
 	resp, err := c.next.Do(req.WithContext(reqCtx))
 	if err != nil {
 		release()
+		if ctxErr := c.ctx.Err(); ctxErr != nil {
+			return nil, canceledRequest(ctxErr)
+		}
 		return nil, err
 	}
 	resp.Body = &releasingBody{ReadCloser: resp.Body, release: release}
 	return resp, nil
+}
+
+// canceledRequest is the error of a request refused or cut short because ctx was
+// cancelled: a smithy.CanceledError, the one error the AWS SDK's retryer never
+// retries. The shared helpers send their requests with context.TODO(), so the SDK
+// can't see the cancellation itself and would retry a bare context.Canceled as a
+// connection error, with backoff — for every file left in an upload.
+func canceledRequest(err error) error {
+	return &smithy.CanceledError{Err: err}
 }
 
 // abortMultipartUpload sends the abort within abortUploadTimeout, cancelled or not.
@@ -496,7 +511,7 @@ func (c ctxHTTPClient) abortMultipartUpload(req *http.Request) (*http.Response, 
 		return r.resp, nil
 	case <-c.ctx.Done():
 		close(waiting)
-		return nil, c.ctx.Err()
+		return nil, canceledRequest(c.ctx.Err())
 	}
 }
 
