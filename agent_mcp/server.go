@@ -20,6 +20,9 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"sort"
+	"sync"
+	"time"
 )
 
 // defaultProtocolVersion is the MCP version advertised when the client doesn't
@@ -53,12 +56,79 @@ type Server struct {
 
 	tools map[string]Tool
 	order []string // registration order, for a stable tools/list
+
+	// The tool calls in flight, by call id, and whether Wait has started (after
+	// which no call starts). idle, made by a Wait that found calls running, is
+	// closed when the last one returns.
+	callsMu  sync.Mutex
+	closing  bool
+	calls    map[uint64]string
+	nextCall uint64
+	idle     chan struct{}
 }
 
 // New returns a Server that identifies itself with name/version in the MCP
 // initialize handshake.
 func New(name, version string) *Server {
-	return &Server{name: name, version: version, tools: map[string]Tool{}}
+	return &Server{name: name, version: version, tools: map[string]Tool{}, calls: map[uint64]string{}}
+}
+
+// errRunOver is a tools/call's answer once Wait has started.
+const errRunOver = "the agent run is over"
+
+// Wait stops new tool calls from starting and waits, at most timeout, for the ones
+// running to return. It returns nil once they all have, or the names of the tools
+// still running (sorted) when timeout passes first. It cancels nothing itself:
+// cancel the context passed to ServeListener first, which every handler receives.
+func (s *Server) Wait(timeout time.Duration) (stillRunning []string) {
+	s.callsMu.Lock()
+	s.closing = true
+	if len(s.calls) == 0 {
+		s.callsMu.Unlock()
+		return nil
+	}
+	if s.idle == nil {
+		s.idle = make(chan struct{})
+	}
+	idle := s.idle
+	s.callsMu.Unlock()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-idle:
+		return nil
+	case <-timer.C:
+	}
+	s.callsMu.Lock()
+	for _, name := range s.calls {
+		stillRunning = append(stillRunning, name)
+	}
+	s.callsMu.Unlock()
+	sort.Strings(stillRunning)
+	return stillRunning
+}
+
+// startCall records a call to the tool name, or reports false once Wait has
+// started. The returned end removes the record.
+func (s *Server) startCall(name string) (end func(), ok bool) {
+	s.callsMu.Lock()
+	defer s.callsMu.Unlock()
+	if s.closing {
+		return nil, false
+	}
+	id := s.nextCall
+	s.nextCall++
+	s.calls[id] = name
+	return func() {
+		s.callsMu.Lock()
+		defer s.callsMu.Unlock()
+		delete(s.calls, id)
+		if len(s.calls) == 0 && s.idle != nil {
+			close(s.idle)
+			s.idle = nil
+		}
+	}, true
 }
 
 // Register adds (or replaces, last-wins) a tool, preserving first-registration
@@ -153,6 +223,17 @@ type rpcResponse struct {
 
 func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 	defer conn.Close()
+	// Once ctx is done no new request is read: closing conn ends the read below. A
+	// call already running finishes; its reply's write may fail.
+	connDone := make(chan struct{})
+	defer close(connDone)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-connDone:
+		}
+	}()
 	// MCP stdio framing is newline-delimited JSON. Raise the buffer so large
 	// args/results don't truncate a line.
 	sc := bufio.NewScanner(conn)
@@ -160,6 +241,9 @@ func (s *Server) handleConn(ctx context.Context, conn net.Conn) {
 	enc := json.NewEncoder(conn) // Encode appends '\n' — keeps framing
 
 	for sc.Scan() {
+		if ctx.Err() != nil {
+			return // a line read before conn was closed
+		}
 		if len(bytes.TrimSpace(sc.Bytes())) == 0 {
 			continue
 		}
@@ -252,6 +336,14 @@ func (s *Server) toolsCall(ctx context.Context, params json.RawMessage) (map[str
 	if !ok {
 		return nil, &rpcError{Code: -32602, Message: "unknown tool: " + p.Name}
 	}
+	end, ok := s.startCall(p.Name)
+	if !ok {
+		return map[string]interface{}{
+			"content": []map[string]interface{}{{"type": "text", "text": errRunOver}},
+			"isError": true,
+		}, nil
+	}
+	defer end()
 	text, err := t.Handler(ctx, p.Arguments)
 	if err != nil {
 		// Surface tool failure as an MCP result (isError) so the agent reads the

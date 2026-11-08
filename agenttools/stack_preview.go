@@ -27,7 +27,7 @@ type StaticSitePreviewPlan struct {
 // deploy_static_site_preview does, building nothing. A repository the runner can't
 // build a preview of is an error.
 func PlanStaticSitePreview(deps DeployStaticSitePreviewDeps, repository string) (StaticSitePreviewPlan, error) {
-	plan, ok, err := planRunnerBuiltPreview(deps, repository, nil)
+	plan, ok, err := planRunnerBuiltPreview(context.Background(), deps, repository, nil)
 	if err != nil {
 		return StaticSitePreviewPlan{}, err
 	}
@@ -126,7 +126,7 @@ type WebServicePreviewPlan struct {
 // PlanWebServicePreview plans repository's backend preview as
 // deploy_web_service_preview does, deploying nothing.
 func PlanWebServicePreview(deps DeployWebServicePreviewDeps, repository string) (WebServicePreviewPlan, error) {
-	plan, err := planWebServicePreview(deps, repository, nil)
+	plan, err := planWebServicePreview(context.Background(), deps, repository, nil)
 	if err != nil {
 		return WebServicePreviewPlan{}, err
 	}

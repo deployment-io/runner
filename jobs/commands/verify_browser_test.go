@@ -666,3 +666,89 @@ func TestVerifyBrowser_MinImageVersion(t *testing.T) {
 		}
 	}
 }
+
+// A check whose agent run ends returns at once and still removes its container.
+func TestVerifyBrowser_CancelledCheckReturnsAndRemovesTheContainer(t *testing.T) {
+	d := &fakeVerifyDocker{present: true}
+	v := newTestVerifyBrowser(t, d)
+	started := make(chan struct{})
+	v.runContainer = func(ctx context.Context, _ string, _ time.Duration) (verifyBrowserExit, error) {
+		close(started)
+		<-ctx.Done()
+		return verifyBrowserExit{}, ctx.Err()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		_, err := v.run(ctx, verifyRequest(), nil)
+		done <- err
+	}()
+	<-started
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("err = %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the check didn't return within 5s of its context being cancelled")
+	}
+	// The removal may finish after the check returns.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		d.mu.Lock()
+		n := len(d.removed)
+		d.mu.Unlock()
+		if n == 1 || time.Now().After(deadline) {
+			if n != 1 {
+				t.Errorf("container removed %d times, want once", n)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// A check whose agent run ends while its container's removal hangs returns
+// without waiting for the removal, and its browser slot stays taken until the
+// removal finishes.
+func TestVerifyBrowser_CancelledCheckDoesNotWaitForRemoval(t *testing.T) {
+	d := &fakeVerifyDocker{present: true}
+	v := newTestVerifyBrowser(t, d)
+	removing := make(chan struct{})
+	release := make(chan struct{})
+	removed := make(chan struct{})
+	v.removeContainer = func(string) {
+		close(removing)
+		<-release
+		close(removed)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	v.runContainer = func(context.Context, string, time.Duration) (verifyBrowserExit, error) {
+		return verifyBrowserExit{exitCode: 0}, nil
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = v.run(ctx, verifyRequest(), nil)
+	}()
+	<-removing
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the check didn't return within 5s of its context being cancelled")
+	}
+	if n := len(v.slots); n != 1 {
+		t.Fatalf("slots in use while the container is still being removed = %d, want 1", n)
+	}
+	close(release)
+	<-removed
+	deadline := time.Now().Add(5 * time.Second)
+	for len(v.slots) != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("the slot wasn't freed after the container was removed")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}

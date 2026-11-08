@@ -1,6 +1,7 @@
 package agenttools
 
 import (
+	"context"
 	"fmt"
 	"strings"
 )
@@ -30,7 +31,7 @@ func CheckRunnerBuiltPreview(deps DeployStaticSitePreviewDeps, repository string
 	if deps.BuildSettings == nil {
 		return RunnerBuiltPreviewCheck{LookupErr: fmt.Errorf("deployment.io can't look up how %s is deployed here", repoDir)}
 	}
-	settings, err := lookupBuildSettings(deps.BuildSettings, entry.CloneURL)
+	settings, err := lookupBuildSettings(context.Background(), deps.BuildSettings, entry.CloneURL)
 	if err != nil {
 		return RunnerBuiltPreviewCheck{LookupErr: fmt.Errorf("look up how deployment.io deploys %s: %w", repoDir, err)}
 	}

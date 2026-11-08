@@ -302,7 +302,7 @@ func (t *verifyPreviewRendered) handle(ctx context.Context, rawArgs json.RawMess
 	if err != nil {
 		return "", err
 	}
-	input, err := t.buildInput(args)
+	input, err := t.buildInput(ctx, args)
 	if err != nil {
 		return "", err
 	}
@@ -612,8 +612,8 @@ func checkRenderedString(name, v string, allowEmpty bool) error {
 // Task's previews at most once) and assembles input.json. allowed_hosts is every
 // host in the record after those checks, so a link or redirect to another of the
 // Task's previews isn't blocked.
-func (t *verifyPreviewRendered) buildInput(args verifyRenderedArgs) (verifyBrowserInput, error) {
-	check := newPreviewURLCheck(t.record)
+func (t *verifyPreviewRendered) buildInput(ctx context.Context, args verifyRenderedArgs) (verifyBrowserInput, error) {
+	check := newPreviewURLCheck(ctx, t.record)
 	if !check.allowedRaw(args.URL) {
 		return verifyBrowserInput{}, fmt.Errorf("url must be a preview URL this Task deployed (the URL deploy_static_site_preview or deploy_web_service_preview returned) — got %q", args.URL)
 	}

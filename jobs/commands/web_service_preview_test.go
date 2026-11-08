@@ -739,8 +739,8 @@ func webPreviewJobParameters(t *testing.T) map[string]interface{} {
 
 func toolNames(spec agentboxSpawnSpec) string {
 	srv := agentmcp.New("test", "0")
-	stop := registerAgentTools(srv, spec)
-	defer stop()
+	tools := registerAgentTools(srv, spec)
+	defer tools.stop()
 	return strings.Join(srv.ToolNames(), ",")
 }
 

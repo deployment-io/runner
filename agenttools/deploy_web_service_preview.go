@@ -304,7 +304,7 @@ func handleDeployWebServicePreview(ctx context.Context, deps DeployWebServicePre
 	if out, err, ok := builds.attach(ctx, request, previewBuildCallWait); ok {
 		return out, err
 	}
-	plan, err := planWebServicePreview(deps, args.Repository, args.RootDirectory)
+	plan, err := planWebServicePreview(ctx, deps, args.Repository, args.RootDirectory)
 	if err != nil {
 		return "", err
 	}
@@ -333,7 +333,7 @@ func handleDeployWebServicePreview(ctx context.Context, deps DeployWebServicePre
 // synchronously. The QA stage deploys backends with it; the tool runs the same
 // planWebServicePreview and runWebServicePreview, the deploy in the background.
 func DeployWebServicePreview(ctx context.Context, deps DeployWebServicePreviewDeps, repository string) (WebServicePreviewDeployed, error) {
-	plan, err := planWebServicePreview(deps, repository, nil)
+	plan, err := planWebServicePreview(ctx, deps, repository, nil)
 	if err != nil {
 		return WebServicePreviewDeployed{}, err
 	}
@@ -344,13 +344,13 @@ func DeployWebServicePreview(ctx context.Context, deps DeployWebServicePreviewDe
 // deploying anything: nil when repository has a backend preview (one managed web
 // service built from a Dockerfile in the runner's region), else the refusal.
 func CheckWebServicePreview(deps DeployWebServicePreviewDeps, repository string) error {
-	_, err := planWebServicePreview(deps, repository, nil)
+	_, err := planWebServicePreview(context.Background(), deps, repository, nil)
 	return err
 }
 
 // planWebServicePreview resolves repository among the Task's repositories, asks
 // deployment-server how it's deployed as a web service and chooses the service.
-func planWebServicePreview(deps DeployWebServicePreviewDeps, repository string, rootDirectory *string) (webServicePreviewPlan, error) {
+func planWebServicePreview(ctx context.Context, deps DeployWebServicePreviewDeps, repository string, rootDirectory *string) (webServicePreviewPlan, error) {
 	repoDir, entry, err := resolveTaskRepository(deps.Repositories, repository)
 	if err != nil {
 		return webServicePreviewPlan{}, err
@@ -358,7 +358,7 @@ func planWebServicePreview(deps DeployWebServicePreviewDeps, repository string, 
 	if deps.Settings == nil || deps.Deploy == nil {
 		return webServicePreviewPlan{}, fmt.Errorf("deployment.io can't deploy backend previews here")
 	}
-	settings, err := lookupWithin(deps.Settings, entry.CloneURL,
+	settings, err := lookupWithin(ctx, deps.Settings, entry.CloneURL,
 		"deployment.io didn't answer in time; call deploy_web_service_preview again")
 	if err != nil {
 		return webServicePreviewPlan{}, fmt.Errorf("look up how deployment.io deploys %s: %w", repoDir, err)
@@ -747,8 +747,8 @@ func healthCheckPath(path string) string {
 
 // lookupWithin calls lookup, giving up after PreviewBuildSettingsTimeout with
 // timeoutMessage so a stalled request never holds the tool call past the agent CLI's
-// timeout.
-func lookupWithin[T any](lookup func(string) (T, error), cloneURL, timeoutMessage string) (T, error) {
+// timeout, or with ctx's error once ctx is cancelled.
+func lookupWithin[T any](ctx context.Context, lookup func(string) (T, error), cloneURL, timeoutMessage string) (T, error) {
 	type answer struct {
 		reply T
 		err   error
@@ -766,6 +766,9 @@ func lookupWithin[T any](lookup func(string) (T, error), cloneURL, timeoutMessag
 	case <-timer.C:
 		var zero T
 		return zero, errors.New(timeoutMessage)
+	case <-ctx.Done():
+		var zero T
+		return zero, ctx.Err()
 	}
 }
 

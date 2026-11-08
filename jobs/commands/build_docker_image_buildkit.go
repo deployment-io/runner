@@ -676,7 +676,7 @@ func buildkitLogsTail(id string) string {
 		return ""
 	}
 	defer cli.Close()
-	lines := strings.Split(strings.TrimRight(verifyBrowserContainerOutput(cli, id), "\n"), "\n")
+	lines := strings.Split(strings.TrimRight(verifyBrowserContainerOutput(context.Background(), cli, id), "\n"), "\n")
 	if len(lines) > buildkitLogLines {
 		lines = lines[len(lines)-buildkitLogLines:]
 	}

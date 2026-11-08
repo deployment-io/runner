@@ -94,7 +94,7 @@ func (p runnerBuiltPreview) displayName() string {
 // site, the settings are detected from the repository (planDetectedPreview).
 // ok=false (no error) when nothing can be detected either — the agent-built path, with
 // the reason in the returned plan's notDetected.
-func planRunnerBuiltPreview(deps DeployStaticSitePreviewDeps, repository string, rootDirectory *string) (runnerBuiltPreview, bool, error) {
+func planRunnerBuiltPreview(ctx context.Context, deps DeployStaticSitePreviewDeps, repository string, rootDirectory *string) (runnerBuiltPreview, bool, error) {
 	repoDir, entry, err := resolveTaskRepository(deps.Repositories, repository)
 	if err != nil {
 		return runnerBuiltPreview{}, false, err
@@ -102,7 +102,7 @@ func planRunnerBuiltPreview(deps DeployStaticSitePreviewDeps, repository string,
 	if deps.BuildSettings == nil {
 		return runnerBuiltPreview{}, false, fmt.Errorf("deployment.io can't look up how %s is deployed here", repoDir)
 	}
-	settings, err := lookupBuildSettings(deps.BuildSettings, entry.CloneURL)
+	settings, err := lookupBuildSettings(ctx, deps.BuildSettings, entry.CloneURL)
 	if err != nil {
 		return runnerBuiltPreview{}, false, fmt.Errorf("look up how deployment.io deploys %s: %w", repoDir, err)
 	}
@@ -215,9 +215,10 @@ func planDetectedPreview(deps DeployStaticSitePreviewDeps, repoDir string, rootD
 
 // lookupBuildSettings calls lookup, giving up after PreviewBuildSettingsTimeout so a
 // stalled request never holds the tool call past the agent CLI's timeout. (The
-// runner's client also puts that deadline on the request itself.)
-func lookupBuildSettings(lookup func(string) (task_previews.StaticSiteBuildSettingsReplyV1, error), cloneURL string) (task_previews.StaticSiteBuildSettingsReplyV1, error) {
-	return lookupWithin(lookup, cloneURL, "deployment.io didn't answer in time; call deploy_static_site_preview again")
+// runner's client also puts that deadline on the request itself.) It gives up when
+// ctx is cancelled too.
+func lookupBuildSettings(ctx context.Context, lookup func(string) (task_previews.StaticSiteBuildSettingsReplyV1, error), cloneURL string) (task_previews.StaticSiteBuildSettingsReplyV1, error) {
+	return lookupWithin(ctx, lookup, cloneURL, "deployment.io didn't answer in time; call deploy_static_site_preview again")
 }
 
 // resolveTaskRepository matches repository (its directory under /work, with or

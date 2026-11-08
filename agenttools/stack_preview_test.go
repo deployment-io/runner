@@ -28,7 +28,7 @@ func stackSiteDeps(t *testing.T, store PreviewStore, configuration task_previews
 		LogsWriter:   io.Discard,
 		Store:        store,
 		Repositories: testRepositories,
-		BuildClients: func() (*s3.Client, *cloudfront.Client, error) { return nil, nil, nil },
+		BuildClients: func(context.Context) (*s3.Client, *cloudfront.Client, error) { return nil, nil, nil },
 		BuildSettings: func(string) (task_previews.StaticSiteBuildSettingsReplyV1, error) {
 			reply := configuration
 			reply.Sites = []task_previews.StaticSiteBuildSettingsV1{site("web", "", "npm run build", "dist", false)}

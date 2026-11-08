@@ -235,7 +235,13 @@ func (v *verifyBrowser) run(ctx context.Context, req agenttools.VerifyBrowserReq
 	if err != nil {
 		return agenttools.VerifyBrowserOutcome{}, err
 	}
-	defer release()
+	// Once the container exists, its removal owns the slot (see removeUnlessCancelled).
+	slotHeld := true
+	defer func() {
+		if slotHeld {
+			release()
+		}
+	}()
 	ioDir, err := v.prepareIODir(req.Input)
 	if err != nil {
 		return agenttools.VerifyBrowserOutcome{}, fmt.Errorf("preparing the QA browser's directory: %w", err)
@@ -245,7 +251,8 @@ func (v *verifyBrowser) run(ctx context.Context, req agenttools.VerifyBrowserReq
 	if err != nil {
 		return agenttools.VerifyBrowserOutcome{}, fmt.Errorf("creating the QA browser container: %w", err)
 	}
-	defer v.removeContainer(id)
+	slotHeld = false
+	defer v.removeUnlessCancelled(ctx, id, release)
 	exit, err := v.runContainer(ctx, id, req.Timeout+verifyBrowserWallClockExtra)
 	if err != nil {
 		return agenttools.VerifyBrowserOutcome{}, err
@@ -258,6 +265,22 @@ func (v *verifyBrowser) run(ctx context.Context, req agenttools.VerifyBrowserReq
 		TimedOut:  exit.timedOut,
 		OOMKilled: exit.oomKilled,
 	}, nil
+}
+
+// removeUnlessCancelled removes the container, then frees its browser slot with
+// release. It stops waiting for the removal when ctx ends (the agent run is over):
+// the removal then finishes on its own and frees the slot only once it has.
+func (v *verifyBrowser) removeUnlessCancelled(ctx context.Context, id string, release func()) {
+	removed := make(chan struct{})
+	go func() {
+		defer close(removed)
+		defer release()
+		v.removeContainer(id)
+	}()
+	select {
+	case <-removed:
+	case <-ctx.Done():
+	}
 }
 
 // ensureImage reports whether the image is on the host. When it isn't, it starts a
@@ -529,8 +552,10 @@ func dockerCreateContainer(ctx context.Context, cfg *container.Config, hostCfg *
 }
 
 // dockerRunVerifyBrowser starts the container and waits for it, at most wallClock:
-// then (or when ctx ends) it is stopped with a grace period. Its output and whether
-// it was OOM-killed are read before the caller removes it.
+// then it is stopped with a grace period. Its output and whether it was OOM-killed
+// are read before the caller removes it. When ctx ends — while it waits, stops the
+// container or reads it — it returns ctx's error at once, and the caller's removal
+// kills the container.
 func dockerRunVerifyBrowser(ctx context.Context, id string, wallClock time.Duration) (verifyBrowserExit, error) {
 	cli, err := client.New(client.FromEnv)
 	if err != nil {
@@ -551,24 +576,32 @@ func dockerRunVerifyBrowser(ctx context.Context, id string, wallClock time.Durat
 		if waitCtx.Err() == nil {
 			return verifyBrowserExit{}, fmt.Errorf("waiting for the QA browser container: %w", err)
 		}
-		grace := verifyBrowserStopGraceSec
-		_, _ = cli.ContainerStop(context.Background(), id, client.ContainerStopOptions{Timeout: &grace})
 		if ctx.Err() != nil {
+			// The agent run is over: no grace period — the caller's removal
+			// kills the container.
 			return verifyBrowserExit{}, ctx.Err()
 		}
+		grace := verifyBrowserStopGraceSec
+		_, _ = cli.ContainerStop(ctx, id, client.ContainerStopOptions{Timeout: &grace})
 		exit.timedOut = true
 	}
-	exit.output = verifyBrowserContainerOutput(cli, id)
-	if info, err := cli.ContainerInspect(context.Background(), id, client.ContainerInspectOptions{}); err == nil && info.Container.State != nil {
+	// Reading the output and the state stops when ctx ends too.
+	exit.output = verifyBrowserContainerOutput(ctx, cli, id)
+	inspectCtx, cancelInspect := context.WithTimeout(ctx, containerInspectTimeout)
+	defer cancelInspect()
+	if info, err := cli.ContainerInspect(inspectCtx, id, client.ContainerInspectOptions{}); err == nil && info.Container.State != nil {
 		exit.oomKilled = info.Container.State.OOMKilled
+	}
+	if ctx.Err() != nil {
+		return verifyBrowserExit{}, ctx.Err()
 	}
 	return exit, nil
 }
 
 // verifyBrowserContainerOutput returns the tail of the container's stdout and
 // stderr, interleaved.
-func verifyBrowserContainerOutput(cli *client.Client, id string) string {
-	ctx, cancel := context.WithTimeout(context.Background(), containerInspectTimeout)
+func verifyBrowserContainerOutput(ctx context.Context, cli *client.Client, id string) string {
+	ctx, cancel := context.WithTimeout(ctx, containerInspectTimeout)
 	defer cancel()
 	logs, err := cli.ContainerLogs(ctx, id, client.ContainerLogsOptions{ShowStdout: true, ShowStderr: true})
 	if err != nil {

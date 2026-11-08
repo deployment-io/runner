@@ -109,7 +109,7 @@ func handleVerifyPreviewReachable(ctx context.Context, record *PreviewRecord, lo
 	if target == "" {
 		return "", fmt.Errorf("url is required")
 	}
-	check := newPreviewURLCheck(record)
+	check := newPreviewURLCheck(ctx, record)
 	if !check.allowedRaw(target) {
 		return "", fmt.Errorf("url must be a preview URL this Task deployed (the URL deploy_static_site_preview or deploy_web_service_preview returned) — got %q", target)
 	}

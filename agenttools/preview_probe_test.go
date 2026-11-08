@@ -98,7 +98,7 @@ func TestRecordPreviewDeploy_Probe(t *testing.T) {
 	}
 
 	// A host from the control plane's list has none.
-	if !newPreviewURLCheck(record).allowedRaw("https://dlisted.cloudfront.net/") {
+	if !newPreviewURLCheck(context.Background(), record).allowedRaw("https://dlisted.cloudfront.net/") {
 		t.Fatal("listed host must be accepted")
 	}
 	if got, _ := record.pendingProbe("dlisted.cloudfront.net"); got != "" {
