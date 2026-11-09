@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -14,11 +15,13 @@ import (
 	goConcurrentPipeline "github.com/ankit-arora/go-utils/go-concurrent-pipeline"
 	goPipeline "github.com/ankit-arora/go-utils/go-concurrent-pipeline/go-pipeline"
 	goShutdownHook "github.com/ankit-arora/go-utils/go-shutdown-hook"
+	"github.com/deployment-io/deployment-runner-kit/enums/commands_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/cpu_architecture_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/os_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/runner_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
+	"github.com/deployment-io/deployment-runner-kit/logs"
 	"github.com/deployment-io/deployment-runner-kit/types"
 	"github.com/deployment-io/deployment-runner/client"
 	"github.com/deployment-io/deployment-runner/jobs/commands"
@@ -96,10 +99,38 @@ func leavingCapacitySpell() bool { return capacityLogged.CompareAndSwap(true, fa
 
 func handleLogEnd(err error, jobID string, logsWriter io.Writer) {
 	if err != nil {
-		io.WriteString(logsWriter, fmt.Sprintf("Error in executing - %s - %s\n", jobID, err.Error()))
+		io.WriteString(loggers.WithKind(logsWriter, logs.LogKindError), fmt.Sprintf("Error in executing - %s - %s\n", jobID, err.Error()))
 	} else {
-		io.WriteString(logsWriter, fmt.Sprintf("Successfully executed - %s\n", jobID))
+		io.WriteString(loggers.WithKind(logsWriter, logs.LogKindDone), fmt.Sprintf("Successfully executed - %s\n", jobID))
 	}
+}
+
+// isTaskStepJob reports whether a job is a Task Step job, the only kind whose
+// log lines are tagged with a stage and kind. Production QA jobs are in Tasks
+// mode too but don't run RunAgentStep.
+func isTaskStepJob(parameters map[string]interface{}, commandEnums []commands_enums.Type) bool {
+	if !commandUtils.IsTasksMode(parameters) || commandUtils.IsSessionMode(parameters) {
+		return false
+	}
+	return slices.Contains(commandEnums, commands_enums.RunAgentStep)
+}
+
+// stageForCommand returns the log stage a Task Step job's command runs in;
+// false means the command leaves the stage as it is.
+func stageForCommand(commandEnum commands_enums.Type) (string, bool) {
+	switch commandEnum {
+	case commands_enums.CheckoutRepo, commands_enums.MaterializeContext:
+		return logs.LogStageSetup, true
+	case commands_enums.RunAgentStep:
+		return logs.LogStageImplement, true
+	case commands_enums.RunReviewStage:
+		return logs.LogStageReview, true
+	case commands_enums.RunQAStage:
+		return logs.LogStageQA, true
+	case commands_enums.CommitAndPush, commands_enums.OpenPullRequest:
+		return logs.LogStagePR, true
+	}
+	return "", false
 }
 
 func executeJobs(jobsStream <-chan pendingJobType, noOfWorkers int, mode runner_enums.Mode, globalOrganizationIdFromEnv string, c *client.RunnerClient) <-chan completingJobType {
@@ -263,7 +294,8 @@ func executeJobs(jobsStream <-chan pendingJobType, noOfWorkers int, mode runner_
 							}
 							return
 						}
-						logsWriter, err := loggers.GetJobLogsWriter(pendingJob.jobID, pendingJob.organizationID, logger, mode)
+						logsWriter, err := loggers.GetJobLogsWriter(pendingJob.jobID, pendingJob.organizationID, logger, mode,
+							isTaskStepJob(parameters, pendingJob.commandEnums))
 						if err != nil {
 							result := getJobResult(pendingJob, err.Error(), nil)
 							resultsStream <- result
@@ -348,6 +380,9 @@ func executeJobs(jobsStream <-chan pendingJobType, noOfWorkers int, mode runner_
 									emitting.SetProgressSink(func(p jobs.LiveProgressV1) {
 										liveProgress.Store(&p)
 									})
+								}
+								if stage, ok := stageForCommand(commandEnum); ok {
+									logsWriter.SetStage(stage)
 								}
 								parameters, err = command.Run(parameters, logsWriter)
 								if err != nil {

@@ -1,7 +1,6 @@
 package loggers
 
 import (
-	"bufio"
 	"bytes"
 	"fmt"
 	goPipeline "github.com/ankit-arora/go-utils/go-concurrent-pipeline/go-pipeline"
@@ -14,9 +13,7 @@ import (
 	"github.com/deployment-io/deployment-runner/client"
 	"github.com/deployment-io/deployment-runner/utils"
 	"github.com/deployment-io/deployment-runner/utils/loggers/cloudwatch"
-	"io"
 	"log"
-	"strings"
 	"time"
 )
 
@@ -26,6 +23,10 @@ type JobLog struct {
 	ErrorMessage   string
 	Ts             int64
 	OrganizationID string
+	// Stage, Kind and Group are set on a Task Step job's lines; see JobLogsWriter.
+	Stage string
+	Kind  string
+	Group *logs.JobLogGroupV1
 }
 
 var AddJobLogsPipeline *goPipeline.Pipeline[string, JobLog]
@@ -40,21 +41,7 @@ func Init() {
 				logger = jobLogs[0].Logger
 				organizationId = jobLogs[0].OrganizationID
 			}
-			var messages []string
-			var jobLogsDto []logs.AddJobLogDtoV1
-			for _, jobLog := range jobLogs {
-				message := jobLog.Message
-				if len(jobLog.ErrorMessage) > 0 {
-					message = jobLog.ErrorMessage
-				}
-				messages = append(messages, message)
-				jobLogsDto = append(jobLogsDto, logs.AddJobLogDtoV1{
-					ID:           jobId,
-					Message:      jobLog.Message,
-					ErrorMessage: jobLog.ErrorMessage,
-					Ts:           jobLog.Ts,
-				})
-			}
+			messages, jobLogsDto := toJobLogDtos(jobId, jobLogs)
 			if logger != nil {
 				err := logger.Log(messages)
 				if err != nil {
@@ -81,6 +68,30 @@ func Init() {
 		//fmt.Println("waiting for logs add pipeline shutdown -- done")
 	})
 
+}
+
+// toJobLogDtos builds the messages for the job's Logger and the DTOs for the
+// API from one batch of a job's lines.
+func toJobLogDtos(jobId string, jobLogs []JobLog) ([]string, []logs.AddJobLogDtoV1) {
+	var messages []string
+	var jobLogsDto []logs.AddJobLogDtoV1
+	for _, jobLog := range jobLogs {
+		message := jobLog.Message
+		if len(jobLog.ErrorMessage) > 0 {
+			message = jobLog.ErrorMessage
+		}
+		messages = append(messages, message)
+		jobLogsDto = append(jobLogsDto, logs.AddJobLogDtoV1{
+			ID:           jobId,
+			Message:      jobLog.Message,
+			ErrorMessage: jobLog.ErrorMessage,
+			Ts:           jobLog.Ts,
+			Stage:        jobLog.Stage,
+			Kind:         jobLog.Kind,
+			Group:        jobLog.Group,
+		})
+	}
+	return messages, jobLogsDto
 }
 
 func Get(parameters map[string]interface{}) (jobs.Logger, error) {
@@ -110,41 +121,16 @@ func LogBuffer(logBuffer *bytes.Buffer, logger jobs.Logger) error {
 	return logger.Log(messages)
 }
 
-func GetJobLogsWriter(jobId, organizationId string, logger jobs.Logger, mode runner_enums.Mode) (*io.PipeWriter, error) {
-	reader, writer := io.Pipe()
-	go func() {
-		defer reader.Close()
-		//read from pipe
-		scanner := bufio.NewScanner(reader)
-		scanner.Split(utils.ScanCRLF)
-		for scanner.Scan() {
-			s := scanner.Text()
-			s = strings.Trim(s, " \n \r")
-			if len(s) > 0 {
-				AddJobLogsPipeline.Add(jobId, JobLog{
-					Logger:         logger,
-					Message:        s,
-					Ts:             time.Now().Unix(),
-					OrganizationID: organizationId,
-				})
-				if mode == runner_enums.LOCAL {
-					log.Println(s)
-				}
-			}
-		}
-		if err := scanner.Err(); err != nil {
-			AddJobLogsPipeline.Add(jobId, JobLog{
-				Logger:         logger,
-				ErrorMessage:   err.Error(),
-				Ts:             time.Now().Unix(),
-				OrganizationID: organizationId,
-			})
-			if mode == runner_enums.LOCAL {
-				log.Println(err.Error())
-			}
-		}
-	}()
-	return writer, nil
+// GetJobLogsWriter returns the job's log writer. Each line it completes goes
+// to AddJobLogsPipeline; taskStep tags them (see JobLogsWriter).
+func GetJobLogsWriter(jobId, organizationId string, logger jobs.Logger, mode runner_enums.Mode, taskStep bool) (*JobLogsWriter, error) {
+	w := NewJobLogsWriter(taskStep, func(l JobLog) {
+		l.Logger = logger
+		l.OrganizationID = organizationId
+		AddJobLogsPipeline.Add(jobId, l)
+	})
+	w.local = mode == runner_enums.LOCAL
+	return w, nil
 }
 
 func Shutdown() {

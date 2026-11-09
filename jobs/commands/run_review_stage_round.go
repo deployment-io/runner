@@ -12,7 +12,9 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/enums/llm_provider_enums"
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
+	"github.com/deployment-io/deployment-runner-kit/logs"
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
+	"github.com/deployment-io/deployment-runner/utils/loggers"
 )
 
 // runReviewRound runs one review container and returns what it reported.
@@ -655,7 +657,10 @@ func logRoundOutput(dir string, label string, logsWriter io.Writer) {
 	if len(data) > reviewRoundResultLogMaxBytes {
 		data = append(data[:reviewRoundResultLogMaxBytes], []byte("\n[… truncated]")...)
 	}
-	io.WriteString(logsWriter, fmt.Sprintf("%s result.json:\n%s\n", label, data))
+	io.WriteString(logsWriter, fmt.Sprintf("%s result.json:\n", label))
+	body := loggers.WithKind(logsWriter, logs.LogKindJSON)
+	io.WriteString(body, fmt.Sprintf("%s\n", data))
+	loggers.EndSource(body)
 }
 
 // cleanupReviewStageSiblings removes every host directory the stage parked
