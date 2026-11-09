@@ -70,9 +70,9 @@ func TestHandleLogEndKinds(t *testing.T) {
 	handleLogEnd(nil, "job-1", w)
 	w.Close()
 	want := []loggers.JobLog{
-		{Message: "--- Review stage ---", Stage: "review", Kind: "section"},
+		{Message: "=== Review ===", Stage: "review", Kind: "section"},
 		{Message: "Error in executing - job-1 - boom", Stage: "review", Kind: "error"},
-		{Message: "--- Pull request ---", Stage: "pr", Kind: "section"},
+		{Message: "=== Pull request ===", Stage: "pr", Kind: "section"},
 		{Message: "Successfully executed - job-1", Stage: "pr", Kind: "done"},
 	}
 	if len(lines) != len(want) {

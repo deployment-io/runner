@@ -20,12 +20,15 @@ const maxLineBytes = 64 * 1024
 const groupWindow = 5 * time.Second
 
 // sectionLines are the lines written when a Task Step job enters a stage.
-// Setup gets none: it is where the log starts.
+// Setup gets none: it is where the log starts. They differ from the
+// "--- Review stage ---" and "--- QA stage ---" headers the stages print over
+// their summaries at the end, so a raw log never shows a stage's name twice
+// as if it were its start.
 var sectionLines = map[string]string{
-	logs.LogStageImplement: "--- Implement stage ---",
-	logs.LogStageReview:    "--- Review stage ---",
-	logs.LogStageQA:        "--- QA stage ---",
-	logs.LogStagePR:        "--- Pull request ---",
+	logs.LogStageImplement: "=== Implement ===",
+	logs.LogStageReview:    "=== Review ===",
+	logs.LogStageQA:        "=== QA ===",
+	logs.LogStagePR:        "=== Pull request ===",
 }
 
 // JobLogsWriter is a job's log writer. It splits lines inside Write, so each

@@ -317,13 +317,13 @@ func TestStageStartsAtSetupAndWritesSections(t *testing.T) {
 	want := []JobLog{
 		{Message: "Checking out repo", Stage: "setup", Kind: "text"},
 		{Message: "Materialized 9 context file(s) into /work/context", Stage: "setup", Kind: "text"},
-		{Message: "--- Implement stage ---", Stage: "implement", Kind: "section"},
+		{Message: "=== Implement ===", Stage: "implement", Kind: "section"},
 		{Message: "Disk before agent step", Stage: "implement", Kind: "text"},
-		{Message: "--- Review stage ---", Stage: "review", Kind: "section"},
+		{Message: "=== Review ===", Stage: "review", Kind: "section"},
 		{Message: "Review round 1: effort high", Stage: "review", Kind: "text"},
-		{Message: "--- QA stage ---", Stage: "qa", Kind: "section"},
+		{Message: "=== QA ===", Stage: "qa", Kind: "section"},
 		{Message: "QA round 1", Stage: "qa", Kind: "text"},
-		{Message: "--- Pull request ---", Stage: "pr", Kind: "section"},
+		{Message: "=== Pull request ===", Stage: "pr", Kind: "section"},
 		{Message: "Committed a8ec2a0", Stage: "pr", Kind: "text"},
 		{Message: "Opened PR #259", Stage: "pr", Kind: "text"},
 		{Message: "Successfully executed - x", Stage: "pr", Kind: "done"},
@@ -379,7 +379,7 @@ func TestRunFoldsToOneLine(t *testing.T) {
 	h.write(t, h.w, "verify_preview_reachable: attempt 1\n")
 	got := h.snapshot()
 	assertLines(t, got, []JobLog{
-		{Message: "--- QA stage ---", Stage: "qa", Kind: "section"},
+		{Message: "=== QA ===", Stage: "qa", Kind: "section"},
 		{Message: "QA round 1: building the preview", Stage: "qa", Kind: "text"},
 		{Message: "Successfully uploaded file: assets/f2.js", Stage: "qa", Kind: "text", Group: &logs.JobLogGroupV1{Name: GroupFileUploads, Count: 3}},
 		{Message: "verify_preview_reachable: attempt 1", Stage: "qa", Kind: "text"},
@@ -415,7 +415,7 @@ func TestGroupEmittedOnStageChangeBeforeSection(t *testing.T) {
 	h.w.SetStage(logs.LogStageImplement)
 	assertLines(t, h.snapshot(), []JobLog{
 		{Message: "Successfully uploaded file: b.js", Stage: "setup", Kind: "text", Group: &logs.JobLogGroupV1{Name: GroupFileUploads, Count: 2}},
-		{Message: "--- Implement stage ---", Stage: "implement", Kind: "section"},
+		{Message: "=== Implement ===", Stage: "implement", Kind: "section"},
 	})
 }
 
@@ -486,7 +486,7 @@ func TestAgentEventsFoldOnlyInClaudeOutput(t *testing.T) {
 	h.write(t, codex, "[rate_limit_event]\n")
 	h.w.Close()
 	assertLines(t, h.snapshot(), []JobLog{
-		{Message: "--- Implement stage ---", Stage: "implement", Kind: "section"},
+		{Message: "=== Implement ===", Stage: "implement", Kind: "section"},
 		{Message: "[system] task_started", Stage: "implement", Kind: "text"},
 		{Message: "[rate_limit_event]", Stage: "implement", Kind: "text"},
 		{Message: "[tool_progress]", Stage: "implement", Kind: "text", Group: &logs.JobLogGroupV1{Name: GroupAgentEvents, Count: 4}},
@@ -514,5 +514,15 @@ func TestToJobLogDtosCarriesTags(t *testing.T) {
 	}
 	if dtos[1].Stage != "" || dtos[1].Kind != "" || dtos[1].Group != nil {
 		t.Fatalf("untagged dto = %+v", dtos[1])
+	}
+}
+
+// The section lines must not read like the end-of-stage summary headers the
+// review and QA stages print (run_review_stage.go, run_qa_stage_report.go).
+func TestSectionLinesDifferFromSummaryHeaders(t *testing.T) {
+	for stage, line := range sectionLines {
+		if strings.HasPrefix(line, "---") {
+			t.Errorf("section line for %s = %q; it reads like a stage summary header", stage, line)
+		}
 	}
 }
