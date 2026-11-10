@@ -526,3 +526,188 @@ func TestSectionLinesDifferFromSummaryHeaders(t *testing.T) {
 		}
 	}
 }
+
+// TestConcurrentStress runs every concurrent path of a tagged writer at once,
+// for the race detector: the job's own stream (whole lines: it is one shared
+// stream, as the pipe was), two agent streams and a fixed-kind stream writing
+// partial lines, SetStage in a loop, a real group timer firing on its own
+// goroutine, and Close while a late writer is still writing.
+// Nothing is lost, spliced or reordered; every line has a stage and a kind;
+// folded counts add up to the noise written.
+func TestConcurrentStress(t *testing.T) {
+	var mu sync.Mutex
+	var got []JobLog
+	w := newJobLogsWriter(true, func(l JobLog) {
+		mu.Lock()
+		defer mu.Unlock()
+		got = append(got, l)
+	}, time.Now, func(_ time.Duration, f func()) func() bool {
+		// A real timer with a short window, so it fires during the writes.
+		return time.AfterFunc(time.Millisecond, f).Stop
+	})
+
+	const n = 300
+	var wg sync.WaitGroup
+	run := func(f func()) {
+		wg.Add(1)
+		go func() { defer wg.Done(); f() }()
+	}
+	run(func() { // the job's own stream, shared with the late writer: whole lines only
+		for i := 0; i < n; i++ {
+			io.WriteString(w, fmt.Sprintf("base-%d\n", i))
+			io.WriteString(w, fmt.Sprintf("Successfully uploaded file: assets/f%d.js\n", i))
+		}
+	})
+	for _, name := range []string{"a", "b"} {
+		name := name
+		run(func() { // an agent stream: tool calls in chunks and agent events
+			src := AgentOutput(w, "claude-code")
+			for i := 0; i < n; i++ {
+				io.WriteString(src, "[tool] Bash: ")
+				io.WriteString(src, fmt.Sprintf("%s-%d", name, i))
+				io.WriteString(src, "\n[system] thinking_tokens\n")
+			}
+			EndSource(src)
+		})
+	}
+	run(func() { // a fixed-kind stream
+		src := WithKind(w, logs.LogKindJSON)
+		for i := 0; i < n; i++ {
+			io.WriteString(src, fmt.Sprintf(`{"json":%d}`, i))
+			io.WriteString(src, "\n")
+		}
+		EndSource(src)
+	})
+	stagesDone := make(chan struct{})
+	run(func() { // stage changes throughout
+		stages := []string{logs.LogStageImplement, logs.LogStageReview, logs.LogStageQA, logs.LogStagePR}
+		for i := 0; ; i++ {
+			select {
+			case <-stagesDone:
+				return
+			default:
+			}
+			w.SetStage(stages[i%len(stages)])
+			time.Sleep(50 * time.Microsecond)
+		}
+	})
+
+	time.Sleep(20 * time.Millisecond)
+	close(stagesDone)
+	wg.Wait()
+
+	// Noise only: groups stay open long enough for the real timer to fire
+	// while two streams keep joining them.
+	const m = 60
+	for _, name := range []string{"x", "y"} {
+		name := name
+		run(func() {
+			src := NewSource(w)
+			for i := 0; i < m; i++ {
+				io.WriteString(src, "Successfully uploaded file: assets/")
+				io.WriteString(src, fmt.Sprintf("%s%d.js\n", name, i))
+				time.Sleep(200 * time.Microsecond)
+			}
+			EndSource(src)
+		})
+	}
+	wg.Wait()
+
+	// A late writer that is still writing when Close runs.
+	lateOK := 0
+	lateDone := make(chan struct{})
+	go func() {
+		defer close(lateDone)
+		for i := 0; ; i++ {
+			if _, err := io.WriteString(w, fmt.Sprintf("late-%d\n", i)); err != nil {
+				if err != io.ErrClosedPipe {
+					t.Errorf("late write: %v", err)
+				}
+				return
+			}
+			lateOK++
+		}
+	}()
+
+	time.Sleep(2 * time.Millisecond)
+	w.Close()
+	<-lateDone
+	time.Sleep(5 * time.Millisecond) // a timer that fires after Close must emit nothing
+
+	mu.Lock()
+	defer mu.Unlock()
+	validStage := map[string]bool{logs.LogStageSetup: true, logs.LogStageImplement: true,
+		logs.LogStageReview: true, logs.LogStageQA: true, logs.LogStagePR: true}
+	next := map[string]int{} // producer → next index expected, so order is kept
+	folded := map[string]int{}
+	for _, l := range got {
+		if !validStage[l.Stage] || l.Kind == "" {
+			t.Fatalf("line without a valid stage or kind: %+v", l)
+		}
+		count := 1
+		if l.Group != nil {
+			count = l.Group.Count
+		}
+		var producer string
+		var idx int
+		switch {
+		case l.Kind == logs.LogKindSection:
+			continue
+		case strings.HasPrefix(l.Message, "Successfully uploaded file: assets/"):
+			folded[GroupFileUploads] += count
+			continue
+		case l.Message == "[system] thinking_tokens":
+			folded[GroupAgentEvents] += count
+			continue
+		case l.Group != nil:
+			t.Fatalf("unexpected group line: %+v", l)
+		}
+		if _, err := fmt.Sscanf(l.Message, "base-%d", &idx); err == nil && l.Message == fmt.Sprintf("base-%d", idx) {
+			producer = "base"
+		} else if _, err := fmt.Sscanf(l.Message, "late-%d", &idx); err == nil && l.Message == fmt.Sprintf("late-%d", idx) {
+			producer = "late"
+		} else if _, err := fmt.Sscanf(l.Message, `{"json":%d}`, &idx); err == nil && l.Message == fmt.Sprintf(`{"json":%d}`, idx) {
+			producer = "json"
+			if l.Kind != logs.LogKindJSON {
+				t.Fatalf("json stream line has kind %q", l.Kind)
+			}
+		} else if strings.HasPrefix(l.Message, "[tool] Bash: ") {
+			var name string
+			rest := strings.TrimPrefix(l.Message, "[tool] Bash: ")
+			if len(rest) < 3 || rest[1] != '-' {
+				t.Fatalf("spliced line %q", l.Message)
+			}
+			name = rest[:1]
+			if _, err := fmt.Sscanf(rest[2:], "%d", &idx); err != nil || rest != fmt.Sprintf("%s-%d", name, idx) {
+				t.Fatalf("spliced line %q", l.Message)
+			}
+			producer = "agent-" + name
+			if l.Kind != logs.LogKindTool {
+				t.Fatalf("agent tool line has kind %q", l.Kind)
+			}
+		} else {
+			t.Fatalf("spliced or unknown line %q", l.Message)
+		}
+		if idx != next[producer] {
+			t.Fatalf("%s: got line %d, want %d (lost or reordered)", producer, idx, next[producer])
+		}
+		next[producer]++
+	}
+	for _, p := range []string{"base", "json", "agent-a", "agent-b"} {
+		if next[p] != n {
+			t.Errorf("%s: %d lines, want %d", p, next[p], n)
+		}
+	}
+	if next["late"] != lateOK {
+		t.Errorf("late: %d lines, want the %d writes that succeeded", next["late"], lateOK)
+	}
+	if folded[GroupFileUploads] != n+2*m {
+		t.Errorf("upload lines folded: %d, want %d", folded[GroupFileUploads], n+2*m)
+	}
+	if folded[GroupAgentEvents] != 2*n {
+		t.Errorf("agent event lines folded: %d, want %d", folded[GroupAgentEvents], 2*n)
+	}
+	if len(w.sources) != 0 {
+		t.Errorf("sources still held after Close: %d", len(w.sources))
+	}
+}
