@@ -311,7 +311,7 @@ func (rs *RunAssistantSession) runSession(run sessionRun) error {
 	logsWg.Add(1)
 	go func() {
 		defer logsWg.Done()
-		streamContainerLogs(dockerCtx, cli, containerID, logsWriter)
+		streamContainerLogs(dockerCtx, cli, containerID, plainLogStreams(logsWriter))
 	}()
 
 	mf := &messageForwarder{

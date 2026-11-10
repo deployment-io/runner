@@ -38,6 +38,7 @@ import (
 	runnerclient "github.com/deployment-io/deployment-runner/client"
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
 	"github.com/deployment-io/deployment-runner/utils"
+	"github.com/deployment-io/deployment-runner/utils/loggers"
 	"github.com/deployment-io/deployment-runner/utils/reclaim"
 	"github.com/moby/moby/api/pkg/stdcopy"
 	"github.com/moby/moby/api/types/container"
@@ -875,7 +876,7 @@ func (rs *RunAgentStep) spawnAgentboxAndWait(spec agentboxSpawnSpec, logsWriter 
 	logsWg.Add(1)
 	go func() {
 		defer logsWg.Done()
-		streamContainerLogs(dockerCtx, cli, containerID, logsWriter)
+		streamContainerLogs(dockerCtx, cli, containerID, agentLogStreams(logsWriter, spec.env))
 	}()
 	// Phase 5.5b: parallel poller forwards live progress snapshots from
 	// agentbox's progress.json (in the bind-mounted output dir) to the
@@ -1095,25 +1096,67 @@ func pollProgressFile(workDirHost string, sink func(jobs.LiveProgressV1), stopCh
 	}
 }
 
-func streamContainerLogs(ctx context.Context, cli *client.Client, containerID string, logsWriter io.Writer) {
+// containerLogStreams is where a container's log stream goes: its stdout and
+// stderr each through their own writer, so a partial line on one never splices
+// with the other, and the runner's own messages about the stream to log.
+type containerLogStreams struct {
+	stdout io.Writer
+	stderr io.Writer
+	log    io.Writer
+}
+
+// plainLogStreams streams a container's output as plain runner output. On an
+// untagged job both streams write to logsWriter itself, as they always have.
+func plainLogStreams(logsWriter io.Writer) containerLogStreams {
+	return containerLogStreams{stdout: loggers.NewSource(logsWriter), stderr: loggers.NewSource(logsWriter), log: logsWriter}
+}
+
+// agentLogStreams streams an agent container's output, tagged by the spawn's
+// own agent type.
+func agentLogStreams(logsWriter io.Writer, env []string) containerLogStreams {
+	agentType := spawnAgentType(env)
+	return containerLogStreams{
+		stdout: loggers.AgentOutput(logsWriter, agentType),
+		stderr: loggers.AgentOutput(logsWriter, agentType),
+		log:    logsWriter,
+	}
+}
+
+// spawnAgentType is the AGENT_TYPE a spawn's env sets; "" or absent means
+// claude-code.
+func spawnAgentType(env []string) string {
+	agentType := ""
+	for _, kv := range env {
+		if v, ok := strings.CutPrefix(kv, "AGENT_TYPE="); ok {
+			agentType = v
+		}
+	}
+	if agentType == "" {
+		return "claude-code"
+	}
+	return agentType
+}
+
+func streamContainerLogs(ctx context.Context, cli *client.Client, containerID string, streams containerLogStreams) {
+	// The streams' partial lines go out when the stream ends.
+	defer loggers.EndSource(streams.stdout)
+	defer loggers.EndSource(streams.stderr)
 	logs, err := cli.ContainerLogs(ctx, containerID, client.ContainerLogsOptions{
 		ShowStdout: true,
 		ShowStderr: true,
 		Follow:     true,
 	})
 	if err != nil {
-		io.WriteString(logsWriter, fmt.Sprintf("error attaching to container logs: %s\n", err))
+		io.WriteString(streams.log, fmt.Sprintf("error attaching to container logs: %s\n", err))
 		return
 	}
 	defer logs.Close()
 	// Container is created with Tty=false, so Docker prepends an 8-byte
 	// header per chunk to multiplex stdout/stderr. Demux via StdCopy so
 	// the dashboard sees readable log text instead of headers leaking
-	// through as control characters. Both streams flow into the same
-	// underlying logsWriter — we don't surface the stdout/stderr split
-	// to users today, but the binary headers MUST be stripped first.
-	if _, err := stdcopy.StdCopy(logsWriter, logsWriter, logs); err != nil && err != io.EOF {
-		io.WriteString(logsWriter, fmt.Sprintf("error streaming container logs: %s\n", err))
+	// through as control characters.
+	if _, err := stdcopy.StdCopy(streams.stdout, streams.stderr, logs); err != nil && err != io.EOF {
+		io.WriteString(streams.log, fmt.Sprintf("error streaming container logs: %s\n", err))
 	}
 }
 
@@ -2418,7 +2461,7 @@ func (rs *RunAgentStep) spawnVendorAndWait(spec agentboxSpawnSpec, logsWriter io
 	logsWg.Add(1)
 	go func() {
 		defer logsWg.Done()
-		streamContainerLogs(dockerCtx, cli, containerID, logsWriter)
+		streamContainerLogs(dockerCtx, cli, containerID, plainLogStreams(logsWriter))
 	}()
 	waitCtx, cancelWait := context.WithTimeout(dockerCtx, defaultVendorTimeout)
 	defer cancelWait()
