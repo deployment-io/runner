@@ -42,6 +42,9 @@ type fakeStackOps struct {
 	// repository: a seed that succeeded creates its roles' users in the deps'
 	// holder, as the real deploy does.
 	seeds map[string]agenttools.WebServicePreviewDeployed
+	// pages are the backends whose pages probe finds they serve pages, by
+	// repository; every other backend is an API.
+	pages map[string]bool
 
 	events      []string
 	wiringCalls int
@@ -121,6 +124,14 @@ func (f *fakeStackOps) ops() *qaStackOps {
 				return task_previews.StackWiringReplyV1{}, f.wiringErr
 			}
 			return task_previews.StackWiringReplyV1{Links: f.links}, nil
+		},
+		probePages: func(_ context.Context, url, healthURL string) agenttools.PreviewPagesProbe {
+			for repo, serves := range f.pages {
+				if serves && url == stackHost("b", repo) {
+					return agenttools.PreviewPagesProbe{ServesPages: true, Reason: "GET / answered 200 text/html"}
+				}
+			}
+			return agenttools.PreviewPagesProbe{Reason: "GET / answered 404 application/json"}
 		},
 	}
 }

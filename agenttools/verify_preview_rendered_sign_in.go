@@ -114,13 +114,13 @@ func (t *verifyPreviewRendered) resolveSignIn(args verifyRenderedArgs) (*browser
 	}
 	site, ok := t.signIns[host]
 	if !ok {
-		return nil, fmt.Errorf("as works only on a site preview that lists browser sign-in roles — got %s", capChars(host, renderedShrunkURLChars))
+		return nil, fmt.Errorf("as works only on a preview that lists browser sign-in roles — got %s", capChars(host, renderedShrunkURLChars))
 	}
 	backends := site.Backends
 	if args.Backend != "" {
 		i := slices.IndexFunc(backends, func(b BrowserSignInBackend) bool { return b.Repository == args.Backend })
 		if i < 0 {
-			return nil, fmt.Errorf("%s is not a backend this site preview signs in to (its backends: %s)", capChars(args.Backend, renderedShrunkURLChars), strings.Join(signInRepositories(backends), ", "))
+			return nil, fmt.Errorf("%s is not a backend this preview signs in to (its backends: %s)", capChars(args.Backend, renderedShrunkURLChars), strings.Join(signInRepositories(backends), ", "))
 		}
 		backends = backends[i : i+1]
 	}
@@ -138,7 +138,7 @@ func (t *verifyPreviewRendered) resolveSignIn(args verifyRenderedArgs) (*browser
 	}
 	switch {
 	case len(found) == 0:
-		return nil, fmt.Errorf("no test user for role %s on this site preview (its roles: %s)", logRole(args.As), strings.Join(roles, ", "))
+		return nil, fmt.Errorf("no test user for role %s on this preview (its roles: %s)", logRole(args.As), strings.Join(roles, ", "))
 	case len(found) > 1:
 		var repositories []string
 		for _, f := range found {

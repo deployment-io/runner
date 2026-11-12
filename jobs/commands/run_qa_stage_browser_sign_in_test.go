@@ -8,7 +8,10 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
+	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner-kit/task_previews"
+	"github.com/deployment-io/deployment-runner-kit/types"
 	agentmcp "github.com/deployment-io/deployment-runner/agent_mcp"
 	"github.com/deployment-io/deployment-runner/agenttools"
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
@@ -29,9 +32,20 @@ func browserLink(repo, name string) task_previews.StackLinkV1 {
 // and 2-auth, through f, and returns its spec and QA_PREVIEWS.
 func browserStackRound(t *testing.T, f *fakeStackOps) (*qaStage, agentboxSpawnSpec, string, *lockedBuffer) {
 	t.Helper()
+	return browserStackRoundWith(t, f, stackQAImage)
+}
+
+// browserStackRoundWith is browserStackRound with the agentbox image.
+func browserStackRoundWith(t *testing.T, f *fakeStackOps, image string) (*qaStage, agentboxSpawnSpec, string, *lockedBuffer) {
+	t.Helper()
 	f.sites, f.backends = map[string]string{"0-web": "web"}, map[string]string{"1-api": "api", "2-auth": "auth"}
 	stage, logs, specs := stackStage(t, []string{"web", "api", "auth"}, []string{"0-web"}, []string{"1-api", "2-auth"}, f)
-	if _, err := runStackRound(t, stage, 1); err != nil {
+	jobs.SetParameterValue[string](stage.parameters, parameters_enums.AgentboxImage, image)
+	env, err := stage.qaSpawnEnv()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stage.deployAndSpawnQA(1, image, t.TempDir(), env); err != nil {
 		t.Fatal(err)
 	}
 	spec := (*specs)[0]
@@ -175,7 +189,7 @@ func TestQAStackRoundNoBrowserRoles(t *testing.T) {
 			if tc.noURL {
 				return
 			}
-			if _, err := callRenderedAs(t, spec, stackHost("s", "0-web")+"/", "admin"); err == nil || !strings.Contains(err.Error(), "as works only on a site preview that lists browser sign-in roles") {
+			if _, err := callRenderedAs(t, spec, stackHost("s", "0-web")+"/", "admin"); err == nil || !strings.Contains(err.Error(), "as works only on a preview that lists browser sign-in roles") {
 				t.Errorf("as: %v", err)
 			}
 		})
@@ -191,7 +205,140 @@ func TestOnlyAStackRoundTakesAs(t *testing.T) {
 	implement.browserSignIns = []agenttools.BrowserSignInSite{{URL: "https://s-0-web.cloudfront.net", Backends: []agenttools.BrowserSignInBackend{
 		{Repository: "1-api", SignInPath: "/signin", Users: []agenttools.PreviewTestUser{{Role: "admin", Email: "qa-admin@example.com", Password: "p"}}},
 	}}}
-	if _, err := callRenderedAs(t, implement, "https://s-0-web.cloudfront.net/", "admin"); err == nil || !strings.Contains(err.Error(), "as works only on a site preview that lists browser sign-in roles") {
+	if _, err := callRenderedAs(t, implement, "https://s-0-web.cloudfront.net/", "admin"); err == nil || !strings.Contains(err.Error(), "as works only on a preview that lists browser sign-in roles") {
 		t.Errorf("implement run: %v", err)
+	}
+}
+
+// Each deployed backend's pages probe is logged, and only a backend that
+// serves pages has serves_pages; a site never does.
+func TestQAStackRoundServesPages(t *testing.T) {
+	f := &fakeStackOps{links: []task_previews.StackLinkV1{browserLink("1-api", "api")}, pages: map[string]bool{"1-api": true},
+		deployErr: map[string]error{"backend:2-auth": errors.New("the service didn't start")}}
+	_, _, raw, logs := browserStackRound(t, f)
+	if want := "QA round 1: the backend preview of 1-api serves pages (GET / answered 200 text/html)\n"; !strings.Contains(logs.String(), want) {
+		t.Errorf("logs = %s\nlack %q", logs.String(), want)
+	}
+	if strings.Contains(logs.String(), "the backend preview of 2-auth serves pages") || strings.Contains(logs.String(), "the backend preview of 2-auth is an API") {
+		t.Errorf("a failed backend was probed: %s", logs.String())
+	}
+	want := `{"repository":"1-api","kind":"backend","url":"https://b-1-api.cloudfront.net","health_url":"https://b-1-api.cloudfront.net/healthz","serves_pages":true}`
+	if !strings.Contains(raw, want) || strings.Count(raw, "serves_pages") != 1 {
+		t.Errorf("QA_PREVIEWS = %s\nwant serves_pages on 1-api alone", raw)
+	}
+
+	f = &fakeStackOps{links: []task_previews.StackLinkV1{browserLink("1-api", "api")}}
+	_, _, raw, logs = browserStackRound(t, f)
+	for _, want := range []string{
+		"QA round 1: the backend preview of 1-api is an API (GET / answered 404 application/json)\n",
+		"QA round 1: the backend preview of 2-auth is an API (GET / answered 404 application/json)\n",
+	} {
+		if !strings.Contains(logs.String(), want) {
+			t.Errorf("logs = %s\nlack %q", logs.String(), want)
+		}
+	}
+	if strings.Contains(raw, "serves_pages") {
+		t.Errorf("QA_PREVIEWS = %s", raw)
+	}
+}
+
+// ownBrowserRolesStack is a round where 1-api serves pages and offers browser
+// and API sign-in, and 2-auth, an API, offers browser sign-in: both connected
+// to the site.
+func ownBrowserRolesStack() *fakeStackOps {
+	api := seeded(agenttools.PreviewSeedSucceeded, signInTestRoles, signInTestSetup)
+	api.BrowserSignInPath = "/signin"
+	return &fakeStackOps{
+		links: []task_previews.StackLinkV1{browserLink("1-api", "api"), browserLink("2-auth", "auth")},
+		pages: map[string]bool{"1-api": true},
+		seeds: map[string]agenttools.WebServicePreviewDeployed{
+			"1-api":  api,
+			"2-auth": browserSeeded("preview-auth-0000002", []task_previews.PreviewRoleV1{{Name: "admin", Description: "runs auth"}}, "/login"),
+		},
+	}
+}
+
+const apiRolesEntry = `"roles":[{"name":"admin","description":"manages the shop"},{"name":"viewer","description":""}]`
+
+// With agentbox 1.9.44, a backend that serves pages offers its browser roles
+// on its own URL: on its own entry and in the set with its URL, and not on the
+// site. Its API sign-in is unchanged.
+func TestQAStackRoundOwnBrowserRoles(t *testing.T) {
+	_, spec, raw, _ := browserStackRoundWith(t, ownBrowserRolesStack(), "deploymenthq/agentbox:1.9.44")
+	for _, want := range []string{
+		`{"repository":"0-web","kind":"site","url":"https://s-0-web.cloudfront.net","connected_backends":["1-api","2-auth"],"browser_roles":[{"name":"admin","description":"runs auth","backend":"2-auth"}]}`,
+		`{"repository":"1-api","kind":"backend","url":"https://b-1-api.cloudfront.net","health_url":"https://b-1-api.cloudfront.net/healthz","serves_pages":true,` + apiRolesEntry +
+			`,"browser_roles":[{"name":"admin","description":"manages the shop","backend":"1-api"},{"name":"viewer","description":"","backend":"1-api"}]}`,
+	} {
+		if !strings.Contains(raw, want) {
+			t.Errorf("QA_PREVIEWS = %s\nlacks %s", raw, want)
+		}
+	}
+	sites := spec.browserSignIns
+	if len(sites) != 2 || sites[0].URL != stackHost("s", "0-web") || len(sites[0].Backends) != 1 || sites[0].Backends[0].Repository != "2-auth" ||
+		sites[1].URL != stackHost("b", "1-api") || len(sites[1].Backends) != 1 || sites[1].Backends[0].Repository != "1-api" || sites[1].Backends[0].SignInPath != "/signin" || len(sites[1].Backends[0].Users) != 2 {
+		t.Fatalf("set = %+v", sites)
+	}
+	if envMap(spec.env)["QA_API_SIGN_IN_TOOL"] != "1" || len(spec.apiSignIns) != 1 || spec.apiSignIns[0].URL != stackHost("b", "1-api") {
+		t.Errorf("api sign-ins %+v, env %v", spec.apiSignIns, envMap(spec.env))
+	}
+	// as signs in on the backend preview's own host.
+	input, err := callRenderedAs(t, spec, stackHost("b", "1-api")+"/", "viewer")
+	if err == nil || !strings.Contains(err.Error(), errBrowserReached.Error()) {
+		t.Fatalf("as viewer: %v", err)
+	}
+	if signIn, _ := input["sign_in"].(map[string]any); signIn["url"] != stackHost("b", "1-api")+"/signin" || signIn["email"] != sites[1].Backends[0].Users[1].Email {
+		t.Errorf("sign_in = %v", signIn)
+	}
+	if _, err := callRenderedAs(t, spec, stackHost("s", "0-web")+"/", "viewer"); err == nil || !strings.Contains(err.Error(), "no test user for role viewer on this preview (its roles: admin)") {
+		t.Errorf("as viewer on the site: %v", err)
+	}
+}
+
+// With an older agentbox, or a backend that doesn't serve pages, its browser
+// roles go to the site, as before.
+func TestQAStackRoundOwnBrowserRolesNeedsServesPagesAnd1944(t *testing.T) {
+	const wantSite = `{"repository":"0-web","kind":"site","url":"https://s-0-web.cloudfront.net","connected_backends":["1-api","2-auth"],` +
+		`"browser_roles":[{"name":"admin","description":"manages the shop","backend":"1-api"},{"name":"viewer","description":"","backend":"1-api"},{"name":"admin","description":"runs auth","backend":"2-auth"}]}`
+	notServing := ownBrowserRolesStack()
+	notServing.pages = nil
+	for _, tc := range []struct {
+		name, image, backend string
+		f                    *fakeStackOps
+	}{
+		{"agentbox 1.9.43", "deploymenthq/agentbox:1.9.43", `{"repository":"1-api","kind":"backend","url":"https://b-1-api.cloudfront.net","health_url":"https://b-1-api.cloudfront.net/healthz","serves_pages":true,` + apiRolesEntry + `}`, ownBrowserRolesStack()},
+		{"an API", "deploymenthq/agentbox:1.9.44", `{"repository":"1-api","kind":"backend","url":"https://b-1-api.cloudfront.net","health_url":"https://b-1-api.cloudfront.net/healthz",` + apiRolesEntry + `}`, notServing},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, spec, raw, _ := browserStackRoundWith(t, tc.f, tc.image)
+			if !strings.Contains(raw, wantSite) || !strings.Contains(raw, tc.backend) {
+				t.Errorf("QA_PREVIEWS = %s", raw)
+			}
+			if sites := spec.browserSignIns; len(sites) != 1 || sites[0].URL != stackHost("s", "0-web") || len(sites[0].Backends) != 2 {
+				t.Errorf("set = %+v", sites)
+			}
+			if envMap(spec.env)["QA_API_SIGN_IN_TOOL"] != "1" || len(spec.apiSignIns) != 1 {
+				t.Errorf("api sign-ins %+v", spec.apiSignIns)
+			}
+		})
+	}
+}
+
+// A user stop ends the wait for a probe: the round stops and QA isn't spawned.
+func TestQAStackRoundStopEndsTheProbeWait(t *testing.T) {
+	f := &fakeStackOps{sites: map[string]string{"0-web": "web"}, backends: map[string]string{"1-api": "api"}, links: []task_previews.StackLinkV1{browserLink("1-api", "api")}}
+	stage, _, specs := stackStage(t, []string{"web", "api"}, []string{"0-web"}, []string{"1-api"}, f)
+	stop := make(chan struct{})
+	stage.stopSignal = stop
+	stage.stackOps.probePages = func(ctx context.Context, _, _ string) agenttools.PreviewPagesProbe {
+		close(stop)
+		<-ctx.Done()
+		return agenttools.PreviewPagesProbe{}
+	}
+	if _, err := runStackRound(t, stage, 1); !errors.Is(err, types.ErrJobStoppedByUser) {
+		t.Errorf("err = %v, want a user stop", err)
+	}
+	if len(*specs) != 0 {
+		t.Error("QA was spawned")
 	}
 }
