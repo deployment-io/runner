@@ -51,6 +51,24 @@ func (r *RunnerClient) GetSessionInput(jobID string, afterTs int64, deliveredAtA
 	return reply.Messages, nil
 }
 
+// GetSessionTaskContext fetches the record of the Task an Ask session is about
+// (the session of jobID). Found is false for every other session. A
+// deployment-server that predates the method fails the call.
+func (r *RunnerClient) GetSessionTaskContext(jobID string, organizationID string) (sessions.GetTaskContextReplyV1, error) {
+	if !r.isConnected {
+		return sessions.GetTaskContextReplyV1{}, ErrConnection
+	}
+	args := sessions.GetTaskContextArgsV1{JobID: jobID}
+	args.OrganizationID = r.GetComputedOrganizationID(organizationID)
+	args.Token = r.token
+	var reply sessions.GetTaskContextReplyV1
+	err := r.c.Call("Sessions.GetTaskContextV1", args, &reply)
+	if err != nil {
+		return sessions.GetTaskContextReplyV1{}, err
+	}
+	return reply, nil
+}
+
 // SetSessionRepoSuggestion forwards the latest repository suggestion the
 // planning agent emitted to deployment-server, which persists it to
 // Session.RepoSuggestion. The dashboard reads it back off the session GET and
