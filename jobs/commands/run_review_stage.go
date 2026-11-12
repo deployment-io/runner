@@ -1574,7 +1574,8 @@ func readBaseCommitsFromJobOutput(parameters map[string]interface{}) map[string]
 }
 
 // mergeReviewIntoJobOutput writes the review block onto the accumulated
-// envelope, where OpenPullRequest reads it to render the Review section.
+// envelope, where OpenPullRequest reads it to render the review tally and
+// "Needs you".
 func mergeReviewIntoJobOutput(parameters map[string]interface{}, out *reviewOutput) error {
 	data := jobOutputData{}
 	if existing, err := jobs.GetParameterValue[string](parameters, parameters_enums.JobOutput); err == nil && len(existing) > 0 {
@@ -1592,7 +1593,8 @@ func mergeReviewIntoJobOutput(parameters map[string]interface{}, out *reviewOutp
 
 // readReviewFromJobOutput pulls the review block back off the envelope. Nil
 // when the stage did not run or the payload is unreadable — OpenPullRequest
-// renders no Review section in that case, which is the pre-stage behaviour.
+// renders no review tally or "Needs you" in that case, which is the pre-stage
+// behaviour.
 func readReviewFromJobOutput(parameters map[string]interface{}) *reviewOutput {
 	existing, err := jobs.GetParameterValue[string](parameters, parameters_enums.JobOutput)
 	if err != nil || len(existing) == 0 {

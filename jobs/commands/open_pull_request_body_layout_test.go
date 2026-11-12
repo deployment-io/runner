@@ -9,7 +9,8 @@ import (
 
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
-	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
+	"github.com/deployment-io/deployment-runner-kit/task_previews"
+	"github.com/deployment-io/deployment-runner-kit/tasks"
 )
 
 // taskSpecJSON is kit's TaskSpec as it reaches the ReviewSpec parameter:
@@ -47,29 +48,51 @@ func requireInOrder(t *testing.T, body string, needles ...string) {
 
 // --- the body's layout -------------------------------------------------------
 
-func TestPRBodyPartsAreInTheFixedOrder(t *testing.T) {
-	review := completedReview(false, layoutFinding("off by one", false, false))
+// fullOpener is an opener with every part of the body to show.
+func fullOpener() *taskOpenPR {
+	review := completedReview(true,
+		layoutFinding("must one", true, true),
+		layoutFinding("noted one", false, false),
+	)
 	review.Rounds[0].Model = "gpt-5.5"
+	review.FixedInLoop = []reviewFindingOutput{layoutFinding("fixed one", true, true)}
+	review.DeployRequirements = []resolvedDeployRequirement{{Variable: "STRIPE_KEY", Service: "api", Environment: "prod", EnvironmentID: "e", Managed: true, Found: true}}
 	opr := reviewTestOpener(review)
-	opr.ctx.DashboardURL = "https://app.example.com"
-	opr.acceptance = []string{"login works", "logout works"}
+	opr.ctx.DashboardURL = "https://app.example.com/"
 	opr.verifyResult = &verifyResult{Ran: true, Passed: true, Command: "go test ./..."}
-	opr.deniedHosts = []string{"pypi.example.com"}
+	opr.qa = completedQA(qaRoundOutput{
+		Criteria:     qaCriteria(tasks.QACriterionFailed, tasks.QACriterionNotChecked),
+		Findings:     []reviewFindingOutput{{Location: "/login", What: "the button does nothing"}},
+		Observations: []string{"the page is slow"},
+		MergeResults: []qaMergeResultOutput{{Repository: "acme/web", BaseBranch: "main", BaseCommit: "0123456789", Merged: true}},
+	})
+	opr.taskPreviews = stubPreviewLister{previews: []task_previews.TaskPreviewV1{
+		{ServiceName: "acme-web-dist", ServiceType: task_previews.ServiceTypeStaticSite, URL: "https://d1abc.cloudfront.net"},
+	}}
+	return opr
+}
 
-	_, body := opr.buildPRTitleAndBody()
+func TestPRBodyPartsAreInTheFixedOrder(t *testing.T) {
+	_, body := fullOpener().buildPRTitleAndBody()
 
-	if !strings.HasPrefix(body, "**Review:** 1 found · 1 noted\n\nAdded the login endpoint.\n\n") {
-		t.Errorf("the body does not open with the tally, a blank line and the summary:\n%s", body)
+	const opening = "**Review:** 3 found · 1 fixed before this PR · 1 must be fixed before merge · 1 noted\n\n" +
+		"**QA on a preview:** 0 of 2 acceptance criteria passed · 1 failed · 1 not checked\n\n" +
+		"**Details:** review, QA results, previews and logs on the [Task page](https://app.example.com/tasks/task-1)\n\n" +
+		"**Before deploying**\n\n"
+	if !strings.HasPrefix(body, opening) {
+		t.Errorf("the body does not open with the tally, the QA line, the details line and Before deploying:\n%s", body)
 	}
 	requireInOrder(t, body,
-		"**Review:** 1 found",
-		"Added the login endpoint.",
-		"**What the Task asks for**",
-		"- login works\n- logout works\n",
-		"**How it was checked**",
+		"**Before deploying**",
+		"`STRIPE_KEY`",
+		"\n\nAdded the login endpoint.\n\n**Needs you**\n\n_Still open and must be fixed_\n\n",
+		"must one",
+		"They need a human.",
+		"\n\n**How it was checked**\n\n",
 		"- `go test ./...` passed",
-		"---\n**Review**",
-		"<details><summary>Hosts the agent was blocked from reaching (1)</summary>",
+		"\n\n**Previews**\n\n",
+		"- acme-web-dist: https://d1abc.cloudfront.net",
+		"Previews are temporary",
 	)
 	const wantEnd = "\n\n---\nGenerated-By: deployment.io Tasks\nTask: My Task\nTask-URL: https://app.example.com/tasks/task-1\n"
 	if !strings.HasSuffix(body, wantEnd) {
@@ -77,25 +100,90 @@ func TestPRBodyPartsAreInTheFixedOrder(t *testing.T) {
 	}
 }
 
-// Review participation Off: no tally and no Review section, the rest intact.
-func TestPRBodyWithoutAReviewKeepsTheOtherParts(t *testing.T) {
+// Each part is left out when it has nothing to show, and leaves no gap.
+func TestPRBodyLeavesOutEachPartWithNothingToShow(t *testing.T) {
+	for name, tc := range map[string]struct {
+		strip  func(*taskOpenPR)
+		absent string
+	}{
+		"no review":        {func(o *taskOpenPR) { o.review = nil }, "**Review:**"},
+		"no QA":            {func(o *taskOpenPR) { o.qa = nil }, "**QA on a preview:**"},
+		"no dashboard URL": {func(o *taskOpenPR) { o.ctx.DashboardURL = "" }, "**Details:**"},
+		"no requirements":  {func(o *taskOpenPR) { o.review.DeployRequirements = nil }, "**Before deploying**"},
+		"no summary":       {func(o *taskOpenPR) { o.agentSummary = "" }, "Added the login endpoint."},
+		"nothing open":     {func(o *taskOpenPR) { o.review = completedReview(false) }, "**Needs you**"},
+		"no verify result": {func(o *taskOpenPR) { o.verifyResult = nil }, "**How it was checked**"},
+		"no previews":      {func(o *taskOpenPR) { o.taskPreviews = stubPreviewLister{} }, "**Previews**"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			opr := fullOpener()
+			tc.strip(opr)
+			_, body := opr.buildPRTitleAndBody()
+			if strings.Contains(body, tc.absent) {
+				t.Errorf("the body carries %q:\n%s", tc.absent, body)
+			}
+			if strings.Contains(body, "\n\n\n") {
+				t.Errorf("a left-out part left a gap:\n%s", body)
+			}
+			if !strings.Contains(body, "Generated-By: deployment.io Tasks") {
+				t.Errorf("the trailer is missing:\n%s", body)
+			}
+		})
+	}
+}
+
+// What the Task page shows is not repeated in the body: the Task's acceptance
+// criteria, the rest of the review, the QA results and the blocked hosts.
+func TestPRBodyLeavesTheTaskPagesPartsOut(t *testing.T) {
+	failedReview := fullOpener()
+	failedReview.review.Rounds = append(failedReview.review.Rounds, reviewRoundOutput{Round: 2, Error: "timeout",
+		Coverage: notCheckedCoverage("timeout")})
+	noReview := fullOpener()
+	noReview.review = nil
+	for name, opr := range map[string]*taskOpenPR{
+		"every part":    fullOpener(),
+		"review failed": failedReview,
+		"no review":     noReview,
+		"ordinary":      reviewTestOpener(completedReview(false, layoutFinding("noted one", false, false))),
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, body := opr.buildPRTitleAndBody()
+			for _, absent := range []string{
+				"What the Task asks for", "What was asked",
+				"Reviewed by", "Passes run", "_Noted_", "noted one", "Fixed during review", "fixed one", "Coverage",
+				"**QA on a preview**\n", "the button does nothing", "the page is slow", "QA checked acme/web",
+				"Hosts the agent was blocked", "<details>",
+			} {
+				if strings.Contains(body, absent) {
+					t.Errorf("the body carries %q:\n%s", absent, body)
+				}
+			}
+		})
+	}
+}
+
+// --- the details line --------------------------------------------------------
+
+func TestDetailsLinePointsToTheTaskPage(t *testing.T) {
 	opr := reviewTestOpener(nil)
-	opr.acceptance = []string{"login works"}
-	opr.verifyResult = &verifyResult{Ran: false}
-	opr.deniedHosts = []string{"pypi.example.com"}
-
+	opr.ctx.DashboardURL = "https://app.example.com/"
+	const url = "https://app.example.com/tasks/task-1"
+	if got, want := opr.detailsLine(), "**Details:** review, QA results, previews and logs on the [Task page]("+url+")"; got != want {
+		t.Errorf("detailsLine = %q, want %q", got, want)
+	}
 	_, body := opr.buildPRTitleAndBody()
+	if !strings.HasPrefix(body, opr.detailsLine()+"\n\n") || !strings.Contains(body, "\nTask-URL: "+url+"\n") {
+		t.Errorf("the details line and Task-URL do not share the Task page's URL:\n%s", body)
+	}
 
-	for _, absent := range []string{"**Review:**", "**Review**"} {
-		if strings.Contains(body, absent) {
-			t.Errorf("a Task with no Review stage got %q:\n%s", absent, body)
-		}
+	opr.ctx.DashboardURL = ""
+	if got := opr.detailsLine(); got != "" {
+		t.Errorf("detailsLine without a dashboard URL = %q, want none", got)
 	}
-	if !strings.HasPrefix(body, "Added the login endpoint.\n\n") {
-		t.Errorf("without a tally the summary should open the body:\n%s", body)
+	_, body = opr.buildPRTitleAndBody()
+	if strings.Contains(body, "**Details:**") || strings.Contains(body, "Task-URL:") {
+		t.Errorf("a Task without a dashboard URL got a link to its page:\n%s", body)
 	}
-	requireInOrder(t, body, "Added the login endpoint.", "**What the Task asks for**", "**How it was checked**",
-		"<details><summary>Hosts the agent", "Generated-By: deployment.io Tasks", "Task: My Task")
 }
 
 // The cap holds with every part as large as it gets, and the summary is what
@@ -104,28 +192,29 @@ func TestPRBodyStaysUnderTheCapWithEveryPartAtItsLimit(t *testing.T) {
 	var findings []reviewFindingOutput
 	for i := 0; i < 40; i++ {
 		findings = append(findings, reviewFindingOutput{
-			Parameter: "correctness", Severity: "low",
+			Parameter: "correctness", Severity: "low", SentBack: true,
 			Location: strings.Repeat("l", 400), What: strings.Repeat("w", 900), Why: strings.Repeat("y", 900),
 		})
 	}
 	opr := reviewTestOpener(completedReview(false, findings...))
+	opr.ctx.DashboardURL = "https://app.example.com"
 	opr.agentSummary = strings.Repeat("This line is part of a very long summary.\n", 2440) // ~100,000 runes
 	if n := utf8.RuneCountInString(opr.agentSummary); n < 100000 {
 		opr.agentSummary += strings.Repeat("x", 100000-n)
 	}
-	var criteria []string
-	for i := 0; i < 25; i++ {
-		criteria = append(criteria, strings.Repeat("c", 500))
+	var previews []task_previews.TaskPreviewV1
+	for i := 0; i < 10; i++ {
+		previews = append(previews, task_previews.TaskPreviewV1{ServiceName: strings.Repeat("n", 300), URL: "https://d.example.com"})
 	}
-	opr.acceptance = parseAcceptanceCriteria(taskSpecJSON(t, criteria))
+	opr.taskPreviews = stubPreviewLister{previews: previews}
 
 	_, body := opr.buildPRTitleAndBody()
 
 	if got := utf8.RuneCountInString(body); got > prBodyMaxRunes {
 		t.Errorf("body is %d runes, want at most %d", got, prBodyMaxRunes)
 	}
-	for _, want := range []string{"**Review:**", prSummaryTruncatedNote, "**What the Task asks for**",
-		"- and 5 more on the Task page", "**Review**", "Generated-By: deployment.io Tasks"} {
+	for _, want := range []string{"**Review:**", "**Details:**", prSummaryTruncatedNote, "**Needs you**",
+		"further finding(s) are not shown here", "**Previews**", "- and 5 more", "Generated-By: deployment.io Tasks"} {
 		if !strings.Contains(body, want) {
 			t.Errorf("the capped body dropped %q", want)
 		}
@@ -156,9 +245,9 @@ func TestReviewTally(t *testing.T) {
 	}{
 		{"nil review", nil, ""},
 		{"no rounds", &reviewOutput{Participation: "on"}, ""},
-		{"failed last round", failedAfterFix, "**Review:** did not complete — details below."},
-		{"nothing examined", nothingExamined, "**Review:** nothing was examined — details below."},
-		{"last fix not re-checked", notRechecked, "**Review:** the last fix was not re-checked — details below."},
+		{"failed last round", failedAfterFix, "**Review:** did not complete — details on the Task page."},
+		{"nothing examined", nothingExamined, "**Review:** nothing was examined — details on the Task page."},
+		{"last fix not re-checked", notRechecked, "**Review:** the last fix was not re-checked — details on the Task page."},
 		{"no findings", completedReview(false), "**Review:** no findings."},
 		{"fixed and noted", fixedAndNoted, "**Review:** 4 found · 3 fixed before this PR · 1 noted"},
 		{"one must-fix", completedReview(true, layoutFinding("no session check", true, false)), "**Review:** 1 found · 1 must be fixed before merge"},
@@ -180,19 +269,15 @@ func TestReviewTally(t *testing.T) {
 	}
 }
 
-// --- what the Task asks for --------------------------------------------------
+// --- the Task's acceptance criteria -----------------------------------------
 
-func TestAcceptanceCriteriaRenderOneBulletEach(t *testing.T) {
+func TestAcceptanceCriteriaAreReadOneEach(t *testing.T) {
 	parameters := map[string]interface{}{}
 	jobs.SetParameterValue[string](parameters, parameters_enums.ReviewSpec,
 		taskSpecJSON(t, []string{"login works", "logout\nworks", "  sessions expire  "}))
-	got := acceptanceSection(readAcceptanceCriteria(parameters))
-	want := "**What the Task asks for**\n\n- login works\n- logout works\n- sessions expire\n"
-	if got != want {
-		t.Errorf("section =\n%q\nwant\n%q", got, want)
-	}
-	if strings.Contains(got, "keep the API stable") {
-		t.Error("a part of the spec other than the criteria reached the body")
+	got := readAcceptanceCriteria(parameters)
+	if want := []string{"login works", "logout works", "sessions expire"}; fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Errorf("criteria = %q, want %q", got, want)
 	}
 }
 
@@ -212,7 +297,7 @@ func TestAcceptanceCriteriaAreReadPastRerunInstructions(t *testing.T) {
 	}
 }
 
-func TestAcceptanceSectionIsLeftOutWithoutCriteria(t *testing.T) {
+func TestAcceptanceCriteriaAreNoneWithoutAStructuredSpec(t *testing.T) {
 	cases := map[string]string{
 		"prose description":     "Add a login endpoint that checks the caller's session.",
 		"object with no key":    `{"Goal":"add login"}`,
@@ -232,25 +317,10 @@ func TestAcceptanceSectionIsLeftOutWithoutCriteria(t *testing.T) {
 		if got := readAcceptanceCriteria(map[string]interface{}{}); got != nil {
 			t.Errorf("criteria = %q, want none", got)
 		}
-		if got := acceptanceSection(nil); got != "" {
-			t.Errorf("section = %q, want none", got)
-		}
 	})
 }
 
 func TestAcceptanceCriteriaAreCapped(t *testing.T) {
-	var criteria []string
-	for i := 0; i < 25; i++ {
-		criteria = append(criteria, fmt.Sprintf("criterion %d", i))
-	}
-	section := acceptanceSection(parseAcceptanceCriteria(taskSpecJSON(t, criteria)))
-	if got := strings.Count(section, "\n- criterion "); got != 20 {
-		t.Errorf("%d criteria rendered, want 20:\n%s", got, section)
-	}
-	if !strings.HasSuffix(section, "- criterion 19\n- and 5 more on the Task page\n") {
-		t.Errorf("the section does not end with the overflow line:\n%s", section)
-	}
-
 	long := parseAcceptanceCriteria(taskSpecJSON(t, []string{strings.Repeat("é", 500)}))
 	if len(long) != 1 || utf8.RuneCountInString(long[0]) != prBodyAcceptanceMaxRunes || !strings.HasSuffix(long[0], "…") {
 		t.Errorf("a 500-rune criterion was not capped at %d runes: %d", prBodyAcceptanceMaxRunes, utf8.RuneCountInString(long[0]))
@@ -321,9 +391,9 @@ func TestHowItWasCheckedKeepsPassingStepsWhenOutputIsDropped(t *testing.T) {
 	}
 }
 
-// --- the Review section --------------------------------------------------------
+// --- "Needs you" ----------------------------------------------------------------
 
-func TestReviewSectionOrderAndCollapsedBlocks(t *testing.T) {
+func TestNeedsYouOrder(t *testing.T) {
 	findings := []reviewFindingOutput{
 		layoutFinding("must one", true, true),
 		layoutFinding("below one", false, true),
@@ -332,43 +402,45 @@ func TestReviewSectionOrderAndCollapsedBlocks(t *testing.T) {
 		findings = append(findings, layoutFinding(fmt.Sprintf("noted %d", i), false, false))
 	}
 	review := completedReview(true, findings...)
-	review.Rounds[0].Model = "gpt-5.5"
 	review.Rounds = append(review.Rounds, reviewRoundOutput{Round: 2, Error: "the review run timed out",
 		Coverage: notCheckedCoverage("the review run timed out")})
 	review.FixError = "max turns reached"
-	for i := 0; i < 5; i++ {
-		review.FixedInLoop = append(review.FixedInLoop, layoutFinding(fmt.Sprintf("fixed %d", i), true, true))
-	}
+	review.FixedInLoop = []reviewFindingOutput{layoutFinding("fixed 0", true, true)}
 
-	section := reviewTestOpener(review).reviewSection()
+	section := reviewTestOpener(review).needsYouSection()
 
 	requireInOrder(t, section,
-		"---\n**Review**\n\n",
-		"Reviewed by gpt-5.5.",
-		"The review did not complete: the review run timed out.",
-		"Passes run: security, correctness.",
-		"_Reported by the last completed review, fix not verified_",
+		"**Needs you**\n\nThe review did not complete: the review run timed out. The change was committed and this pull request opened anyway; nothing here has been gated on a review verdict.\n",
+		"\n_Reported by the last completed review, fix not verified_\n\n",
 		"must one",
-		"A fix attempt did not complete (max turns reached)",
-		"_Reported by the last completed review, fix not verified (does not hold this pull request)_",
+		"\nA fix attempt did not complete (max turns reached); the change is shown as it was before that attempt.\n",
+		"\n_Reported by the last completed review, fix not verified (does not hold this pull request)_\n\n",
 		"below one",
-		"_Noted_",
-		"noted 15",
-		// 18 visible + 2 fixed rendered = the 20-item cap; 3 fixed left out.
-		"_3 further finding(s) are not shown here",
-		"These findings were open at the last completed review. They need a human.",
-		"<details><summary>Fixed during review (5)</summary>\n\n- **correctness / medium**",
-		"fixed 1",
-		"\n\n</details>\n",
-		"<details><summary>Coverage</summary>\n\nCoverage — security: checked;",
-		"\n\n</details>\n",
+		"\nThese findings were open at the last completed review. They need a human.\n",
 	)
-	if strings.Contains(section, "fixed 2") {
-		t.Errorf("a fixed finding past the item cap was rendered:\n%s", section)
+	for _, absent := range []string{"noted", "fixed 0", "further finding(s)", "Coverage"} {
+		if strings.Contains(section, absent) {
+			t.Errorf("the part carries %q:\n%s", absent, section)
+		}
 	}
 }
 
-func TestReviewSectionSaysWhenFindingsAreUnverified(t *testing.T) {
+// A still-open finding below the hold threshold is listed on its own, with the
+// fix outcome line under it and no "They need a human." — nothing holds the
+// pull request.
+func TestNeedsYouWithOnlyABelowHoldFinding(t *testing.T) {
+	review := completedReview(false, layoutFinding("below one", false, true))
+	review.StoppedNoChange = true
+	section := reviewTestOpener(review).needsYouSection()
+	want := "**Needs you**\n" +
+		"\n_" + stillOpenBelowHoldHeading + "_\n\n" + renderFinding(layoutFinding("below one", false, true)) +
+		"\n_The last fix round changed nothing._\n"
+	if section != want {
+		t.Errorf("section =\n%q\nwant\n%q", section, want)
+	}
+}
+
+func TestNeedsYouSaysWhenFindingsAreUnverified(t *testing.T) {
 	base := func() *reviewOutput {
 		return completedReview(true, layoutFinding("must one", true, true), layoutFinding("below one", false, true))
 	}
@@ -397,7 +469,7 @@ func TestReviewSectionSaysWhenFindingsAreUnverified(t *testing.T) {
 		"final tree reviewed":         {base(), verified, unverified},
 	} {
 		t.Run(name, func(t *testing.T) {
-			section := reviewTestOpener(tc.review).reviewSection()
+			section := reviewTestOpener(tc.review).needsYouSection()
 			for _, w := range tc.want {
 				if !strings.Contains(section, w) {
 					t.Errorf("missing %q:\n%s", w, section)
@@ -412,72 +484,32 @@ func TestReviewSectionSaysWhenFindingsAreUnverified(t *testing.T) {
 	}
 }
 
-// With no completed round the coverage line is collapsed too.
-func TestReviewSectionCollapsesCoverageWithNoCompletedRound(t *testing.T) {
-	review := &reviewOutput{Participation: "on", Rounds: []reviewRoundOutput{{
-		Round: 1, Error: "no review_result", Coverage: notCheckedCoverage("no review_result"),
-	}}}
-	section := reviewTestOpener(review).reviewSection()
-	requireInOrder(t, section, "The review did not complete", "<details><summary>Coverage</summary>\n\nCoverage — ", "\n\n</details>\n")
-}
+// Whatever the per-finding caps allow, "Needs you" stays within its rune cap
+// and says it was cut; the trailer stays last.
+func TestNeedsYouIsCutWithANote(t *testing.T) {
+	review := completedReview(false, layoutFinding("below one", false, true))
+	review.StoppedNoChange = true
+	// A declining fix run's explanation is capped on its own, so a long failure
+	// reason is what pushes the part past its cap.
+	review.Rounds = append(review.Rounds, reviewRoundOutput{Round: 2, Error: strings.Repeat("e", reviewSectionMaxRunes)})
+	opr := reviewTestOpener(review)
 
-// --- blocked hosts -------------------------------------------------------------
-
-func TestBlockedHostsAreCollapsedWithTheirCount(t *testing.T) {
-	hosts := make([]string, 0, 80)
-	for i := 0; i < 80; i++ {
-		hosts = append(hosts, fmt.Sprintf("host-%02d.example.com", i))
+	section := opr.needsYouSection()
+	const note = "\n\n_This list was truncated — the full review is on the Task page._\n"
+	if !strings.HasSuffix(section, note) {
+		t.Fatalf("the part was not cut with its note:\n%s", section[len(section)-200:])
 	}
-	section := (&taskOpenPR{deniedHosts: hosts}).blockedHostsSection()
-	if !strings.HasPrefix(section, "<details><summary>Hosts the agent was blocked from reaching (80)</summary>\n\nThe agent attempted") {
-		t.Errorf("the hosts are not in a <details> block carrying the count:\n%s", section)
-	}
-	if !strings.HasSuffix(section, "- and 30 more\n\n</details>\n") {
-		t.Errorf("the block does not close after the list:\n%s", section)
-	}
-	if got := (&taskOpenPR{}).blockedHostsSection(); got != "" {
-		t.Errorf("a Step with no denied hosts got %q", got)
-	}
-}
-
-// A cut never leaves a collapsed block open. The Review section is cut near
-// its end, which is where its collapsed blocks are, and on GitHub an unclosed
-// <details> swallows everything after it — the blocked hosts and the trailer.
-func TestACutNeverLeavesACollapsedBlockOpen(t *testing.T) {
-	long := strings.Repeat("x", 290)
-	var findings, fixed []reviewFindingOutput
-	for i := 0; i < 8; i++ {
-		findings = append(findings, reviewFindingOutput{Key: fmt.Sprint("o", i), Parameter: "correctness", Severity: "low",
-			Location: strings.Repeat("p", 190), What: long, Why: long})
-	}
-	for i := 0; i < 6; i++ {
-		fixed = append(fixed, reviewFindingOutput{Key: fmt.Sprint("f", i), Parameter: "security", Severity: "medium",
-			Location: strings.Repeat("q", 190), What: long, Why: long})
-	}
-	var coverage []reviewCoverageOutput
-	for _, p := range []string{"security", "correctness", "spec conformance", "testing", "deploy readiness", "performance", "maintainability", "reliability"} {
-		coverage = append(coverage, reviewCoverageOutput{Parameter: p, State: "not checked", Reason: "no pass for this parameter in this release"})
-	}
-	coverage[0].State, coverage[1].State = "checked", "checked"
-	opr := &taskOpenPR{
-		ctx:         commandUtils.TaskJobContext{TaskTitle: "T"},
-		deniedHosts: []string{"a.example"},
-		review: &reviewOutput{Participation: "on", FinalTreeReviewed: true, FixedInLoop: fixed,
-			Rounds: []reviewRoundOutput{{Round: 1, Completed: true, Findings: findings, Coverage: coverage}}},
-	}
-	section := opr.reviewSection()
-	if !strings.Contains(section, "The Review section was truncated") {
-		t.Fatalf("the fixture no longer forces a cut; make the findings longer:\n%s", section)
+	if n := utf8.RuneCountInString(section); n > reviewSectionMaxRunes+utf8.RuneCountInString(note) {
+		t.Errorf("the part is %d runes, over its cap", n)
 	}
 	_, body := opr.buildPRTitleAndBody()
-	if open, closed := strings.Count(body, "<details>"), strings.Count(body, "</details>"); open != closed {
-		t.Errorf("%d <details> but %d </details>; the rest of the body would be swallowed:\n%s", open, closed, body)
-	}
-	if !strings.HasSuffix(strings.TrimSpace(body), "Task: T") {
+	if !strings.HasSuffix(strings.TrimSpace(body), "Task: My Task") {
 		t.Errorf("the trailer is no longer last:\n%s", body)
 	}
+}
 
-	// The whole-body cut closes what it cuts into, and stays within budget.
+// The whole-body cut closes what it cuts into, and stays within budget.
+func TestCutToRuneBudgetNeverLeavesACollapsedBlockOpen(t *testing.T) {
 	text := "intro\n\n<details><summary>Output</summary>\n\n" + strings.Repeat("line\n", 100) + "\n</details>\n\ntail\n"
 	cut := cutToRuneBudget(text, 120, "\n\n_cut_")
 	if strings.Count(cut, "<details>") != strings.Count(cut, "</details>") {

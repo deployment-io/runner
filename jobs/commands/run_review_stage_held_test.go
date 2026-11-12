@@ -274,14 +274,6 @@ func TestAFindingHeldByAnEarlierRoundIsNotStillPresentOnceItIsResolved(t *testin
 	if stage.fixedInLoop[0].Held {
 		t.Error("the fixed finding is still marked held — the pull request would list it as fixed and still present at once")
 	}
-	section := (&taskOpenPR{review: &reviewOutput{
-		Participation: "on",
-		Rounds:        stage.rounds,
-		FixedInLoop:   stage.fixedInLoop,
-	}}).reviewSection()
-	if strings.Contains(section, "_Still present after a fix round._") {
-		t.Errorf("a fixed finding is rendered as still present:\n%s", section)
-	}
 }
 
 // The reviewer's note is kept apart from why, and replaced each round. Folded
@@ -346,10 +338,6 @@ func TestAResolvedFindingCarriesNoStillPresentNoteIntoFixedDuringReview(t *testi
 	}
 	if fixed := stage.fixedInLoop[0]; fixed.StillPresentNote != "" || fixed.Why != "anyone can read them" {
 		t.Errorf("fixed finding = %+v, want no still-present note and the original why", fixed)
-	}
-	section := (&taskOpenPR{review: &reviewOutput{Participation: "on", Rounds: stage.rounds, FixedInLoop: stage.fixedInLoop}}).reviewSection()
-	if strings.Contains(section, "no auth check") {
-		t.Errorf("the fixed finding still carries the held round's note:\n%s", section)
 	}
 }
 
@@ -471,7 +459,7 @@ func TestFindingKeyNeverExceedsAgentboxsKeyCap(t *testing.T) {
 // A held finding under the must-fix heading says so. Without the line it reads
 // as a finding nobody has tried to fix yet, which understates a problem that
 // has already survived a fix round.
-func TestTheReviewSectionSaysAHeldFindingIsStillPresent(t *testing.T) {
+func TestNeedsYouSaysAHeldFindingIsStillPresent(t *testing.T) {
 	review := completedReview(true,
 		reviewFindingOutput{
 			Parameter: "security", Severity: "critical", Location: "0-acme/api/debug.go:12",
@@ -484,7 +472,7 @@ func TestTheReviewSectionSaysAHeldFindingIsStillPresent(t *testing.T) {
 			What: "the retry loop never terminates", MustFix: true,
 		})
 
-	section := (&taskOpenPR{review: review}).reviewSection()
+	section := (&taskOpenPR{review: review}).needsYouSection()
 
 	if !strings.Contains(section, "_Still present after a fix round._") {
 		t.Errorf("the held finding is not marked still present:\n%s", section)

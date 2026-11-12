@@ -235,20 +235,6 @@ func TestQAFixReviewRoundRetriesABusyModel(t *testing.T) {
 	}
 }
 
-func TestCoverageLineFoldsAFailedRound(t *testing.T) {
-	got := coverageLine(notCheckedCoverage("the review run timed out"))
-	if want := "Coverage — every parameter not checked (review run failed: the review run timed out)\n"; got != want {
-		t.Errorf("coverageLine = %q, want %q", got, want)
-	}
-	mixed := []reviewCoverageOutput{
-		{Parameter: "security", State: "checked"},
-		{Parameter: "testing", State: "not checked", Reason: "no tests"},
-	}
-	if want := "Coverage — security: checked; testing: not checked (no tests)\n"; coverageLine(mixed) != want {
-		t.Errorf("coverageLine = %q, want %q", coverageLine(mixed), want)
-	}
-}
-
 func TestReviewLogFoldsAFailedRoundsCoverage(t *testing.T) {
 	var logs strings.Builder
 	stage := &reviewStage{logsWriter: &logs}
@@ -271,7 +257,7 @@ func TestDidNotCompleteSentenceHasOnePeriod(t *testing.T) {
 		"the review run timed out":                                     "The review did not complete: the review run timed out. The change was committed",
 	} {
 		review := &reviewOutput{Rounds: []reviewRoundOutput{{Round: 1, Error: reason, Coverage: notCheckedCoverage(reason)}}}
-		section := reviewTestOpener(review).reviewSection()
+		section := reviewTestOpener(review).needsYouSection()
 		if !strings.Contains(section, want) {
 			t.Errorf("the section lacks %q:\n%s", want, section)
 		}

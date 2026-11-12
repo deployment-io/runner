@@ -408,20 +408,20 @@ func TestAFixRunThatChangedNothingEndsTheLoopAndHandsOff(t *testing.T) {
 			if !pr.needsFixes() {
 				t.Error("the pull request was not requested as a draft")
 			}
-			section := pr.reviewSection()
+			section := pr.needsYouSection()
 			if !strings.Contains(section, "_The last fix round changed nothing._") {
-				t.Errorf("the review section does not carry the no-change line:\n%s", section)
+				t.Errorf("\"Needs you\" does not carry the no-change line:\n%s", section)
 			}
 			if strings.Contains(section, "A fix attempt did not complete") {
-				t.Errorf("the review section reports a failed fix attempt that did not happen:\n%s", section)
+				t.Errorf("\"Needs you\" reports a failed fix attempt that did not happen:\n%s", section)
 			}
 			// The loop stopped on the no-change round, not on its budget, so
 			// the closing line must not say the budget ran out.
 			if strings.Contains(section, "fix budget ran out") {
-				t.Errorf("the review section says the fix budget ran out when the loop stopped on a no-change round:\n%s", section)
+				t.Errorf("\"Needs you\" says the fix budget ran out when the loop stopped on a no-change round:\n%s", section)
 			}
 			if !strings.Contains(section, "These findings are still open. They need a human.") {
-				t.Errorf("the review section lost the hand-to-a-human line:\n%s", section)
+				t.Errorf("\"Needs you\" lost the hand-to-a-human line:\n%s", section)
 			}
 			if _, err := os.Stat(fixRoundSnapshotPath(workDir, 1)); !os.IsNotExist(err) {
 				t.Errorf("the undo copy was kept after the fix run succeeded: %v", err)
@@ -530,8 +530,8 @@ func TestAFailedFixRunThatChangedNothingIsStillRecordedAsAFailure(t *testing.T) 
 	if !strings.Contains(logs.String(), "back to exactly what it was") {
 		t.Errorf("the job log does not say the change was put back:\n%s", logs.String())
 	}
-	if section := (&taskOpenPR{review: review}).reviewSection(); strings.Contains(section, "changed nothing") {
-		t.Errorf("the review section reads as a declined finding rather than a failed fix:\n%s", section)
+	if section := (&taskOpenPR{review: review}).needsYouSection(); strings.Contains(section, "changed nothing") {
+		t.Errorf("\"Needs you\" reads as a declined finding rather than a failed fix:\n%s", section)
 	}
 }
 
@@ -540,21 +540,21 @@ func TestAFailedFixRunThatChangedNothingIsStillRecordedAsAFailure(t *testing.T) 
 // The diff under a pull request whose fix run failed is the IMPLEMENTER's, not
 // a half-applied cleanup. A reader comparing the findings against the change
 // has to be told, or they go looking for fix work that was rolled back.
-func TestTheReviewSectionNamesAFailedFixAttemptOnlyWhenThereWasOne(t *testing.T) {
+func TestNeedsYouNamesAFailedFixAttemptOnlyWhenThereWasOne(t *testing.T) {
 	review := completedReview(true, reviewFindingOutput{
 		Parameter: "security", Severity: "high", Location: "0-acme/api/handler.go:41",
 		What: "no session check", MustFix: true,
 	})
 
-	if section := (&taskOpenPR{review: review}).reviewSection(); strings.Contains(section, "A fix attempt did not complete") {
+	if section := (&taskOpenPR{review: review}).needsYouSection(); strings.Contains(section, "A fix attempt did not complete") {
 		t.Errorf("a review with no failed fix attempt claimed one:\n%s", section)
 	}
 
 	review.FixError = `agent step did not succeed: status=failure exit_code=1 error="max turns reached"`
-	section := (&taskOpenPR{review: review}).reviewSection()
+	section := (&taskOpenPR{review: review}).needsYouSection()
 	want := "A fix attempt did not complete (" + review.FixError + "); the change is shown as it was before that attempt."
 	if !strings.Contains(section, want) {
-		t.Errorf("the review section does not carry the failed-fix sentence:\n%s", section)
+		t.Errorf("\"Needs you\" does not carry the failed-fix sentence:\n%s", section)
 	}
 	// Under the must-fix findings, which is what the sentence is about.
 	if strings.Index(section, "no session check") > strings.Index(section, want) {
@@ -835,21 +835,21 @@ func TestRepositoryDirsIncludeOnesWithNoStartCommit(t *testing.T) {
 
 // The pull request states what actually happened: how a failed or skipped fix
 // ended, and a closing line that is true however the loop ended.
-func TestTheReviewSectionWordsTheFixOutcomeHonestly(t *testing.T) {
+func TestNeedsYouWordsTheFixOutcomeHonestly(t *testing.T) {
 	base := func() *reviewOutput {
 		return completedReview(true, reviewFindingOutput{Parameter: "security", Severity: "high",
 			Location: "handler.go:41", What: "no session check", MustFix: true})
 	}
 	failed := base()
 	failed.FixError = "agent step did not succeed"
-	body := reviewTestOpener(failed).reviewSection()
+	body := reviewTestOpener(failed).needsYouSection()
 	if strings.Contains(body, "fix budget ran out") || !strings.Contains(body, "A fix attempt did not complete") {
 		t.Errorf("a failed fix is worded wrongly:\n%s", body)
 	}
 	skipped := base()
 	skipped.FixError = "the change could not be copied first, so a failed fix could not have been undone"
 	skipped.FixNotAttempted = true
-	body = reviewTestOpener(skipped).reviewSection()
+	body = reviewTestOpener(skipped).needsYouSection()
 	if !strings.Contains(body, "No fix was attempted") || strings.Contains(body, "A fix attempt did not complete") {
 		t.Errorf("a skipped fix is worded wrongly:\n%s", body)
 	}
@@ -858,7 +858,7 @@ func TestTheReviewSectionWordsTheFixOutcomeHonestly(t *testing.T) {
 	// which were never routed back, so "after the fix budget ran out" is not
 	// true of all of them.
 	exhausted := base()
-	if body := reviewTestOpener(exhausted).reviewSection(); strings.Contains(body, "fix budget ran out") ||
+	if body := reviewTestOpener(exhausted).needsYouSection(); strings.Contains(body, "fix budget ran out") ||
 		!strings.Contains(body, "These findings are still open. They need a human.") {
 		t.Errorf("an exhausted loop is worded wrongly:\n%s", body)
 	}

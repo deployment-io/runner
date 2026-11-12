@@ -18,7 +18,10 @@ func (s stubPreviewLister) ListTaskPreviews(string, string) ([]task_previews.Tas
 	return s.previews, s.err
 }
 
-const previewFootnote = "A preview shows the code as of its last deploy, which can be earlier than this pull request's final commit. Previews are removed once all of this Task's pull requests are merged or closed, about 72 hours after its last preview deploy, or when the Task is deleted — whichever comes first."
+const (
+	previewSentence        = "Previews are temporary: they are removed once this Task's pull requests are merged or closed, or after they sit idle (about 72 hours).\n"
+	backendPreviewSentence = "Previews are temporary: they are removed once this Task's pull requests are merged or closed, or after they sit idle (about 72 hours; backend previews about 4).\n"
+)
 
 func previewOpener(lister stubPreviewLister) *taskOpenPR {
 	opr := reviewTestOpener(completedReview(false))
@@ -30,17 +33,12 @@ func TestPreviewSection_OnePreview(t *testing.T) {
 	_, body := previewOpener(stubPreviewLister{previews: []task_previews.TaskPreviewV1{
 		{ServiceName: "acme-web-dist", ServiceType: task_previews.ServiceTypeStaticSite, URL: "https://d1abc.cloudfront.net"},
 	}}).buildPRTitleAndBody()
-	want := "**Preview**\n\n" +
-		"Previews of this Task's change:\n\n" +
+	want := "**Previews**\n\n" +
 		"- acme-web-dist: https://d1abc.cloudfront.net\n\n" +
-		previewFootnote
-	if !strings.Contains(body, want) {
-		t.Fatalf("body lacks the Preview part.\nwant:\n%s\n\ngot:\n%s", want, body)
-	}
-	// Directly after the tally line, before the summary.
-	tally := reviewTally(completedReview(false))
-	if !strings.HasPrefix(body, tally+"\n\n"+want+"\n\n") {
-		t.Fatalf("Preview part is not directly after the tally:\n%s", body)
+		previewSentence
+	// After the summary, directly before the trailer.
+	if !strings.Contains(body, "Added the login endpoint.\n\n"+want+"\n---\nGenerated-By: deployment.io Tasks\n") {
+		t.Fatalf("the Previews part is not between the summary and the trailer.\nwant:\n%s\n\ngot:\n%s", want, body)
 	}
 }
 
@@ -53,15 +51,14 @@ func TestPreviewSection_SixPreviews(t *testing.T) {
 		})
 	}
 	got := formatPreviewSection(previews)
-	want := "**Preview**\n\n" +
-		"Previews of this Task's change:\n\n" +
+	want := "**Previews**\n\n" +
 		"- svc-1: https://d1.cloudfront.net\n" +
 		"- svc-2: https://d2.cloudfront.net\n" +
 		"- svc-3: https://d3.cloudfront.net\n" +
 		"- svc-4: https://d4.cloudfront.net\n" +
 		"- svc-5: https://d5.cloudfront.net\n" +
 		"- and 1 more under Resources → Previews in the dashboard\n\n" +
-		previewFootnote + "\n"
+		previewSentence
 	if got != want {
 		t.Fatalf("got:\n%q\nwant:\n%q", got, want)
 	}
@@ -85,63 +82,34 @@ func TestPreviewSection_AbsentWithoutPreviews(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, body := previewOpener(lister).buildPRTitleAndBody()
-			if strings.Contains(body, "**Preview**") || strings.Contains(body, "Previews of this Task's change") {
-				t.Fatalf("Preview part should be absent:\n%s", body)
+			if strings.Contains(body, "**Previews**") || strings.Contains(body, "Previews are temporary") {
+				t.Fatalf("Previews part should be absent:\n%s", body)
 			}
 		})
 	}
 }
 
-const backendPreviewFootnote = " Backend previews are removed sooner, about 4 hours after the Task's last preview deploy."
-
-// A web or private service preview is removed after 4 idle hours; the
-// description says so after the removal sentence. Static previews alone don't.
+// A web or private service preview is removed after 4 idle hours; the one
+// sentence says so. Static previews alone don't.
 func TestPreviewSection_BackendSentence(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
 		serviceType string
-		want        bool
+		want        string
 	}{
-		{"web service", task_previews.ServiceTypeWebService, true},
-		{"private service", task_previews.ServiceTypePrivateService, true},
-		{"static site only", task_previews.ServiceTypeStaticSite, false},
+		{"web service", task_previews.ServiceTypeWebService, backendPreviewSentence},
+		{"private service", task_previews.ServiceTypePrivateService, backendPreviewSentence},
+		{"static site only", task_previews.ServiceTypeStaticSite, previewSentence},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := formatPreviewSection([]task_previews.TaskPreviewV1{
 				{ServiceName: "web", ServiceType: task_previews.ServiceTypeStaticSite, URL: "https://d1.cloudfront.net"},
 				{ServiceName: "svc", ServiceType: tc.serviceType, URL: "https://d2.cloudfront.net"},
 			})
-			withSentence := strings.HasSuffix(got, previewFootnote+backendPreviewFootnote+"\n")
-			if withSentence != tc.want {
-				t.Fatalf("backend sentence present = %v, want %v:\n%s", withSentence, tc.want, got)
-			}
-			if !tc.want && !strings.HasSuffix(got, previewFootnote+"\n") {
-				t.Fatalf("removal sentence changed:\n%s", got)
+			want := "**Previews**\n\n- web: https://d1.cloudfront.net\n- svc: https://d2.cloudfront.net\n\n" + tc.want
+			if got != want {
+				t.Fatalf("got:\n%q\nwant:\n%q", got, want)
 			}
 		})
-	}
-}
-
-// The whole section with a backend preview: the intro and the "code as of"
-// sentence don't say who deployed the previews, since the QA stage builds
-// backend previews too.
-func TestPreviewSection_WithBackendPreview(t *testing.T) {
-	got := formatPreviewSection([]task_previews.TaskPreviewV1{
-		{ServiceName: "acme-web-dist", ServiceType: task_previews.ServiceTypeStaticSite, URL: "https://d1abc.cloudfront.net"},
-		{ServiceName: "acme-api", ServiceType: task_previews.ServiceTypeWebService, URL: "https://api-preview.example.com"},
-	})
-	want := "**Preview**\n\n" +
-		"Previews of this Task's change:\n\n" +
-		"- acme-web-dist: https://d1abc.cloudfront.net\n" +
-		"- acme-api: https://api-preview.example.com\n\n" +
-		"A preview shows the code as of its last deploy, which can be earlier than this pull request's final commit. " +
-		"Previews are removed once all of this Task's pull requests are merged or closed, about 72 hours after its last preview deploy, " +
-		"or when the Task is deleted — whichever comes first." +
-		" Backend previews are removed sooner, about 4 hours after the Task's last preview deploy.\n"
-	if got != want {
-		t.Fatalf("got:\n%q\nwant:\n%q", got, want)
-	}
-	if strings.Contains(got, "agent") {
-		t.Errorf("the section says the agent deployed the previews:\n%s", got)
 	}
 }

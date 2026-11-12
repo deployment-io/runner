@@ -291,45 +291,6 @@ func renderedModelFor(t *testing.T, logical string, provider llm_provider_enums.
 	return env["MODEL"]
 }
 
-// --- the pull-request body -------------------------------------------------
-
-// The body says WHO reviewed, because a Task's reviewer is no longer implied by
-// its model — and a reader weighing a finding is weighing that model's
-// judgement.
-func TestTheReviewSectionSaysWhoReviewed(t *testing.T) {
-	opr := &taskOpenPR{review: &reviewOutput{
-		Participation: "on",
-		Rounds: []reviewRoundOutput{{
-			Round: 1, Completed: true, AgentType: "codex", Model: "gpt-5.5",
-			Coverage: []reviewCoverageOutput{{Parameter: "security", State: "checked"}},
-		}},
-	}}
-	section := opr.reviewSection()
-	if !strings.Contains(section, "Reviewed by gpt-5.5") {
-		t.Errorf("the review section does not name the reviewer:\n%s", section)
-	}
-	if strings.Contains(section, "rounds") {
-		t.Errorf("a single-round review announced a round count:\n%s", section)
-	}
-
-	// More than one round means the first found something that had to be
-	// fixed, which is part of reading what follows.
-	opr.review.Rounds = append(opr.review.Rounds, reviewRoundOutput{
-		Round: 2, Completed: true, AgentType: "codex", Model: "gpt-5.5",
-		Coverage: []reviewCoverageOutput{{Parameter: "security", State: "checked"}},
-	})
-	if section := opr.reviewSection(); !strings.Contains(section, "Reviewed by gpt-5.5, 2 rounds") {
-		t.Errorf("a two-round review does not carry its round count:\n%s", section)
-	}
-
-	// A review recorded by a runner older than this line names nobody, and
-	// saying nothing beats guessing.
-	opr.review.Rounds = []reviewRoundOutput{{Round: 1, Completed: true}}
-	if section := opr.reviewSection(); strings.Contains(section, "Reviewed by") {
-		t.Errorf("a review with no recorded model claimed one anyway:\n%s", section)
-	}
-}
-
 // The implementer's credential pair never survives into the reviewer's view —
 // not even on the failure path, where the view still exists to name the
 // reviewer in the record. A caller that spawned from it without checking the
@@ -360,56 +321,5 @@ func TestAMalformedReviewerBundleFailsTheRound(t *testing.T) {
 	parameters[parameterKeyString(parameters_enums.ReviewAgentEnvVars)] = "not a map"
 	if _, failure := reviewerParameters(parameters); !strings.Contains(failure, "could not be read") {
 		t.Errorf("a malformed reviewer bundle produced failure %q, want a named read failure", failure)
-	}
-}
-
-// "Reviewed by" names only a review that ran. A round that failed reviewed
-// nothing; naming its model would claim a review that did not happen.
-func TestReviewedByCountsOnlyCompletedRounds(t *testing.T) {
-	failedOnly := &reviewOutput{Participation: "on", Rounds: []reviewRoundOutput{{
-		Round: 1, Completed: false, Model: "gpt-5.5", Error: "no credentials for the reviewer model gpt-5.5",
-		Coverage: []reviewCoverageOutput{{Parameter: "security", State: "not checked"}},
-	}}}
-	if line := reviewedByLine(failedOnly); line != "" {
-		t.Errorf("a review whose only round failed produced %q", line)
-	}
-	mixed := &reviewOutput{Participation: "on", Rounds: []reviewRoundOutput{
-		{Round: 1, Completed: true, Model: "gpt-5.5",
-			Coverage: []reviewCoverageOutput{{Parameter: "security", State: "checked"}}},
-		{Round: 2, Completed: false, Model: "gpt-5.5", Error: "timed out"},
-	}}
-	if line := reviewedByLine(mixed); line != "Reviewed by gpt-5.5.\n\n" {
-		t.Errorf("one completed round of two produced %q, want no round count", line)
-	}
-}
-
-// Completing is not the same as reviewing. A round that checked no parameter
-// looked at nothing, and "Reviewed by gpt-5.5." directly above "No pass
-// examined this change" is what made a reviewer whose sandbox never started
-// read as a reviewer that approved the change.
-func TestReviewedByNamesNobodyWhenNoPassExaminedTheChange(t *testing.T) {
-	examinedNothing := &reviewOutput{Participation: "on", Rounds: []reviewRoundOutput{{
-		Round: 1, Completed: true, AgentType: "codex", Model: "gpt-5.5",
-		Coverage: []reviewCoverageOutput{
-			{Parameter: "security", State: "skipped", Reason: "every command failed"},
-			{Parameter: "correctness", State: "not checked", Reason: "the pass did not run"},
-		},
-	}}}
-	if line := reviewedByLine(examinedNothing); line != "" {
-		t.Errorf("a review that examined nothing produced %q", line)
-	}
-	// And the section it belongs to says so plainly instead.
-	section := (&taskOpenPR{review: examinedNothing}).reviewSection()
-	if strings.Contains(section, "Reviewed by") {
-		t.Errorf("the review section claims a reviewer that examined nothing:\n%s", section)
-	}
-	if !strings.Contains(section, "No pass examined this change") {
-		t.Errorf("the review section does not say nothing was examined:\n%s", section)
-	}
-
-	// One checked parameter in any completed round is a review, and it is named.
-	examinedNothing.Rounds[0].Coverage[0].State = "Checked"
-	if line := reviewedByLine(examinedNothing); line != "Reviewed by gpt-5.5.\n\n" {
-		t.Errorf("a round that checked a parameter produced %q, want the reviewer named", line)
 	}
 }

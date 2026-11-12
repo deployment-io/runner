@@ -6,21 +6,20 @@ import (
 	"unicode/utf8"
 )
 
-// Bounds on the Review section of a pull-request body.
+// Bounds on the "Needs you" part of a pull-request body.
 //
 // A PR body is read by a human in a web page. Every finding the review
-// produced is written to the job log in full, unconditionally, by the Review
-// stage — so these caps decide what is worth a reviewer's first screen, not
-// what is worth keeping. The overflow line names what was left out so nobody
-// mistakes the shortened list for the whole one.
+// produced is on the Task page and in the job log in full — so these caps
+// decide what is worth a reviewer's first screen, not what is worth keeping.
+// The overflow line names what was left out so nobody mistakes the shortened
+// list for the whole one.
 const (
 	reviewSectionMaxRunes = 8000
 	reviewSectionMaxItems = 20
 	// reviewSectionReserveRunes is held back from the findings' allowance for
-	// what has to come AFTER them: the overflow line, the must-fix note, and
-	// the coverage line naming all eight parameters. Without the reserve the
-	// findings would spend the whole budget and the line explaining how much
-	// was omitted would itself be omitted.
+	// what has to come AFTER them: the overflow line and the must-fix note.
+	// Without the reserve the findings would spend the whole budget and the
+	// line explaining how much was omitted would itself be omitted.
 	reviewSectionReserveRunes = 1200
 	reviewLocationMaxRunes    = 200
 	reviewDetailMaxRunes      = 300
@@ -56,28 +55,21 @@ func stripNeedsFixesPrefix(title string) string {
 	return trimmed
 }
 
-// reviewSection renders the Review stage's record into the pull-request body.
+// needsYouSection renders "Needs you": what of the Review stage's record a
+// reviewer has to act on before merging — the sentence saying the review did
+// not complete, and the findings still open, the must-fix ones first. The
+// rest of the review (what was noted, what the loop fixed, the coverage) is on
+// the Task page.
 //
-// Order is deliberate and is the reader's priority order: what is still wrong
-// and must be fixed, then what was sent back for a fix, survived it, and does
-// not hold the pull request, then what was merely noted. What the loop already
-// fixed (which explains why the change looks different from what the
-// implementer first wrote) and the coverage line (which answers "what did you
-// look at" — a question that only arises once the findings have been read)
-// come last, collapsed: they are reference, not verdict.
-//
-// Empty when the Review stage did not run at all, so a Task with review
-// participation Off has no Review section.
-func (opr *taskOpenPR) reviewSection() string {
+// Empty when the Review stage did not run, or completed with nothing open and
+// did not fail.
+func (opr *taskOpenPR) needsYouSection() string {
 	if opr.review == nil || len(opr.review.Rounds) == 0 {
 		return ""
 	}
+	// Each block below opens with its own blank line.
+	const heading = "**Needs you**\n"
 	var sb strings.Builder
-	sb.WriteString("\n---\n")
-	sb.WriteString("**Review**\n\n")
-	sb.WriteString(reviewedByLine(opr.review))
-
-	latest := latestCompletedRound(opr.review)
 	failed := failedFinalRound(opr.review)
 	if failed != nil {
 		// Fail-open, said out loud. A review that could not complete must not
@@ -85,36 +77,46 @@ func (opr *taskOpenPR) reviewSection() string {
 		// The reason is often an agent's own sentence, full stop included;
 		// this sentence adds its own.
 		reason := strings.TrimRight(failed.Error, ". ")
-		sb.WriteString(fmt.Sprintf("The review did not complete: %s. The change was committed and this pull request opened anyway; nothing here has been gated on a review verdict.\n\n", reason))
+		sb.WriteString(fmt.Sprintf("\nThe review did not complete: %s. The change was committed and this pull request opened anyway; nothing here has been gated on a review verdict.\n", reason))
 	}
-	if latest == nil {
-		sb.WriteString(coverageBlock(opr.review.Rounds[len(opr.review.Rounds)-1].Coverage))
-		return boundSection(sb.String())
+	if latest := latestCompletedRound(opr.review); latest != nil {
+		budget := reviewSectionMaxRunes - utf8.RuneCountInString(heading) - utf8.RuneCountInString(sb.String())
+		sb.WriteString(opr.openFindings(latest, failed != nil, budget))
 	}
+	if sb.Len() == 0 {
+		return ""
+	}
+	return boundSection(heading + sb.String())
+}
 
-	sb.WriteString(passesLine(latest.Coverage))
-	stillOpen, notedAfterFix, annotated := splitFindings(latest.Findings)
-	fixed := opr.review.FixedInLoop
+// openFindings renders the must-fix group and the still-open-below-hold group
+// of the latest completed round, with the line on how the last fix attempt
+// ended, the overflow line and the closing must-fix note, within runes. Empty
+// when both groups are.
+func (opr *taskOpenPR) openFindings(latest *reviewRoundOutput, failed bool, runes int) string {
+	stillOpen, notedAfterFix, _ := splitFindings(latest.Findings)
+	if len(stillOpen)+len(notedAfterFix) == 0 {
+		return ""
+	}
 	// The findings are UNVERIFIED when a fix ran after the round that reported
 	// them and nothing re-checked it: the last round failed, or a kept fix run
 	// was never reviewed. Calling them "still open" would assert something
 	// nobody checked.
-	unverified := failed != nil || !opr.review.FinalTreeReviewed
+	unverified := failed || !opr.review.FinalTreeReviewed
 
-	// Both budgets are spent in reader-priority order — the visible groups
-	// first, then the collapsed fixed findings — and the overflow line is
+	// The budgets are spent in reader-priority order, and the overflow line is
 	// written from what is LEFT OVER, so the note that says how much was
 	// dropped is never itself the thing that gets dropped.
-	budget := &renderBudget{items: reviewSectionMaxItems, runes: reviewSectionMaxRunes - utf8.RuneCountInString(sb.String()) - reviewSectionReserveRunes}
-	fixError := strings.TrimSpace(opr.review.FixError)
+	budget := &renderBudget{items: reviewSectionMaxItems, runes: runes - reviewSectionReserveRunes}
 	// The line about how the last fix attempt ended goes under the group that
 	// holds the findings that attempt was sent: the must-fix heading when any
 	// of them holds the pull request, the below-hold heading otherwise.
-	outcome := fixOutcomeLine(opr.review, fixError)
+	outcome := fixOutcomeLine(opr.review, strings.TrimSpace(opr.review.FixError))
 	// The line is written whatever the findings leave, so its runes come out
 	// of the findings' allowance first — a declining fix run's explanation can
 	// be long, and must not push the section past its budget.
 	budget.runes -= utf8.RuneCountInString(outcome)
+	var sb strings.Builder
 	writeFindingGroup(&sb, mustFixHeading(unverified), stillOpen, budget)
 	if len(stillOpen) > 0 {
 		sb.WriteString(outcome)
@@ -123,17 +125,11 @@ func (opr *taskOpenPR) reviewSection() string {
 	if len(stillOpen) == 0 {
 		sb.WriteString(outcome)
 	}
-	writeFindingGroup(&sb, "Noted", annotated, budget)
-	// Built before the overflow line so the overflow count includes it.
-	fixedBlock := fixedDuringReviewBlock(fixed, budget)
-	if omitted := len(stillOpen) + len(notedAfterFix) + len(fixed) + len(annotated) - budget.rendered; omitted > 0 {
-		sb.WriteString(fmt.Sprintf("\n_%d further finding(s) are not shown here — the full review is in the Step's job log._\n", omitted))
+	if omitted := len(stillOpen) + len(notedAfterFix) - budget.rendered; omitted > 0 {
+		sb.WriteString(fmt.Sprintf("\n_%d further finding(s) are not shown here — the full review is on the Task page._\n", omitted))
 	}
 	// One closing line for every way the loop can end with a must-fix finding
-	// open. "Routed back to the agent … after the fix budget ran out" was
-	// false for a must-fix finding first reported in the last round (never
-	// routed back), and for a loop that ended on a failed or no-change fix
-	// round. Findings that did go through a fix round say so themselves
+	// open. Findings that did go through a fix round say so themselves
 	// ("Still present after a fix round"), and the outcome line above says how
 	// the last fix attempt ended.
 	if opr.review.MustFixOpen {
@@ -143,48 +139,18 @@ func (opr *taskOpenPR) reviewSection() string {
 			sb.WriteString("\nThese findings are still open. They need a human.\n")
 		}
 	}
-	sb.WriteString(fixedBlock)
-	sb.WriteString(coverageBlock(latest.Coverage))
-	return boundSection(sb.String())
-}
-
-// fixedDuringReviewBlock renders what the loop already fixed in a collapsed
-// block, spending what the visible groups left of the budget. Empty when
-// there is nothing to show or no budget left to show any of it — the
-// overflow line counts what was not rendered.
-func fixedDuringReviewBlock(fixed []reviewFindingOutput, budget *renderBudget) string {
-	if len(fixed) == 0 || budget.exhausted() {
-		return ""
-	}
-	header := fmt.Sprintf("\n<details><summary>Fixed during review (%d)</summary>\n\n", len(fixed))
-	budget.runes -= utf8.RuneCountInString(header)
-	var findings strings.Builder
-	writeFindings(&findings, fixed, budget)
-	if findings.Len() == 0 {
-		return ""
-	}
-	return header + findings.String() + "\n</details>\n"
-}
-
-// coverageBlock puts the coverage line in a collapsed block, or "" when there
-// is no coverage to show.
-func coverageBlock(coverage []reviewCoverageOutput) string {
-	line := coverageLine(coverage)
-	if line == "" {
-		return ""
-	}
-	return "\n<details><summary>Coverage</summary>\n\n" + line + "\n</details>\n"
+	return sb.String()
 }
 
 // reviewTally is the one line at the top of the body that says what the review
 // did, computed from the same record — and counting exactly the findings — the
-// Review section lists. Empty when the Review stage did not run.
+// Task page lists. Empty when the Review stage did not run.
 func reviewTally(review *reviewOutput) string {
 	if review == nil || len(review.Rounds) == 0 {
 		return ""
 	}
 	if failedFinalRound(review) != nil {
-		return "**Review:** did not complete — details below."
+		return "**Review:** did not complete — details on the Task page."
 	}
 	latest := latestCompletedRound(review)
 	examined := false
@@ -195,10 +161,10 @@ func reviewTally(review *reviewOutput) string {
 		}
 	}
 	if !examined {
-		return "**Review:** nothing was examined — details below."
+		return "**Review:** nothing was examined — details on the Task page."
 	}
 	if !review.FinalTreeReviewed {
-		return "**Review:** the last fix was not re-checked — details below."
+		return "**Review:** the last fix was not re-checked — details on the Task page."
 	}
 	fixed, mustFix, noted := len(review.FixedInLoop), 0, 0
 	for _, f := range latest.Findings {
@@ -294,55 +260,6 @@ func quoteBlock(text string) string {
 	return sb.String()
 }
 
-// reviewedByLine says WHO reviewed, because that is no longer implied by the
-// Task. A Task may run its review rounds on a model other than the one that
-// implemented the change, and a reader weighing a finding — or the absence of
-// one — is weighing the judgement of whichever model actually made it.
-//
-// ONLY ROUNDS THAT COMPLETED AND EXAMINED SOMETHING COUNT. A round that failed
-// before or during its run reviewed nothing, so naming its model as the
-// reviewer would claim a review that did not happen — the failure sentence
-// below already says what went wrong. Nor is completing enough on its own: a
-// round that checked no parameter looked at nothing either, and "Reviewed by
-// gpt-5.5." sitting directly above "No pass examined this change" is the
-// sentence that made a reviewer whose sandbox never started read as a reviewer
-// that approved the change. With no such round the line is omitted. The model
-// is read from the rounds themselves rather than from the Job, so it names the
-// reviewer that ran; empty for a review recorded by a runner older than this
-// line, where saying nothing beats guessing.
-//
-// The round count comes along when more than one round completed, since "two
-// rounds" means the first round found something that had to be fixed — which
-// is part of reading what follows.
-func reviewedByLine(review *reviewOutput) string {
-	var model string
-	completed := 0
-	examined := false
-	for i := len(review.Rounds) - 1; i >= 0; i-- {
-		round := review.Rounds[i]
-		if !round.Completed {
-			continue
-		}
-		completed++
-		if model == "" {
-			model = strings.TrimSpace(round.Model)
-		}
-		for _, c := range round.Coverage {
-			if coverageChecked(c.State) {
-				examined = true
-				break
-			}
-		}
-	}
-	if model == "" || !examined {
-		return ""
-	}
-	if completed > 1 {
-		return fmt.Sprintf("Reviewed by %s, %d rounds.\n\n", model, completed)
-	}
-	return fmt.Sprintf("Reviewed by %s.\n\n", model)
-}
-
 // mustFixHeading names what the must-fix findings actually are, which depends
 // on whether the last completed round reviewed the tree being committed.
 //
@@ -381,46 +298,6 @@ func failedFinalRound(review *reviewOutput) *reviewRoundOutput {
 		return nil
 	}
 	return last
-}
-
-// passesLine names what actually ran, so "no findings" is readable as a
-// verdict rather than as a silence.
-func passesLine(coverage []reviewCoverageOutput) string {
-	var ran []string
-	for _, c := range coverage {
-		if coverageChecked(c.State) {
-			ran = append(ran, c.Parameter)
-		}
-	}
-	if len(ran) == 0 {
-		return "No pass examined this change — see the coverage line below for why.\n"
-	}
-	return fmt.Sprintf("Passes run: %s.\n", strings.Join(ran, ", "))
-}
-
-// coverageLine names ALL EIGHT parameters and what happened to each, on one
-// line. Eight short answers beat a table nobody reads, and the point is that a
-// parameter nothing ran for is visibly different from one that came back
-// clean.
-//
-// A round that examined nothing (notCheckedCoverage) has eight entries saying
-// the same thing; that reads as one line naming the reason once.
-func coverageLine(coverage []reviewCoverageOutput) string {
-	if len(coverage) == 0 {
-		return ""
-	}
-	if reason, ok := sharedNotCheckedReason(coverage); ok {
-		return "Coverage — every parameter not checked (" + reason + ")\n"
-	}
-	parts := make([]string, 0, len(coverage))
-	for _, c := range coverage {
-		part := fmt.Sprintf("%s: %s", c.Parameter, strings.ToLower(strings.TrimSpace(c.State)))
-		if reason := strings.TrimSpace(c.Reason); reason != "" {
-			part += " (" + reason + ")"
-		}
-		parts = append(parts, part)
-	}
-	return "Coverage — " + strings.Join(parts, "; ") + "\n"
 }
 
 // sharedNotCheckedReason reports the one reason when every coverage entry is
@@ -522,16 +399,16 @@ func renderFinding(f reviewFindingOutput) string {
 }
 
 // boundSection is the last guard: whatever the per-finding caps allowed, the
-// section as a whole stays within its rune budget, and says so when it is cut.
+// "Needs you" part as a whole stays within its rune budget, and says so when
+// it is cut.
 func boundSection(section string) string {
 	if utf8.RuneCountInString(section) <= reviewSectionMaxRunes {
 		return section
 	}
 	runes := []rune(section)
-	// The cut lands near the end, which is where the collapsed blocks are; one
-	// left open would swallow everything after it on GitHub — the blocked
-	// hosts, the trailer, and this very note.
-	return closeOpenDetails(string(runes[:reviewSectionMaxRunes])) + "\n\n_The Review section was truncated — the full review is in the Step's job log._\n"
+	// A block left open by the cut would swallow everything after it on
+	// GitHub — the parts below, the trailer, and this very note.
+	return closeOpenDetails(string(runes[:reviewSectionMaxRunes])) + "\n\n_This list was truncated — the full review is on the Task page._\n"
 }
 
 // capRunes truncates to n runes with an ellipsis, counting runes rather than

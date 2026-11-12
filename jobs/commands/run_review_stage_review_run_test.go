@@ -10,10 +10,10 @@ import (
 
 // --- what a review run contributes to the Step's record ----------------------
 
-// A REVIEWER'S BLOCKED HOSTS ARE NOT THE STEP'S. The pull request's blocked-host
-// section tells the user to add what it lists to Tasks → Allowed Hosts, and a
-// Codex reviewer's startup calls (github.com, api.github.com, chatgpt.com) turned
-// up there on a pull request whose implementer never tried to reach them.
+// A REVIEWER'S BLOCKED HOSTS ARE NOT THE STEP'S. The Step's blocked hosts are
+// what the user is told to add to Tasks → Allowed Hosts, and a Codex reviewer's
+// startup calls (github.com, api.github.com, chatgpt.com) turned up there on a
+// Step whose implementer never tried to reach them.
 func TestAReviewRoundsBlockedHostsStayOutOfTheStepsRecord(t *testing.T) {
 	workDir := t.TempDir()
 	writeFile(t, filepath.Join(workDir, "0-acme/api", "handler.go"), "the implementation\n")
@@ -40,19 +40,8 @@ func TestAReviewRoundsBlockedHostsStayOutOfTheStepsRecord(t *testing.T) {
 		t.Fatalf("run: %s", err)
 	}
 
-	hosts, err := readDeniedHostsFromJobOutput(out)
-	if err != nil {
-		t.Fatalf("readDeniedHostsFromJobOutput: %s", err)
-	}
-	if len(hosts) != 1 || hosts[0] != "registry.internal" {
+	if hosts := decodeJobOutput(t, out).Agent.DeniedHosts; len(hosts) != 1 || hosts[0] != "registry.internal" {
 		t.Errorf("the Step's blocked hosts = %v, want only what the implement run tried to reach", hosts)
-	}
-	// Which is what keeps them off the pull request, where they read as advice.
-	section := (&taskOpenPR{deniedHosts: hosts}).blockedHostsSection()
-	for _, host := range []string{"api.github.com", "chatgpt.com"} {
-		if strings.Contains(section, host) {
-			t.Errorf("the pull request asks the user to allow %s, which only the reviewer wanted:\n%s", host, section)
-		}
 	}
 	// They are not lost, though: whoever is debugging the reviewer needs them.
 	if !strings.Contains(logs.String(), "Review round 1: the reviewer's requests to these hosts were blocked: api.github.com, chatgpt.com") {
@@ -74,15 +63,8 @@ func TestAFixRunsBlockedHostsStillReachTheStepsRecord(t *testing.T) {
 		t.Fatalf("recordFixRunResult: %s", err)
 	}
 
-	hosts, err := readDeniedHostsFromJobOutput(parameters)
-	if err != nil {
-		t.Fatalf("readDeniedHostsFromJobOutput: %s", err)
-	}
-	if len(hosts) != 1 || hosts[0] != "proxy.corp" {
+	if hosts := decodeJobOutput(t, parameters).Agent.DeniedHosts; len(hosts) != 1 || hosts[0] != "proxy.corp" {
 		t.Fatalf("the Step's blocked hosts = %v, want the fix run's own", hosts)
-	}
-	if !strings.Contains((&taskOpenPR{deniedHosts: hosts}).blockedHostsSection(), "proxy.corp") {
-		t.Error("the fix run's blocked host never reached the pull request")
 	}
 }
 

@@ -18,7 +18,7 @@ import (
 const reviewCommentsMax = 30
 
 // reviewCommentsBody is the review's own text. It does not say "the full review
-// is in the description": the description's Review section is capped and sends
+// is in the description": the description's "Needs you" part is capped and sends
 // its overflow to the job log. The count is the provider's placeholder for the
 // number of comments actually posted: the server drops comments that are not
 // on the diff after this body is written.
@@ -249,7 +249,7 @@ func findingClassRank(f reviewFindingOutput) int {
 }
 
 // reviewCommentBody renders one finding as a comment. Plain and bounded by the
-// Review section's caps; every model-written field goes through
+// "Needs you" part's caps; every model-written field goes through
 // neutraliseModelText.
 func reviewCommentBody(f reviewFindingOutput) string {
 	var sb strings.Builder

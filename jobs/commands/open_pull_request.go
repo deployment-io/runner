@@ -48,26 +48,16 @@ func (opr *OpenPullRequest) Run(parameters map[string]interface{}, logsWriter io
 	if err != nil {
 		return parameters, fmt.Errorf("error reading commit-and-push output: %s", err)
 	}
-	deniedHosts, err := readDeniedHostsFromJobOutput(parameters)
-	if err != nil {
-		// Defensive: a malformed JobOutput here shouldn't fail the PR open
-		// (the PR is the user-facing artifact and we want it to land).
-		// Log and continue with no deny-section in the PR body.
-		io.WriteString(logsWriter, fmt.Sprintf("warning: could not read denied_hosts from job output: %s\n", err))
-		deniedHosts = nil
-	}
 	jobID, _ := jobs.GetParameterValue[string](parameters, parameters_enums.JobID)
 	opener := &taskOpenPR{
 		ctx:          ctx,
 		jobID:        jobID,
 		logsWriter:   logsWriter,
-		deniedHosts:  deniedHosts,
 		agentSummary: readAgentSummaryFromJobOutput(parameters),
 		agentPRTitle: readAgentPRTitleFromJobOutput(parameters),
 		verifyResult: readVerifyResultFromJobOutput(parameters),
 		review:       readReviewFromJobOutput(parameters),
 		qa:           readQAFromJobOutput(parameters),
-		acceptance:   readAcceptanceCriteria(parameters),
 	}
 	prOutputs, err := opener.openAll(hasChangesByIndex)
 	if err != nil {
@@ -82,18 +72,10 @@ func (opr *OpenPullRequest) Run(parameters map[string]interface{}, logsWriter io
 // taskOpenPR bundles the per-Step-Job state for the per-repo loop.
 // Mirrors the taskCheckout / taskCommitPush pattern. No token cache
 // here — token lookup happens server-side in the RPC.
-//
-// deniedHosts carries the agentbox proxy's allowlist-deny set for this
-// Step run (sourced from the agent block of JobOutput, which RunAgentStep
-// populated from /result.json). Surfaced in the PR body so reviewers see
-// what hosts the agent tried to reach but couldn't — closes the
-// feedback loop on org-level allowlist tuning. Empty when no allowlist
-// denies happened during the Step.
 type taskOpenPR struct {
 	ctx          commandUtils.TaskJobContext
 	jobID        string // the Step Job's, for its progress events
 	logsWriter   io.Writer
-	deniedHosts  []string
 	agentSummary string // agent.changes_summary from /result.json; "" when missing
 	// agentPRTitle is the agent-produced short PR title from /result.json
 	// (newer agentbox images that emit pr_title). Empty when the agentbox
@@ -107,20 +89,16 @@ type taskOpenPR struct {
 	// review is the Review stage's record for this Step run. Nil when the
 	// stage did not run — a Task with review participation Off, or a Job
 	// created before the stage existed — in which case the PR body carries no
-	// Review section and looks exactly as it did before.
+	// review tally and no "Needs you".
 	review *reviewOutput
 	// qa is the QA stage's record for this Step run. Nil when the stage did not
-	// run, in which case the body has no QA line or section. It is advisory: it
-	// never touches needsFixes, the title or the draft state.
+	// run, in which case the body has no QA line. It is advisory: it never
+	// touches needsFixes, the title or the draft state.
 	qa *qaOutput
-	// acceptance is the Task's acceptance criteria, read off the ReviewSpec
-	// parameter (see readAcceptanceCriteria). Nil for a Task without a
-	// structured spec, in which case the body has no "What the Task asks for".
-	acceptance []string
 	// pullRequests is the deployment-server RPC surface this command uses.
 	// Nil means the runner client; tests substitute a stub.
 	pullRequests pullRequestRPC
-	// taskPreviews lists the Task's previews for the body's Preview part. Nil
+	// taskPreviews lists the Task's previews for the body's Previews part. Nil
 	// means the runner client; tests substitute a stub.
 	taskPreviews taskPreviewRPC
 	// prsOpened and prsUpdated count this run's pull requests, for the stage's
@@ -262,19 +240,14 @@ func (opr *taskOpenPR) needsFixes() bool {
 // than we do.
 const (
 	prBodyMaxRunes = 60000
-	// prBodyDeniedHostsMaxItems bounds the blocked-host list. A run that was
-	// denied hundreds of hosts was denied the same handful over and over in
-	// practice; the count in the overflow line is what the reader needs past
-	// the first fifty names.
-	prBodyDeniedHostsMaxItems = 50
 	// prBodyVerifyOverflowReserveRunes is held back from whatever budget the
 	// "How it was checked" section is given for the line saying how many steps were
 	// left out, so the note about what was dropped is never itself the thing
 	// that gets dropped.
 	prBodyVerifyOverflowReserveRunes = 200
-	// prSummaryTruncatedNote goes where the summary was cut. The Task-URL
-	// line above it is what "the Task page" refers to, so the note needs no
-	// link of its own.
+	// prSummaryTruncatedNote goes where the summary was cut. The details line
+	// and the trailer's Task-URL line are what "the Task page" refers to, so
+	// the note needs no link of its own.
 	prSummaryTruncatedNote = "\n\n_The summary was truncated. The full text is on the Task page._"
 	// prBodyTruncatedNote goes at the end of a body that had to be cut below
 	// the summary — the last guard's note, for the case where dropping the
@@ -286,65 +259,65 @@ const (
 // is decided by subjectAndLeadIn (agent pr_title > changes_summary
 // first line > generic fallback; see that function for the policy).
 //
-// The body has a fixed layout, every part left out when it has nothing to
-// show: the one-line review tally, the one-line QA status, the Task's previews, "Before deploying" (the configuration the
-// change needs that its environment lacks), the agent's summary, what the Task
-// asks for, how the change was checked, the Review section, the "QA on a
-// preview" section, the blocked hosts, and the trailer last. What a reviewer reads first is what the review did and
-// what the change is; the reference material sits below it, collapsed.
+// The body is kept to what someone reviewing on GitHub needs before merging;
+// the Task page, which is live while this body is written once, carries the
+// rest. It has a fixed layout, every part left out when it has nothing to
+// show: the one-line review tally, the one-line QA status, the line pointing
+// to the Task page, "Before deploying" (the configuration the change needs
+// that its environment lacks), the agent's summary, "Needs you" (the review
+// findings still open and what stopped the review), how the change was
+// checked, the Task's previews, and the trailer last.
 //
 // EVERYTHING EXCEPT THE SUMMARY IS BUILT FIRST and the summary is given what
-// is left of prBodyMaxRunes. Each of those parts is bounded — the Review
-// section by reviewSectionMaxRunes, the Preview part by its line and name caps, "Before deploying" by its entry cap and
-// its capped names, the criteria and blocked hosts by their
-// item caps, a verify step's output by boundVerifyTail — and the agent's
-// summary is the one part that is not, so it is the part that yields when the
-// body has to fit.
+// is left of prBodyMaxRunes. Each of those parts is bounded — "Needs you" by
+// reviewSectionMaxRunes, the Previews part by its line and name caps, "Before
+// deploying" by its entry cap and its capped names, a verify step's output by
+// boundVerifyTail — and the agent's summary is the one part that is not, so it
+// is the part that yields when the body has to fit.
 //
 // The body as a whole is bounded LAST and unconditionally. Giving the summary
 // what is left over is what keeps an ordinary pull request readable; it is not
 // what makes the cap hold. Those parts' own bounds are several, and several
 // bounded parts still add up — plus the trailer carries a Task title of any
 // length. The last cut is the one that guarantees the pull request opens.
-//
-// The QA section is advisory, so it is the first bounded part to go: when the
-// parts around the summary do not fit on their own it is dropped whole, before
-// the last cut can reach the Review section. Its status line stays.
 func (opr *taskOpenPR) buildPRTitleAndBody() (string, string) {
 	subject, leadIn := opr.subjectAndLeadIn()
 	tally := reviewTally(opr.review)
 	qaLine := qaStatusLine(opr.qa)
-	preview := opr.previewSection()
+	details := opr.detailsLine()
 	deploy := beforeDeployingSection(opr.review, opr.ctx.DashboardURL)
-	asks := acceptanceSection(opr.acceptance)
-	review := strings.Trim(opr.reviewSection(), "\n")
-	qa := strings.Trim(opr.qaSection(), "\n")
-	hosts := opr.blockedHostsSection()
+	needsYou := opr.needsYouSection()
+	previews := opr.previewSection()
 	trailer := opr.trailer()
 	// "How it was checked" is the one part here with no bound of its own — a
 	// step's output is bounded by boundVerifyTail, but the number of failing
 	// steps follows the Task's repositories — so it is given what the rest of
 	// the body leaves, less the separator in front of it.
-	others := joinBodyParts(tally, qaLine, preview, deploy, asks, review, qa, hosts, trailer) + "\n"
-	if qa != "" && overBodyBudget(others) {
-		qa = ""
-		others = joinBodyParts(tally, qaLine, preview, deploy, asks, review, hosts, trailer) + "\n"
-	}
+	others := joinBodyParts(tally, qaLine, details, deploy, needsYou, previews, trailer) + "\n"
 	checked := opr.howCheckedSection(prBodyMaxRunes - utf8.RuneCountInString(others) - len(bodyPartSeparator))
-	rest := joinBodyParts(tally, qaLine, preview, deploy, asks, checked, review, qa, hosts, trailer) + "\n"
-	if qa != "" && overBodyBudget(rest) {
-		qa = ""
-		rest = joinBodyParts(tally, qaLine, preview, deploy, asks, checked, review, hosts, trailer) + "\n"
-	}
+	rest := joinBodyParts(tally, qaLine, details, deploy, needsYou, checked, previews, trailer) + "\n"
 	leadIn = boundPRSummary(leadIn, prBodyMaxRunes-utf8.RuneCountInString(rest)-len(bodyPartSeparator))
-	body := joinBodyParts(tally, qaLine, preview, deploy, leadIn, asks, checked, review, qa, hosts, trailer) + "\n"
+	body := joinBodyParts(tally, qaLine, details, deploy, leadIn, needsYou, checked, previews, trailer) + "\n"
 	return subject, cutToRuneBudget(body, prBodyMaxRunes, prBodyTruncatedNote)
 }
 
-// overBodyBudget reports whether the parts around the summary leave it no
-// room at all — the point past which the last cut would start eating them.
-func overBodyBudget(parts string) bool {
-	return utf8.RuneCountInString(parts)+len(bodyPartSeparator) > prBodyMaxRunes
+// detailsLine points a reviewer at the Task page for everything the body
+// leaves out. Empty when the Task has no dashboard URL.
+func (opr *taskOpenPR) detailsLine() string {
+	url := opr.taskPageURL()
+	if url == "" {
+		return ""
+	}
+	return fmt.Sprintf("**Details:** review, QA results, previews and logs on the [Task page](%s)", url)
+}
+
+// taskPageURL is the Task's page in the dashboard, or "" when the Task has no
+// dashboard URL.
+func (opr *taskOpenPR) taskPageURL() string {
+	if len(opr.ctx.DashboardURL) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("%s/tasks/%s", strings.TrimRight(opr.ctx.DashboardURL, "/"), opr.ctx.TaskID)
 }
 
 // bodyPartSeparator is the blank line between two parts of the body.
@@ -369,13 +342,13 @@ func (opr *taskOpenPR) trailer() string {
 	sb.WriteString("---\n")
 	sb.WriteString("Generated-By: deployment.io Tasks\n")
 	sb.WriteString(fmt.Sprintf("Task: %s\n", opr.ctx.TaskTitle))
-	if len(opr.ctx.DashboardURL) > 0 {
-		sb.WriteString(fmt.Sprintf("Task-URL: %s/tasks/%s\n", strings.TrimRight(opr.ctx.DashboardURL, "/"), opr.ctx.TaskID))
+	if url := opr.taskPageURL(); url != "" {
+		sb.WriteString(fmt.Sprintf("Task-URL: %s\n", url))
 	}
 	return sb.String()
 }
 
-// Bounds on the Preview part.
+// Bounds on the Previews part.
 const (
 	prBodyPreviewMaxItems     = 5
 	prBodyPreviewNameMaxRunes = 100
@@ -396,15 +369,15 @@ func (opr *taskOpenPR) previewSection() string {
 	return formatPreviewSection(previews)
 }
 
-// formatPreviewSection renders the Preview part: at most prBodyPreviewMaxItems
-// lines, each name cut to prBodyPreviewNameMaxRunes. Empty for no previews.
+// formatPreviewSection renders the Previews part: at most prBodyPreviewMaxItems
+// lines, each name cut to prBodyPreviewNameMaxRunes, then one sentence on when
+// they go away. Empty for no previews.
 func formatPreviewSection(previews []task_previews.TaskPreviewV1) string {
 	if len(previews) == 0 {
 		return ""
 	}
 	var sb strings.Builder
-	sb.WriteString("**Preview**\n\n")
-	sb.WriteString("Previews of this Task's change:\n\n")
+	sb.WriteString("**Previews**\n\n")
 	shown := previews
 	if len(shown) > prBodyPreviewMaxItems {
 		shown = shown[:prBodyPreviewMaxItems]
@@ -419,12 +392,12 @@ func formatPreviewSection(previews []task_previews.TaskPreviewV1) string {
 	if omitted := len(previews) - len(shown); omitted > 0 {
 		sb.WriteString(fmt.Sprintf("- and %d more under Resources → Previews in the dashboard\n", omitted))
 	}
-	sb.WriteString("\nA preview shows the code as of its last deploy, which can be earlier than this pull request's final commit. ")
-	sb.WriteString("Previews are removed once all of this Task's pull requests are merged or closed, about 72 hours after its last preview deploy, or when the Task is deleted — whichever comes first.")
+	sb.WriteString("\nPreviews are temporary: they are removed once this Task's pull requests are merged or closed, or after they sit idle ")
 	if hasBackendPreview(previews) {
-		sb.WriteString(" Backend previews are removed sooner, about 4 hours after the Task's last preview deploy.")
+		sb.WriteString("(about 72 hours; backend previews about 4).\n")
+	} else {
+		sb.WriteString("(about 72 hours).\n")
 	}
-	sb.WriteString("\n")
 	return sb.String()
 }
 
@@ -437,33 +410,6 @@ func hasBackendPreview(previews []task_previews.TaskPreviewV1) bool {
 		}
 	}
 	return false
-}
-
-// blockedHostsSection lists the hostnames the agentbox proxy denied during
-// this Step, so the PR reviewer can see what the agent tried to reach — helps
-// diagnose "agent gave up because it couldn't fetch X" without digging
-// through container logs. Collapsed, with the count in its summary: it is
-// reference material, not what a reviewer reads first. Empty when nothing was
-// denied.
-func (opr *taskOpenPR) blockedHostsSection() string {
-	if len(opr.deniedHosts) == 0 {
-		return ""
-	}
-	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("<details><summary>Hosts the agent was blocked from reaching (%d)</summary>\n\n", len(opr.deniedHosts)))
-	sb.WriteString("The agent attempted to reach the following hostnames but they weren't on the allowlist. Add them to your org's Tasks → Allowed Hosts settings if expected:\n\n")
-	shown := opr.deniedHosts
-	if len(shown) > prBodyDeniedHostsMaxItems {
-		shown = shown[:prBodyDeniedHostsMaxItems]
-	}
-	for _, h := range shown {
-		sb.WriteString(fmt.Sprintf("- `%s`\n", h))
-	}
-	if omitted := len(opr.deniedHosts) - len(shown); omitted > 0 {
-		sb.WriteString(fmt.Sprintf("- and %d more\n", omitted))
-	}
-	sb.WriteString("\n</details>\n")
-	return sb.String()
 }
 
 // boundPRSummary fits the agent's narrative into the runes the rest of the
@@ -522,11 +468,8 @@ func closeOpenDetails(text string) string {
 	return text
 }
 
-// Bounds on "What the Task asks for".
-const (
-	prBodyAcceptanceMaxItems = 20
-	prBodyAcceptanceMaxRunes = 300
-)
+// prBodyAcceptanceMaxRunes caps one acceptance criterion.
+const prBodyAcceptanceMaxRunes = 300
 
 // readAcceptanceCriteria reads the Task's acceptance criteria off the Job's
 // ReviewSpec parameter, which kit stamps on every Step Job.
@@ -535,11 +478,7 @@ const (
 // marshalled with no json tags, so the criteria sit under "Acceptance"; for a
 // Task without one it is the prose Description, which carries no criteria.
 // Only a value that is a JSON object is decoded, and only that one key is
-// read: nothing else from the spec belongs in the body. Nil when there are no
-// non-blank criteria — the section is then left out.
-//
-// The criteria are the Task's, not the Step's, so a multi-Step Task shows all
-// of them on every Step's pull request.
+// read. Nil when there are no non-blank criteria.
 func readAcceptanceCriteria(parameters map[string]interface{}) []string {
 	spec, err := jobs.GetParameterValue[string](parameters, parameters_enums.ReviewSpec)
 	if err != nil {
@@ -597,28 +536,6 @@ func stripRerunInstructions(spec string) string {
 		return spec[i+len(reviewSpecMarker):]
 	}
 	return spec
-}
-
-// acceptanceSection renders "What the Task asks for": the Task's acceptance
-// criteria, one bullet each, so a reviewer reads the change against what was
-// asked. Empty when there are none.
-func acceptanceSection(criteria []string) string {
-	if len(criteria) == 0 {
-		return ""
-	}
-	var sb strings.Builder
-	sb.WriteString("**What the Task asks for**\n\n")
-	shown := criteria
-	if len(shown) > prBodyAcceptanceMaxItems {
-		shown = shown[:prBodyAcceptanceMaxItems]
-	}
-	for _, c := range shown {
-		sb.WriteString("- " + c + "\n")
-	}
-	if omitted := len(criteria) - len(shown); omitted > 0 {
-		sb.WriteString(fmt.Sprintf("- and %d more on the Task page\n", omitted))
-	}
-	return sb.String()
 }
 
 // howCheckedSection renders "How it was checked": deployment.io's own verify
@@ -804,27 +721,6 @@ func (opr *taskOpenPR) mergeIntoJobOutput(parameters map[string]interface{}, out
 	return nil
 }
 
-// readDeniedHostsFromJobOutput pulls the agentbox proxy's allowlist
-// deny set that RunAgentStep wrote to the accumulated JobOutput. Empty
-// slice on missing/malformed payloads — caller treats absence as "no
-// denies" rather than failing the PR open. Mirrors the
-// readHasChangesFromJobOutput shape; both read different fields off
-// the same envelope.
-func readDeniedHostsFromJobOutput(parameters map[string]interface{}) ([]string, error) {
-	existing, err := jobs.GetParameterValue[string](parameters, parameters_enums.JobOutput)
-	if err != nil || len(existing) == 0 {
-		return nil, nil
-	}
-	var data jobOutputData
-	if err := json.Unmarshal([]byte(existing), &data); err != nil {
-		return nil, err
-	}
-	if data.Agent == nil {
-		return nil, nil
-	}
-	return data.Agent.DeniedHosts, nil
-}
-
 // readAgentPRTitleFromJobOutput pulls the agent.pr_title field that
 // RunAgentStep populated from agentbox's /result.json. Returns "" on
 // missing/malformed payloads so the caller's fallback path (truncated
@@ -849,7 +745,7 @@ func readAgentPRTitleFromJobOutput(parameters map[string]interface{}) string {
 // RunAgentStep wrote to the accumulated JobOutput. Nil on a missing or
 // malformed payload — the PR is the user-facing artifact and must still land;
 // the worst case is a PR body without the "How it was checked" section, and the job
-// log still carries the warning. Mirrors readDeniedHostsFromJobOutput; both
+// log still carries the warning. Mirrors readAgentPRTitleFromJobOutput; both
 // read different fields off the same envelope.
 func readVerifyResultFromJobOutput(parameters map[string]interface{}) *verifyResult {
 	existing, err := jobs.GetParameterValue[string](parameters, parameters_enums.JobOutput)
