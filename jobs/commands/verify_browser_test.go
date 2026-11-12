@@ -667,6 +667,35 @@ func TestVerifyBrowser_MinImageVersion(t *testing.T) {
 	}
 }
 
+// A check that signs in names the feature in its refusal; the back step's stays
+// as it was.
+func TestVerifyBrowser_MinImageFeature(t *testing.T) {
+	t.Setenv(verifyBrowserImageEnv, "")
+	const ref = "docker.io/deploymenthq/verify-browser:1.4.0"
+	for _, tc := range []struct {
+		min, feature, want string
+	}{
+		{"1.5.0", "signing in", ": the QA browser image " + ref + " doesn't support signing in (it needs verify-browser 1.5.0 or later)"},
+		{"1.5.0", "", ": the QA browser image " + ref + " doesn't support the back step (it needs verify-browser 1.5.0 or later); check without it, for example with a goto to the earlier page"},
+	} {
+		d := &fakeVerifyDocker{run: writeResult(`{"schema_version":1,"status":"completed","verdict":"pass"}`)}
+		v := newTestVerifyBrowser(t, d)
+		req := verifyRequest()
+		req.ImageRef, req.MinImageVersion, req.MinImageFeature = ref, tc.min, tc.feature
+		_, err := v.run(context.Background(), req, nil)
+		if err == nil || !errors.Is(err, agenttools.ErrVerifyBrowserNotRun) || !strings.HasSuffix(err.Error(), tc.want) {
+			t.Errorf("feature %q: err = %v, want one ending %q", tc.feature, err, tc.want)
+		}
+		if d.pulls != 0 || len(d.created) != 0 {
+			t.Errorf("feature %q: pulled %d, created %d; want nothing", tc.feature, d.pulls, len(d.created))
+		}
+	}
+	// The pinned image signs in.
+	if verifyBrowserImage != "docker.io/deploymenthq/verify-browser:1.5.0" || !imageVersionAtLeast(verifyBrowserImage, "1.5.0") {
+		t.Errorf("verifyBrowserImage = %s, want verify-browser 1.5.0", verifyBrowserImage)
+	}
+}
+
 // A check whose agent run ends returns at once and still removes its container.
 func TestVerifyBrowser_CancelledCheckReturnsAndRemovesTheContainer(t *testing.T) {
 	d := &fakeVerifyDocker{present: true}
@@ -750,5 +779,17 @@ func TestVerifyBrowser_CancelledCheckDoesNotWaitForRemoval(t *testing.T) {
 			t.Fatal("the slot wasn't freed after the container was removed")
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestTailWriterReportsACut(t *testing.T) {
+	w := &tailWriter{max: 8}
+	w.Write([]byte("12345678"))
+	if w.cut || string(w.buf) != "12345678" {
+		t.Fatalf("buf %q, cut %v", w.buf, w.cut)
+	}
+	w.Write([]byte("9"))
+	if !w.cut || string(w.buf) != "23456789" {
+		t.Fatalf("buf %q, cut %v", w.buf, w.cut)
 	}
 }

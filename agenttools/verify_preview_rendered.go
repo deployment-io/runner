@@ -34,8 +34,11 @@ import (
 
 const (
 	verifyRenderedDefaultTimeoutSeconds = 45
-	verifyRenderedMinTimeoutSeconds     = 5
-	verifyRenderedMaxTimeoutSeconds     = 90
+	// verifyRenderedSignInTimeoutSeconds is the default of a check with as: the
+	// sign-in comes out of the same budget.
+	verifyRenderedSignInTimeoutSeconds = 60
+	verifyRenderedMinTimeoutSeconds    = 5
+	verifyRenderedMaxTimeoutSeconds    = 90
 	// verifyRenderedMaxCalls bounds how many times one agent run may call the tool —
 	// every call counts, including ones that return "preparing" or an error. One
 	// page at two window sizes is two calls.
@@ -78,10 +81,20 @@ type VerifyBrowserRequest struct {
 	// MinImageVersion is the oldest verify-browser release (X.Y.Z) that can run
 	// this check, "" for any. The runner refuses an older image without running it.
 	MinImageVersion string
+	// MinImageFeature names, for the refusal, what needs MinImageVersion
+	// (e.g. "signing in"); "" is the back step.
+	MinImageFeature string
 }
 
 // verifyBrowserBackVersion is the first verify-browser release with the back step.
 const verifyBrowserBackVersion = "1.4.0"
+
+// verifyBrowserSignInVersion is the first verify-browser release with sign_in,
+// and verifyBrowserSignInFeature what an older image is refused for.
+const (
+	verifyBrowserSignInVersion = "1.5.0"
+	verifyBrowserSignInFeature = "signing in"
+)
 
 // VerifyBrowserOutcome is what one verify-browser run left behind.
 type VerifyBrowserOutcome struct {
@@ -93,7 +106,9 @@ type VerifyBrowserOutcome struct {
 	// Result is /io/result.json, nil when the container wrote none.
 	Result []byte
 	// Output is the container's output (its tail, when long).
-	Output    string
+	Output string
+	// OutputCut: Output is a tail, its start cut.
+	OutputCut bool
 	ExitCode  int
 	TimedOut  bool // the container overran its wall clock and was stopped
 	OOMKilled bool
@@ -148,6 +163,14 @@ const verifyPreviewRenderedInputSchema = `{
       "maximum": 90,
       "description": "The whole check's time budget (default 45, max 90)."
     },
+    "as": {
+      "type": "string",
+      "description": "Optional: check the page signed in as this role — one of the roles listed under this site preview to sign in as in the browser."
+    },
+    "backend": {
+      "type": "string",
+      "description": "Optional, only with as: the backend repository whose role as is, when that role is listed for more than one of this site preview's backends."
+    },
     "viewport": {
       "type": "object",
       "description": "Optional window size for this check — one size per call; default desktop, 1280×720. Either {\"preset\":\"desktop\"} (1280×720), {\"preset\":\"tablet\"} (712×1138, an emulated Galaxy Tab S4: touch, mobile user agent) or {\"preset\":\"mobile\"} (412×839, an emulated Pixel 7: touch, mobile user agent), or {\"width\":W,\"height\":H} with integers 320–2560 and 480–1600 (no device emulation). Not both forms.",
@@ -185,7 +208,13 @@ const verifyPreviewRenderedDescription = "Load a preview in a real browser (head
 	"Requests to private, internal or cloud-metadata addresses are always refused by design; never report that as something " +
 	"to allow or fix. If the result has status \"preparing\", the browser is being set up on this runner: call " +
 	"verify_preview_rendered again with the same arguments in a minute. At most 30 calls per run — every call counts, " +
-	"including \"preparing\" replies and errors."
+	"including \"preparing\" replies and errors.\n\n" +
+	"Signed in: to check a page signed in, pass as = one of the roles listed under that site preview to sign in as in the " +
+	"browser, and backend too when that role is listed for more than one of its backends. deployment.io signs in on the " +
+	"app's own sign-in page with the role's test user before the check; you never see the email or password. When url is " +
+	"the site's front page (path /, no query), the check starts on the page the app shows after signing in. Any other url, " +
+	"and any goto step, is a full page load, which can sign the browser out on a preview; move between pages by clicking. " +
+	"The result's sign_in says how the sign-in went."
 
 // verifyRenderedStep is one step, in the contract's shape.
 type verifyRenderedStep struct {
@@ -214,6 +243,10 @@ type verifyRenderedArgs struct {
 	// rather than silently decoded; parseVerifyRenderedArgs fills viewport.
 	Viewport json.RawMessage `json:"viewport"`
 	viewport *verifyRenderedViewport
+	// As is the role to sign in as and Backend the backend repository it is a
+	// role of (only with As); both trimmed, "" when absent.
+	As      string `json:"as"`
+	Backend string `json:"backend"`
 }
 
 // verifyRenderedViewport is input.json's viewport: a preset, or a width and height.
@@ -239,6 +272,17 @@ type verifyBrowserInput struct {
 	// RTCPeerConnection, reporting each in blocked_requests
 	// (verify-browser 1.3.0+). Written only for production checks.
 	ReadOnly bool `json:"read_only,omitempty"`
+	// SignIn is the test user to sign in as before the first load
+	// (verify-browser 1.5.0+), written only for a check with as.
+	SignIn *verifyBrowserSignIn `json:"sign_in,omitempty"`
+}
+
+// verifyBrowserSignIn is input.json's sign_in: the sign-in page and the test
+// user's email and password.
+type verifyBrowserSignIn struct {
+	URL      string `json:"url"`
+	Email    string `json:"email"`
+	Password string `json:"password"`
 }
 
 // VerifyBrowserReadOnlyUnsupportedReason is why a production QA run stops when
@@ -255,6 +299,12 @@ type verifyPreviewRendered struct {
 	// told, once, when a result shows the browser ignored it.
 	readOnly              bool
 	onReadOnlyUnsupported func(reason string)
+
+	// signIns are the site previews QA may check signed in, by lower-case host
+	// (nil: as is refused); redact is what the run's results, errors and log
+	// lines are redacted of — the run's test user passwords — when there are.
+	signIns map[string]BrowserSignInSite
+	redact  apiRedactor
 
 	mu    sync.Mutex
 	calls int
@@ -292,6 +342,19 @@ func registerVerifyPreviewRendered(s *agentmcp.Server, t *verifyPreviewRendered)
 }
 
 func (t *verifyPreviewRendered) handle(ctx context.Context, rawArgs json.RawMessage) (string, error) {
+	text, err := t.check(ctx, rawArgs)
+	if t.signIns == nil {
+		return text, err
+	}
+	if err != nil {
+		err = errors.New(t.redact.text(err.Error()))
+	}
+	// The result is redacted before it is rendered, and rendering escapes the
+	// mark's < and >; the agent reads it as written.
+	return unescapeRedactedMark(t.redact.text(text)), err
+}
+
+func (t *verifyPreviewRendered) check(ctx context.Context, rawArgs json.RawMessage) (string, error) {
 	if t.isUnsupported() {
 		return "", errors.New("QA couldn't check the page: " + VerifyBrowserReadOnlyUnsupportedReason)
 	}
@@ -302,9 +365,19 @@ func (t *verifyPreviewRendered) handle(ctx context.Context, rawArgs json.RawMess
 	if err != nil {
 		return "", err
 	}
+	signIn, err := t.resolveSignIn(args)
+	if err != nil {
+		return "", err
+	}
 	input, err := t.buildInput(ctx, args)
 	if err != nil {
 		return "", err
+	}
+	if signIn != nil {
+		input.SignIn = signIn.input(input.URL)
+		if args.TimeoutSeconds == nil {
+			input.TimeoutMS = verifyRenderedSignInTimeoutSeconds * 1000
+		}
 	}
 	inputJSON, err := json.Marshal(input)
 	if err != nil {
@@ -313,22 +386,28 @@ func (t *verifyPreviewRendered) handle(ctx context.Context, rawArgs json.RawMess
 	if t.run == nil {
 		return "", errors.New("the QA browser is not available on this runner")
 	}
-	t.logf("verify_preview_rendered: checking %s in the QA browser (%d steps, %d assertions, timeout %ds%s)", input.URL, len(input.Steps), len(input.Assertions), input.TimeoutMS/1000, input.Viewport.logSuffix())
+	t.logf("verify_preview_rendered: checking %s in the QA browser (%d steps, %d assertions, timeout %ds%s)%s", input.URL, len(input.Steps), len(input.Assertions), input.TimeoutMS/1000, input.Viewport.logSuffix(), signIn.logSuffix())
 	started := time.Now()
-	req := VerifyBrowserRequest{Input: inputJSON, Timeout: time.Duration(input.TimeoutMS) * time.Millisecond, MinImageVersion: minVerifyBrowserVersion(input.Steps)}
+	req := VerifyBrowserRequest{Input: inputJSON, Timeout: time.Duration(input.TimeoutMS) * time.Millisecond}
+	req.MinImageVersion, req.MinImageFeature = minVerifyBrowserVersion(input)
 	outcome, err := t.run(ctx, req, t.logsWriter)
-	return t.finish(outcome, err, input.Viewport != nil, time.Since(started))
+	outcome = t.redactOutcome(outcome)
+	return t.finish(outcome, err, renderedCheck{wantViewport: input.Viewport != nil, signIn: signIn}, time.Since(started))
 }
 
-// minVerifyBrowserVersion is the oldest verify-browser release that runs steps,
-// "" when any does.
-func minVerifyBrowserVersion(steps []verifyRenderedStep) string {
-	for _, s := range steps {
+// minVerifyBrowserVersion is the oldest verify-browser release that runs the
+// check, "" when any does, and the feature that needs it ("" for the back
+// step).
+func minVerifyBrowserVersion(input verifyBrowserInput) (version, feature string) {
+	if input.SignIn != nil {
+		return verifyBrowserSignInVersion, verifyBrowserSignInFeature
+	}
+	for _, s := range input.Steps {
 		if s.Action == "back" {
-			return verifyBrowserBackVersion
+			return verifyBrowserBackVersion, ""
 		}
 	}
-	return ""
+	return "", ""
 }
 
 // logSuffix describes a requested viewport in the Step log, "" when none was.
@@ -342,9 +421,9 @@ func (v *verifyRenderedViewport) logSuffix() string {
 	return fmt.Sprintf(", viewport %d×%d", v.Width, v.Height)
 }
 
-// finish maps a run to the tool's result and logs its outcome. wantViewport is
-// whether the agent asked for a window size.
-func (t *verifyPreviewRendered) finish(outcome VerifyBrowserOutcome, runErr error, wantViewport bool, elapsed time.Duration) (string, error) {
+// finish maps a run to the tool's result and logs its outcome. check is what
+// the agent asked of the browser (a window size, a sign-in).
+func (t *verifyPreviewRendered) finish(outcome VerifyBrowserOutcome, runErr error, check renderedCheck, elapsed time.Duration) (string, error) {
 	if runErr != nil {
 		t.logf("verify_preview_rendered: could not run the QA browser after %.1fs: %s", elapsed.Seconds(), runErr)
 		return "", fmt.Errorf("QA couldn't check the page: %w", runErr)
@@ -357,7 +436,7 @@ func (t *verifyPreviewRendered) finish(outcome VerifyBrowserOutcome, runErr erro
 	if t.readOnly && len(outcome.Result) > 0 && !hasBlockedRequests(outcome.Result) {
 		return "", t.readOnlyUnsupported(outcome.ImageRef)
 	}
-	text, verdict, err := renderVerifyBrowserOutcome(outcome, wantViewport)
+	text, r, err := renderVerifyBrowserCheck(outcome, check)
 	if err != nil {
 		t.logf("verify_preview_rendered: QA couldn't check the page after %.1fs: %s", elapsed.Seconds(), firstLine(err.Error()))
 		if strings.TrimSpace(outcome.Output) != "" {
@@ -365,7 +444,8 @@ func (t *verifyPreviewRendered) finish(outcome VerifyBrowserOutcome, runErr erro
 		}
 		return "", err
 	}
-	t.logf("verify_preview_rendered: %s after %.1fs", verdict, elapsed.Seconds())
+	t.logf("verify_preview_rendered: %s after %.1fs", r.Verdict, elapsed.Seconds())
+	t.logSignIn(r.SignIn)
 	return text, nil
 }
 
@@ -417,7 +497,7 @@ func (t *verifyPreviewRendered) takeCall() bool {
 
 func (t *verifyPreviewRendered) logf(format string, args ...interface{}) {
 	if t.logsWriter != nil {
-		io.WriteString(t.logsWriter, fmt.Sprintf(format, args...)+"\n")
+		io.WriteString(t.logsWriter, t.redact.text(fmt.Sprintf(format, args...))+"\n")
 	}
 }
 
@@ -438,6 +518,7 @@ func parseVerifyRenderedArgs(rawArgs json.RawMessage) (verifyRenderedArgs, error
 		}
 	}
 	args.URL = strings.TrimSpace(args.URL)
+	args.As, args.Backend = strings.TrimSpace(args.As), strings.TrimSpace(args.Backend)
 	if args.URL == "" {
 		return args, errors.New("url is required")
 	}

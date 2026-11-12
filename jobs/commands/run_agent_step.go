@@ -1979,6 +1979,11 @@ type agentboxSpawnSpec struct {
 	// verify_api_sign_in over them.
 	apiSignIns    []agenttools.APISignInPreview
 	apiSignInTool bool
+	// browserSignIns, set beside verifyToolsOnly by a stack-path QA round with
+	// a site preview QA may check signed in, are those sites: its
+	// verify_preview_rendered takes as, and redacts the test user passwords
+	// (apiPasswords and theirs) from its results and log lines.
+	browserSignIns []agenttools.BrowserSignInSite
 	// onSiteDeployed, set by a QA round off the stack path, is told when one of
 	// the agent's deploy_static_site_preview calls ends with a deployed preview
 	// or a failure: the round's progress event for that preview.
@@ -2047,7 +2052,8 @@ type agentTools struct {
 // what stops them. A production QA run gets only its two read-only checks;
 // a stack-path QA round gets ping and the two verify tools (and
 // verify_api_request when apiRequestTool is set, and verify_api_sign_in beside
-// it when apiSignInTool is too); every other run
+// it when apiSignInTool is too; its verify_preview_rendered takes as when
+// browserSignIns has a site); every other run
 // gets ping and, with previewDeps, the three preview tools —
 // and deploy_web_service_preview when webPreviewDeps is set too (implement and
 // fix runs). The returned stop stops both deploy tools; finish hears their
@@ -2065,7 +2071,11 @@ func registerAgentTools(mcpSrv *agentmcp.Server, spec agentboxSpawnSpec) agentTo
 	}
 	if spec.verifyToolsOnly {
 		agenttools.RegisterVerifyPreviewReachable(mcpSrv, spec.previewDeps.Record, spec.previewDeps.LogsWriter)
-		agenttools.RegisterVerifyPreviewRendered(mcpSrv, spec.previewDeps.Record, spec.previewDeps.VerifyBrowser, spec.previewDeps.LogsWriter)
+		if len(spec.browserSignIns) > 0 {
+			agenttools.RegisterVerifyPreviewRenderedSignIn(mcpSrv, spec.previewDeps.Record, spec.previewDeps.VerifyBrowser, spec.previewDeps.LogsWriter, spec.browserSignIns, spec.apiPasswords)
+		} else {
+			agenttools.RegisterVerifyPreviewRendered(mcpSrv, spec.previewDeps.Record, spec.previewDeps.VerifyBrowser, spec.previewDeps.LogsWriter)
+		}
 		if spec.apiRequestTool {
 			// One state per agent run: the sessions its sign-ins get.
 			sessions := agenttools.NewAPISessions(spec.apiPasswords, spec.apiSignIns)
