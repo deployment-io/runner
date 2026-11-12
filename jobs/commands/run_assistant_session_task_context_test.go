@@ -9,7 +9,18 @@ import (
 	"testing"
 
 	"github.com/deployment-io/deployment-runner-kit/sessions"
+	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
 )
+
+// skipUnlessCanChownToAgentbox skips a test that calls prepareSessionDirs,
+// which hands the session's dirs to the agentbox user: only root, or that user
+// itself, may chown to it (as TestTheSnapshotIsOwnedByTheAgentboxUser skips).
+func skipUnlessCanChownToAgentbox(t *testing.T) {
+	t.Helper()
+	if os.Geteuid() != commandUtils.AgentboxUID && os.Geteuid() != 0 {
+		t.Skipf("chown to %d is not permitted as uid %d", commandUtils.AgentboxUID, os.Geteuid())
+	}
+}
 
 // legacyPlanModePrompt is planModePrompt as it was before it was split into
 // planModeRole and sessionRules, copied verbatim: planning sessions must keep
@@ -108,6 +119,7 @@ func readSystemPrompt(t *testing.T, workDir string) string {
 }
 
 func TestTaskContext_FoundWritesRecordAndAskPrompt(t *testing.T) {
+	skipUnlessCanChownToAgentbox(t)
 	first, second := "66e1a2b3c4d5e6f7a8b9c0d1", "66e1a2b3c4d5e6f7a8b9c0d2"
 	stubTaskContext(t, sessions.GetTaskContextReplyV1{
 		Found: true,
@@ -220,6 +232,7 @@ func TestTaskContext_FoundWritesRecordAndAskPrompt(t *testing.T) {
 }
 
 func TestTaskContext_NotFoundIsPlanningSession(t *testing.T) {
+	skipUnlessCanChownToAgentbox(t)
 	calls := stubTaskContext(t, sessions.GetTaskContextReplyV1{}, nil)
 	work := t.TempDir()
 	var log strings.Builder
@@ -241,6 +254,7 @@ func TestTaskContext_NotFoundIsPlanningSession(t *testing.T) {
 }
 
 func TestTaskContext_RPCFailingFallsBackToPlanMode(t *testing.T) {
+	skipUnlessCanChownToAgentbox(t)
 	calls := stubTaskContext(t, sessions.GetTaskContextReplyV1{Found: true}, errors.New("rpc: can't find method Sessions.GetTaskContextV1"))
 	work := t.TempDir()
 	var log strings.Builder
