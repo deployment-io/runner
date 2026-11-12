@@ -36,6 +36,8 @@ type qaStackOps struct {
 	planBackend   func(deps agenttools.DeployWebServicePreviewDeps, repository string) (agenttools.WebServicePreviewPlan, error)
 	deployBackend func(ctx context.Context, deps agenttools.DeployWebServicePreviewDeps, plan agenttools.WebServicePreviewPlan, variables map[string]string) (agenttools.WebServicePreviewDeployed, error)
 	wiring        func(repositories []task_previews.StackRepositoryV1) (task_previews.StackWiringReplyV1, error)
+	// probePages finds out whether a deployed backend preview serves pages.
+	probePages func(ctx context.Context, url, healthURL string) agenttools.PreviewPagesProbe
 }
 
 // qaStackOps is the stage's stack operations: the test seam's, or the tools'
@@ -54,6 +56,7 @@ func (s *qaStage) qaStackOps() qaStackOps {
 		wiring: func(repositories []task_previews.StackRepositoryV1) (task_previews.StackWiringReplyV1, error) {
 			return runnerclient.Get().StackWiring(orgID, taskID, repositories, agenttools.PreviewBuildSettingsTimeout)
 		},
+		probePages: agenttools.ProbeServesPages,
 	}
 }
 
@@ -73,17 +76,22 @@ type qaPreview struct {
 	HealthURL           string   `json:"health_url,omitempty"`
 	ConnectedBackends   []string `json:"connected_backends,omitempty"`
 	UnconnectedBackends []string `json:"unconnected_backends,omitempty"`
+	// ServesPages is true on a deployed backend whose probe found that it
+	// serves pages (qaStackPreview.servesPages); never on a site or a failed
+	// entry.
+	ServesPages bool `json:"serves_pages,omitempty"`
 	// Roles are a backend's roles QA may sign in as (qaStackPreview.roles),
 	// absent when it has none. Never an email or a password.
 	Roles []qaPreviewRole `json:"roles,omitempty"`
 	// BrowserRoles are a site's roles QA may sign in as in the browser: those
 	// of each connected backend that offers it (qaStackPreview.browserRoles),
-	// absent when there are none. Never an email or a password.
+	// absent when there are none — or, on a backend that offers them on its own
+	// URL (qaStackRound.ownBrowserSignIn), its own. Never an email or a password.
 	BrowserRoles []qaPreviewBrowserRole `json:"browser_roles,omitempty"`
 	Error        string                 `json:"error,omitempty"`
 }
 
-// qaPreviewBrowserRole is a role of a site's QA_PREVIEWS entry: a role of the
+// qaPreviewBrowserRole is a browser role of a QA_PREVIEWS entry: a role of the
 // backend entry whose repository is Backend.
 type qaPreviewBrowserRole struct {
 	Name        string `json:"name"`
@@ -125,10 +133,14 @@ type qaStackPreview struct {
 	// browserRoles, browserSignInPath and browserUsers are, kept apart from
 	// the API sign-in's, a deployed backend's roles, browser sign-in page and
 	// its roles' test users when QA may sign in as them in the browser on a
-	// site connected to it (browserSignInRoles).
+	// site connected to it, or on its own URL (browserSignInRoles).
 	browserRoles      []task_previews.PreviewRoleV1
 	browserSignInPath string
 	browserUsers      []agenttools.PreviewTestUser
+	// probe is a deployed backend's pages probe, running from its deploy
+	// until waitProbes; servesPages is what it found.
+	probe       chan agenttools.PreviewPagesProbe
+	servesPages bool
 }
 
 // qaStackRound is one stack-path round's deploys.
@@ -142,6 +154,9 @@ type qaStackRound struct {
 	sites    []*qaStackPreview
 	backends []*qaStackPreview
 	pairs    []*qaStackPair
+	// readsBackendBrowserRoles is true when the round's agentbox reads a
+	// backend entry's browser_roles (minOwnBrowserSignInAgentboxVersion).
+	readsBackendBrowserRoles bool
 	// backendDetails is what the failing backend deploy did, for fail's
 	// progress event; nil outside that deploy.
 	backendDetails *previewDeployDetails
@@ -152,7 +167,8 @@ type qaStackRound struct {
 // verify tools alone — and, when a backend preview deployed, verify_api_request
 // with QA_API_REQUEST_TOOL=1, and beside it, when a backend has roles,
 // verify_api_sign_in with QA_API_SIGN_IN_TOOL=1. When a site preview can be
-// checked signed in, verify_preview_rendered takes as.
+// checked signed in (or a backend preview that serves pages, with an agentbox
+// that reads it), verify_preview_rendered takes as.
 func (s *qaStage) deployStackAndSpawnQA(round int, imageRef, qaDir string, env []string) (agentResult, error) {
 	previewDeps := buildStaticSitePreviewDeps(s.ctx, s.parameters, s.workDirHost, s.logsWriter)
 	mergeResults := s.newQAMergeResults()
@@ -166,7 +182,7 @@ func (s *qaStage) deployStackAndSpawnQA(round int, imageRef, qaDir string, env [
 	}
 	previewDeps.Distributions = s.staticDistributions
 	label := fmt.Sprintf("QA round %d", round)
-	previews, err := s.deployStack(label, previewDeps)
+	previews, err := s.deployStack(label, imageVersionAtLeast(imageRef, minOwnBrowserSignInAgentboxVersion), previewDeps)
 	if err != nil {
 		return agentResult{}, err
 	}
@@ -197,12 +213,13 @@ func hasDeployedBackend(previews []qaPreview) bool {
 }
 
 // deployStack deploys the round's previews and records how they connect
-// (roundWiring). It returns QA_PREVIEWS' entries, or an error when the user
-// stopped the Step or no preview deployed.
-func (s *qaStage) deployStack(label string, previewDeps *agenttools.DeployStaticSitePreviewDeps) ([]qaPreview, error) {
+// (roundWiring). readsBackendBrowserRoles is true when the round's agentbox
+// reads a backend entry's browser_roles. It returns QA_PREVIEWS' entries, or an error
+// when the user stopped the Step or no preview deployed.
+func (s *qaStage) deployStack(label string, readsBackendBrowserRoles bool, previewDeps *agenttools.DeployStaticSitePreviewDeps) ([]qaPreview, error) {
 	ctx, cancel := s.stopContext()
 	defer cancel()
-	r := &qaStackRound{stage: s, label: label, ops: s.qaStackOps(), ctx: ctx, siteDeps: *previewDeps, webDeps: *s.roundWebPreviewDeps(previewDeps)}
+	r := &qaStackRound{stage: s, label: label, ops: s.qaStackOps(), ctx: ctx, siteDeps: *previewDeps, webDeps: *s.roundWebPreviewDeps(previewDeps), readsBackendBrowserRoles: readsBackendBrowserRoles}
 	r.plan()
 	reply, lookupFailed := s.stackWiringReply(r.ops)
 	r.pairs = pairStack(r.sites, r.backends, reply.Links, lookupFailed)
@@ -312,7 +329,8 @@ func (r *qaStackRound) fail(p *qaStackPreview, kind string, err error) {
 }
 
 // deploy reserves the linked sites' addresses, then deploys the backends, then
-// the sites. Only a user stop is an error.
+// the sites, and then waits for the backends' pages probes. Only a user stop is
+// an error.
 func (r *qaStackRound) deploy() error {
 	if err := r.reserveSites(); err != nil {
 		return err
@@ -320,7 +338,10 @@ func (r *qaStackRound) deploy() error {
 	if err := r.deployBackends(); err != nil {
 		return err
 	}
-	return r.deploySites()
+	if err := r.deploySites(); err != nil {
+		return err
+	}
+	return r.waitProbes()
 }
 
 // reserveSites reserves the distribution of every site linked to a backend of
@@ -390,6 +411,41 @@ func (r *qaStackRound) deployBackends() error {
 		r.webDeps.Record.AddURL(d.URL)
 		io.WriteString(r.stage.logsWriter, fmt.Sprintf("%s: the backend preview of %s is deployed at %s (health check %s)\n", r.label, backend.repository, d.URL, d.HealthURL))
 		r.stage.emitPreviewDeploy(previewDeployResult{repo: r.stage.entryName(backend.repository), kind: qaPreviewBackend, url: d.URL, details: facts.result(d)})
+		r.startProbe(backend)
+	}
+	return nil
+}
+
+// startProbe starts finding out, in the background while the round deploys
+// on, whether the deployed backend serves pages.
+func (r *qaStackRound) startProbe(backend *qaStackPreview) {
+	backend.probe = make(chan agenttools.PreviewPagesProbe, 1)
+	go func(ctx context.Context, url, healthURL string, out chan<- agenttools.PreviewPagesProbe) {
+		out <- r.ops.probePages(ctx, url, healthURL)
+	}(r.ctx, backend.url, backend.healthURL, backend.probe)
+}
+
+// waitProbes waits for each backend's pages probe, in work-dir order, and logs
+// what it found. Only a user stop is an error.
+func (r *qaStackRound) waitProbes() error {
+	for _, backend := range r.backends {
+		if backend.probe == nil {
+			continue
+		}
+		var probe agenttools.PreviewPagesProbe
+		select {
+		case probe = <-backend.probe:
+		case <-r.ctx.Done():
+		}
+		if r.stage.stopped() {
+			return types.ErrJobStoppedByUser
+		}
+		backend.servesPages = probe.ServesPages
+		what := "is an API"
+		if probe.ServesPages {
+			what = "serves pages"
+		}
+		io.WriteString(r.stage.logsWriter, fmt.Sprintf("%s: the backend preview of %s %s (%s)\n", r.label, backend.repository, what, probe.Reason))
 	}
 	return nil
 }
@@ -475,9 +531,14 @@ func (r *qaStackRound) previews() []qaPreview {
 		if backend := backends[repository]; backend != nil {
 			entry := qaPreview{Repository: repository, Kind: qaPreviewBackend, Error: backend.err}
 			if backend.err == "" {
-				entry.URL, entry.HealthURL = backend.url, backend.healthURL
+				entry.URL, entry.HealthURL, entry.ServesPages = backend.url, backend.healthURL, backend.servesPages
 				for _, role := range backend.roles {
 					entry.Roles = append(entry.Roles, qaPreviewRole{Name: role.Name, Description: role.Description})
+				}
+				if r.ownBrowserSignIn(backend) {
+					for _, role := range backend.browserRoles {
+						entry.BrowserRoles = append(entry.BrowserRoles, qaPreviewBrowserRole{Name: role.Name, Description: role.Description, Backend: backend.repository})
+					}
 				}
 			}
 			out = append(out, entry)
@@ -545,37 +606,56 @@ func (r *qaStackRound) signIns() []agenttools.APISignInPreview {
 	return out
 }
 
-// browserSignIns are the round's site previews QA may check signed in: each
+// browserSignIns are the round's previews QA may check signed in: each
 // deployed site with a connected backend that offers browser sign-in, and
-// those backends in connected_backends order.
+// those backends in connected_backends order; then each backend that offers it
+// on its own URL, with itself as its only backend.
 func (r *qaStackRound) browserSignIns() []agenttools.BrowserSignInSite {
 	var out []agenttools.BrowserSignInSite
 	for _, site := range r.sites {
 		var backends []agenttools.BrowserSignInBackend
 		for _, backend := range r.browserBackends(site) {
-			backends = append(backends, agenttools.BrowserSignInBackend{Repository: backend.repository, SignInPath: backend.browserSignInPath, Users: backend.browserUsers})
+			backends = append(backends, browserSignInBackend(backend))
 		}
 		if len(backends) > 0 {
 			out = append(out, agenttools.BrowserSignInSite{URL: site.url, Backends: backends})
 		}
 	}
+	for _, backend := range r.backends {
+		if r.ownBrowserSignIn(backend) {
+			out = append(out, agenttools.BrowserSignInSite{URL: backend.url, Backends: []agenttools.BrowserSignInBackend{browserSignInBackend(backend)}})
+		}
+	}
 	return out
+}
+
+func browserSignInBackend(backend *qaStackPreview) agenttools.BrowserSignInBackend {
+	return agenttools.BrowserSignInBackend{Repository: backend.repository, SignInPath: backend.browserSignInPath, Users: backend.browserUsers}
 }
 
 // browserBackends are the backends that offer site browser sign-in, in its
 // pairs' order: none for a site that failed; else each deployed one it is
-// connected to with roles QA may sign in as in the browser.
+// connected to with roles QA may sign in as in the browser, but for one that
+// offers them on its own URL.
 func (r *qaStackRound) browserBackends(site *qaStackPreview) []*qaStackPreview {
 	if site.err != "" {
 		return nil
 	}
 	var out []*qaStackPreview
 	for _, p := range r.pairs {
-		if p.site == site && p.connected() && p.backend.err == "" && len(p.backend.browserRoles) > 0 {
+		if p.site == site && p.connected() && p.backend.err == "" && len(p.backend.browserRoles) > 0 && !r.ownBrowserSignIn(p.backend) {
 			out = append(out, p.backend)
 		}
 	}
 	return out
+}
+
+// ownBrowserSignIn reports whether backend offers its browser sign-in roles on
+// its own URL instead of on its connected sites: it deployed, serves pages and
+// has roles QA may sign in as in the browser, and the round's agentbox reads a
+// backend entry's browser_roles.
+func (r *qaStackRound) ownBrowserSignIn(backend *qaStackPreview) bool {
+	return r.readsBackendBrowserRoles && backend.err == "" && backend.servesPages && len(backend.browserRoles) > 0
 }
 
 // sitePreview is site's QA_PREVIEWS entry: with a URL, every backend of the

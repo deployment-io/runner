@@ -165,7 +165,7 @@ const verifyPreviewRenderedInputSchema = `{
     },
     "as": {
       "type": "string",
-      "description": "Optional: check the page signed in as this role — one of the roles listed under this site preview to sign in as in the browser."
+      "description": "Optional: check the page signed in as this role — one of the roles listed under this preview to sign in as in the browser."
     },
     "backend": {
       "type": "string",
@@ -209,7 +209,7 @@ const verifyPreviewRenderedDescription = "Load a preview in a real browser (head
 	"to allow or fix. If the result has status \"preparing\", the browser is being set up on this runner: call " +
 	"verify_preview_rendered again with the same arguments in a minute. At most 30 calls per run — every call counts, " +
 	"including \"preparing\" replies and errors.\n\n" +
-	"Signed in: to check a page signed in, pass as = one of the roles listed under that site preview to sign in as in the " +
+	"Signed in: to check a page signed in, pass as = one of the roles listed under that preview to sign in as in the " +
 	"browser, and backend too when that role is listed for more than one of its backends. deployment.io signs in on the " +
 	"app's own sign-in page with the role's test user before the check; you never see the email or password. When url is " +
 	"the site's front page (path /, no query), the check starts on the page the app shows after signing in. Any other url, " +

@@ -116,12 +116,12 @@ func TestVerifyRenderedAs_Refusals(t *testing.T) {
 		{"backend without as", `{"url":"` + signInSite + `/","backend":"1-acme/api"}`, "backend is only used with as", false, false},
 		{"backend without as, no set", `{"url":"` + signInSite + `/","backend":"1-acme/api","as":" "}`, "backend is only used with as", false, true},
 		{"production", `{"url":"` + signInSite + `/","as":"owner"}`, "as is not available on production checks", true, false},
-		{"no set", `{"url":"` + signInSite + `/","as":"owner"}`, "as works only on a site preview that lists browser sign-in roles — got d111.cloudfront.net", false, true},
-		{"not a signing-in site", `{"url":"https://d222.cloudfront.net/","as":"owner"}`, "as works only on a site preview that lists browser sign-in roles — got d222.cloudfront.net", false, false},
-		{"unknown backend", `{"url":"` + signInSite + `/","as":"owner","backend":"9-acme/x"}`, "9-acme/x is not a backend this site preview signs in to (its backends: 1-acme/api, 2-acme/auth)", false, false},
-		{"unknown role", `{"url":"` + signInSite + `/","as":"admin"}`, "no test user for role admin on this site preview (its roles: owner, member)", false, false},
-		{"role not of the given backend", `{"url":"` + signInSite + `/","as":"member","backend":"2-acme/auth"}`, "no test user for role member on this site preview (its roles: owner)", false, false},
-		{"invalid role name", `{"url":"` + signInSite + `/","as":"Bad Role"}`, "no test user for role ? on this site preview", false, false},
+		{"no set", `{"url":"` + signInSite + `/","as":"owner"}`, "as works only on a preview that lists browser sign-in roles — got d111.cloudfront.net", false, true},
+		{"not a signing-in site", `{"url":"https://d222.cloudfront.net/","as":"owner"}`, "as works only on a preview that lists browser sign-in roles — got d222.cloudfront.net", false, false},
+		{"unknown backend", `{"url":"` + signInSite + `/","as":"owner","backend":"9-acme/x"}`, "9-acme/x is not a backend this preview signs in to (its backends: 1-acme/api, 2-acme/auth)", false, false},
+		{"unknown role", `{"url":"` + signInSite + `/","as":"admin"}`, "no test user for role admin on this preview (its roles: owner, member)", false, false},
+		{"role not of the given backend", `{"url":"` + signInSite + `/","as":"member","backend":"2-acme/auth"}`, "no test user for role member on this preview (its roles: owner)", false, false},
+		{"invalid role name", `{"url":"` + signInSite + `/","as":"Bad Role"}`, "no test user for role ? on this preview", false, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			fb := &fakeBrowser{outcome: VerifyBrowserOutcome{Result: passResult()}}
@@ -409,6 +409,26 @@ func TestUnescapeRedactedMark(t *testing.T) {
 	}
 }
 
+// A backend preview that serves pages is in the set with its own URL and
+// itself as its only backend: as signs in on its own host.
+func TestVerifyRenderedAs_OnABackendPreview(t *testing.T) {
+	const backendPreview = "https://b333.cloudfront.net"
+	fb := &fakeBrowser{outcome: VerifyBrowserOutcome{Result: signInResult(`{"signed_in":true,"failed_requests":[],"refused_cookies":[]}`)}}
+	sites := []BrowserSignInSite{{URL: backendPreview, Backends: []BrowserSignInBackend{
+		{Repository: "1-acme/app", SignInPath: "/users/sign_in", Users: []PreviewTestUser{{Role: "editor", Email: "qa-editor-cccc3333@example.com", Password: ownerPassword}}},
+	}}}
+	tool := newVerifyPreviewRenderedSignIn(renderedRecord(backendPreview+"/"), fb.run, &bytes.Buffer{}, sites, nil)
+	if _, err := call(t, tool, `{"url":"`+backendPreview+`/","as":"editor"}`); err != nil {
+		t.Fatal(err)
+	}
+	if in := fb.input(t); in.SignIn == nil || in.SignIn.URL != backendPreview+"/users/sign_in" || in.SignIn.Email != "qa-editor-cccc3333@example.com" {
+		t.Errorf("sign_in = %+v", in.SignIn)
+	}
+	if _, err := call(t, tool, `{"url":"`+backendPreview+`/","as":"admin"}`); err == nil || err.Error() != "no test user for role admin on this preview (its roles: editor)" {
+		t.Errorf("as admin: %v", err)
+	}
+}
+
 func TestVerifyRendered_SchemaAndDescriptionMentionAs(t *testing.T) {
 	var schema struct {
 		Properties map[string]any `json:"properties"`
@@ -419,8 +439,11 @@ func TestVerifyRendered_SchemaAndDescriptionMentionAs(t *testing.T) {
 	if schema.Properties["as"] == nil || schema.Properties["backend"] == nil {
 		t.Error("schema lacks as or backend")
 	}
+	if as, _ := schema.Properties["as"].(map[string]any); as["description"] != "Optional: check the page signed in as this role — one of the roles listed under this preview to sign in as in the browser." {
+		t.Errorf("as = %v", as["description"])
+	}
 	for _, want := range []string{
-		"pass as = one of the roles listed under that site preview to sign in as in the browser, and backend too when that role is listed for more than one of its backends.",
+		"pass as = one of the roles listed under that preview to sign in as in the browser, and backend too when that role is listed for more than one of its backends.",
 		"you never see the email or password.",
 		"When url is the site's front page (path /, no query), the check starts on the page the app shows after signing in.",
 		"move between pages by clicking.",

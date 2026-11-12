@@ -95,6 +95,12 @@ const minBackendQAAgentboxVersion = "1.9.35"
 // its static sites itself, as before.
 const minPreviewsQAAgentboxVersion = "1.9.37"
 
+// minOwnBrowserSignInAgentboxVersion is the first agentbox that reads
+// browser_roles on a backend entry of QA_PREVIEWS. With it a backend preview
+// that serves pages offers its browser sign-in roles on its own URL; with an
+// older image they go to the sites connected to it, as before.
+const minOwnBrowserSignInAgentboxVersion = "1.9.44"
+
 // qaNoTimeToDeployBackendReason is round 1's status reason when the stage's
 // budget can't fit deploying the backend previews and the QA run.
 const qaNoTimeToDeployBackendReason = "no time left to deploy the backend preview"
