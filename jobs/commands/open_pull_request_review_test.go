@@ -1,8 +1,10 @@
 package commands
 
 import (
+	"fmt"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
 )
@@ -42,12 +44,12 @@ func completedReview(mustFixOpen bool, findings ...reviewFindingOutput) *reviewO
 	}
 }
 
-// The Review section is what a reviewer reads instead of the job log. It has
-// to say what ran, what is still wrong, what the loop already fixed, and what
-// nobody looked at.
-func TestReviewSectionRendersFindingsInReaderPriorityOrder(t *testing.T) {
+// "Needs you" lists what a reviewer has to act on, must-fix first. What was
+// merely noted and what the loop already fixed are on the Task page.
+func TestNeedsYouRendersOpenFindingsInReaderPriorityOrder(t *testing.T) {
 	review := completedReview(true,
 		reviewFindingOutput{Parameter: "correctness", Severity: "low", Location: "sum.go:9", What: "off by one", Why: "wrong total"},
+		reviewFindingOutput{Parameter: "correctness", Severity: "medium", Location: "list.go:3", What: "nil slice returned", SentBack: true},
 		reviewFindingOutput{Parameter: "security", Severity: "high", Location: "handler.go:41", What: "no session check", Why: "any caller can read another org's data", MustFix: true},
 	)
 	review.FixedInLoop = []reviewFindingOutput{
@@ -56,72 +58,86 @@ func TestReviewSectionRendersFindingsInReaderPriorityOrder(t *testing.T) {
 
 	_, body := reviewTestOpener(review).buildPRTitleAndBody()
 
-	stillOpen := strings.Index(body, "no session check")
-	fixed := strings.Index(body, "token logged in plaintext")
-	annotated := strings.Index(body, "off by one")
-	if stillOpen < 0 || fixed < 0 || annotated < 0 {
-		t.Fatalf("a finding group is missing from the body:\n%s", body)
-	}
-	if !(stillOpen < annotated && annotated < fixed) {
-		t.Errorf("findings are out of order — still-open must-fix, then annotated, then the collapsed fixed ones:\n%s", body)
-	}
-	if !strings.Contains(body, "Passes run: security, correctness.") {
-		t.Errorf("the body does not say which passes ran:\n%s", body)
-	}
-	// One coverage line naming ALL EIGHT parameters, so "no findings" cannot
-	// be confused with "nobody looked".
-	for _, parameter := range []string{"security", "correctness", "spec conformance", "testing",
-		"deploy readiness", "performance", "maintainability", "reliability"} {
-		if !strings.Contains(body, parameter+":") {
-			t.Errorf("the coverage line omits %q:\n%s", parameter, body)
+	requireInOrder(t, body,
+		"Added the login endpoint.",
+		"**Needs you**\n\n_Still open and must be fixed_\n\n",
+		"no session check",
+		"_"+stillOpenBelowHoldHeading+"_",
+		"nil slice returned",
+		"These findings are still open. They need a human.",
+	)
+	for _, absent := range []string{"off by one", "token logged in plaintext", "Passes run", "Coverage", "Fixed during review", "_Noted_"} {
+		if strings.Contains(body, absent) {
+			t.Errorf("the body carries %q, which is on the Task page:\n%s", absent, body)
 		}
-	}
-	if !strings.Contains(body, "They need a human.") {
-		t.Errorf("an open must-fix finding is not called out:\n%s", body)
 	}
 }
 
-// The existing sections must render exactly as before — the Review section is
-// an addition, not a replacement.
-func TestReviewSectionLeavesTheExistingBodyAlone(t *testing.T) {
-	opener := reviewTestOpener(nil)
-	_, body := opener.buildPRTitleAndBody()
+// Review participation Off: no tally and no "Needs you".
+func TestNeedsYouIsLeftOutWithoutAReview(t *testing.T) {
+	_, body := reviewTestOpener(nil).buildPRTitleAndBody()
 
 	for _, want := range []string{"Generated-By: deployment.io Tasks", "Task: My Task", "Added the login endpoint."} {
 		if !strings.Contains(body, want) {
 			t.Errorf("the body lost %q:\n%s", want, body)
 		}
 	}
-	if strings.Contains(body, "**Review**") {
-		t.Errorf("a Task with no Review stage got a Review section:\n%s", body)
+	for _, absent := range []string{"**Review:**", "**Needs you**"} {
+		if strings.Contains(body, absent) {
+			t.Errorf("a Task with no Review stage got %q:\n%s", absent, body)
+		}
+	}
+}
+
+// A review with nothing open — clean, or only noted or fixed findings — needs
+// nobody, so there is no "Needs you".
+func TestNeedsYouIsLeftOutWhenNothingIsOpen(t *testing.T) {
+	notedOnly := completedReview(false, reviewFindingOutput{Parameter: "correctness", Severity: "low", What: "off by one"})
+	fixedOnly := completedReview(false)
+	fixedOnly.FixedInLoop = []reviewFindingOutput{{Parameter: "security", Severity: "high", What: "token logged", MustFix: true}}
+	declined := completedReview(false, reviewFindingOutput{Parameter: "correctness", Severity: "low", What: "off by one"})
+	declined.StoppedNoChange = true
+	for name, review := range map[string]*reviewOutput{
+		"clean":                 completedReview(false),
+		"noted only":            notedOnly,
+		"fixed only":            fixedOnly,
+		"noted, last fix no-op": declined,
+		"no rounds":             {Participation: "on"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := reviewTestOpener(review).needsYouSection(); got != "" {
+				t.Errorf("needsYouSection = %q, want none", got)
+			}
+		})
 	}
 }
 
 // A review that could not complete must not leave a body that reads as a clean
 // review — the whole cost of failing open is paid here.
-func TestReviewSectionSaysWhenTheReviewDidNotComplete(t *testing.T) {
+func TestNeedsYouSaysWhenTheReviewDidNotComplete(t *testing.T) {
 	review := &reviewOutput{
 		Participation: "on",
 		Rounds: []reviewRoundOutput{{
 			Round:     1,
 			Completed: false,
-			Error:     "the review run produced no review_result",
+			Error:     "the review run produced no review_result.",
 			Coverage:  notCheckedCoverage("the review run produced no review_result"),
 		}},
 	}
 
+	got := reviewTestOpener(review).needsYouSection()
+	want := "**Needs you**\n\nThe review did not complete: the review run produced no review_result. " +
+		"The change was committed and this pull request opened anyway; nothing here has been gated on a review verdict.\n"
+	if got != want {
+		t.Errorf("needsYouSection =\n%q\nwant\n%q", got, want)
+	}
 	_, body := reviewTestOpener(review).buildPRTitleAndBody()
-	if !strings.Contains(body, "The review did not complete") || !strings.Contains(body, "no review_result") {
-		t.Errorf("the body does not say the review failed or why:\n%s", body)
-	}
-	if !strings.Contains(body, "not checked") {
-		t.Errorf("the body does not record that nothing was examined:\n%s", body)
-	}
+	requireInOrder(t, body, "**Review:** did not complete — details on the Task page.", "Added the login endpoint.", want)
 }
 
 // Findings from earlier rounds that DID complete are still rendered, even
-// though the persisted coverage is the failed round's all-NotChecked record.
-func TestReviewSectionKeepsEarlierRoundsFindingsWhenTheLastRoundFails(t *testing.T) {
+// though the last round failed.
+func TestNeedsYouKeepsEarlierRoundsFindingsWhenTheLastRoundFails(t *testing.T) {
 	review := completedReview(false,
 		reviewFindingOutput{Parameter: "security", Severity: "high", Location: "handler.go:41", What: "no session check", MustFix: true},
 	)
@@ -131,12 +147,7 @@ func TestReviewSectionKeepsEarlierRoundsFindingsWhenTheLastRoundFails(t *testing
 	})
 
 	_, body := reviewTestOpener(review).buildPRTitleAndBody()
-	if !strings.Contains(body, "no session check") {
-		t.Errorf("round 1's findings were dropped because round 2 failed:\n%s", body)
-	}
-	if !strings.Contains(body, "did not complete") {
-		t.Errorf("the failed final round is not mentioned:\n%s", body)
-	}
+	requireInOrder(t, body, "**Needs you**", "did not complete", "no session check")
 	// And they are NOT presented as the current verdict. A fix run may well
 	// have addressed them since; the round that would have confirmed it is
 	// the one that failed, so "still open" asserts something nobody checked.
@@ -150,7 +161,7 @@ func TestReviewSectionKeepsEarlierRoundsFindingsWhenTheLastRoundFails(t *testing
 
 // When the last round DID complete, its must-fix findings are the current
 // verdict on the current tree and are labelled as such.
-func TestReviewSectionLabelsMustFixFindingsAsStillOpenWhenTheLastRoundCompleted(t *testing.T) {
+func TestNeedsYouLabelsMustFixFindingsAsStillOpenWhenTheLastRoundCompleted(t *testing.T) {
 	review := completedReview(true,
 		reviewFindingOutput{Parameter: "security", Severity: "high", Location: "handler.go:41", What: "no session check", MustFix: true},
 	)
@@ -164,13 +175,13 @@ func TestReviewSectionLabelsMustFixFindingsAsStillOpenWhenTheLastRoundCompleted(
 	}
 }
 
-// The section is bounded: a review that reported forty things renders twenty
-// and says how many it left out, with the rest in the job log.
-func TestReviewSectionBoundsWhatItRendersAndSaysWhatItOmitted(t *testing.T) {
+// The part is bounded: a review that left forty things open renders at most
+// twenty and says how many it left out, with the rest on the Task page.
+func TestNeedsYouBoundsWhatItRendersAndSaysWhatItOmitted(t *testing.T) {
 	var findings []reviewFindingOutput
 	for i := 0; i < 40; i++ {
 		findings = append(findings, reviewFindingOutput{
-			Parameter: "correctness", Severity: "low",
+			Parameter: "correctness", Severity: "low", SentBack: true,
 			Location: strings.Repeat("l", 400),
 			What:     strings.Repeat("w", 900),
 			Why:      strings.Repeat("y", 900),
@@ -178,26 +189,53 @@ func TestReviewSectionBoundsWhatItRendersAndSaysWhatItOmitted(t *testing.T) {
 	}
 	review := completedReview(false, findings...)
 
-	_, body := reviewTestOpener(review).buildPRTitleAndBody()
-	if strings.Count(body, "**correctness / low**") > reviewSectionMaxItems {
-		t.Errorf("the body rendered more than %d findings", reviewSectionMaxItems)
+	section := reviewTestOpener(review).needsYouSection()
+	shown := strings.Count(section, "**correctness / low**")
+	if shown > reviewSectionMaxItems {
+		t.Errorf("the part rendered more than %d findings", reviewSectionMaxItems)
 	}
-	if !strings.Contains(body, "further finding(s) are not shown here") {
-		t.Errorf("the body does not say what it omitted:\n%s", body[:500])
+	if want := fmt.Sprintf("_%d further finding(s) are not shown here — the full review is on the Task page._", 40-shown); !strings.Contains(section, want) {
+		t.Errorf("the part does not say %q:\n%s", want, section)
 	}
-	if strings.Contains(body, strings.Repeat("l", reviewLocationMaxRunes+1)) {
+	if n := utf8.RuneCountInString(section); n > reviewSectionMaxRunes+100 {
+		t.Errorf("the part is %d runes, over its cap", n)
+	}
+	if strings.Contains(section, strings.Repeat("l", reviewLocationMaxRunes+1)) {
 		t.Error("a finding's location was rendered past its cap")
 	}
-	if strings.Contains(body, strings.Repeat("w", reviewDetailMaxRunes+1)) {
+	if strings.Contains(section, strings.Repeat("w", reviewDetailMaxRunes+1)) {
 		t.Error("a finding's what was rendered past its cap")
 	}
 }
 
+// The overflow line counts only the two groups "Needs you" lists: noted and
+// fixed findings are on the Task page, not "further findings" left out here.
+func TestNeedsYouOverflowCountsOnlyItsGroups(t *testing.T) {
+	var findings []reviewFindingOutput
+	for i := 0; i < 22; i++ {
+		findings = append(findings, reviewFindingOutput{Parameter: "security", Severity: "high", What: fmt.Sprintf("must %d", i), MustFix: true})
+	}
+	findings = append(findings, reviewFindingOutput{Parameter: "correctness", Severity: "low", What: "below", SentBack: true})
+	for i := 0; i < 7; i++ {
+		findings = append(findings, reviewFindingOutput{Parameter: "correctness", Severity: "low", What: fmt.Sprintf("noted %d", i)})
+	}
+	review := completedReview(true, findings...)
+	review.FixedInLoop = []reviewFindingOutput{{Parameter: "security", Severity: "high", What: "fixed", MustFix: true}}
+
+	section := reviewTestOpener(review).needsYouSection()
+	// 23 open, 20 shown.
+	if !strings.Contains(section, "\n_3 further finding(s) are not shown here — the full review is on the Task page._\n") {
+		t.Errorf("the overflow line does not count 3:\n%s", section)
+	}
+	if strings.Contains(section, "noted ") || strings.Contains(section, "  fixed\n") {
+		t.Errorf("a noted or fixed finding was rendered:\n%s", section)
+	}
+}
+
 // A re-run renders THIS attempt's review, not the previous one's. The provider
-// now applies the body on the already-open path, so a stale section would
-// outlive the fixes that resolved it — which is the defect this whole change
-// closes for the Verification section too.
-func TestReviewSectionOnARerunRendersTheCurrentAttempt(t *testing.T) {
+// now applies the body on the already-open path, so a stale "Needs you" would
+// outlive the fixes that resolved it.
+func TestNeedsYouOnARerunRendersTheCurrentAttempt(t *testing.T) {
 	firstAttempt := completedReview(true,
 		reviewFindingOutput{Parameter: "security", Severity: "high", Location: "handler.go:41", What: "no session check", MustFix: true},
 	)
@@ -212,11 +250,11 @@ func TestReviewSectionOnARerunRendersTheCurrentAttempt(t *testing.T) {
 	}
 	_, secondBody := reviewTestOpener(secondAttempt).buildPRTitleAndBody()
 
-	if strings.Contains(secondBody, "They need a human.") {
+	if strings.Contains(secondBody, "**Needs you**") || strings.Contains(secondBody, "no session check") {
 		t.Errorf("attempt two's body still says findings are open:\n%s", secondBody)
 	}
-	if !strings.Contains(secondBody, "Fixed during review") {
-		t.Errorf("attempt two's body does not report the fix:\n%s", secondBody)
+	if !strings.HasPrefix(secondBody, "**Review:** 1 found · 1 fixed before this PR\n\n") {
+		t.Errorf("attempt two's tally does not report the fix:\n%s", secondBody)
 	}
 }
 

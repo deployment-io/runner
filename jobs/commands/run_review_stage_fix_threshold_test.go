@@ -157,9 +157,11 @@ func TestALowIsSentBackAndFixedInLoop(t *testing.T) {
 	if review.MustFixOpen {
 		t.Error("must_fix_open = true after every finding was resolved")
 	}
-	section := (&taskOpenPR{review: review}).reviewSection()
-	if !strings.Contains(section, "<summary>Fixed during review (2)</summary>") || !strings.Contains(section, "echoes the request path") {
-		t.Errorf("the fixed Low is not under Fixed during review:\n%s", section)
+	if section := (&taskOpenPR{review: review}).needsYouSection(); section != "" {
+		t.Errorf("a review that fixed everything still needs someone:\n%s", section)
+	}
+	if tally := reviewTally(review); tally != "**Review:** 2 found · 2 fixed before this PR" {
+		t.Errorf("tally = %q, want both findings counted as fixed", tally)
 	}
 }
 
@@ -187,7 +189,7 @@ func TestALowStillOpenAfterTheBoundsIsNotedAndHoldsNothing(t *testing.T) {
 	if opener.needsFixes() {
 		t.Error("a surviving Low made the pull request a draft")
 	}
-	section := opener.reviewSection()
+	section := opener.needsYouSection()
 	if !strings.Contains(section, "_"+stillOpenBelowHoldHeading+"_") {
 		t.Errorf("the surviving Low is not under the still-open-below-hold group:\n%s", section)
 	}
@@ -208,7 +210,7 @@ func TestAMediumStillOpenHoldsThePullRequest(t *testing.T) {
 	if !review.MustFixOpen || !(&taskOpenPR{review: review}).needsFixes() {
 		t.Error("an open Medium did not hold the pull request")
 	}
-	section := (&taskOpenPR{review: review}).reviewSection()
+	section := (&taskOpenPR{review: review}).needsYouSection()
 	mustFixAt := strings.Index(section, mustFixHeading(false))
 	notedAt := strings.Index(section, "_"+stillOpenBelowHoldHeading+"_")
 	if mustFixAt < 0 || notedAt < 0 || mustFixAt > notedAt {
@@ -266,7 +268,7 @@ func TestANoChangeStopWithOnlyLowsOpenIsNotADraft(t *testing.T) {
 	if review.MustFixOpen || (&taskOpenPR{review: review}).needsFixes() {
 		t.Error("a no-change stop with only a Low open made the pull request a draft")
 	}
-	section := (&taskOpenPR{review: review}).reviewSection()
+	section := (&taskOpenPR{review: review}).needsYouSection()
 	notedAt := strings.Index(section, "_"+stillOpenBelowHoldHeading+"_")
 	lineAt := strings.Index(section, "_The last fix round changed nothing._")
 	if notedAt < 0 || lineAt < notedAt {
@@ -287,7 +289,7 @@ func TestANoChangeStopWithAMediumOpenKeepsItsLineUnderMustFix(t *testing.T) {
 	if !review.MustFixOpen {
 		t.Fatal("an open Medium did not hold after a no-change stop")
 	}
-	section := (&taskOpenPR{review: review}).reviewSection()
+	section := (&taskOpenPR{review: review}).needsYouSection()
 	lineAt := strings.Index(section, "_The last fix round changed nothing")
 	notedAt := strings.Index(section, "_"+stillOpenBelowHoldHeading+"_")
 	if lineAt < 0 || notedAt < 0 || lineAt > notedAt {

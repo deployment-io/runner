@@ -395,7 +395,7 @@ func TestPRBodyStaysUnderTheCapWithTwentyRequirements(t *testing.T) {
 	var findings []reviewFindingOutput
 	for i := 0; i < 40; i++ {
 		findings = append(findings, reviewFindingOutput{
-			Parameter: "correctness", Severity: "low",
+			Parameter: "correctness", Severity: "low", SentBack: true,
 			Location: strings.Repeat("l", 400), What: strings.Repeat("w", 900), Why: strings.Repeat("y", 900),
 		})
 	}
@@ -410,16 +410,6 @@ func TestPRBodyStaysUnderTheCapWithTwentyRequirements(t *testing.T) {
 	opr := reviewTestOpener(review)
 	opr.ctx.DashboardURL = "https://app.example.com/dashboard"
 	opr.agentSummary = strings.Repeat("x", 100000)
-	var criteria []string
-	for i := 0; i < 25; i++ {
-		criteria = append(criteria, strings.Repeat("c", 500))
-	}
-	opr.acceptance = parseAcceptanceCriteria(taskSpecJSON(t, criteria))
-	var hosts []string
-	for i := 0; i < 80; i++ {
-		hosts = append(hosts, fmt.Sprintf("%s-%d.example.com", strings.Repeat("h", 200), i))
-	}
-	opr.deniedHosts = hosts
 
 	_, body := opr.buildPRTitleAndBody()
 

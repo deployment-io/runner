@@ -198,45 +198,8 @@ func TestTaskOpenPR_BuildPRTitleAndBody_TrailerAndLeadIn(t *testing.T) {
 	}
 }
 
-// TestTaskOpenPR_BuildPRTitleAndBody_WithDeniedHosts pins the
-// denied-hosts section as a collapsed block, with the count in its summary,
-// BEFORE the trailer (which is always last), listing each host as a
-// code-formatted bullet. Surfaced to reviewers so they can suggest allowlist
-// additions.
-func TestTaskOpenPR_BuildPRTitleAndBody_WithDeniedHosts(t *testing.T) {
-	opr := &taskOpenPR{
-		ctx: commandUtils.TaskJobContext{
-			OrganizationID: "org-1",
-			TaskID:         "task-1",
-			TaskTitle:      "My Task",
-			StepIndex:      0,
-		},
-		deniedHosts: []string{"pypi.example.com", "registry.internal"},
-	}
-	_, body := opr.buildPRTitleAndBody()
-
-	if !strings.Contains(body, "<details><summary>Hosts the agent was blocked from reaching (2)</summary>\n\n") {
-		t.Errorf("body missing the collapsed denied-hosts block:\n%s", body)
-	}
-	if !strings.Contains(body, "`pypi.example.com`") {
-		t.Errorf("body missing pypi.example.com bullet:\n%s", body)
-	}
-	if !strings.Contains(body, "`registry.internal`") {
-		t.Errorf("body missing registry.internal bullet:\n%s", body)
-	}
-	// The hosts and their closing tag are inside the block, and the trailer
-	// comes after it.
-	deniedIdx := strings.Index(body, "<details><summary>Hosts the agent")
-	hostIdx := strings.Index(body, "`registry.internal`")
-	closeIdx := strings.Index(body, "</details>")
-	trailerIdx := strings.Index(body, "Generated-By:")
-	if deniedIdx == -1 || !(deniedIdx < hostIdx && hostIdx < closeIdx && closeIdx < trailerIdx) {
-		t.Errorf("denied hosts must sit inside their <details> block, before the trailer:\n%s", body)
-	}
-}
-
 // An ordinary body — a Step with no review, no verify result and a summary
-// that fits — is the summary and the trailer, byte for byte. The cap is a
+// that fits — is the details line, the summary and the trailer, byte for byte. The cap is a
 // guard on the one case that would fail the PR open, not a reformatting of
 // every pull request.
 func TestTaskOpenPR_OrdinaryBodyIsUnchanged(t *testing.T) {
@@ -251,7 +214,8 @@ func TestTaskOpenPR_OrdinaryBodyIsUnchanged(t *testing.T) {
 	subject, body := opr.buildPRTitleAndBody()
 
 	const wantSubject = "Add OAuth login to auth-service"
-	const wantBody = "Added the login endpoint.\n\nIt checks the caller's session.\n\n" +
+	const wantBody = "**Details:** review, QA results, previews and logs on the [Task page](https://app.example.com/tasks/task-1)\n\n" +
+		"Added the login endpoint.\n\nIt checks the caller's session.\n\n" +
 		"---\n" +
 		"Generated-By: deployment.io Tasks\n" +
 		"Task: My Task\n" +
@@ -270,7 +234,7 @@ func TestTaskOpenPR_OrdinaryBodyIsUnchanged(t *testing.T) {
 // GitHub rejects a body over 65,536 characters, and a rejected body is a pull
 // request that never opens. The summary is the part with no bound of its own,
 // so it is the part that yields — and everything the reader cannot get
-// elsewhere (the metadata, the Review section) survives the cut.
+// elsewhere (the metadata, "Needs you") survives the cut.
 func TestTaskOpenPR_BodyIsCappedAtSixtyThousandRunes(t *testing.T) {
 	opr := reviewTestOpener(completedReview(true, reviewFindingOutput{
 		Parameter: "security", Severity: "high", Location: "handler.go:41",
@@ -289,7 +253,7 @@ func TestTaskOpenPR_BodyIsCappedAtSixtyThousandRunes(t *testing.T) {
 	for _, want := range []string{
 		"Generated-By: deployment.io Tasks",
 		"Task-URL: https://app.example.com/tasks/task-1",
-		"**Review**",
+		"**Needs you**",
 		"no session check",
 		prSummaryTruncatedNote,
 	} {
@@ -336,32 +300,6 @@ func TestTaskOpenPR_BodyCapNeverSplitsAMultiByteCharacter(t *testing.T) {
 	}
 }
 
-// A run denied hundreds of hosts is denied the same handful over and over.
-// Fifty names and a count beat a list that crowds out the rest of the body.
-func TestTaskOpenPR_BlockedHostsAreCappedWithACount(t *testing.T) {
-	hosts := make([]string, 0, 80)
-	for i := 0; i < 80; i++ {
-		hosts = append(hosts, fmt.Sprintf("host-%02d.example.com", i))
-	}
-	opr := &taskOpenPR{
-		ctx: commandUtils.TaskJobContext{
-			OrganizationID: "org-1", TaskID: "task-1", TaskTitle: "My Task", StepIndex: 0,
-		},
-		deniedHosts: hosts,
-	}
-	_, body := opr.buildPRTitleAndBody()
-
-	if got := strings.Count(body, "`host-"); got != 50 {
-		t.Errorf("%d hosts rendered, want %d", got, prBodyDeniedHostsMaxItems)
-	}
-	if !strings.Contains(body, "- and 30 more\n") {
-		t.Errorf("the body does not say how many hosts were left out:\n%s", body)
-	}
-	if strings.Contains(body, "`host-50.example.com`") {
-		t.Errorf("a host past the cap was rendered:\n%s", body)
-	}
-}
-
 // A handful of pre-existing failures across repos is an ordinary body, well
 // under the cap. Every one of them is named: the failures are what this pull
 // request exists to explain, and the body has room, so nothing is dropped and
@@ -399,7 +337,7 @@ func TestTaskOpenPR_FailingVerifyStepsAreAllKeptWhenTheBodyFits(t *testing.T) {
 // report a pre-existing failure per repo, each with its own bounded output, and
 // bounded parts still add up: past the whole body's cap the section reports what
 // it can and names the rest as a count, so the pull request is not rejected by
-// the provider. The Review section, which comes after it, has to survive too.
+// the provider. "Needs you", which comes before it, has to survive too.
 func TestTaskOpenPR_ManyFailingVerifyStepsStillFitTheBody(t *testing.T) {
 	steps := make([]verifyStep, 0, 60)
 	for i := 0; i < 60; i++ {
@@ -423,7 +361,7 @@ func TestTaskOpenPR_ManyFailingVerifyStepsStillFitTheBody(t *testing.T) {
 	if !strings.Contains(body, "more failing step(s)") {
 		t.Errorf("the body does not say how many failing steps were left out:\n%s", body)
 	}
-	for _, want := range []string{"Generated-By: deployment.io Tasks", "**Review**", "no session check"} {
+	for _, want := range []string{"Generated-By: deployment.io Tasks", "**Needs you**", "no session check"} {
 		if !strings.Contains(body, want) {
 			t.Errorf("the verification section crowded out %q:\n%s", want, body)
 		}

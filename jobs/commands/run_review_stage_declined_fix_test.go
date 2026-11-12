@@ -81,9 +81,9 @@ func TestAFixRunThatChangedNothingDoesNotReplaceTheDescription(t *testing.T) {
 	if review.DeclinedExplanation != declinedFixRunResult().ChangesSummary {
 		t.Errorf("declined_explanation = %q, want the fix run's summary", review.DeclinedExplanation)
 	}
-	section := (&taskOpenPR{review: review}).reviewSection()
+	section := (&taskOpenPR{review: review}).needsYouSection()
 	if !strings.Contains(section, "_The last fix round changed nothing. The agent's explanation:_\n\n> I didn't change any code") {
-		t.Errorf("the review section does not quote the explanation:\n%s", section)
+		t.Errorf("\"Needs you\" does not quote the explanation:\n%s", section)
 	}
 }
 

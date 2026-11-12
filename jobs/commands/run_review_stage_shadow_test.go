@@ -234,7 +234,7 @@ func TestTheShadowReviewRunsOnceAfterRoundOneAndIsLogOnly(t *testing.T) {
 	if len(review.Rounds) != 2 || review.MustFixOpen {
 		t.Errorf("rounds = %d, must_fix_open = %t; want 2 rounds and nothing open", len(review.Rounds), review.MustFixOpen)
 	}
-	section := (&taskOpenPR{review: review}).reviewSection()
+	section := (&taskOpenPR{review: review}).needsYouSection()
 	for _, what := range []string{"compared with ==", "error from Save"} {
 		if strings.Contains(section, what) || strings.Contains(reviewJSON(t, out), what) {
 			t.Errorf("the shadow review's finding %q reached the review output or the pull request", what)

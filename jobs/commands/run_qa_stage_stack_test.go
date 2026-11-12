@@ -686,24 +686,14 @@ func TestQAStackReportCarriesNamesOnly(t *testing.T) {
 	if qa == nil || len(qa.Rounds) != 1 || len(qa.Rounds[0].Wiring) != 1 || !reflect.DeepEqual(qa.Backends, []string{"1-api"}) {
 		t.Fatalf("qa = %+v", qa)
 	}
-	section := (&taskOpenPR{qa: qa}).qaSection()
-	checked := strings.Index(section, "QA checked web merged with main")
-	built := strings.Index(section, "- QA built web's preview to call api's preview (VITE_API_URL) and allowed its origin on api's preview (CORS_ORIGINS).")
-	if checked < 0 || built < checked {
-		t.Errorf("section:\n%s", section)
+	_, body := (&taskOpenPR{qa: qa, taskPreviews: stubPreviewLister{}}).buildPRTitleAndBody()
+	if !strings.Contains(logs.String(), "QA built web's preview to call api's preview (VITE_API_URL) and allowed its origin on api's preview (CORS_ORIGINS).") {
+		t.Errorf("the log lacks the wiring line:\n%s", logs.String())
 	}
-	for name, text := range map[string]string{"job output": jobOutput, "pull request": section, "log": logs.String()} {
+	for name, text := range map[string]string{"job output": jobOutput, "pull request": body, "log": logs.String()} {
 		if strings.Contains(text, secretPath) || strings.Contains(text, strings.TrimPrefix(secretPath, "/")) {
 			t.Errorf("the %s carries the production path:\n%s", name, text)
 		}
-	}
-
-	// A round that couldn't run still lists its pairs.
-	qa.Status, qa.StatusReason = tasks.QAStatusCouldNotRun, "the QA run produced no qa_result"
-	qa.Rounds[0].Status, qa.Rounds[0].Criteria = tasks.QAStatusCouldNotRun, nil
-	qa.Rounds[0].MergeResults = nil
-	if section := (&taskOpenPR{qa: qa}).qaSection(); !strings.Contains(section, "QA built web's preview") {
-		t.Errorf("couldn't-run section:\n%s", section)
 	}
 }
 
