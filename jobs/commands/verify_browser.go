@@ -38,8 +38,8 @@ import (
 // verifyBrowserImage is the verify-browser release this runner uses. Pinned to an
 // exact version; bump it deliberately when a new verify-browser-vX.Y.Z ships.
 // 1.3.0 is the first with read_only, which production QA requires; 1.4.0 the
-// first with the back step.
-const verifyBrowserImage = "docker.io/deploymenthq/verify-browser:1.4.0"
+// first with the back step; 1.5.0 the first with sign_in.
+const verifyBrowserImage = "docker.io/deploymenthq/verify-browser:1.5.0"
 
 // minReadOnlyVerifyBrowserVersion is the first verify-browser release that
 // honours read_only. A production QA run refuses an older image rather than
@@ -161,6 +161,8 @@ type verifyBrowserExit struct {
 	timedOut  bool
 	oomKilled bool
 	output    string
+	// outputCut: output is a tail, its start cut.
+	outputCut bool
 }
 
 // verifyBrowser runs checks. Its Docker calls are fields so tests can replace them.
@@ -218,6 +220,9 @@ func newVerifyBrowser() *verifyBrowser {
 func (v *verifyBrowser) run(ctx context.Context, req agenttools.VerifyBrowserRequest, logsWriter io.Writer) (agenttools.VerifyBrowserOutcome, error) {
 	ref := v.imageRef(req.ImageRef)
 	if req.MinImageVersion != "" && !imageVersionAtLeast(ref, req.MinImageVersion) {
+		if req.MinImageFeature != "" {
+			return agenttools.VerifyBrowserOutcome{}, fmt.Errorf("%w: the QA browser image %s doesn't support %s (it needs verify-browser %s or later)", agenttools.ErrVerifyBrowserNotRun, ref, req.MinImageFeature, req.MinImageVersion)
+		}
 		return agenttools.VerifyBrowserOutcome{}, fmt.Errorf("%w: the QA browser image %s doesn't support the back step (it needs verify-browser %s or later); check without it, for example with a goto to the earlier page", agenttools.ErrVerifyBrowserNotRun, ref, req.MinImageVersion)
 	}
 	// Held from before the presence check so a concurrent prune can't remove the
@@ -261,6 +266,7 @@ func (v *verifyBrowser) run(ctx context.Context, req agenttools.VerifyBrowserReq
 		ImageRef:  ref,
 		Result:    readVerifyBrowserResult(filepath.Join(ioDir, "result.json")),
 		Output:    exit.output,
+		OutputCut: exit.outputCut,
 		ExitCode:  exit.exitCode,
 		TimedOut:  exit.timedOut,
 		OOMKilled: exit.oomKilled,
@@ -586,7 +592,7 @@ func dockerRunVerifyBrowser(ctx context.Context, id string, wallClock time.Durat
 		exit.timedOut = true
 	}
 	// Reading the output and the state stops when ctx ends too.
-	exit.output = verifyBrowserContainerOutput(ctx, cli, id)
+	exit.output, exit.outputCut = verifyBrowserContainerOutputTail(ctx, cli, id)
 	inspectCtx, cancelInspect := context.WithTimeout(ctx, containerInspectTimeout)
 	defer cancelInspect()
 	if info, err := cli.ContainerInspect(inspectCtx, id, client.ContainerInspectOptions{}); err == nil && info.Container.State != nil {
@@ -601,28 +607,38 @@ func dockerRunVerifyBrowser(ctx context.Context, id string, wallClock time.Durat
 // verifyBrowserContainerOutput returns the tail of the container's stdout and
 // stderr, interleaved.
 func verifyBrowserContainerOutput(ctx context.Context, cli *client.Client, id string) string {
+	output, _ := verifyBrowserContainerOutputTail(ctx, cli, id)
+	return output
+}
+
+// verifyBrowserContainerOutputTail is verifyBrowserContainerOutput and whether
+// its start was cut.
+func verifyBrowserContainerOutputTail(ctx context.Context, cli *client.Client, id string) (string, bool) {
 	ctx, cancel := context.WithTimeout(ctx, containerInspectTimeout)
 	defer cancel()
 	logs, err := cli.ContainerLogs(ctx, id, client.ContainerLogsOptions{ShowStdout: true, ShowStderr: true})
 	if err != nil {
-		return ""
+		return "", false
 	}
 	defer logs.Close()
 	tail := &tailWriter{max: verifyBrowserOutputMax}
 	_, _ = stdcopy.StdCopy(tail, tail, logs)
-	return string(tail.buf)
+	return string(tail.buf), tail.cut
 }
 
-// tailWriter keeps the last max bytes written to it.
+// tailWriter keeps the last max bytes written to it; cut is set once it has
+// dropped any.
 type tailWriter struct {
 	max int
 	buf []byte
+	cut bool
 }
 
 func (t *tailWriter) Write(p []byte) (int, error) {
 	t.buf = append(t.buf, p...)
 	if over := len(t.buf) - t.max; over > 0 {
 		t.buf = append([]byte(nil), t.buf[over:]...)
+		t.cut = true
 	}
 	return len(p), nil
 }

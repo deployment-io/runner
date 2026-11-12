@@ -108,46 +108,78 @@ type renderedResult struct {
 	DOMTextSnippet  string                   `json:"dom_text_snippet"`
 	// Outline is absent from 1.0.0 results, and then from the reply.
 	Outline []renderedOutlineEntry `json:"outline,omitempty"`
+	// SignIn is how a check with as signed in (verify-browser 1.5.0+); absent
+	// from every other check's reply.
+	SignIn *renderedSignIn `json:"sign_in,omitempty"`
 	// Truncated is set when parts of the result were shortened or dropped to keep
 	// it under verifyRenderedMaxResultBytes.
 	Truncated bool `json:"truncated,omitempty"`
 }
 
-// renderVerifyBrowserOutcome returns the tool's JSON text and the verdict, or an
-// error that says QA couldn't check the page and why. wantViewport is whether the
-// agent asked for a window size: a completed result without one is from an image
-// that ignored the request, and is not passed off as seen at that size.
+// renderVerifyBrowserOutcome returns the tool's JSON text and the verdict of a
+// check without as, or an error that says QA couldn't check the page and why
+// (renderVerifyBrowserCheck).
 func renderVerifyBrowserOutcome(o VerifyBrowserOutcome, wantViewport bool) (string, string, error) {
-	switch {
-	case o.TimedOut:
-		return "", "", couldntCheck("the browser did not finish in time and was stopped", o.Output)
-	case o.OOMKilled:
-		return "", "", couldntCheck("the browser ran out of memory (the QA browser has 1 GiB)", o.Output)
-	case len(o.Result) == 0:
-		return "", "", couldntCheck(fmt.Sprintf("the browser exited (code %d) without a result", o.ExitCode), o.Output)
-	}
-	var r renderedResult
-	if err := json.Unmarshal(o.Result, &r); err != nil {
-		return "", "", couldntCheck("the browser's result is not valid JSON", o.Output)
-	}
-	if r.SchemaVersion != 1 {
-		return "", "", couldntCheck(fmt.Sprintf("the browser's result has schema_version %d, want 1", r.SchemaVersion), o.Output)
-	}
-	switch {
-	case r.Status == "error":
-		return "", "", fmt.Errorf("QA couldn't check the page: %s", capChars(r.Error, renderedImageErrorChars))
-	case r.Status != "completed" || (r.Verdict != "pass" && r.Verdict != "fail"):
-		return "", "", couldntCheck(fmt.Sprintf("the browser's result has status %q and verdict %q", capChars(r.Status, renderedShortChars), capChars(r.Verdict, renderedShortChars)), o.Output)
-	}
-	if wantViewport && r.Viewport == nil {
-		return "", "", olderImageError(o.ImageRef)
-	}
-	capRenderedResult(&r)
-	text, err := fitRenderedResult(&r)
+	text, r, err := renderVerifyBrowserCheck(o, renderedCheck{wantViewport: wantViewport})
 	if err != nil {
 		return "", "", err
 	}
 	return text, r.Verdict, nil
+}
+
+// renderedCheck is what a check asked of the browser that its result must
+// show: wantViewport is whether the agent asked for a window size, signIn the
+// check's sign-in (nil without as).
+type renderedCheck struct {
+	wantViewport bool
+	signIn       *browserSignInCheck
+}
+
+// renderVerifyBrowserCheck returns the tool's JSON text and the result it was
+// made from, or an error that says QA couldn't check the page and why. A
+// completed result without a viewport the agent asked for is from an image that
+// ignored the request, and is not passed off as seen at that size. A check with
+// as must have sign_in, which the reply carries with the role and backend; a
+// check without as never has one in its reply.
+func renderVerifyBrowserCheck(o VerifyBrowserOutcome, check renderedCheck) (string, *renderedResult, error) {
+	switch {
+	case o.TimedOut:
+		return "", nil, couldntCheck("the browser did not finish in time and was stopped", o.Output)
+	case o.OOMKilled:
+		return "", nil, couldntCheck("the browser ran out of memory (the QA browser has 1 GiB)", o.Output)
+	case len(o.Result) == 0:
+		return "", nil, couldntCheck(fmt.Sprintf("the browser exited (code %d) without a result", o.ExitCode), o.Output)
+	}
+	var r renderedResult
+	if err := json.Unmarshal(o.Result, &r); err != nil {
+		return "", nil, couldntCheck("the browser's result is not valid JSON", o.Output)
+	}
+	if r.SchemaVersion != 1 {
+		return "", nil, couldntCheck(fmt.Sprintf("the browser's result has schema_version %d, want 1", r.SchemaVersion), o.Output)
+	}
+	switch {
+	case r.Status == "error":
+		return "", nil, fmt.Errorf("QA couldn't check the page: %s", capChars(r.Error, renderedImageErrorChars))
+	case r.Status != "completed" || (r.Verdict != "pass" && r.Verdict != "fail"):
+		return "", nil, couldntCheck(fmt.Sprintf("the browser's result has status %q and verdict %q", capChars(r.Status, renderedShortChars), capChars(r.Verdict, renderedShortChars)), o.Output)
+	}
+	if check.signIn == nil {
+		r.SignIn = nil
+	} else {
+		if r.SignIn == nil {
+			return "", nil, signInIgnoredError(o.ImageRef)
+		}
+		r.SignIn.As, r.SignIn.Backend = check.signIn.role, check.signIn.backend
+	}
+	if check.wantViewport && r.Viewport == nil {
+		return "", nil, olderImageError(o.ImageRef)
+	}
+	capRenderedResult(&r)
+	text, err := fitRenderedResult(&r)
+	if err != nil {
+		return "", nil, err
+	}
+	return text, &r, nil
 }
 
 // olderImageError is the error for a requested viewport the image ignored.
@@ -226,15 +258,7 @@ func capRenderedResult(r *renderedResult) {
 	}
 	r.PageErrors = capStrings(r.PageErrors, renderedMaxPageErrors, renderedPageErrorChars)
 	r.ConsoleErrors = capStrings(r.ConsoleErrors, renderedMaxConsoleErrors, renderedConsoleErrorChars)
-	if len(r.FailedRequests) > renderedMaxFailedRequests {
-		r.FailedRequests = r.FailedRequests[:renderedMaxFailedRequests]
-	}
-	for i := range r.FailedRequests {
-		f := &r.FailedRequests[i]
-		f.URL = capChars(f.URL, renderedURLChars)
-		f.Method = capChars(f.Method, renderedShortChars)
-		f.Failure = capChars(f.Failure, renderedDetailChars)
-	}
+	r.FailedRequests = capFailedRequests(r.FailedRequests)
 	r.BlockedNavigations = capStrings(r.BlockedNavigations, renderedMaxBlocked, renderedURLChars)
 	if len(r.BlockedRequests) > renderedMaxBlocked {
 		r.BlockedRequests = r.BlockedRequests[:renderedMaxBlocked]
@@ -245,6 +269,7 @@ func capRenderedResult(r *renderedResult) {
 		b.Method = capChars(b.Method, renderedShortChars)
 	}
 	r.DOMTextSnippet = capChars(r.DOMTextSnippet, renderedDOMTextChars)
+	capRenderedSignIn(r.SignIn)
 	if len(r.Outline) > renderedMaxOutline {
 		r.Outline = r.Outline[:renderedMaxOutline]
 	}
@@ -267,6 +292,29 @@ func capRenderedResult(r *renderedResult) {
 	r.Message = renderedSummary(r)
 }
 
+// capFailedRequests applies failed_requests' caps; nil stays nil.
+func capFailedRequests(list []renderedFailedRequest) []renderedFailedRequest {
+	if len(list) > renderedMaxFailedRequests {
+		list = list[:renderedMaxFailedRequests]
+	}
+	for i := range list {
+		f := &list[i]
+		f.URL = capChars(f.URL, renderedURLChars)
+		f.Method = capChars(f.Method, renderedShortChars)
+		f.Failure = capChars(f.Failure, renderedDetailChars)
+	}
+	return list
+}
+
+// signInFailedRequests is r's sign-in's failed requests (nil without one), for
+// the shrinks that shorten failed_requests to shorten them too.
+func (r *renderedResult) signInFailedRequests() *[]renderedFailedRequest {
+	if r.SignIn == nil {
+		return new([]renderedFailedRequest)
+	}
+	return &r.SignIn.FailedRequests
+}
+
 // renderedShrinks are applied in order until the result fits: the least useful
 // parts go first.
 var renderedShrinks = []func(r *renderedResult){
@@ -277,8 +325,10 @@ var renderedShrinks = []func(r *renderedResult){
 		for i := range r.BlockedRequests {
 			r.BlockedRequests[i].URL = capChars(r.BlockedRequests[i].URL, renderedShrunkURLChars)
 		}
-		for i := range r.FailedRequests {
-			r.FailedRequests[i].URL = capChars(r.FailedRequests[i].URL, renderedShrunkURLChars)
+		for _, list := range []*[]renderedFailedRequest{&r.FailedRequests, r.signInFailedRequests()} {
+			for i := range *list {
+				(*list)[i].URL = capChars((*list)[i].URL, renderedShrunkURLChars)
+			}
 		}
 	},
 	func(r *renderedResult) { r.ConsoleErrors = []string{} },
@@ -298,14 +348,18 @@ var renderedShrinks = []func(r *renderedResult){
 		for i := range r.Assertions {
 			r.Assertions[i].Detail = capChars(r.Assertions[i].Detail, renderedShrunkDetailChars)
 		}
-		for i := range r.FailedRequests {
-			r.FailedRequests[i].Failure = capChars(r.FailedRequests[i].Failure, renderedShrunkDetailChars)
+		for _, list := range []*[]renderedFailedRequest{&r.FailedRequests, r.signInFailedRequests()} {
+			for i := range *list {
+				(*list)[i].Failure = capChars((*list)[i].Failure, renderedShrunkDetailChars)
+			}
 		}
 	},
 	func(r *renderedResult) {
 		r.PageErrors = capStrings(r.PageErrors, 3, renderedShrunkPageErrorChar)
-		if len(r.FailedRequests) > 5 {
-			r.FailedRequests = r.FailedRequests[:5]
+		for _, list := range []*[]renderedFailedRequest{&r.FailedRequests, r.signInFailedRequests()} {
+			if len(*list) > 5 {
+				*list = (*list)[:5]
+			}
 		}
 		r.DOMTextSnippet = ""
 	},
@@ -343,6 +397,9 @@ func fitRenderedResult(r *renderedResult) (string, error) {
 // no page errors; no failed requests".
 func renderedSummary(r *renderedResult) string {
 	var parts []string
+	if r.SignIn != nil {
+		parts = append(parts, r.SignIn.phrase())
+	}
 	if r.HTTPStatus < 200 || r.HTTPStatus > 299 {
 		if r.HTTPStatus == 0 {
 			parts = append(parts, "the first load got no response")

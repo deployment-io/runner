@@ -209,6 +209,9 @@ type qaStage struct {
 	// roundSignIns are, in the stack path, the last round's backends QA may
 	// sign in at (qaStackRound.signIns).
 	roundSignIns []agenttools.APISignInPreview
+	// roundBrowserSignIns are, in the stack path, the last round's site
+	// previews QA may check signed in (qaStackRound.browserSignIns).
+	roundBrowserSignIns []agenttools.BrowserSignInSite
 
 	// stack is the stack path (minPreviewsQAAgentboxVersion): the runner deploys
 	// every site and backend preview itself and the QA run gets QA_PREVIEWS.

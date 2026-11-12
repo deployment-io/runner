@@ -192,6 +192,10 @@ type WebServicePreviewDeployed struct {
 	// as each role's test user.
 	Roles  []task_previews.PreviewRoleV1
 	SignIn *task_previews.PreviewSignInV1
+	// BrowserSignInPath is the service's browser sign-in page (trimmed; "":
+	// none): with a seed that succeeded, QA can sign in as each role's test
+	// user on the pages of a site preview connected to this one.
+	BrowserSignInPath string
 }
 
 // WebPreviewDeployFailed is the error of a failed step of a backend preview deploy.
@@ -601,6 +605,8 @@ func runWebServicePreview(ctx context.Context, deps DeployWebServicePreviewDeps,
 		Seed:         out.Seed,
 		Roles:        p.service.PreviewRoles,
 		SignIn:       p.service.PreviewSignIn,
+
+		BrowserSignInPath: strings.TrimSpace(p.service.PreviewBrowserSignInPath),
 	}, nil
 }
 
