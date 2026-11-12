@@ -209,9 +209,12 @@ type sessionRun struct {
 // prepareSessionDirs creates the bind-mounted input/output message dirs and the
 // system prompt file (prompt: planModePrompt, or askPrompt for an Ask session), then chowns them to the agentbox `agent` user so the
 // UID-1000 container can read input and write output through the bind mount.
+// They must exist before the container is created: they are bound read-write
+// on top of a read-only /work, and a bind's mountpoint can't be created inside
+// a read-only bind (sessionSpawnSpec).
 func prepareSessionDirs(workDirHost, prompt string) error {
 	outDir := filepath.Join(workDirHost, ".agentbox-output", "messages")
-	inDir := filepath.Join(workDirHost, ".agentbox-input", "messages")
+	inDir := filepath.Join(workDirHost, sessionInputDirRel, "messages")
 	// tmpDir backs TMPDIR/GOTMPDIR for the session container, exactly as the
 	// Step path does — buildSessionSpawnEnvVars points at it, and TMPDIR
 	// naming a missing directory fails every write with ENOENT.
@@ -229,13 +232,13 @@ func prepareSessionDirs(workDirHost, prompt string) error {
 			return err
 		}
 	}
-	promptPath := filepath.Join(workDirHost, ".agentbox-input", "system-prompt.txt")
+	promptPath := filepath.Join(workDirHost, sessionInputDirRel, "system-prompt.txt")
 	if err := os.WriteFile(promptPath, []byte(prompt), 0644); err != nil {
 		return err
 	}
 	for _, p := range []string{
 		filepath.Join(workDirHost, ".agentbox-output"),
-		filepath.Join(workDirHost, ".agentbox-input"),
+		filepath.Join(workDirHost, sessionInputDirRel),
 		tmpDir,
 		corepackDir,
 		uploadsDir,
@@ -324,9 +327,7 @@ func (rs *RunAssistantSession) runSession(run sessionRun) error {
 	// (the whole host budget on a small runner) and held it for the
 	// conversation's lifetime, blocking every deploy behind them.
 	sessionMemoryBytes := resources.MemoryForAssistantSession()
-	containerID, err := createAgentboxContainer(dockerCtx, cli, agentboxSpawnSpec{
-		imageRef: run.imageRef, workDirHost: workDirHost, env: run.envVars, memoryBytes: sessionMemoryBytes,
-	})
+	containerID, err := createAgentboxContainer(dockerCtx, cli, sessionSpawnSpec(run, sessionMemoryBytes))
 	if err != nil {
 		return err
 	}
@@ -342,12 +343,16 @@ func (rs *RunAssistantSession) runSession(run sessionRun) error {
 		streamContainerLogs(dockerCtx, cli, containerID, plainLogStreams(logsWriter))
 	}()
 
+	// The container can plant links in its output dir; the runner reads there
+	// as root and never follows one.
+	files := newSessionFiles(workDirHost, logsWriter)
 	mf := &messageForwarder{
 		dir:   filepath.Join(workDirHost, ".agentbox-output", "messages"),
+		files: files,
 		orgID: orgID, jobID: jobID, logsWriter: logsWriter, seen: map[string]bool{},
 	}
 	ip := &inputPump{
-		dir:        filepath.Join(workDirHost, ".agentbox-input", "messages"),
+		dir:        filepath.Join(workDirHost, sessionInputDirRel, "messages"),
 		uploadsDir: filepath.Join(workDirHost, sessionUploadsDirRel),
 		// baseDir is the session's /work: a repo added mid-session is cloned
 		// into <baseDir>/<index>-<name>, alongside the ones CheckoutRepo put
@@ -363,10 +368,12 @@ func (rs *RunAssistantSession) runSession(run sessionRun) error {
 	}
 	sf := &specForwarder{
 		path:  filepath.Join(workDirHost, ".agentbox-output", "task-spec.json"),
+		files: files,
 		orgID: orgID, jobID: jobID, logsWriter: logsWriter,
 	}
 	rf := &repoSuggestionForwarder{
 		path:  filepath.Join(workDirHost, ".agentbox-output", "repo-suggestion.json"),
+		files: files,
 		orgID: orgID, jobID: jobID, logsWriter: logsWriter,
 	}
 	stopBridge := make(chan struct{})
@@ -385,7 +392,7 @@ func (rs *RunAssistantSession) runSession(run sessionRun) error {
 	mf.tick() // final drain of any buffered output
 	sf.tick() // final spec snapshot
 	rf.tick() // final repo-suggestion snapshot
-	logSessionOutcome(workDirHost, logsWriter)
+	logSessionOutcome(files, logsWriter)
 	if errors.Is(waitErr, types.ErrJobStoppedByUser) {
 		return nil // user / cron / convert stop — the normal session end
 	}
@@ -398,18 +405,29 @@ func (rs *RunAssistantSession) runSession(run sessionRun) error {
 	// user sees why it stopped, and return an error so the Job is reported
 	// failed (deployment-server then marks the session Failed).
 	if exitCode != 0 {
-		failMsg := sessionAgentFailureMessage(workDirHost)
+		failMsg := sessionAgentFailureMessage(files)
 		rs.forwardSessionFailure(orgID, jobID, failMsg, logsWriter)
 		return fmt.Errorf("session agent exited with code %d: %s", exitCode, failMsg)
 	}
 	return nil
 }
 
+// sessionSpawnSpec is the session container's spec: /work read-only, with only
+// the directories agentbox must write bound back read-write
+// (agentboxSpawnSpec.readOnlyWorkDir). The runner itself still writes the rest
+// of the work dir on the host side — uploads, mid-session clones.
+func sessionSpawnSpec(run sessionRun, memoryBytes int64) agentboxSpawnSpec {
+	return agentboxSpawnSpec{
+		imageRef: run.imageRef, workDirHost: run.workDirHost, env: run.envVars, memoryBytes: memoryBytes,
+		readOnlyWorkDir: true,
+	}
+}
+
 // sessionAgentFailureMessage builds a user-facing reason for a failed session
 // agent, preferring agentbox's classified error from result.json (auth / credit
 // / rate-limit context) when present.
-func sessionAgentFailureMessage(workDirHost string) string {
-	if result, err := readAgentResult(workDirHost); err == nil && strings.TrimSpace(result.Error) != "" {
+func sessionAgentFailureMessage(files *sessionFiles) string {
+	if result, err := files.readAgentResult(); err == nil && strings.TrimSpace(result.Error) != "" {
 		return result.Error
 	}
 	return "the agent stopped unexpectedly — it may have run out of API credits, hit an auth or rate-limit error, or crashed"
@@ -458,6 +476,7 @@ func runSessionTicker(stop <-chan struct{}, fn func()) {
 // deltas correctly.
 type messageForwarder struct {
 	dir          string
+	files        *sessionFiles // reads without following links
 	orgID, jobID string
 	logsWriter   io.Writer
 	seen         map[string]bool
@@ -465,6 +484,9 @@ type messageForwarder struct {
 }
 
 func (mf *messageForwarder) tick() {
+	if !mf.files.checkDir(mf.dir) {
+		return // missing, or a link the container planted: read nothing
+	}
 	entries, _ := os.ReadDir(mf.dir)
 	var names []string
 	for _, e := range entries {
@@ -482,7 +504,12 @@ func (mf *messageForwarder) tick() {
 	var records []outputRec
 	var consumed []string
 	for _, n := range names {
-		b, err := os.ReadFile(filepath.Join(mf.dir, n))
+		b, err := mf.files.read(filepath.Join(mf.dir, n))
+		if errors.Is(err, errNotRegularFile) {
+			// A link or other non-file: never read, never retried (read logged it).
+			mf.seen[n] = true
+			continue
+		}
 		if err != nil {
 			break // retry from n next tick
 		}
@@ -686,7 +713,7 @@ func (ip *inputPump) write(m sessions.UserMessageDtoV1) error {
 		return err
 	}
 	name := fmt.Sprintf("%010d.json", ip.seq+1)
-	if err := atomicWrite(ip.dir, name, b); err != nil {
+	if err := atomicWrite(ip.baseDir, ip.dir, name, b); err != nil {
 		return err
 	}
 	ip.seq++ // only a delivered record consumes a sequence number
@@ -993,31 +1020,18 @@ func (ip *inputPump) writeAttachment(a sessions.SessionAttachmentDtoV1) error {
 	if len(a.Bytes) > 0 {
 		data = a.Bytes
 	}
-	return atomicWrite(ip.uploadsDir, rel, data)
-}
-
-// atomicWrite writes dir/name via temp+rename, creating parent dirs as needed.
-func atomicWrite(dir, name string, data []byte) error {
-	dest := filepath.Join(dir, name)
-	if err := os.MkdirAll(filepath.Dir(dest), 0755); err != nil {
-		return err
-	}
-	tmp := dest + ".tmp"
-	if err := os.WriteFile(tmp, data, 0644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, dest)
+	return atomicWrite(ip.baseDir, ip.uploadsDir, rel, data)
 }
 
 // logSessionOutcome best-effort surfaces the final agent result and whether a
 // task spec was produced. Spec persistence to the Session record is wired in a
 // later phase (app-server convert flow).
-func logSessionOutcome(workDirHost string, logsWriter io.Writer) {
-	if result, err := readAgentResult(workDirHost); err == nil {
+func logSessionOutcome(files *sessionFiles, logsWriter io.Writer) {
+	if result, err := files.readAgentResult(); err == nil {
 		io.WriteString(logsWriter, fmt.Sprintf("session ended: status=%s\n", result.Status))
 	}
-	specPath := filepath.Join(workDirHost, ".agentbox-output", "task-spec.json")
-	if b, err := os.ReadFile(specPath); err == nil && len(b) > 0 {
+	specPath := filepath.Join(files.root, ".agentbox-output", "task-spec.json")
+	if b, err := files.read(specPath); err == nil && len(b) > 0 {
 		io.WriteString(logsWriter, "session produced a task spec\n")
 	}
 }
@@ -1029,15 +1043,16 @@ func logSessionOutcome(workDirHost string, logsWriter io.Writer) {
 // lastContent unchanged so the next tick retries.
 type specForwarder struct {
 	path         string
+	files        *sessionFiles // reads without following links
 	orgID, jobID string
 	logsWriter   io.Writer
 	lastContent  string
 }
 
 func (sf *specForwarder) tick() {
-	b, err := os.ReadFile(sf.path)
+	b, err := sf.files.read(sf.path)
 	if err != nil {
-		return // not written yet
+		return // not written yet (or a link: treated as not written)
 	}
 	if string(b) == sf.lastContent {
 		return // unchanged since the last successful forward
@@ -1083,6 +1098,7 @@ func (sf *specForwarder) tick() {
 // the file leaves this idle and silent.
 type repoSuggestionForwarder struct {
 	path         string
+	files        *sessionFiles // reads without following links
 	orgID, jobID string
 	logsWriter   io.Writer
 	lastContent  string
@@ -1091,9 +1107,9 @@ type repoSuggestionForwarder struct {
 }
 
 func (rf *repoSuggestionForwarder) tick() {
-	b, err := os.ReadFile(rf.path)
+	b, err := rf.files.read(rf.path)
 	if err != nil {
-		return // not written yet — the agent has suggested nothing
+		return // not written yet (or a link) — the agent has suggested nothing
 	}
 	if string(b) == rf.lastContent {
 		return // unchanged since the last successful forward

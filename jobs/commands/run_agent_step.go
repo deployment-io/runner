@@ -1002,10 +1002,24 @@ func createAgentboxContainer(ctx context.Context, cli *client.Client, spec agent
 // of the /work bind rather than being hidden by it.
 func agentboxMounts(spec agentboxSpawnSpec) []mount.Mount {
 	mounts := []mount.Mount{{
-		Type:   mount.TypeBind,
-		Source: spec.workDirHost,
-		Target: agentboxWorkDirInContainer,
+		Type:     mount.TypeBind,
+		Source:   spec.workDirHost,
+		Target:   agentboxWorkDirInContainer,
+		ReadOnly: spec.readOnlyWorkDir,
 	}}
+	if spec.readOnlyWorkDir {
+		// The other way round from a review round: /work read-only, and only
+		// the directories the container must write bound back read-write on
+		// top of it. Each must already exist on the host — a bind's mountpoint
+		// can't be created inside a read-only bind (prepareSessionDirs).
+		for _, dir := range sessionWritableDirsRel {
+			mounts = append(mounts, mount.Mount{
+				Type:   mount.TypeBind,
+				Source: filepath.Join(spec.workDirHost, dir),
+				Target: agentboxWorkDirInContainer + "/" + dir,
+			})
+		}
+	}
 	if spec.cacheVolume != "" {
 		mounts = append(mounts, mount.Mount{
 			Type:   mount.TypeVolume,
@@ -1557,6 +1571,13 @@ func readAgentResult(workDirHost string) (agentResult, error) {
 	if err != nil {
 		return agentResult{}, fmt.Errorf("error reading %s: %s", resultPath, err)
 	}
+	return parseAgentResult(data)
+}
+
+// parseAgentResult decodes result.json's content; split from readAgentResult
+// so an assistant session can read the file without following a link
+// (sessionFiles.readAgentResult).
+func parseAgentResult(data []byte) (agentResult, error) {
 	var result agentResult
 	if err := json.Unmarshal(data, &result); err != nil {
 		return agentResult{}, fmt.Errorf("error unmarshalling agent result: %s", err)
@@ -1954,6 +1975,13 @@ type agentboxSpawnSpec struct {
 	// own sandbox cannot start from either editing the change or, as happened,
 	// failing every command it ran and reporting nothing.
 	readOnlyRepoDirs []string
+	// readOnlyWorkDir binds the work dir READ-ONLY at /work, with only
+	// sessionWritableDirsRel bound back read-write on top of it — see
+	// agentboxMounts. Set by ASSISTANT SESSIONS ONLY (sessionSpawnSpec): a
+	// session plans and answers, and the kernel, not a tool allowlist or the
+	// agent's own sandbox, is what keeps it from editing the checkouts,
+	// context/ or uploads/. Every other spawn keeps a writable /work.
+	readOnlyWorkDir bool
 	// readOnlyContextDir is a host directory bound READ-ONLY at /work/context
 	// on top of the /work bind: the Review stage's own copy of the org's
 	// deployment context (see prepareContextCopy). Set by REVIEW spawns only;
