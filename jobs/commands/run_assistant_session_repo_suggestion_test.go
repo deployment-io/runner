@@ -34,7 +34,8 @@ func newSuggestionForwarder(t *testing.T) (*repoSuggestionForwarder, *suggestion
 	path := filepath.Join(dir, "repo-suggestion.json")
 	sink := &suggestionSink{}
 	return &repoSuggestionForwarder{
-		path: path, orgID: "org-1", jobID: "job-1", logsWriter: io.Discard, send: sink.send,
+		path: path, files: newSessionFiles(dir, io.Discard),
+		orgID: "org-1", jobID: "job-1", logsWriter: io.Discard, send: sink.send,
 	}, sink, path
 }
 

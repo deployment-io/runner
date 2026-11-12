@@ -21,6 +21,7 @@ func newTestPump(t *testing.T) (*inputPump, string) {
 	ip := &inputPump{
 		dir:        filepath.Join(base, ".agentbox-input", "messages"),
 		uploadsDir: filepath.Join(base, sessionUploadsDirRel),
+		baseDir:    base,
 		logsWriter: io.Discard,
 		seen:       map[string]bool{},
 	}
