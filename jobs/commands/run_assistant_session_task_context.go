@@ -32,8 +32,8 @@ const (
 	// session base dir — the agent's /work/context/task. MaterializeContext
 	// (which owns /work/context) ran before this command, so nothing removes it.
 	taskContextDirRel = "context/task"
-	// taskContextLogTruncatedLine starts a run's log.txt when deployment-server
-	// left its oldest lines out.
+	// taskContextLogTruncatedLine starts a run's or a delivery's log.txt when
+	// deployment-server left its oldest lines out.
 	taskContextLogTruncatedLine = "[deployment.io: this log was cut to its newest 1 MiB]\n"
 )
 
@@ -79,6 +79,8 @@ type taskContextFile struct {
 	AcceptanceCriteria []string                    `json:"acceptance_criteria"`
 	Spec               json.RawMessage             `json:"spec"`
 	Repositories       []taskContextRepositoryFile `json:"repositories"`
+	Terminus           string                      `json:"terminus"`
+	ProductionQA       *taskContextProductionQA    `json:"production_qa,omitempty"`
 }
 
 type taskContextRepositoryFile struct {
@@ -88,10 +90,61 @@ type taskContextRepositoryFile struct {
 	CheckedOutBranch string `json:"checked_out_branch"`
 	PRURL            string `json:"pr_url"`
 	PRState          string `json:"pr_state"`
+	// DeployTarget is omitted when the repository has none.
+	DeployTarget *taskContextDeployTarget `json:"deploy_target,omitempty"`
+	MergedAt     int64                    `json:"merged_at,omitempty"`
+	Delivery     *taskContextDelivery     `json:"delivery,omitempty"`
+	// DeliveryLog is delivery/<n>/log.txt's path relative to the record, set
+	// only when that file is written.
+	DeliveryLog string `json:"delivery_log,omitempty"`
 }
 
-// writeTaskContext replaces dir with the record: task.json, and
-// runs/<n>-<jobID>/ per run, n = 1 for the oldest. Everything is
+type taskContextDeployTarget struct {
+	Deployment  string `json:"deployment"`
+	Environment string `json:"environment"`
+	Type        string `json:"type"`
+}
+
+type taskContextDelivery struct {
+	State  string `json:"state"`
+	Reason string `json:"reason"`
+	Commit string `json:"commit"`
+	// MissingVariables is omitted when empty: gob delivers an empty list as
+	// nil.
+	MissingVariables   []string `json:"missing_variables,omitempty"`
+	FollowedAutoDeploy bool     `json:"followed_auto_deploy"`
+	StartedAt          int64    `json:"started_at"`
+	EndedAt            int64    `json:"ended_at"`
+}
+
+type taskContextProductionQA struct {
+	State      string `json:"state"`
+	Reason     string `json:"reason"`
+	Passed     int    `json:"passed"`
+	Failed     int    `json:"failed"`
+	NotChecked int    `json:"not_checked"`
+	NoCriteria bool   `json:"no_criteria"`
+	StartedAt  int64  `json:"started_at"`
+	EndedAt    int64  `json:"ended_at"`
+	// Run is the production QA run's directory, taskContextProductionQADir,
+	// set only when it is written.
+	Run string `json:"run,omitempty"`
+}
+
+// taskContextProductionQADir is the production QA run's directory in the
+// record, written like a run.
+const taskContextProductionQADir = "production-qa"
+
+// taskDeliveryLogPath is the n-th repository's delivery log, relative to the
+// record.
+func taskDeliveryLogPath(n int) string {
+	return filepath.Join("delivery", strconv.Itoa(n), "log.txt")
+}
+
+// writeTaskContext replaces dir with the record: task.json,
+// runs/<n>-<jobID>/ per run, n = 1 for the oldest, delivery/<n>/log.txt per
+// repository with a delivery log, n its index in task.json's repositories, and
+// production-qa/ (written like a run) when the production QA has a run. Everything is
 // world-readable (files 0644, dirs 0755), which is all the read-only agent
 // needs.
 func writeTaskContext(dir string, reply sessions.GetTaskContextReplyV1) error {
@@ -113,6 +166,27 @@ func writeTaskContext(dir string, reply sessions.GetTaskContextReplyV1) error {
 			return err
 		}
 	}
+	for i, r := range reply.Task.Repositories {
+		if r.DeliveryLog == "" {
+			continue
+		}
+		path := filepath.Join(dir, taskDeliveryLogPath(i))
+		if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+			return err
+		}
+		log := r.DeliveryLog
+		if r.DeliveryLogTruncated {
+			log = taskContextLogTruncatedLine + log
+		}
+		if err := os.WriteFile(path, []byte(log), 0644); err != nil {
+			return err
+		}
+	}
+	if qa := reply.Task.ProductionQA; qa != nil && qa.Run != nil {
+		if err := writeTaskRun(filepath.Join(dir, taskContextProductionQADir), *qa.Run); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -124,6 +198,7 @@ func taskContextFileFor(t sessions.TaskContextV1) taskContextFile {
 		AcceptanceCriteria: t.AcceptanceCriteria,
 		Spec:               json.RawMessage("null"),
 		Repositories:       []taskContextRepositoryFile{},
+		Terminus:           t.Terminus,
 	}
 	if f.AcceptanceCriteria == nil {
 		f.AcceptanceCriteria = []string{}
@@ -131,15 +206,53 @@ func taskContextFileFor(t sessions.TaskContextV1) taskContextFile {
 	if t.SpecJSON != "" && json.Valid([]byte(t.SpecJSON)) {
 		f.Spec = json.RawMessage(t.SpecJSON)
 	}
-	for _, r := range t.Repositories {
-		f.Repositories = append(f.Repositories, taskContextRepositoryFile{
+	for i, r := range t.Repositories {
+		repo := taskContextRepositoryFile{
 			Name:             r.Name,
 			BaseBranch:       r.BaseBranch,
 			TaskBranch:       r.TaskBranch,
 			CheckedOutBranch: r.CheckedOutBranch,
 			PRURL:            r.PRURL,
 			PRState:          r.PRState,
-		})
+			MergedAt:         r.MergedAt,
+		}
+		if r.DeployTargetName != "" || r.DeployEnvironmentName != "" || r.DeployTargetType != "" {
+			repo.DeployTarget = &taskContextDeployTarget{
+				Deployment:  r.DeployTargetName,
+				Environment: r.DeployEnvironmentName,
+				Type:        r.DeployTargetType,
+			}
+		}
+		if d := r.Delivery; d != nil {
+			repo.Delivery = &taskContextDelivery{
+				State:              d.State,
+				Reason:             d.Reason,
+				Commit:             d.CommitHash,
+				MissingVariables:   d.MissingVariables,
+				FollowedAutoDeploy: d.FollowedAutoDeploy,
+				StartedAt:          d.StartedAt,
+				EndedAt:            d.EndedAt,
+			}
+		}
+		if r.DeliveryLog != "" {
+			repo.DeliveryLog = filepath.ToSlash(taskDeliveryLogPath(i))
+		}
+		f.Repositories = append(f.Repositories, repo)
+	}
+	if qa := t.ProductionQA; qa != nil {
+		f.ProductionQA = &taskContextProductionQA{
+			State:      qa.State,
+			Reason:     qa.Reason,
+			Passed:     qa.Passed,
+			Failed:     qa.Failed,
+			NotChecked: qa.NotChecked,
+			NoCriteria: qa.NoCriteria,
+			StartedAt:  qa.StartedAt,
+			EndedAt:    qa.EndedAt,
+		}
+		if qa.Run != nil {
+			f.ProductionQA.Run = taskContextProductionQADir
+		}
 	}
 	return f
 }

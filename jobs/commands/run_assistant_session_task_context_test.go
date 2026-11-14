@@ -301,3 +301,208 @@ func TestTaskContext_RetriesThenSucceeds(t *testing.T) {
 		t.Errorf("empty fields in task.json:\n%s", raw)
 	}
 }
+
+func readTaskJSON(t *testing.T, dir string) map[string]interface{} {
+	t.Helper()
+	var task map[string]interface{}
+	raw := readFile(t, filepath.Join(dir, "task.json"))
+	if err := json.Unmarshal([]byte(raw), &task); err != nil {
+		t.Fatalf("task.json: %v\n%s", err, raw)
+	}
+	return task
+}
+
+func TestTaskContext_DeployedTask(t *testing.T) {
+	qaJob := "66e1a2b3c4d5e6f7a8b9c0d9"
+	reply := sessions.GetTaskContextReplyV1{
+		Found: true,
+		Task: sessions.TaskContextV1{
+			ID: "66e1a2b3c4d5e6f7a8b9c0aa", Terminus: "Deployed",
+			Repositories: []sessions.TaskRepositoryContextV1{
+				{
+					Name: "acme/api", PRState: "merged", MergedAt: 1000,
+					DeployTargetName: "api", DeployEnvironmentName: "production", DeployTargetType: "Web Service",
+					Delivery: &sessions.TaskDeliveryContextV1{
+						State: "deployed", CommitHash: "abc123", FollowedAutoDeploy: true, StartedAt: 1001, EndedAt: 1100,
+					},
+					DeliveryLog: "building\ndeployed\n",
+				},
+				{Name: "acme/docs", PRState: "open", DeployTargetName: "docs", DeployEnvironmentName: "production", DeployTargetType: "Static Site"},
+				{
+					Name: "acme/web", PRState: "merged", MergedAt: 1010,
+					DeployTargetName: "web", DeployEnvironmentName: "production", DeployTargetType: "Static Site",
+					Delivery: &sessions.TaskDeliveryContextV1{
+						State: "deploy_failed", Reason: "the build failed", CommitHash: "def456",
+						MissingVariables: []string{"API_URL"}, StartedAt: 1011, EndedAt: 1200,
+					},
+					DeliveryLog: "npm ERR!\n", DeliveryLogTruncated: true,
+				},
+			},
+			ProductionQA: &sessions.TaskProductionQAContextV1{
+				State: "completed", Passed: 1, Failed: 1, NotChecked: 2, StartedAt: 2000, EndedAt: 2100,
+				Run: &sessions.TaskRunContextV1{JobID: qaJob, OutputJSON: `{"qa":{"verdict":"fail"}}`, Log: "checking\n"},
+			},
+		},
+	}
+	dir := filepath.Join(t.TempDir(), "context", "task")
+	// Stale delivery logs and production QA from an earlier pickup are replaced.
+	if err := os.MkdirAll(filepath.Join(dir, "delivery", "1"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeTaskContext(dir, reply); err != nil {
+		t.Fatal(err)
+	}
+	task := readTaskJSON(t, dir)
+	if task["terminus"] != "Deployed" {
+		t.Errorf("terminus: %v", task["terminus"])
+	}
+	repos := task["repositories"].([]interface{})
+	api, docs, web := repos[0].(map[string]interface{}), repos[1].(map[string]interface{}), repos[2].(map[string]interface{})
+	b, _ := json.Marshal(api)
+	if want := `{"base_branch":"","checked_out_branch":"","delivery":{"commit":"abc123","ended_at":1100,"followed_auto_deploy":true,"reason":"","started_at":1001,"state":"deployed"},"delivery_log":"delivery/0/log.txt","deploy_target":{"deployment":"api","environment":"production","type":"Web Service"},"merged_at":1000,"name":"acme/api","pr_state":"merged","pr_url":"","task_branch":""}`; string(b) != want {
+		t.Errorf("repository 0:\n got %s\nwant %s", b, want)
+	}
+	for _, k := range []string{"merged_at", "delivery", "delivery_log"} {
+		if _, ok := docs[k]; ok {
+			t.Errorf("repository 1 must omit %s: %v", k, docs)
+		}
+	}
+	if target, _ := docs["deploy_target"].(map[string]interface{}); target["type"] != "Static Site" {
+		t.Errorf("repository 1 deploy_target: %v", docs["deploy_target"])
+	}
+	delivery := web["delivery"].(map[string]interface{})
+	if mv, _ := delivery["missing_variables"].([]interface{}); len(mv) != 1 || mv[0] != "API_URL" ||
+		delivery["state"] != "deploy_failed" || delivery["reason"] != "the build failed" || web["delivery_log"] != "delivery/2/log.txt" {
+		t.Errorf("repository 2: %v", web)
+	}
+	qa, _ := task["production_qa"].(map[string]interface{})
+	b, _ = json.Marshal(qa)
+	if want := `{"ended_at":2100,"failed":1,"no_criteria":false,"not_checked":2,"passed":1,"reason":"","run":"production-qa","started_at":2000,"state":"completed"}`; string(b) != want {
+		t.Errorf("production_qa:\n got %s\nwant %s", b, want)
+	}
+
+	if got := readFile(t, filepath.Join(dir, "delivery", "0", "log.txt")); got != "building\ndeployed\n" {
+		t.Errorf("delivery/0/log.txt: %q", got)
+	}
+	if got := readFile(t, filepath.Join(dir, "delivery", "2", "log.txt")); got != "[deployment.io: this log was cut to its newest 1 MiB]\nnpm ERR!\n" {
+		t.Errorf("delivery/2/log.txt: %q", got)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "delivery", "1")); !os.IsNotExist(err) {
+		t.Error("no delivery/1 for a repository without a delivery log")
+	}
+	qaDir := filepath.Join(dir, "production-qa")
+	if got := readFile(t, filepath.Join(qaDir, "output.json")); got != `{"qa":{"verdict":"fail"}}` {
+		t.Errorf("production-qa/output.json: %q", got)
+	}
+	if got := readFile(t, filepath.Join(qaDir, "events.jsonl")); got != "" {
+		t.Errorf("production-qa/events.jsonl: %q", got)
+	}
+	if got := readFile(t, filepath.Join(qaDir, "log.txt")); got != "checking\n" {
+		t.Errorf("production-qa/log.txt: %q", got)
+	}
+	for _, p := range []string{filepath.Join(dir, "delivery", "0", "log.txt"), filepath.Join(qaDir, "log.txt")} {
+		if fi, err := os.Stat(p); err != nil || fi.Mode().Perm() != 0644 {
+			t.Errorf("%s mode: %v %v", p, fi.Mode(), err)
+		}
+	}
+	for _, p := range []string{filepath.Join(dir, "delivery"), filepath.Join(dir, "delivery", "0"), qaDir} {
+		if fi, err := os.Stat(p); err != nil || fi.Mode().Perm() != 0755 {
+			t.Errorf("%s mode: %v %v", p, fi.Mode(), err)
+		}
+	}
+
+	// A production QA without a run: no "run", no production-qa/.
+	reply.Task.ProductionQA.Run = nil
+	if err := writeTaskContext(dir, reply); err != nil {
+		t.Fatal(err)
+	}
+	qa, _ = readTaskJSON(t, dir)["production_qa"].(map[string]interface{})
+	if _, ok := qa["run"]; ok || qa["state"] != "completed" {
+		t.Errorf("production_qa without a run: %v", qa)
+	}
+	if _, err := os.Stat(qaDir); !os.IsNotExist(err) {
+		t.Error("no production-qa/ without a run")
+	}
+}
+
+func TestTaskContext_PullRequestTaskGainsOnlyTerminus(t *testing.T) {
+	first := "66e1a2b3c4d5e6f7a8b9c0d1"
+	reply := sessions.GetTaskContextReplyV1{
+		Found: true,
+		Task: sessions.TaskContextV1{
+			ID: "66e1a2b3c4d5e6f7a8b9c0aa", Title: "t", Terminus: "Pull request",
+			Repositories: []sessions.TaskRepositoryContextV1{
+				{Name: "acme/api", BaseBranch: "main", TaskBranch: "task/abc", CheckedOutBranch: "main", PRState: "merged", MergedAt: 1700},
+				{Name: "acme/web", BaseBranch: "main", TaskBranch: "task/abc", CheckedOutBranch: "task/abc", PRState: "open"},
+			},
+		},
+		Runs: []sessions.TaskRunContextV1{{JobID: first, OutputJSON: `{"summary":"s"}`, EventsJSONL: "{\"seq\":1}\n", Log: "a\n", LogTruncated: true}},
+	}
+	dir := filepath.Join(t.TempDir(), "context", "task")
+	if err := writeTaskContext(dir, reply); err != nil {
+		t.Fatal(err)
+	}
+	raw := readFile(t, filepath.Join(dir, "task.json"))
+	want := `{
+  "id": "66e1a2b3c4d5e6f7a8b9c0aa",
+  "title": "t",
+  "description": "",
+  "acceptance_criteria": [],
+  "spec": null,
+  "repositories": [
+    {
+      "name": "acme/api",
+      "base_branch": "main",
+      "task_branch": "task/abc",
+      "checked_out_branch": "main",
+      "pr_url": "",
+      "pr_state": "merged",
+      "merged_at": 1700
+    },
+    {
+      "name": "acme/web",
+      "base_branch": "main",
+      "task_branch": "task/abc",
+      "checked_out_branch": "task/abc",
+      "pr_url": "",
+      "pr_state": "open"
+    }
+  ],
+  "terminus": "Pull request"
+}
+`
+	if raw != want {
+		t.Errorf("task.json:\n%s\nwant\n%s", raw, want)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var names []string
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	if strings.Join(names, ",") != "runs,task.json" {
+		t.Errorf("record: %v (no delivery/ or production-qa/ for a Pull request Task)", names)
+	}
+	run := filepath.Join(dir, "runs", "1-"+first)
+	for name, want := range map[string]string{
+		"output.json":  `{"summary":"s"}`,
+		"events.jsonl": "{\"seq\":1}\n",
+		"log.txt":      "[deployment.io: this log was cut to its newest 1 MiB]\na\n",
+	} {
+		if got := readFile(t, filepath.Join(run, name)); got != want {
+			t.Errorf("run %s: %q", name, got)
+		}
+	}
+}
+
+func TestAskRoleDescribesTheDeploy(t *testing.T) {
+	want := `and rerun-feedback.txt when the run was a re-run with feedback. For a Task that deploys once its pull request merges (task.json's terminus "Deployed"), each repository in task.json also has its deploy target and its delivery — how the merged change went out: state, reason, the commit that went out, missing variables — delivery/<n>/log.txt is that deploy's log (n is the repository's position in task.json, from 0), and production-qa/ is the QA run on production after every repository deployed (output.json, whose "qa" holds the verdict per criterion; log.txt). Pre-built context`
+	if !strings.Contains(askRole, want) {
+		t.Error("askRole must describe delivery/ and production-qa/ right after the runs")
+	}
+	if askPrompt != askRole+"\n\n"+sessionRules || planModePrompt != legacyPlanModePrompt {
+		t.Error("askPrompt must still end with sessionRules and planModePrompt is unchanged")
+	}
+}
