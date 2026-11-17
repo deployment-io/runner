@@ -126,7 +126,7 @@ func blockingBrowser() (RunVerifyBrowser, <-chan struct{}) {
 func TestVerifyPreviewRenderedReturnsOnCancel(t *testing.T) {
 	run, started := blockingBrowser()
 	srv := agentmcp.New("test", "0")
-	RegisterVerifyPreviewRendered(srv, renderedRecord(renderedPreview), run, io.Discard)
+	RegisterVerifyPreviewRendered(srv, renderedRecord(renderedPreview), run, io.Discard, nil)
 	returnsOnCancel(t, srv, "verify_preview_rendered", `{"url":"https://d111.cloudfront.net/"}`, started)
 
 	run, started = blockingBrowser()
@@ -306,7 +306,7 @@ func TestPreviewListingReturnsOnCancel(t *testing.T) {
 		defer release()
 		run, _ := blockingBrowser()
 		srv := agentmcp.New("test", "0")
-		RegisterVerifyPreviewRendered(srv, record, run, io.Discard)
+		RegisterVerifyPreviewRendered(srv, record, run, io.Discard, nil)
 		returnsOnCancel(t, srv, "verify_preview_rendered", `{"url":"https://dunlisted.cloudfront.net/"}`, started)
 	})
 	t.Run("verify_api_request", func(t *testing.T) {

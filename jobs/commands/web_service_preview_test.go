@@ -761,7 +761,7 @@ func TestWebServicePreviewToolRegistration(t *testing.T) {
 	}
 
 	stage, qaWorkDir := changedQAStage(t, nil)
-	qa := stage.qaSpawnSpec("img", qaRoundDirPath(qaWorkDir, 1), nil, buildStaticSitePreviewDeps(stage.ctx, stage.parameters, qaWorkDir, io.Discard))
+	qa := stage.qaSpawnSpec(1, "img", qaRoundDirPath(qaWorkDir, 1), nil, buildStaticSitePreviewDeps(stage.ctx, stage.parameters, qaWorkDir, io.Discard))
 	production := agentboxSpawnSpec{productionTools: &productionQATools{record: productionQARecord(productionTestTargets)}}
 	for name, spec := range map[string]agentboxSpawnSpec{"QA round": qa, "production QA": production} {
 		if got := toolNames(spec); strings.Contains(got, "deploy_web_service_preview") {

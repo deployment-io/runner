@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -96,7 +97,7 @@ func TestProductionQAHealthCheck(t *testing.T) {
 				t.Fatal("stopped")
 			}
 			want := qaCriterion{Criterion: "acme/api: GET " + tc.path + " answers with a status from 200 to 400", State: tc.state, Reason: tc.reason}
-			if c != want {
+			if !reflect.DeepEqual(c, want) {
 				t.Errorf("criterion = %+v, want %+v", c, want)
 			}
 			if n := h.count(tc.path); n != tc.attempts {
@@ -189,7 +190,7 @@ func TestProductionQAHealthOnly(t *testing.T) {
 		{Criterion: "The pricing page lists three plans", State: tasks.QACriterionNotChecked, Reason: notChecked},
 		{Criterion: "The API answers /plans", State: tasks.QACriterionNotChecked, Reason: notChecked},
 	}
-	if got := qa.Rounds[0].Criteria; len(got) != len(want) || got[0] != want[0] || got[1] != want[1] || got[2] != want[2] {
+	if got := qa.Rounds[0].Criteria; !reflect.DeepEqual(got, want) {
 		t.Errorf("criteria = %+v, want %+v", got, want)
 	}
 	if data.Usage != nil && data.Usage.QA != nil {
@@ -215,7 +216,7 @@ func TestProductionQAHealthOnlyNoAcceptanceCriteria(t *testing.T) {
 			}
 			want := qaCriterion{Criterion: "acme/api: GET /ping answers with a status from 200 to 400", State: tc.state,
 				Reason: fmt.Sprintf("answered %d", tc.status)}
-			if got := qa.Rounds[0].Criteria; len(got) != 1 || got[0] != want {
+			if got := qa.Rounds[0].Criteria; len(got) != 1 || !reflect.DeepEqual(got[0], want) {
 				t.Errorf("criteria = %+v, want only %+v", got, want)
 			}
 		})
@@ -239,7 +240,7 @@ func TestProductionQAMixedSmokeCheckWithHealthCheck(t *testing.T) {
 		t.Fatalf("qa = %+v, want completed with criteria", qa)
 	}
 	want := qaCriterion{Criterion: "acme/api: GET /ping answers with a status from 200 to 400", State: tasks.QACriterionFailed, Reason: "answered 503"}
-	if got := qa.Rounds[0].Criteria; len(got) != 1 || got[0] != want {
+	if got := qa.Rounds[0].Criteria; len(got) != 1 || !reflect.DeepEqual(got[0], want) {
 		t.Errorf("criteria = %+v, want only %+v", got, want)
 	}
 }
@@ -280,7 +281,7 @@ func TestProductionQAMixedTargets(t *testing.T) {
 		t.Fatalf("criteria = %+v, want %+v", got, want)
 	}
 	for i := range want {
-		if got[i] != want[i] {
+		if !reflect.DeepEqual(got[i], want[i]) {
 			t.Errorf("criterion %d = %+v, want %+v", i, got[i], want[i])
 		}
 	}
@@ -363,7 +364,7 @@ func TestProductionQAHealthCriteriaAreNeverCut(t *testing.T) {
 	agent[49].State = tasks.QACriterionFailed
 	health := []qaCriterion{{Criterion: "1-acme/api: GET /ping", State: tasks.QACriterionPassed}}
 	got := withHealthCriteria(agent, health)
-	if len(got) != 51 || got[49] != agent[49] || got[50] != health[0] {
+	if len(got) != 51 || !reflect.DeepEqual(got[49], agent[49]) || !reflect.DeepEqual(got[50], health[0]) {
 		t.Errorf("%d criteria, want the 50 acceptance results then the health check", len(got))
 	}
 
@@ -376,7 +377,7 @@ func TestProductionQAHealthCriteriaAreNeverCut(t *testing.T) {
 	parameters := map[string]interface{}{}
 	jobs.SetParameterValue[string](parameters, parameters_enums.ReviewSpec, taskSpecJSON(t, acceptance))
 	round := healthOnlyRound(parameters, []productionQATarget{{Repository: "1-acme/api"}}, health)
-	if len(round.Criteria) != 51 || round.Criteria[0] != health[0] ||
+	if len(round.Criteria) != 51 || !reflect.DeepEqual(round.Criteria[0], health[0]) ||
 		round.Criteria[50].Criterion != "criterion 49" || round.Criteria[50].State != tasks.QACriterionNotChecked {
 		t.Errorf("%d criteria, want the health check then 50 not_checked", len(round.Criteria))
 	}

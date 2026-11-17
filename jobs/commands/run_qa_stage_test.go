@@ -365,7 +365,7 @@ func TestQASpawnSpecMountsTheQADirAndBuildsPreviewsFromTheTaskDir(t *testing.T) 
 	stage.contextCopyDir = "/tmp/org-1/task-1-qa-context-1"
 	qaDir := qaRoundDirPath(workDir, 1)
 	deps := buildStaticSitePreviewDeps(stage.ctx, stage.parameters, workDir, io.Discard)
-	spec := stage.qaSpawnSpec("agentbox:1.9.32", qaDir, nil, deps)
+	spec := stage.qaSpawnSpec(1, "agentbox:1.9.32", qaDir, nil, deps)
 	if spec.workDirHost != qaDir || strings.HasPrefix(qaDir, workDir+"/") {
 		t.Errorf("/work is %q, want a sibling of the Task dir %q", spec.workDirHost, workDir)
 	}

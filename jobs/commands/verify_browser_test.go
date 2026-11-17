@@ -690,9 +690,9 @@ func TestVerifyBrowser_MinImageFeature(t *testing.T) {
 			t.Errorf("feature %q: pulled %d, created %d; want nothing", tc.feature, d.pulls, len(d.created))
 		}
 	}
-	// The pinned image signs in.
-	if verifyBrowserImage != "docker.io/deploymenthq/verify-browser:1.5.0" || !imageVersionAtLeast(verifyBrowserImage, "1.5.0") {
-		t.Errorf("verifyBrowserImage = %s, want verify-browser 1.5.0", verifyBrowserImage)
+	// The pinned image signs in and takes screenshots.
+	if verifyBrowserImage != "docker.io/deploymenthq/verify-browser:1.6.0" || !imageVersionAtLeast(verifyBrowserImage, "1.5.0") {
+		t.Errorf("verifyBrowserImage = %s, want verify-browser 1.6.0", verifyBrowserImage)
 	}
 }
 

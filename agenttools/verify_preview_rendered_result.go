@@ -87,13 +87,16 @@ type renderedViewport struct {
 
 // renderedResult is the image's result.json as the agent receives it, plus message.
 type renderedResult struct {
-	SchemaVersion int    `json:"schema_version"`
-	Status        string `json:"status"`
-	Error         string `json:"error,omitempty"`
-	Verdict       string `json:"verdict"`
-	Message       string `json:"message"`
-	HTTPStatus    int    `json:"http_status"`
-	FinalURL      string `json:"final_url"`
+	SchemaVersion int `json:"schema_version"`
+	// CheckID names the check in a QA round that keeps screenshots ("c3": the
+	// run's third call), for QA to cite; absent from every other reply.
+	CheckID    string `json:"check_id,omitempty"`
+	Status     string `json:"status"`
+	Error      string `json:"error,omitempty"`
+	Verdict    string `json:"verdict"`
+	Message    string `json:"message"`
+	HTTPStatus int    `json:"http_status"`
+	FinalURL   string `json:"final_url"`
 	// Viewport is absent from results before 1.2.0, and then from the reply.
 	Viewport           *renderedViewport         `json:"viewport,omitempty"`
 	Steps              []renderedStepResult      `json:"steps"`
@@ -133,6 +136,9 @@ func renderVerifyBrowserOutcome(o VerifyBrowserOutcome, wantViewport bool) (stri
 type renderedCheck struct {
 	wantViewport bool
 	signIn       *browserSignInCheck
+	// checkID is the check's id in a QA round that keeps screenshots, "" in
+	// every other run.
+	checkID string
 }
 
 // renderVerifyBrowserCheck returns the tool's JSON text and the result it was
@@ -163,6 +169,8 @@ func renderVerifyBrowserCheck(o VerifyBrowserOutcome, check renderedCheck) (stri
 	case r.Status != "completed" || (r.Verdict != "pass" && r.Verdict != "fail"):
 		return "", nil, couldntCheck(fmt.Sprintf("the browser's result has status %q and verdict %q", capChars(r.Status, renderedShortChars), capChars(r.Verdict, renderedShortChars)), o.Output)
 	}
+	// Never the image's own: the runner names the check.
+	r.CheckID = check.checkID
 	if check.signIn == nil {
 		r.SignIn = nil
 	} else {

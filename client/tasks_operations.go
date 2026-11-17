@@ -142,3 +142,48 @@ func (r *RunnerClient) AppendTaskEvents(organizationID string, args tasks.Append
 	}
 	return nil
 }
+
+// uploadQAEvidenceTimeout bounds one UploadQAEvidence call. A var so tests can
+// shorten it.
+var uploadQAEvidenceTimeout = 30 * time.Second
+
+// UploadQAEvidence sends one QA screenshot (Jobs.UploadQAEvidenceV1), to be
+// stored for the Step's QA result, and returns the id deployment-server stored
+// it under for QACriterionDtoV1.EvidenceIDs. A deployment-server without the
+// RPC answers "can't find method".
+//
+// Like SaveInfraContext, the call runs over its own connection whose deadline
+// is uploadQAEvidenceTimeout from now, closed afterwards: the dial, the
+// screenshot's write and the reply's read all fail once it passes, and a
+// stalled upload never holds the shared connection (whose net/rpc send lock
+// the QA result's report and the heartbeat need).
+func (r *RunnerClient) UploadQAEvidence(organizationID string, upload tasks.UploadQAEvidenceDtoV1) (string, error) {
+	if !r.isConnected || r.dial == nil {
+		return "", ErrConnection
+	}
+	timeout := uploadQAEvidenceTimeout
+	deadline := time.Now().Add(timeout)
+	conn, err := r.dial(timeout)
+	if err != nil {
+		return "", err
+	}
+	if err := conn.SetDeadline(deadline); err != nil {
+		conn.Close()
+		return "", err
+	}
+	c := rpc.NewClient(conn)
+	defer c.Close()
+
+	args := tasks.UploadQAEvidenceArgsV1{}
+	args.OrganizationID = r.GetComputedOrganizationID(organizationID)
+	args.Token = r.token
+	args.Upload = upload
+	var reply tasks.UploadQAEvidenceReplyV1
+	if err := c.Call("Jobs.UploadQAEvidenceV1", args, &reply); err != nil {
+		return "", err
+	}
+	if reply.EvidenceID == "" {
+		return "", fmt.Errorf("deployment.io returned no id for the screenshot")
+	}
+	return reply.EvidenceID, nil
+}

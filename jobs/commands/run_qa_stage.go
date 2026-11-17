@@ -125,7 +125,7 @@ func (rq *RunQAStage) Run(parameters map[string]interface{}, logsWriter io.Write
 	}
 	workDirHost := commandUtils.GetTaskRepositoriesBaseDir(ctx.OrganizationID, ctx.TaskID)
 	// Every directory the stage parks beside the work dir — the QA rounds',
-	// the context copy, and what the fix run and its review round leave — goes
+	// their screenshots, the context copy, and what the fix run and its review round leave — goes
 	// however the stage ends.
 	defer cleanupQAStageSiblings(workDirHost)
 	qaParams, qaFailure := qaParameters(parameters)
@@ -166,7 +166,7 @@ func qaParameters(parameters map[string]interface{}) (map[string]interface{}, st
 // and inside it.
 func cleanupQAStageSiblings(workDirHost string) {
 	base := strings.TrimRight(workDirHost, "/")
-	for _, pattern := range []string{base + "-qa-round-*", base + "-qa-context-*"} {
+	for _, pattern := range []string{base + "-qa-round-*", base + "-qa-context-*", base + "-qa-evidence-*"} {
 		matches, err := filepath.Glob(pattern)
 		if err != nil {
 			continue
@@ -232,6 +232,15 @@ type qaStage struct {
 	wiringFailed bool
 
 	out *qaOutput
+	// screenshots are each QA round's screenshot store, by round number (nil
+	// for a round whose store couldn't be created); finish uploads the final
+	// round's cited ones. evidenceIDs are, after the upload, the stored ids of
+	// each of the final round's criteria, by position.
+	screenshots map[int]*agenttools.QAScreenshots
+	evidenceIDs map[int][]string
+	// uploadEvidence stores one screenshot; nil is client.UploadQAEvidence.
+	// Tests only.
+	uploadEvidence func(upload tasks.UploadQAEvidenceDtoV1) (string, error)
 	// fixStage is the reviewStage the fix run ran in, and the review round
 	// after a kept fix runs in.
 	fixStage *reviewStage
@@ -556,6 +565,7 @@ func (s *qaStage) finish() (map[string]interface{}, error) {
 	if err := mergeQAIntoJobOutput(s.parameters, s.out); err != nil {
 		io.WriteString(s.logsWriter, fmt.Sprintf("warning: could not record QA on the job output: %s\n", err))
 	}
+	s.uploadQAEvidence()
 	s.reportQAResult()
 	if s.pendingRound != nil {
 		final := s.out.finalRound()

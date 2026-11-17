@@ -1,13 +1,16 @@
 package commands
 
 import (
+	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner-kit/tasks"
+	"github.com/deployment-io/deployment-runner/agenttools"
 	"github.com/deployment-io/deployment-runner/client"
 )
 
@@ -36,8 +39,8 @@ func (s *qaStage) qaResultDto() tasks.QAResultDtoV1 {
 		Model:        s.model(),
 	}
 	if final := s.out.finalRound(); final != nil {
-		for _, c := range final.Criteria {
-			dto.Criteria = append(dto.Criteria, tasks.QACriterionDtoV1{Criterion: c.Criterion, State: c.State, Reason: c.Reason})
+		for i, c := range final.Criteria {
+			dto.Criteria = append(dto.Criteria, tasks.QACriterionDtoV1{Criterion: c.Criterion, State: c.State, Reason: c.Reason, EvidenceIDs: s.evidenceIDs[i]})
 		}
 		dto.Findings = reviewFindingDtos(final.Findings)
 	}
@@ -151,4 +154,124 @@ func qaFixLogLine(out *qaOutput) string {
 		return "QA fix: kept; the final QA round only reports\n"
 	}
 	return ""
+}
+
+const (
+	// qaEvidencePerCriterion is how many screenshots one criterion cites, at
+	// most, as deployment-server keeps.
+	qaEvidencePerCriterion = 3
+	// qaEvidenceMaxCriterion is how many criteria a screenshot's Criteria may
+	// index (kit's qa_models.MaxCriteria): a position at or past it is left out.
+	qaEvidenceMaxCriterion = 50
+)
+
+// qaEvidenceCheck is one cited check to upload: its id and the positions of
+// the criteria citing it.
+type qaEvidenceCheck struct {
+	checkID  string
+	criteria []int
+}
+
+// uploadQAEvidence stores the FINAL round's cited screenshots on
+// deployment-server and records, in evidenceIDs, each criterion's stored ids
+// in its citation order. Each cited check the round's store holds is uploaded
+// once, sequentially, in the order first cited; the first upload that fails
+// stops the rest, and the criteria keep the ids stored before it. Earlier
+// rounds' screenshots are never uploaded.
+func (s *qaStage) uploadQAEvidence() {
+	final := s.out.finalRound()
+	if final == nil || len(final.Criteria) == 0 {
+		return
+	}
+	store := s.screenshots[final.Round]
+	cited, checks := qaCitedChecks(final.Criteria, store)
+	if len(checks) == 0 {
+		return
+	}
+	upload := s.uploadEvidence
+	if upload == nil {
+		upload = func(u tasks.UploadQAEvidenceDtoV1) (string, error) {
+			return client.Get().UploadQAEvidence(s.ctx.OrganizationID, u)
+		}
+	}
+	jobID, _ := jobs.GetParameterValue[string](s.parameters, parameters_enums.JobID)
+	stored := map[string]string{}
+	for _, check := range checks {
+		id, err := s.uploadOneScreenshot(upload, store, final.Round, jobID, check)
+		if err != nil {
+			io.WriteString(s.logsWriter, fmt.Sprintf("QA: couldn't store a screenshot (%s); QA's remaining screenshots were not stored\n", err))
+			break
+		}
+		stored[check.checkID] = id
+	}
+	s.evidenceIDs = map[int][]string{}
+	for i, checkIDs := range cited {
+		for _, checkID := range checkIDs {
+			if id, ok := stored[checkID]; ok {
+				s.evidenceIDs[i] = append(s.evidenceIDs[i], id)
+			}
+		}
+	}
+	if len(stored) == len(checks) {
+		io.WriteString(s.logsWriter, fmt.Sprintf("QA: stored %d screenshots for %d criteria\n", len(stored), len(s.evidenceIDs)))
+	}
+}
+
+// uploadOneScreenshot uploads one check's screenshot and returns its stored id.
+func (s *qaStage) uploadOneScreenshot(upload func(tasks.UploadQAEvidenceDtoV1) (string, error), store *agenttools.QAScreenshots, round int, jobID string, check qaEvidenceCheck) (string, error) {
+	image, width, height, err := store.Get(check.checkID)
+	if err != nil {
+		return "", err
+	}
+	id, err := upload(tasks.UploadQAEvidenceDtoV1{
+		TaskID:    s.ctx.TaskID,
+		StepIndex: int(s.ctx.StepIndex),
+		JobID:     jobID,
+		Round:     round,
+		CheckID:   check.checkID,
+		Criteria:  check.criteria,
+		Image:     image,
+		Width:     width,
+		Height:    height,
+	})
+	if err == nil && id == "" {
+		err = errors.New("deployment.io returned no id for the screenshot")
+	}
+	return id, err
+}
+
+// qaCitedChecks is, per criterion position, the check ids it cites that store
+// holds a screenshot for (duplicates dropped, at most qaEvidencePerCriterion),
+// and the distinct checks to upload, in the order first cited, each with the
+// positions citing it below qaEvidenceMaxCriterion. A check cited only at or
+// past that position isn't uploaded.
+func qaCitedChecks(criteria []qaCriterion, store *agenttools.QAScreenshots) (map[int][]string, []qaEvidenceCheck) {
+	cited := map[int][]string{}
+	var checks []qaEvidenceCheck
+	index := map[string]int{}
+	for i, c := range criteria {
+		var ids []string
+		for _, checkID := range c.Evidence {
+			if len(ids) == qaEvidencePerCriterion {
+				break
+			}
+			if slices.Contains(ids, checkID) || !store.Has(checkID) {
+				continue
+			}
+			ids = append(ids, checkID)
+			if i >= qaEvidenceMaxCriterion {
+				continue
+			}
+			if j, ok := index[checkID]; ok {
+				checks[j].criteria = append(checks[j].criteria, i)
+				continue
+			}
+			index[checkID] = len(checks)
+			checks = append(checks, qaEvidenceCheck{checkID: checkID, criteria: []int{i}})
+		}
+		if len(ids) > 0 {
+			cited[i] = ids
+		}
+	}
+	return cited, checks
 }
