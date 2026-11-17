@@ -13,16 +13,19 @@ package commands
 // per runner, whatever the number of Steps.
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/containerd/errdefs"
@@ -38,8 +41,9 @@ import (
 // verifyBrowserImage is the verify-browser release this runner uses. Pinned to an
 // exact version; bump it deliberately when a new verify-browser-vX.Y.Z ships.
 // 1.3.0 is the first with read_only, which production QA requires; 1.4.0 the
-// first with the back step; 1.5.0 the first with sign_in.
-const verifyBrowserImage = "docker.io/deploymenthq/verify-browser:1.5.0"
+// first with the back step; 1.5.0 the first with sign_in; 1.6.0 the first with
+// screenshot.
+const verifyBrowserImage = "docker.io/deploymenthq/verify-browser:1.6.0"
 
 // minReadOnlyVerifyBrowserVersion is the first verify-browser release that
 // honours read_only. A production QA run refuses an older image rather than
@@ -85,6 +89,8 @@ const (
 	verifyBrowserOutputMax = 64 * 1024
 	// verifyBrowserResultMax caps the result.json read back.
 	verifyBrowserResultMax = 1024 * 1024
+	// verifyBrowserScreenshotMax caps the screenshot.jpg read back.
+	verifyBrowserScreenshotMax = agenttools.QAScreenshotMaxBytes
 )
 
 // verifyBrowserImageRef picks the image for one check: the runner's
@@ -262,7 +268,7 @@ func (v *verifyBrowser) run(ctx context.Context, req agenttools.VerifyBrowserReq
 	if err != nil {
 		return agenttools.VerifyBrowserOutcome{}, err
 	}
-	return agenttools.VerifyBrowserOutcome{
+	outcome := agenttools.VerifyBrowserOutcome{
 		ImageRef:  ref,
 		Result:    readVerifyBrowserResult(filepath.Join(ioDir, "result.json")),
 		Output:    exit.output,
@@ -270,7 +276,11 @@ func (v *verifyBrowser) run(ctx context.Context, req agenttools.VerifyBrowserReq
 		ExitCode:  exit.exitCode,
 		TimedOut:  exit.timedOut,
 		OOMKilled: exit.oomKilled,
-	}, nil
+	}
+	if req.Screenshot {
+		outcome.Screenshot = readVerifyBrowserScreenshot(filepath.Join(ioDir, "screenshot.jpg"), logsWriter)
+	}
+	return outcome, nil
 }
 
 // removeUnlessCancelled removes the container, then frees its browser slot with
@@ -516,17 +526,70 @@ func verifyBrowserHostConfig(ioDir string) *container.HostConfig {
 }
 
 // readVerifyBrowserResult returns result.json, or nil when there is none (or it is
-// too large to be one).
+// too large to be one, or not a regular file).
 func readVerifyBrowserResult(path string) []byte {
-	info, err := os.Stat(path)
-	if err != nil || !info.Mode().IsRegular() || info.Size() > verifyBrowserResultMax {
-		return nil
-	}
-	data, err := os.ReadFile(path)
+	data, err := readVerifyBrowserFile(path, verifyBrowserResultMax)
 	if err != nil {
 		return nil
 	}
 	return data
+}
+
+// readVerifyBrowserScreenshot returns screenshot.jpg, or nil. No file is nil
+// without a word (an image before 1.6.0, or a result with screenshot_error);
+// a file that is refused is nil with a line in the Step log saying why.
+func readVerifyBrowserScreenshot(path string, logsWriter io.Writer) []byte {
+	data, err := readVerifyBrowserFile(path, verifyBrowserScreenshotMax)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err == nil && !bytes.HasPrefix(data, []byte{0xFF, 0xD8, 0xFF}) {
+		err = errors.New("it is not a JPEG")
+	}
+	if err != nil {
+		if logsWriter != nil {
+			io.WriteString(logsWriter, fmt.Sprintf("QA: dropped a check's screenshot: %s\n", err))
+		}
+		return nil
+	}
+	return data
+}
+
+// readVerifyBrowserFile reads a file the container left in /io: never through
+// a symlink and never blocking (opened O_NOFOLLOW|O_NONBLOCK, so a FIFO can't
+// hang it), only a regular file, and only when it is at most max bytes — a
+// larger one is refused by its size, without reading it. A missing file is
+// fs.ErrNotExist; every refusal is an error saying why.
+func readVerifyBrowserFile(path string, max int64) ([]byte, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		if errors.Is(err, syscall.ELOOP) {
+			return nil, errors.New("it is a symbolic link")
+		}
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, err
+		}
+		return nil, fmt.Errorf("it can't be opened: %w", err)
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("it can't be read: %w", err)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, errors.New("it is not a regular file")
+	}
+	if info.Size() > max {
+		return nil, fmt.Errorf("it is larger than %d bytes", max)
+	}
+	data, err := io.ReadAll(io.LimitReader(f, max+1))
+	if err != nil {
+		return nil, fmt.Errorf("it can't be read: %w", err)
+	}
+	if int64(len(data)) > max {
+		return nil, fmt.Errorf("it is larger than %d bytes", max)
+	}
+	return data, nil
 }
 
 func dockerImagePresent(ctx context.Context, ref string) (bool, error) {

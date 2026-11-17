@@ -58,7 +58,7 @@ func TestOnlyAStackRoundServesTheAPIRequestTool(t *testing.T) {
 	implement := implementSpawnSpec("img", workDir, "cache", nil, tools)
 	production := agentboxSpawnSpec{productionTools: &productionQATools{record: productionQARecord(productionTestTargets)}}
 	stage, qaWorkDir := changedQAStage(t, nil)
-	backendsPath := stage.qaSpawnSpec("img", qaRoundDirPath(qaWorkDir, 1), nil, buildStaticSitePreviewDeps(stage.ctx, stage.parameters, qaWorkDir, io.Discard))
+	backendsPath := stage.qaSpawnSpec(1, "img", qaRoundDirPath(qaWorkDir, 1), nil, buildStaticSitePreviewDeps(stage.ctx, stage.parameters, qaWorkDir, io.Discard))
 	for name, spec := range map[string]agentboxSpawnSpec{"implement": implement, "production QA": production, "QA_BACKENDS round": backendsPath} {
 		if got := toolNames(spec); strings.Contains(got, "verify_api_request") {
 			t.Errorf("%s tools = %s", name, got)

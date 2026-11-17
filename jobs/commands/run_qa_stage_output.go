@@ -22,11 +22,13 @@ type qaResult struct {
 }
 
 // qaCriterion is one acceptance criterion as QA reported it: passed, failed or
-// not_checked, with QA's reason.
+// not_checked, with QA's reason and the check ids of the verify_preview_rendered
+// checks it cited (agentbox's "evidence", in a QA round with QA_EVIDENCE=1).
 type qaCriterion struct {
-	Criterion string `json:"criterion"`
-	State     string `json:"state"`
-	Reason    string `json:"reason,omitempty"`
+	Criterion string   `json:"criterion"`
+	State     string   `json:"state"`
+	Reason    string   `json:"reason,omitempty"`
+	Evidence  []string `json:"evidence,omitempty"`
 }
 
 // qaOutput is the QA stage's record on the Job output (key "qa"). Status,

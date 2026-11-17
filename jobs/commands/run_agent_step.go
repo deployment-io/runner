@@ -1991,6 +1991,11 @@ type agentboxSpawnSpec struct {
 	// tools with its two read-only checks (registerAgentTools); previewDeps is
 	// nil beside it.
 	productionTools *productionQATools
+	// qaScreenshots, set by a preview QA round only (both paths), is the round's
+	// screenshot store: its verify_preview_rendered asks for a screenshot of
+	// every check and gives each result a check_id. Nil for every other spawn —
+	// implement and fix runs, the review, production QA.
+	qaScreenshots *agenttools.QAScreenshots
 	// verifyToolsOnly, set by a stack-path QA round, serves ping and the two
 	// verify tools over previewDeps.Record — the previews the runner deployed —
 	// and no deploy tool.
@@ -2100,9 +2105,9 @@ func registerAgentTools(mcpSrv *agentmcp.Server, spec agentboxSpawnSpec) agentTo
 	if spec.verifyToolsOnly {
 		agenttools.RegisterVerifyPreviewReachable(mcpSrv, spec.previewDeps.Record, spec.previewDeps.LogsWriter)
 		if len(spec.browserSignIns) > 0 {
-			agenttools.RegisterVerifyPreviewRenderedSignIn(mcpSrv, spec.previewDeps.Record, spec.previewDeps.VerifyBrowser, spec.previewDeps.LogsWriter, spec.browserSignIns, spec.apiPasswords)
+			agenttools.RegisterVerifyPreviewRenderedSignIn(mcpSrv, spec.previewDeps.Record, spec.previewDeps.VerifyBrowser, spec.previewDeps.LogsWriter, spec.browserSignIns, spec.apiPasswords, spec.qaScreenshots)
 		} else {
-			agenttools.RegisterVerifyPreviewRendered(mcpSrv, spec.previewDeps.Record, spec.previewDeps.VerifyBrowser, spec.previewDeps.LogsWriter)
+			agenttools.RegisterVerifyPreviewRendered(mcpSrv, spec.previewDeps.Record, spec.previewDeps.VerifyBrowser, spec.previewDeps.LogsWriter, spec.qaScreenshots)
 		}
 		if spec.apiRequestTool {
 			// One state per agent run: the sessions its sign-ins get.
@@ -2126,7 +2131,8 @@ func registerAgentTools(mcpSrv *agentmcp.Server, spec agentboxSpawnSpec) agentTo
 		stopWebPreviews = agenttools.RegisterDeployWebServicePreview(mcpSrv, *spec.webPreviewDeps)
 	}
 	agenttools.RegisterVerifyPreviewReachable(mcpSrv, spec.previewDeps.Record, spec.previewDeps.LogsWriter)
-	agenttools.RegisterVerifyPreviewRendered(mcpSrv, spec.previewDeps.Record, spec.previewDeps.VerifyBrowser, spec.previewDeps.LogsWriter)
+	// qaScreenshots is nil for implement and fix runs: only a QA round keeps them.
+	agenttools.RegisterVerifyPreviewRendered(mcpSrv, spec.previewDeps.Record, spec.previewDeps.VerifyBrowser, spec.previewDeps.LogsWriter, spec.qaScreenshots)
 	return agentTools{
 		stop: func() {
 			stopPreviewBuilds()

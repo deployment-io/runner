@@ -84,6 +84,9 @@ type VerifyBrowserRequest struct {
 	// MinImageFeature names, for the refusal, what needs MinImageVersion
 	// (e.g. "signing in"); "" is the back step.
 	MinImageFeature string
+	// Screenshot asks for the check's screenshot (verify-browser 1.6.0+; an
+	// older image ignores it and the outcome has none).
+	Screenshot bool
 }
 
 // verifyBrowserBackVersion is the first verify-browser release with the back step.
@@ -112,6 +115,9 @@ type VerifyBrowserOutcome struct {
 	ExitCode  int
 	TimedOut  bool // the container overran its wall clock and was stopped
 	OOMKilled bool
+	// Screenshot is /io/screenshot.jpg when the request asked for one: a JPEG
+	// of at most QAScreenshotMaxBytes, nil when there is none or it was refused.
+	Screenshot []byte
 }
 
 // RunVerifyBrowser runs one check in a verify-browser container. An error means the
@@ -275,6 +281,9 @@ type verifyBrowserInput struct {
 	// SignIn is the test user to sign in as before the first load
 	// (verify-browser 1.5.0+), written only for a check with as.
 	SignIn *verifyBrowserSignIn `json:"sign_in,omitempty"`
+	// Screenshot asks for /io/screenshot.jpg (verify-browser 1.6.0+; an older
+	// image ignores it). Written only in a QA round that keeps screenshots.
+	Screenshot bool `json:"screenshot,omitempty"`
 }
 
 // verifyBrowserSignIn is input.json's sign_in: the sign-in page and the test
@@ -305,6 +314,9 @@ type verifyPreviewRendered struct {
 	// lines are redacted of — the run's test user passwords — when there are.
 	signIns map[string]BrowserSignInSite
 	redact  apiRedactor
+	// screenshots is the QA round's store (nil: no screenshot is asked for and
+	// no result carries check_id).
+	screenshots *QAScreenshots
 
 	mu    sync.Mutex
 	calls int
@@ -315,9 +327,11 @@ type verifyPreviewRendered struct {
 
 // RegisterVerifyPreviewRendered registers the verify_preview_rendered tool. record is
 // the agent run's preview record (shared with the other preview tools); run starts the
-// browser container; logsWriter is the Step Job's log writer.
-func RegisterVerifyPreviewRendered(s *agentmcp.Server, record *PreviewRecord, run RunVerifyBrowser, logsWriter io.Writer) {
-	registerVerifyPreviewRendered(s, &verifyPreviewRendered{record: record, run: run, logsWriter: logsWriter})
+// browser container; logsWriter is the Step Job's log writer. screenshots, set
+// for a preview QA round only, is where each check's screenshot is kept under
+// its check id, which the check's result carries; nil asks for none.
+func RegisterVerifyPreviewRendered(s *agentmcp.Server, record *PreviewRecord, run RunVerifyBrowser, logsWriter io.Writer, screenshots *QAScreenshots) {
+	registerVerifyPreviewRendered(s, &verifyPreviewRendered{record: record, run: run, logsWriter: logsWriter, screenshots: screenshots})
 }
 
 // RegisterVerifyPreviewRenderedReadOnly registers verify_preview_rendered for a
@@ -358,7 +372,8 @@ func (t *verifyPreviewRendered) check(ctx context.Context, rawArgs json.RawMessa
 	if t.isUnsupported() {
 		return "", errors.New("QA couldn't check the page: " + VerifyBrowserReadOnlyUnsupportedReason)
 	}
-	if !t.takeCall() {
+	callNumber, ok := t.takeCall()
+	if !ok {
 		return "", fmt.Errorf("verify_preview_rendered has already been called %d times in this run, the most allowed — stop checking and report what you have found so far", verifyRenderedMaxCalls)
 	}
 	args, err := parseVerifyRenderedArgs(rawArgs)
@@ -379,6 +394,7 @@ func (t *verifyPreviewRendered) check(ctx context.Context, rawArgs json.RawMessa
 			input.TimeoutMS = verifyRenderedSignInTimeoutSeconds * 1000
 		}
 	}
+	input.Screenshot = t.screenshots != nil
 	inputJSON, err := json.Marshal(input)
 	if err != nil {
 		return "", err
@@ -388,11 +404,15 @@ func (t *verifyPreviewRendered) check(ctx context.Context, rawArgs json.RawMessa
 	}
 	t.logf("verify_preview_rendered: checking %s in the QA browser (%d steps, %d assertions, timeout %ds%s)%s", input.URL, len(input.Steps), len(input.Assertions), input.TimeoutMS/1000, input.Viewport.logSuffix(), signIn.logSuffix())
 	started := time.Now()
-	req := VerifyBrowserRequest{Input: inputJSON, Timeout: time.Duration(input.TimeoutMS) * time.Millisecond}
+	req := VerifyBrowserRequest{Input: inputJSON, Timeout: time.Duration(input.TimeoutMS) * time.Millisecond, Screenshot: input.Screenshot}
 	req.MinImageVersion, req.MinImageFeature = minVerifyBrowserVersion(input)
 	outcome, err := t.run(ctx, req, t.logsWriter)
 	outcome = t.redactOutcome(outcome)
-	return t.finish(outcome, err, renderedCheck{wantViewport: input.Viewport != nil, signIn: signIn}, time.Since(started))
+	check := renderedCheck{wantViewport: input.Viewport != nil, signIn: signIn}
+	if t.screenshots != nil {
+		check.checkID = fmt.Sprintf("c%d", callNumber)
+	}
+	return t.finish(outcome, err, check, time.Since(started))
 }
 
 // minVerifyBrowserVersion is the oldest verify-browser release that runs the
@@ -446,7 +466,35 @@ func (t *verifyPreviewRendered) finish(outcome VerifyBrowserOutcome, runErr erro
 	}
 	t.logf("verify_preview_rendered: %s after %.1fs", r.Verdict, elapsed.Seconds())
 	t.logSignIn(r.SignIn)
+	t.keepScreenshot(check.checkID, outcome)
 	return text, nil
+}
+
+// keepScreenshot writes a completed check's screenshot to the round's store
+// under its check id, sized by the result's "screenshot" object. A screenshot
+// without that object, or with a size outside 1–10000, is dropped with a line
+// in the Step log; no screenshot at all is nothing.
+func (t *verifyPreviewRendered) keepScreenshot(checkID string, outcome VerifyBrowserOutcome) {
+	if t.screenshots == nil || checkID == "" || len(outcome.Screenshot) == 0 {
+		return
+	}
+	var result struct {
+		Screenshot *struct {
+			Width  int `json:"width"`
+			Height int `json:"height"`
+		} `json:"screenshot"`
+	}
+	switch err := json.Unmarshal(outcome.Result, &result); {
+	case err != nil || result.Screenshot == nil:
+		t.logf("QA: dropped a check's screenshot: the result doesn't give its size")
+		return
+	case !validQAScreenshotSize(result.Screenshot.Width, result.Screenshot.Height):
+		t.logf("QA: dropped a check's screenshot: its size %d×%d is out of range", result.Screenshot.Width, result.Screenshot.Height)
+		return
+	}
+	if err := t.screenshots.put(checkID, outcome.Screenshot, result.Screenshot.Width, result.Screenshot.Height); err != nil {
+		t.logf("QA: dropped a check's screenshot: %s", err)
+	}
 }
 
 // hasBlockedRequests reports whether result.json carries blocked_requests,
@@ -485,14 +533,16 @@ func (t *verifyPreviewRendered) isUnsupported() bool {
 	return t.unsupported
 }
 
-func (t *verifyPreviewRendered) takeCall() bool {
+// takeCall counts a call and returns its number in the run (1–30), or false
+// when the run has had them all.
+func (t *verifyPreviewRendered) takeCall() (int, bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.calls >= verifyRenderedMaxCalls {
-		return false
+		return 0, false
 	}
 	t.calls++
-	return true
+	return t.calls, true
 }
 
 func (t *verifyPreviewRendered) logf(format string, args ...interface{}) {

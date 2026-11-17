@@ -186,7 +186,7 @@ func (s *qaStage) deployStackAndSpawnQA(round int, imageRef, qaDir string, env [
 	if err != nil {
 		return agentResult{}, err
 	}
-	spec := s.qaSpawnSpec(imageRef, qaDir, withQAPreviews(env, previews), previewDeps)
+	spec := s.qaSpawnSpec(round, imageRef, qaDir, withQAPreviews(env, previews), previewDeps)
 	spec.verifyToolsOnly = true
 	if hasDeployedBackend(previews) {
 		spec.apiRequestTool = true

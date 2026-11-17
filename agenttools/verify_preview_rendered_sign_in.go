@@ -57,9 +57,11 @@ type BrowserSignInBackend struct {
 // stack-path QA round whose site previews can be checked signed in (sites; none
 // is RegisterVerifyPreviewRendered). passwords are the run's test user
 // passwords beside the sites' own: every result, error and log line of the tool
-// is redacted of all of them.
-func RegisterVerifyPreviewRenderedSignIn(s *agentmcp.Server, record *PreviewRecord, run RunVerifyBrowser, logsWriter io.Writer, sites []BrowserSignInSite, passwords []string) {
-	registerVerifyPreviewRendered(s, newVerifyPreviewRenderedSignIn(record, run, logsWriter, sites, passwords))
+// is redacted of all of them. screenshots is RegisterVerifyPreviewRendered's.
+func RegisterVerifyPreviewRenderedSignIn(s *agentmcp.Server, record *PreviewRecord, run RunVerifyBrowser, logsWriter io.Writer, sites []BrowserSignInSite, passwords []string, screenshots *QAScreenshots) {
+	t := newVerifyPreviewRenderedSignIn(record, run, logsWriter, sites, passwords)
+	t.screenshots = screenshots
+	registerVerifyPreviewRendered(s, t)
 }
 
 // newVerifyPreviewRenderedSignIn is the tool's state for

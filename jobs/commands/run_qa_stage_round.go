@@ -76,7 +76,7 @@ func (s *qaStage) deployAndSpawnQA(round int, imageRef, qaDir string, env []stri
 		return agentResult{}, err
 	}
 	env = withQABackends(env, backends)
-	spec := s.qaSpawnSpec(imageRef, qaDir, env, previewDeps)
+	spec := s.qaSpawnSpec(round, imageRef, qaDir, env, previewDeps)
 	spec.onSiteDeployed = func(repository, url string, err error) {
 		// A repository outside the Task is refused by the tool: no preview.
 		if name, ok := s.taskEntryName(repository); ok {
@@ -259,8 +259,9 @@ func withQABackends(env []string, backends []qaBackend) []string {
 // qaSpawnSpec is a QA round's container: /work is the QA dir, the context
 // copy is bound read-only over /work/context, the tool socket sits beside the
 // QA dir, and the preview tools build from the Task dir. No repository mounts
-// and no dependency cache: the QA run builds nothing itself.
-func (s *qaStage) qaSpawnSpec(imageRef, qaDir string, env []string, previewDeps *agenttools.DeployStaticSitePreviewDeps) agentboxSpawnSpec {
+// and no dependency cache: the QA run builds nothing itself. The round gets a
+// fresh screenshot store (qaRoundScreenshots).
+func (s *qaStage) qaSpawnSpec(round int, imageRef, qaDir string, env []string, previewDeps *agenttools.DeployStaticSitePreviewDeps) agentboxSpawnSpec {
 	return agentboxSpawnSpec{
 		imageRef:           imageRef,
 		workDirHost:        qaDir,
@@ -269,7 +270,30 @@ func (s *qaStage) qaSpawnSpec(imageRef, qaDir string, env []string, previewDeps 
 		previewDeps:        previewDeps,
 		waitTimeout:        qaRunTimeout,
 		readOnlyContextDir: s.contextCopyDir,
+		qaScreenshots:      s.qaRoundScreenshots(round),
 	}
+}
+
+// qaEvidenceDirPath is a QA round's screenshot store: a sibling of the Task
+// dir, removed with the stage's other siblings however the stage ends.
+func qaEvidenceDirPath(workDirHost string, round int) string {
+	return fmt.Sprintf("%s-qa-evidence-%d", strings.TrimRight(workDirHost, "/"), round)
+}
+
+// qaRoundScreenshots creates the round's screenshot store and keeps it by
+// round number for finish's upload. A store that can't be created is nil —
+// the round then keeps no screenshots — with a line in the Step log.
+func (s *qaStage) qaRoundScreenshots(round int) *agenttools.QAScreenshots {
+	if s.screenshots == nil {
+		s.screenshots = map[int]*agenttools.QAScreenshots{}
+	}
+	store, err := agenttools.NewQAScreenshots(qaEvidenceDirPath(s.workDirHost, round))
+	if err != nil {
+		io.WriteString(s.logsWriter, fmt.Sprintf("QA round %d: no screenshots will be kept (%s)\n", round, err))
+		store = nil
+	}
+	s.screenshots[round] = store
+	return store
 }
 
 // qaSpawnEnv builds the QA container's environment: the QA view's agent and
@@ -285,7 +309,9 @@ func (s *qaStage) qaSpawnEnv() ([]string, error) {
 		// QA_PREVIEWS says it all: QA_REPOSITORIES is blank.
 		repositories = nil
 	}
-	return applyQAEnv(env, spec, repositories), nil
+	// QA_EVIDENCE: the round's verify_preview_rendered results carry check_id
+	// for QA to cite. Not in applyQAEnv: production QA keeps no screenshots.
+	return append(applyQAEnv(env, spec, repositories), "QA_EVIDENCE=1"), nil
 }
 
 // applyQAEnv turns an implement-run environment into a QA-run one.
