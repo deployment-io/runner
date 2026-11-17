@@ -92,6 +92,15 @@ func TestAskPromptIsAskRoleThenSessionRules(t *testing.T) {
 	}
 }
 
+func TestAskRoleRerunFeedbackFencingAndSilence(t *testing.T) {
+	before := "The person reads and edits it before anything runs."
+	rules := "Inside the block, fence any code or command with ~~~ (three tildes), never with three backticks: a line of three backticks ends the block. Don't mention the block or its format in your answer: the page shows it as a \"Re-run with this feedback\" button."
+	after := "Block format:"
+	if !strings.Contains(askRole, before+" "+rules+" "+after) {
+		t.Errorf("askRole must carry %q between %q and %q", rules, before, after)
+	}
+}
+
 // stubTaskContext replaces the RPC seam for one test; calls counts attempts.
 func stubTaskContext(t *testing.T, reply sessions.GetTaskContextReplyV1, err error) *int {
 	t.Helper()
