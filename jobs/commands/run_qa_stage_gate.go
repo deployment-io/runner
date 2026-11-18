@@ -32,17 +32,22 @@ type qaGate struct {
 	// Task with a site or a backend preview, unchanged ones included.
 	stack bool
 	// dropped is, in the stack path, every backend left out because it uses a
-	// Go module of another changed repository: the round reports it as a
-	// backend preview that couldn't be planned, and deploys nothing for it.
+	// library of another changed repository and QA can't build it against the
+	// change: the round reports it as a backend preview that couldn't be
+	// planned, and deploys nothing for it.
 	dropped []droppedBackend
+	// linked is, in the stack path, every kept backend that uses a library of
+	// another changed repository: its preview builds against this Task's
+	// change (prepareCrossRepoBuild).
+	linked []linkedBackend
 }
 
 // gate decides whether QA runs, before anything is spawned. It classifies
 // every CHANGED repository: a static site the runner can build a preview of,
 // a backend the runner deploys as a web-service preview itself, or both. A
-// backend that uses the Go module of another changed repository is left out
-// (dropBackendsUsingChangedRepositories): its preview couldn't build the
-// change. It returns:
+// backend that uses the Go module of another changed repository is built
+// against the change in the stack path when it qualifies, and left out
+// otherwise (dropBackendsUsingChangedRepositories). It returns:
 //
 //	{static, backends, "", ""}       run QA on these repositories;
 //	{nil, nil, "", ""}               no repository changed — no QA run, no result;
@@ -68,13 +73,13 @@ func (s *qaStage) gate() qaGate {
 	}
 	buildable, lookupErr := s.buildableRepositories(candidates)
 	backends := s.backendRepositories(candidates)
-	backends, dropped := s.dropBackendsUsingChangedRepositories(backends, changed)
+	backends, dropped, linked := s.dropBackendsUsingChangedRepositories(backends, changed, stack)
 	if len(buildable) == 0 && len(backends) == 0 {
 		if lookupErr != "" {
 			return qaGate{status: tasks.QAStatusCouldNotRun, reason: lookupErr}
 		}
 		if len(dropped) > 0 {
-			return qaGate{status: tasks.QAStatusSkipped, reason: fmt.Sprintf(qaBackendUsesChangedRepositoryReason, dropped[0].backendDir, dropped[0].dependencyDir, dropped[0].dependencyDir)}
+			return qaGate{status: tasks.QAStatusSkipped, reason: dropped[0].skippedReason()}
 		}
 		return qaGate{status: tasks.QAStatusSkipped, reason: qaNoStaticSiteOrBackendReason}
 	}
@@ -83,7 +88,7 @@ func (s *qaStage) gate() qaGate {
 	}
 	g := qaGate{static: buildable, backends: backends, stack: stack}
 	if stack {
-		g.dropped = dropped
+		g.dropped, g.linked = dropped, linked
 	}
 	if s.qaFailure != "" {
 		g.status, g.reason = tasks.QAStatusCouldNotRun, s.qaFailure
@@ -237,62 +242,64 @@ func (s *qaStage) backendRepositories(changed []string) []string {
 	return backends
 }
 
-// droppedBackend is a backend left out because it uses a Go module from
-// dependencyDir, a repository this Task changes.
+// droppedBackend is a backend left out because it uses description (the Go
+// module <path>) from dependencyDir, a repository this Task changes; why is
+// what QA needs to build it against the change ("" outside the stack path).
 type droppedBackend struct {
-	backendDir, dependencyDir, modulePath string
+	backendDir, dependencyDir, description, why string
 }
 
 // previewError is the dropped backend's QA_PREVIEWS error.
 func (d droppedBackend) previewError() string {
-	return fmt.Sprintf("left out: it uses the Go module %s from %s, which this Task also changes, and a preview builds against the version in its go.mod", d.modulePath, d.dependencyDir)
+	return fmt.Sprintf("left out: it uses %s from %s, which this Task also changes, and QA builds it against this Task's change only when %s", d.description, d.dependencyDir, d.why)
 }
 
-// dropBackendsUsingChangedRepositories leaves out every backend whose go.mod
-// requires the Go module of another CHANGED repository of the Task: its
-// preview builds against the version its go.mod pins, so it would fail to
-// build or not show the change. An unchanged repository's released version is
-// what the build uses anyway, so depending on one is fine. It returns the
-// backends kept and those left out, in work-dir order.
-func (s *qaStage) dropBackendsUsingChangedRepositories(backends, changed []string) ([]string, []droppedBackend) {
+// skippedReason is the gate's skipped reason when d is the first backend left
+// out and nothing else is left to check.
+func (d droppedBackend) skippedReason() string {
+	if d.why == "" {
+		return fmt.Sprintf(qaBackendUsesChangedRepositoryReason, d.backendDir, d.dependencyDir, d.dependencyDir)
+	}
+	return fmt.Sprintf("%s depends on %s, which this Task also changes, and QA builds it against this Task's change only when %s, so QA can't check this change yet", d.backendDir, d.dependencyDir, d.why)
+}
+
+// dropBackendsUsingChangedRepositories sorts out every backend that uses a
+// library of another CHANGED repository of the Task (crossRepoLinker.Detect):
+// its preview would build against the version its manifest pins. In the stack
+// path a backend that qualifies (crossRepoLinker.Qualifies) is kept and linked
+// — its preview builds against this Task's change (prepareCrossRepoBuild) —
+// and one that doesn't is left out; outside it every such backend is left
+// out. An unchanged repository's released version is what the build uses
+// anyway, so depending on one is fine. It returns, in work-dir order, the
+// backends kept, those left out and the linked ones among the kept.
+func (s *qaStage) dropBackendsUsingChangedRepositories(backends, changed []string, stack bool) ([]string, []droppedBackend, []linkedBackend) {
 	var kept []string
 	var dropped []droppedBackend
+	var linked []linkedBackend
 	for _, dir := range backends {
-		dependencyDir, modulePath, found := s.crossRepoGoDependency(dir, changed)
-		if !found {
+		linker, deps := s.detectCrossRepo(dir, changed)
+		if len(deps) == 0 {
 			kept = append(kept, dir)
 			continue
 		}
-		io.WriteString(s.logsWriter, fmt.Sprintf("QA stage: leaving %s's backend preview out — it uses the Go module %s from %s, which this Task also changes, and a preview builds against the version in its go.mod; QA can check it once that change is released\n", dir, modulePath, dependencyDir))
-		dropped = append(dropped, droppedBackend{backendDir: dir, dependencyDir: dependencyDir, modulePath: modulePath})
-	}
-	return kept, dropped
-}
-
-// crossRepoGoDependency reports the first changed repository (other than
-// backendDir) whose Go module backendDir's go.mod requires, with that module's
-// path. Only go.mod files at the repositories' roots are read. A backend
-// without a go.mod isn't a Go module and depends on nothing here; a changed
-// repository without a go.mod or a module line is skipped. A read error other
-// than "not found" is logged and never leaves the backend out.
-func (s *qaStage) crossRepoGoDependency(backendDir string, changed []string) (dependencyDir, modulePath string, found bool) {
-	_, required, ok := s.readGoMod(backendDir)
-	if !ok || len(required) == 0 {
-		return "", "", false
-	}
-	for _, dir := range changed {
-		if dir == backendDir {
+		first := deps[0]
+		if !stack {
+			io.WriteString(s.logsWriter, fmt.Sprintf("QA stage: leaving %s's backend preview out — it uses %s from %s, which this Task also changes, and a preview builds against the version in its go.mod; QA can check it once that change is released\n", dir, first.description, first.dir))
+			dropped = append(dropped, droppedBackend{backendDir: dir, dependencyDir: first.dir, description: first.description})
 			continue
 		}
-		module, _, ok := s.readGoMod(dir)
-		if !ok || module == "" {
+		if ok, why := linker.Qualifies(dir); !ok {
+			io.WriteString(s.logsWriter, fmt.Sprintf("QA stage: leaving %s's backend preview out — it uses %s from %s, which this Task also changes, and QA builds it against this Task's change only when %s\n", dir, first.description, first.dir, why))
+			dropped = append(dropped, droppedBackend{backendDir: dir, dependencyDir: first.dir, description: first.description, why: why})
 			continue
 		}
-		if required[module] {
-			return dir, module, true
+		for _, d := range deps {
+			io.WriteString(s.logsWriter, fmt.Sprintf("QA stage: %s uses %s from %s, which this Task also changes — its preview builds against this Task's change\n", dir, d.description, d.dir))
 		}
+		kept = append(kept, dir)
+		linked = append(linked, linkedBackend{backendDir: dir, linker: linker, dependencies: deps})
 	}
-	return "", "", false
+	return kept, dropped, linked
 }
 
 // readGoMod reads dir's go.mod under the work dir: its module path and every
