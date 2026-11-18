@@ -10,8 +10,8 @@ import (
 
 // goCrossRepoLinker is the Go crossRepoLinker: a vendored Go backend whose
 // go.mod requires the module of another changed repository is built with
-// go mod edit -replace to a copy of it, then go mod tidy and go mod vendor,
-// offline against the Step's module cache.
+// go mod edit -replace to a copy of it, then go mod vendor, offline against
+// the Step's module cache.
 type goCrossRepoLinker struct {
 	stage *qaStage
 }
@@ -57,9 +57,16 @@ func (goCrossRepoLinker) CheckService(buildDir, serviceDir string) string {
 }
 
 // Prepare is, in golang:<version> (goBuildVersion of the build copy's go.mod),
-// one go mod edit -replace per dependency to its copy, then go mod tidy and
-// go mod vendor — offline, against the Step's module cache at
-// /cache/gomod.
+// one go mod edit -replace per dependency to its copy, then go mod vendor —
+// offline, against the Step's module cache at /cache/gomod.
+//
+// No go mod tidy: tidy also loads the tests of every dependency (testify,
+// ginkgo, …), modules agentbox's vendor phase never downloads (go mod download
+// fetches what the repository's own packages and tests need), so offline it
+// fails on modules the build never uses. go mod vendor needs only the
+// packages the backend builds and tests — the set the vendor phase fetched.
+// A module a replaced dependency newly requires that isn't in the cache still
+// fails here, and is reported (prepareCrossRepoBuild).
 func (goCrossRepoLinker) Prepare(buildDir string, deps []crossRepoDependency) (crossRepoCommands, error) {
 	data, err := readGoModFile(filepath.Join(buildDir, "go.mod"))
 	if err != nil {
@@ -73,12 +80,12 @@ func (goCrossRepoLinker) Prepare(buildDir string, deps []crossRepoDependency) (c
 	for k, d := range deps {
 		commands = append(commands, []string{"go", "mod", "edit", fmt.Sprintf("-replace=%s=./%s", d.name, crossRepoReplaceDir(k))})
 	}
-	commands = append(commands, []string{"go", "mod", "tidy"}, []string{"go", "mod", "vendor"})
+	commands = append(commands, []string{"go", "mod", "vendor"})
 	return crossRepoCommands{
 		image:    "golang:" + version,
 		commands: commands,
 		env:      goCrossRepoEnv(),
-		summary:  "go mod tidy and go mod vendor",
+		summary:  "go mod vendor",
 	}, nil
 }
 

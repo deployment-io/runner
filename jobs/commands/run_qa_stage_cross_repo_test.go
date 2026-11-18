@@ -286,7 +286,6 @@ func TestGoCrossRepoPrepareAndContainerSpec(t *testing.T) {
 	wantCommands := [][]string{
 		{"go", "mod", "edit", "-replace=github.com/deployment-io/kit=./.deployment-io/replace/0"},
 		{"go", "mod", "edit", "-replace=github.com/deployment-io/lib=./.deployment-io/replace/1"},
-		{"go", "mod", "tidy"},
 		{"go", "mod", "vendor"},
 	}
 	if !reflect.DeepEqual(commands.commands, wantCommands) {
@@ -403,7 +402,7 @@ func appBuildDir(t *testing.T) string {
 }
 
 const crossPreparingLine = "QA round 1: building " + crossApp + "'s preview against this Task's " + crossKit + " (github.com/deployment-io/kit) and " +
-	crossLib + " (github.com/deployment-io/lib) — go mod tidy and go mod vendor in the preview's build copy only\n"
+	crossLib + " (github.com/deployment-io/lib) — go mod vendor in the preview's build copy only\n"
 
 // Each dependency's build source lands at .deployment-io/replace/<k> of the
 // build copy before the commands run, in a container over the Step's cache.
@@ -419,7 +418,7 @@ func TestCrossRepoPrepareBuildPlacesTheDependencies(t *testing.T) {
 	if err := os.Symlink(outside, filepath.Join(buildDir, ".deployment-io")); err != nil {
 		t.Fatal(err)
 	}
-	f := &fakeCrossRepoDocker{output: map[string]string{"go mod tidy": "go: finding module for package x\n"}}
+	f := &fakeCrossRepoDocker{output: map[string]string{"go mod vendor": "go: finding module for package x\n"}}
 	f.atExec = func() {
 		for k, repo := range []string{crossKit, crossLib} {
 			if got := readFile(t, filepath.Join(buildDir, ".deployment-io", "replace", fmt.Sprint(k), "repository.txt")); got != repo {
@@ -437,7 +436,7 @@ func TestCrossRepoPrepareBuildPlacesTheDependencies(t *testing.T) {
 	if want := []string{
 		"go mod edit -replace=github.com/deployment-io/kit=./.deployment-io/replace/0",
 		"go mod edit -replace=github.com/deployment-io/lib=./.deployment-io/replace/1",
-		"go mod tidy", "go mod vendor",
+		"go mod vendor",
 	}; !reflect.DeepEqual(f.commands, want) {
 		t.Errorf("commands = %q", f.commands)
 	}
@@ -461,9 +460,9 @@ func TestCrossRepoPrepareBuildPlacesTheDependencies(t *testing.T) {
 // checked before anything is prepared.
 func TestCrossRepoPrepareBuildFailures(t *testing.T) {
 	const prefix = "couldn't build " + crossApp + " against this Task's " + crossKit + " and " + crossLib + ": "
-	var tidyOutput strings.Builder
+	var vendorOutput strings.Builder
 	for i := 1; i <= 25; i++ {
-		fmt.Fprintf(&tidyOutput, "line %d\n", i)
+		fmt.Fprintf(&vendorOutput, "line %d\n", i)
 	}
 	var last20 []string
 	for i := 6; i <= 25; i++ {
@@ -486,8 +485,8 @@ func TestCrossRepoPrepareBuildFailures(t *testing.T) {
 			want: prefix + "couldn't make " + crossLib + "'s build source: the merge result couldn't be checked out"},
 		{name: "pull", docker: fakeCrossRepoDocker{pullErr: errors.New("no route to host")}, wantSources: 2,
 			want: prefix + "couldn't pull golang:1.27: no route to host"},
-		{name: "exit", docker: fakeCrossRepoDocker{codes: map[string]int{"go mod tidy": 1}, output: map[string]string{"go mod tidy": tidyOutput.String()}}, wantSources: 2, wantCreated: true,
-			want: prefix + "go mod tidy exited with code 1\n" + strings.Join(last20, "\n")},
+		{name: "exit", docker: fakeCrossRepoDocker{codes: map[string]int{"go mod vendor": 1}, output: map[string]string{"go mod vendor": vendorOutput.String()}}, wantSources: 2, wantCreated: true,
+			want: prefix + "go mod vendor exited with code 1\n" + strings.Join(last20, "\n")},
 		{name: "timeout", docker: fakeCrossRepoDocker{hang: "go mod vendor"}, timeout: 20 * time.Millisecond, wantSources: 2, wantCreated: true,
 			want: prefix + "the commands didn't finish within 10 minutes"},
 	} {

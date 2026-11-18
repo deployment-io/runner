@@ -58,7 +58,7 @@ type crossRepoDependency struct {
 
 // crossRepoCommands is what a linker runs in a build copy: commands in order,
 // in a container of image with env. summary names them for the Step log
-// ("go mod tidy and go mod vendor").
+// ("go mod vendor").
 type crossRepoCommands struct {
 	image    string
 	commands [][]string
