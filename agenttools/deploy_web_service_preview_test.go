@@ -460,3 +460,48 @@ func TestCheckWebServicePreview(t *testing.T) {
 		t.Errorf("several web services: got %v", err)
 	}
 }
+
+// PrepareBuild runs on the build copy after its root directory is checked and
+// before the image is built; what it writes is what the deploy builds, and its
+// error fails the deploy as it is, with nothing deployed.
+func TestDeployWebServicePreviewPrepareBuild(t *testing.T) {
+	for _, prepareErr := range []error{nil, errors.New("couldn't build 1-acme/api against this Task's 0-acme/kit: no")} {
+		var deployed bool
+		var prepared []string
+		deps := webDeps(t, &fakeWebStore{}, &fakeWebCloudFront{}, func(_ context.Context, in WebServicePreviewDeployInput) (WebServicePreviewDeployOutput, error) {
+			deployed = true
+			if data, err := os.ReadFile(filepath.Join(in.BuildDir, "prepared.txt")); err != nil || string(data) != "yes" {
+				t.Errorf("the deploy didn't build the prepared copy: %q %v", data, err)
+			}
+			return WebServicePreviewDeployOutput{LoadBalancerDNS: "alb-x.elb.amazonaws.com"}, nil
+		})
+		deps.PrepareBuild = func(_ context.Context, repository, buildDir, serviceDir string) error {
+			if filepath.Dir(buildDir) != filepath.Dir(deps.WorkDirHost) {
+				t.Errorf("build dir %s isn't beside the work dir", buildDir)
+			}
+			prepared = append(prepared, repository, serviceDirRel(buildDir, serviceDir))
+			if err := os.WriteFile(filepath.Join(buildDir, "prepared.txt"), []byte("yes"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			return prepareErr
+		}
+		_, err := DeployWebServicePreview(context.Background(), deps, "1-acme/api")
+		if prepareErr == nil && (err != nil || !deployed) {
+			t.Errorf("deploy = %v, deployed %v", err, deployed)
+		}
+		if prepareErr != nil && (err == nil || err.Error() != prepareErr.Error() || deployed) {
+			t.Errorf("deploy = %v, deployed %v; want %v and nothing deployed", err, deployed, prepareErr)
+		}
+		if len(prepared) != 2 || prepared[0] != "1-acme/api" || prepared[1] != "services/api" {
+			t.Errorf("PrepareBuild calls = %v", prepared)
+		}
+	}
+}
+
+func serviceDirRel(buildDir, serviceDir string) string {
+	rel, err := filepath.Rel(buildDir, serviceDir)
+	if err != nil {
+		return err.Error()
+	}
+	return rel
+}

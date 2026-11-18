@@ -87,6 +87,13 @@ type DeployWebServicePreviewDeps struct {
 	// Distributions is: RegisterDeployWebServicePreview makes one per agent run
 	// when unset, and the QA stage passes one to every round.
 	TestUsers *PreviewTestUsers
+
+	// PrepareBuild, when set, prepares the build copy before the image is
+	// built: buildDir is the copy (PreviewBuildSource), serviceDir the service's
+	// directory in it. An error fails the deploy as it is. Set by the QA stage
+	// only, for a backend built against another repository's change; nil
+	// (implement and fix runs, production) builds the copy as it is.
+	PrepareBuild func(ctx context.Context, repository, buildDir, serviceDir string) error
 }
 
 // WebPreviewDistributions are the CloudFront distributions created by the deploys
@@ -544,6 +551,11 @@ func runWebServicePreview(ctx context.Context, deps DeployWebServicePreviewDeps,
 	}
 	if err := checkInside(copyDir, serviceDir); err != nil {
 		return WebServicePreviewDeployed{}, fmt.Errorf("%s's root directory: %w", p.service.DeploymentName, err)
+	}
+	if deps.PrepareBuild != nil {
+		if err := deps.PrepareBuild(ctx, p.repository, copyDir, serviceDir); err != nil {
+			return WebServicePreviewDeployed{}, err
+		}
 	}
 
 	database, databaseNote, err := planPreviewDatabase(ctx, deps, p, serviceDir)

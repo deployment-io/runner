@@ -36,6 +36,10 @@ require golang.org/x/sys v0.20.0 // indirect
 `
 	appServerDroppedLog    = "QA stage: leaving 2-deployment-io/app-server's backend preview out — it uses the Go module github.com/deployment-io/kit from 1-deployment-io/kit, which this Task also changes, and a preview builds against the version in its go.mod; QA can check it once that change is released"
 	appServerDroppedReason = "2-deployment-io/app-server depends on 1-deployment-io/kit, which this Task also changes; previews build against the released 1-deployment-io/kit, so QA can't check this change yet"
+	// The stack path's, for a backend that doesn't vendor its dependencies.
+	appServerNotVendoredLog    = "QA stage: leaving 2-deployment-io/app-server's backend preview out — it uses the Go module github.com/deployment-io/kit from 1-deployment-io/kit, which this Task also changes, and QA builds it against this Task's change only when it vendors its dependencies (vendor/modules.txt at the repository root)\n"
+	appServerNotVendoredReason = "2-deployment-io/app-server depends on 1-deployment-io/kit, which this Task also changes, and QA builds it against this Task's change only when it vendors its dependencies (vendor/modules.txt at the repository root), so QA can't check this change yet"
+	appServerNotVendoredError  = "left out: it uses the Go module github.com/deployment-io/kit from 1-deployment-io/kit, which this Task also changes, and QA builds it against this Task's change only when it vendors its dependencies (vendor/modules.txt at the repository root)"
 )
 
 // goModRepo is one repository of a go.mod gate test: its go.mod ("" for none)
@@ -92,6 +96,8 @@ func TestQAGateLeavesOutABackendUsingAChangedGoModule(t *testing.T) {
 		wantStatic, wantBackends []string
 		wantStatus, wantReason   string
 		wantDropped              bool
+		// dropLog is the drop's log line; "" is appServerDroppedLog.
+		dropLog string
 	}{
 		{
 			name: "require block, kit changed", image: backendQAImage,
@@ -130,10 +136,10 @@ func TestQAGateLeavesOutABackendUsingAChangedGoModule(t *testing.T) {
 			wantBackends: []string{app},
 		},
 		{
-			name: "stack path: app-server unchanged, kit changed", image: stackQAImage,
+			name: "stack path: app-server unchanged, kit changed, not vendored", image: stackQAImage,
 			repos:      []goModRepo{{kit, kitGoMod, true}, {app, appServerGoMod, false}},
 			backend:    []string{app},
-			wantStatus: tasks.QAStatusSkipped, wantReason: appServerDroppedReason, wantDropped: true,
+			wantStatus: tasks.QAStatusSkipped, wantReason: appServerNotVendoredReason, wantDropped: true, dropLog: appServerNotVendoredLog,
 		},
 		{
 			name: "backend without go.mod", image: backendQAImage,
@@ -176,7 +182,11 @@ func TestQAGateLeavesOutABackendUsingAChangedGoModule(t *testing.T) {
 			if g.status != tc.wantStatus || g.reason != tc.wantReason {
 				t.Errorf("gate = %q %q, want %q %q", g.status, g.reason, tc.wantStatus, tc.wantReason)
 			}
-			if got := strings.Contains(logs.String(), appServerDroppedLog); got != tc.wantDropped {
+			dropLog := tc.dropLog
+			if dropLog == "" {
+				dropLog = appServerDroppedLog
+			}
+			if got := strings.Contains(logs.String(), dropLog); got != tc.wantDropped {
 				t.Errorf("the drop logged = %v, want %v:\n%s", got, tc.wantDropped, logs.String())
 			}
 		})
@@ -289,7 +299,7 @@ func TestQAGateLeavesOutABackendUsingAModuleBlock(t *testing.T) {
 func TestQAGateHandsTheDroppedBackendToTheStack(t *testing.T) {
 	const web, kit, app = "0-deployment-io/web", "1-deployment-io/kit", "2-deployment-io/app-server"
 	repos := []goModRepo{{web, "", true}, {kit, kitGoMod, true}, {app, appServerGoMod, true}}
-	want := []droppedBackend{{backendDir: app, dependencyDir: kit, modulePath: "github.com/deployment-io/kit"}}
+	want := []droppedBackend{{backendDir: app, dependencyDir: kit, description: "the Go module github.com/deployment-io/kit", why: "it vendors its dependencies (vendor/modules.txt at the repository root)"}}
 	for _, tc := range []struct {
 		image string
 		want  []droppedBackend
@@ -311,7 +321,7 @@ func TestQAStackReportsADroppedBackend(t *testing.T) {
 	f := &fakeStackOps{sites: map[string]string{"0-web": "web"}, backends: map[string]string{"1-api": "api"},
 		links: []task_previews.StackLinkV1{webLink(urlVar("VITE_API_URL", ""), originVar("CORS_ORIGINS", ","))}}
 	stage, _, specs := stackStage(t, []string{"web", "api", "kit"}, []string{"0-web"}, nil, f)
-	stage.droppedBackends = []droppedBackend{{backendDir: "1-api", dependencyDir: "2-kit", modulePath: "github.com/acme/kit"}}
+	stage.droppedBackends = []droppedBackend{{backendDir: "1-api", dependencyDir: "2-kit", description: "the Go module github.com/acme/kit", why: "it vendors its dependencies (vendor/modules.txt at the repository root)"}}
 	if _, err := runStackRound(t, stage, 1); err != nil {
 		t.Fatal(err)
 	}
@@ -323,7 +333,7 @@ func TestQAStackReportsADroppedBackend(t *testing.T) {
 	}
 	got := envMap((*specs)[0].env)["QA_PREVIEWS"]
 	const want = `[{"repository":"0-web","kind":"site","url":"https://s-0-web.cloudfront.net","unconnected_backends":["1-api"]},` +
-		`{"repository":"1-api","kind":"backend","error":"left out: it uses the Go module github.com/acme/kit from 2-kit, which this Task also changes, and a preview builds against the version in its go.mod"}]`
+		`{"repository":"1-api","kind":"backend","error":"left out: it uses the Go module github.com/acme/kit from 2-kit, which this Task also changes, and QA builds it against this Task's change only when it vendors its dependencies (vendor/modules.txt at the repository root)"}]`
 	if got != want {
 		t.Errorf("QA_PREVIEWS = %s\nwant %s", got, want)
 	}

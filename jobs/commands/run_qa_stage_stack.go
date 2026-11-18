@@ -303,6 +303,17 @@ func (r *qaStackRound) plan() {
 	}
 }
 
+// linkedBackend is the gate's record of repository when it is a backend built
+// against this Task's change of its dependencies.
+func (s *qaStage) linkedBackend(repository string) (linkedBackend, bool) {
+	for _, b := range s.linkedBackends {
+		if b.backendDir == repository {
+			return b, true
+		}
+	}
+	return linkedBackend{}, false
+}
+
 // stackBackends is every backend of a stack-path round in work-dir order: the
 // ones it deploys and the ones the gate left out (droppedBackends).
 func (s *qaStage) stackBackends() []string {
@@ -390,6 +401,9 @@ func (r *qaStackRound) deployBackends() error {
 		}
 		io.WriteString(r.stage.logsWriter, line+"\n")
 		webDeps, facts := recordPreviewDeploy(r.webDeps)
+		if linked, ok := r.stage.linkedBackend(backend.repository); ok {
+			webDeps.PrepareBuild = r.stage.crossRepoPrepareBuild(r.label, linked, r.siteDeps.MergeResult)
+		}
 		d, err := r.ops.deployBackend(r.ctx, webDeps, backend.backend, origins)
 		if r.stage.stopped() {
 			return types.ErrJobStoppedByUser
