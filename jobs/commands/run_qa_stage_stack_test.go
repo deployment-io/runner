@@ -46,8 +46,21 @@ type fakeStackOps struct {
 	// repository; every other backend is an API.
 	pages map[string]bool
 
+	// environments are each site's deployment's environment.
+	environments map[string]string
+	// companionReply and companionErr are CompanionBackendsV1's answer.
+	companionReply task_previews.CompanionBackendsReplyV1
+	companionErr   error
+
 	events      []string
 	wiringCalls int
+	// companionCalls and companionArgs are the CompanionBackendsV1 calls.
+	companionCalls int
+	companionArgs  companionLookupArgs
+	// checkouts are each planned companion's Checkout, by name; built are the
+	// files (path → contents) each deploy of one built, in deploy order.
+	checkouts   map[string]func(ctx context.Context, dir string) error
+	built       []map[string]string
 	wiringRepos []task_previews.StackRepositoryV1
 	siteVars    map[string]map[string]string
 	backendVars map[string]map[string]string
@@ -73,7 +86,7 @@ func (f *fakeStackOps) ops() *qaStackOps {
 			if err := f.planErr["site:"+repo]; err != nil {
 				return agenttools.StaticSitePreviewPlan{}, err
 			}
-			return agenttools.StaticSitePreviewPlan{Repository: repo, DeploymentName: f.sites[repo]}, nil
+			return agenttools.StaticSitePreviewPlan{Repository: repo, DeploymentName: f.sites[repo], EnvironmentName: f.environments[repo]}, nil
 		},
 		reserveSite: func(_ context.Context, deps agenttools.DeployStaticSitePreviewDeps, p agenttools.StaticSitePreviewPlan) (string, error) {
 			f.event("reserve " + p.Repository)
@@ -103,6 +116,13 @@ func (f *fakeStackOps) ops() *qaStackOps {
 			f.event("deploy backend " + p.Repository)
 			f.webDeps = append(f.webDeps, deps)
 			f.backendVars[p.Repository] = vars
+			if checkout := f.checkouts[p.Repository]; checkout != nil {
+				files, err := checkoutFiles(checkout)
+				if err != nil {
+					return agenttools.WebServicePreviewDeployed{}, err
+				}
+				f.built = append(f.built, files)
+			}
 			if err := f.deployErr["backend:"+p.Repository]; err != nil {
 				return agenttools.WebServicePreviewDeployed{}, err
 			}
@@ -124,6 +144,26 @@ func (f *fakeStackOps) ops() *qaStackOps {
 				return task_previews.StackWiringReplyV1{}, f.wiringErr
 			}
 			return task_previews.StackWiringReplyV1{Links: f.links}, nil
+		},
+		companions: func(repos []task_previews.StackRepositoryV1, frontends []task_previews.CompanionFrontendV1, region string) (task_previews.CompanionBackendsReplyV1, error) {
+			f.event("companions")
+			f.companionCalls++
+			f.companionArgs = companionLookupArgs{repos, frontends, region}
+			if f.companionErr != nil {
+				return task_previews.CompanionBackendsReplyV1{}, f.companionErr
+			}
+			return f.companionReply, nil
+		},
+		planCompanion: func(_ agenttools.DeployWebServicePreviewDeps, c agenttools.CompanionWebService) (agenttools.WebServicePreviewPlan, error) {
+			f.event("plan companion " + c.Repository)
+			if err := f.planErr["companion:"+c.Repository]; err != nil {
+				return agenttools.WebServicePreviewPlan{}, err
+			}
+			if f.checkouts == nil {
+				f.checkouts = map[string]func(context.Context, string) error{}
+			}
+			f.checkouts[c.Repository] = c.Checkout
+			return agenttools.WebServicePreviewPlan{Repository: c.Repository, DeploymentName: c.API, ServiceName: "svc-" + c.Repository}, nil
 		},
 		probePages: func(_ context.Context, url, healthURL string) agenttools.PreviewPagesProbe {
 			for repo, serves := range f.pages {
