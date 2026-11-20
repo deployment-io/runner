@@ -175,6 +175,7 @@ func urlPath(path string) string {
 // repositories by entry name (name maps a work-dir name to it).
 func (p *qaStackPair) wiringOutput(name func(dir string) string) qaWiringOutput {
 	out := qaWiringOutput{Frontend: name(p.site.repository), API: name(p.backend.repository), Connected: p.connected(), Reason: p.reason}
+	out.Companion = p.backend.companion != nil
 	switch {
 	case out.Connected:
 		for _, v := range p.link.APIURLVariables {

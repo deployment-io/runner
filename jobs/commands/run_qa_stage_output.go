@@ -83,6 +83,13 @@ type qaRoundOutput struct {
 	// round's previews: whether the site's preview was built to call the
 	// backend's. Variable names only, never a value or a path.
 	Wiring []qaWiringOutput `json:"wiring,omitempty"`
+	// Companions are, on the stack path, the round's companion backends (web
+	// services outside the Task its site previews call, deployed unchanged from
+	// their production branch), in CompanionBackendsV1's order.
+	Companions []qaCompanionOutput `json:"companions,omitempty"`
+	// BackendsNotDeployed are the site variables that call a web service
+	// outside the Task with no companion preview, and why.
+	BackendsNotDeployed []qaBackendNotDeployedOutput `json:"backends_not_deployed,omitempty"`
 }
 
 // Values of qaWiringOutput.Reason.
@@ -110,6 +117,9 @@ type qaWiringOutput struct {
 	APIVariables      []string `json:"api_variables,omitempty"`
 	// Reason is why the site isn't connected (qaWiring*), "" when it is.
 	Reason string `json:"reason,omitempty"`
+	// Companion is true when API is a companion backend, named by its
+	// repository.
+	Companion bool `json:"companion,omitempty"`
 }
 
 // finalRound is the round whose result is the stage's, or nil when the gate

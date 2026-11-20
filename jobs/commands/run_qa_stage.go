@@ -101,6 +101,13 @@ const minPreviewsQAAgentboxVersion = "1.9.37"
 // older image they go to the sites connected to it, as before.
 const minOwnBrowserSignInAgentboxVersion = "1.9.44"
 
+// minCompanionQAAgentboxVersion is the first agentbox that reads a companion's
+// entry of QA_PREVIEWS and a site's backends_not_deployed. With it, on the stack
+// path, the runner also deploys unchanged previews of the web services outside
+// the Task that the site previews call (run_qa_stage_companions.go); with an
+// older image it deploys none, as before.
+const minCompanionQAAgentboxVersion = "1.9.48"
+
 // qaNoTimeToDeployBackendReason is round 1's status reason when the stage's
 // budget can't fit deploying the backend previews and the QA run.
 const qaNoTimeToDeployBackendReason = "no time left to deploy the backend preview"
@@ -234,6 +241,15 @@ type qaStage struct {
 	wiring       task_previews.StackWiringReplyV1
 	wiringLooked bool
 	wiringFailed bool
+	// companions are the stage's companion backends and companionsNotDeployed
+	// the site variables with none, looked up once per stage (companionsLooked)
+	// with an agentbox that reads them.
+	companions            []*qaCompanion
+	companionsNotDeployed []task_previews.CompanionNotDeployedV1
+	companionsLooked      bool
+	// companionTimeout bounds a companion's source fetch; 0 is
+	// qaCompanionSourceTimeout. Tests only.
+	companionTimeout time.Duration
 
 	out *qaOutput
 	// screenshots are each QA round's screenshot store, by round number (nil
@@ -296,6 +312,11 @@ type qaStage struct {
 	// roundWiring is how the running stack-path round connected its previews,
 	// set when its deploys end.
 	roundWiring []qaWiringOutput
+	// roundCompanions and roundBackendsNotDeployed are, with an agentbox that
+	// reads them, the running stack-path round's companions and site variables
+	// with no backend preview, set when its deploys end.
+	roundCompanions          []qaCompanionOutput
+	roundBackendsNotDeployed []qaBackendNotDeployedOutput
 	// eventRound is the running round's number, for its progress events.
 	eventRound int
 	// pendingRound is round 1 when it is sent back for a fix: whether it is the
@@ -325,6 +346,8 @@ func (s *qaStage) model() string {
 // run is the gate, round 1, and the one fix round. It returns an error only for
 // a user stop and for a fix run whose undo did not work.
 func (s *qaStage) run() (map[string]interface{}, error) {
+	// The companions' fetched sources go however the stage ends.
+	defer s.removeCompanionSources()
 	g := s.gate()
 	if g.status == "" && len(g.static) == 0 && len(g.backends) == 0 {
 		// Nothing changed: nothing to check and nothing to report.
@@ -449,9 +472,10 @@ func (s *qaStage) canAfford(d time.Duration) bool {
 }
 
 // backendDeployAllowance is what a QA round's backend deploys add to its time:
-// qaBackendDeployAllowance when the gate found backends, else nothing.
+// qaBackendDeployAllowance when the gate found backends or the stage has a
+// companion, else nothing.
 func (s *qaStage) backendDeployAllowance() time.Duration {
-	if len(s.backends) == 0 {
+	if len(s.backends) == 0 && len(s.companions) == 0 {
 		return 0
 	}
 	return qaBackendDeployAllowance
@@ -491,6 +515,7 @@ func (s *qaStage) qaRound(round int) (qaRoundOutput, error) {
 	var result agentResult
 	var err error
 	s.roundMergeResults, s.roundWiring = nil, nil
+	s.roundCompanions, s.roundBackendsNotDeployed = nil, nil
 	if s.runQA != nil {
 		result, err = s.runQA(round)
 	} else {
@@ -503,6 +528,8 @@ func (s *qaStage) qaRound(round int) (qaRoundOutput, error) {
 	out := s.roundOutput(round, result, err)
 	out.MergeResults = s.roundMergeResults
 	out.Wiring = s.roundWiring
+	out.Companions = s.roundCompanions
+	out.BackendsNotDeployed = s.roundBackendsNotDeployed
 	s.out.Rounds = append(s.out.Rounds, out)
 	s.emitRoundEvents(out)
 	return out, nil

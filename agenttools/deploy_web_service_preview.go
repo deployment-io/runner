@@ -292,6 +292,10 @@ type webServicePreviewPlan struct {
 	// wired are variables the QA stage sets on top of the preview configuration's
 	// (the origins of the site previews that call it); nil for the tool.
 	wired map[string]string
+	// checkout, set for a companion (PlanCompanionWebServicePreview), writes its
+	// source into a new build directory: its preview never builds from the work
+	// dir (PreviewBuildSource).
+	checkout func(ctx context.Context, dir string) error
 }
 
 func handleDeployWebServicePreview(ctx context.Context, deps DeployWebServicePreviewDeps, builds *previewBuilds, rawArgs json.RawMessage) (string, error) {
@@ -530,7 +534,8 @@ func webServiceRoots(services []task_previews.WebServicePreviewSettingsV1) strin
 }
 
 // runWebServicePreview deploys p from a copy of the agent's working tree (or the
-// merge result, when deps.MergeResult can make it) and puts a CloudFront
+// merge result, when deps.MergeResult can make it; for a companion, its own
+// checkout) and puts a CloudFront
 // distribution in front of it on the first deploy, removing the copy in every case.
 func runWebServicePreview(ctx context.Context, deps DeployWebServicePreviewDeps, p webServicePreviewPlan) (WebServicePreviewDeployed, error) {
 	previewID, existing, err := ensurePreview(ctx, deps.Store, p.serviceName)
@@ -538,11 +543,19 @@ func runWebServicePreview(ctx context.Context, deps DeployWebServicePreviewDeps,
 		return WebServicePreviewDeployed{}, fmt.Errorf("ensure preview record: %w", err)
 	}
 	existing = deps.Distributions.fill(previewID, existing)
-	copyDir, err := PreviewBuildSource(ctx, DeployStaticSitePreviewDeps{WorkDirHost: deps.WorkDirHost, LogsWriter: deps.LogsWriter, MergeResult: deps.MergeResult}, p.repository)
+	var copyDir string
+	if p.checkout != nil {
+		copyDir, err = companionBuildSource(ctx, deps, p)
+	} else {
+		copyDir, err = PreviewBuildSource(ctx, DeployStaticSitePreviewDeps{WorkDirHost: deps.WorkDirHost, LogsWriter: deps.LogsWriter, MergeResult: deps.MergeResult}, p.repository)
+	}
 	if copyDir != "" {
 		defer os.RemoveAll(copyDir)
 	}
 	if err != nil {
+		if p.checkout != nil {
+			return WebServicePreviewDeployed{}, fmt.Errorf("check out %s for the preview build: %w", p.repository, err)
+		}
 		return WebServicePreviewDeployed{}, fmt.Errorf("copy %s for the preview build: %w", p.repository, err)
 	}
 	serviceDir := filepath.Join(copyDir, p.rootDirectory)

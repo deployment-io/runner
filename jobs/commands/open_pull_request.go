@@ -3,6 +3,7 @@ package commands
 import (
 	"encoding/json"
 	"fmt"
+	"html"
 	"io"
 	"strings"
 	"unicode/utf8"
@@ -366,13 +367,18 @@ func (opr *taskOpenPR) previewSection() string {
 		}
 		return ""
 	}
-	return formatPreviewSection(previews)
+	var companions []qaCompanionOutput
+	if final := opr.qa.finalRound(); final != nil {
+		companions = final.Companions
+	}
+	return formatPreviewSection(previews, companions)
 }
 
 // formatPreviewSection renders the Previews part: at most prBodyPreviewMaxItems
 // lines, each name cut to prBodyPreviewNameMaxRunes, then one sentence on when
-// they go away. Empty for no previews.
-func formatPreviewSection(previews []task_previews.TaskPreviewV1) string {
+// they go away. A preview of one of companions (the QA stage's final round's)
+// says it is not part of the change. Empty for no previews.
+func formatPreviewSection(previews []task_previews.TaskPreviewV1, companions []qaCompanionOutput) string {
 	if len(previews) == 0 {
 		return ""
 	}
@@ -383,11 +389,8 @@ func formatPreviewSection(previews []task_previews.TaskPreviewV1) string {
 		shown = shown[:prBodyPreviewMaxItems]
 	}
 	for _, p := range shown {
-		name := p.ServiceName
-		if r := []rune(name); len(r) > prBodyPreviewNameMaxRunes {
-			name = string(r[:prBodyPreviewNameMaxRunes])
-		}
-		sb.WriteString(fmt.Sprintf("- %s: %s\n", name, p.URL))
+		name := cutRunes(p.ServiceName, prBodyPreviewNameMaxRunes)
+		sb.WriteString(fmt.Sprintf("- %s: %s%s\n", name, p.URL, companionPreviewNote(p.ServiceName, companions)))
 	}
 	if omitted := len(previews) - len(shown); omitted > 0 {
 		sb.WriteString(fmt.Sprintf("- and %d more under Resources → Previews in the dashboard\n", omitted))
@@ -399,6 +402,38 @@ func formatPreviewSection(previews []task_previews.TaskPreviewV1) string {
 		sb.WriteString("(about 72 hours).\n")
 	}
 	return sb.String()
+}
+
+// companionPreviewNote is what a preview line adds when serviceName is a
+// companion's preview: an unchanged preview, deployed for QA only.
+func companionPreviewNote(serviceName string, companions []qaCompanionOutput) string {
+	for _, c := range companions {
+		if c.ServiceName != "" && c.ServiceName == serviceName {
+			return fmt.Sprintf(" — an unchanged preview of %s from %s, deployed for QA only; not part of this change",
+				prBodyLiteral(cutRunes(c.API, prBodyPreviewNameMaxRunes)), prBodyLiteral(cutRunes(c.Branch, prBodyPreviewNameMaxRunes)))
+		}
+	}
+	return ""
+}
+
+// prBodyMarkdownEscaper backslash-escapes what Markdown would read as markup.
+var prBodyMarkdownEscaper = strings.NewReplacer(
+	`\`, `\\`, "`", "\\`", `*`, `\*`, `_`, `\_`, `[`, `\[`, `]`, `\]`,
+	`(`, `\(`, `)`, `\)`, `#`, `\#`, `|`, `\|`, `~`, `\~`, `!`, `\!`,
+)
+
+// prBodyLiteral is s as literal text in the pull request body: HTML and
+// Markdown markup in it are escaped.
+func prBodyLiteral(s string) string {
+	return html.EscapeString(prBodyMarkdownEscaper.Replace(s))
+}
+
+// cutRunes is s cut to its first n runes.
+func cutRunes(s string, n int) string {
+	if r := []rune(s); len(r) > n {
+		return string(r[:n])
+	}
+	return s
 }
 
 // hasBackendPreview reports whether any preview is a backend service, which is

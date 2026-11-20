@@ -36,6 +36,10 @@ type qaStackOps struct {
 	planBackend   func(deps agenttools.DeployWebServicePreviewDeps, repository string) (agenttools.WebServicePreviewPlan, error)
 	deployBackend func(ctx context.Context, deps agenttools.DeployWebServicePreviewDeps, plan agenttools.WebServicePreviewPlan, variables map[string]string) (agenttools.WebServicePreviewDeployed, error)
 	wiring        func(repositories []task_previews.StackRepositoryV1) (task_previews.StackWiringReplyV1, error)
+	// companions is deployment-server's CompanionBackendsV1; planCompanion plans
+	// a companion's backend preview, which deployBackend deploys.
+	companions    func(repositories []task_previews.StackRepositoryV1, frontends []task_previews.CompanionFrontendV1, region string) (task_previews.CompanionBackendsReplyV1, error)
+	planCompanion func(deps agenttools.DeployWebServicePreviewDeps, c agenttools.CompanionWebService) (agenttools.WebServicePreviewPlan, error)
 	// probePages finds out whether a deployed backend preview serves pages.
 	probePages func(ctx context.Context, url, healthURL string) agenttools.PreviewPagesProbe
 }
@@ -56,7 +60,11 @@ func (s *qaStage) qaStackOps() qaStackOps {
 		wiring: func(repositories []task_previews.StackRepositoryV1) (task_previews.StackWiringReplyV1, error) {
 			return runnerclient.Get().StackWiring(orgID, taskID, repositories, agenttools.PreviewBuildSettingsTimeout)
 		},
-		probePages: agenttools.ProbeServesPages,
+		companions: func(repositories []task_previews.StackRepositoryV1, frontends []task_previews.CompanionFrontendV1, region string) (task_previews.CompanionBackendsReplyV1, error) {
+			return runnerclient.Get().CompanionBackends(orgID, taskID, repositories, frontends, region, agenttools.PreviewBuildSettingsTimeout)
+		},
+		planCompanion: agenttools.PlanCompanionWebServicePreview,
+		probePages:    agenttools.ProbeServesPages,
 	}
 }
 
@@ -89,6 +97,14 @@ type qaPreview struct {
 	// URL (qaStackRound.ownBrowserSignIn), its own. Never an email or a password.
 	BrowserRoles []qaPreviewBrowserRole `json:"browser_roles,omitempty"`
 	Error        string                 `json:"error,omitempty"`
+	// Companion is true on a companion's backend entry (an unchanged preview of
+	// a web service outside the Task), whose Deployment is the production
+	// deployment's name.
+	Companion  bool   `json:"companion,omitempty"`
+	Deployment string `json:"deployment,omitempty"`
+	// BackendsNotDeployed are, on a deployed site, its variables that call a
+	// web service outside the Task with no companion preview.
+	BackendsNotDeployed []qaPreviewNotDeployed `json:"backends_not_deployed,omitempty"`
 }
 
 // qaPreviewBrowserRole is a browser role of a QA_PREVIEWS entry: a role of the
@@ -120,6 +136,8 @@ type qaStackPreview struct {
 	// leftOut is a backend the gate left out (droppedBackends): planErr says
 	// why, and its pairs are "backend left out", not a failed deploy.
 	leftOut bool
+	// companion is set on a companion's backend preview.
+	companion *qaCompanion
 	// origin is a site's reserved address, https://<distribution domain>.
 	origin         string
 	url, healthURL string
@@ -153,7 +171,9 @@ type qaStackRound struct {
 	webDeps  agenttools.DeployWebServicePreviewDeps
 	sites    []*qaStackPreview
 	backends []*qaStackPreview
-	pairs    []*qaStackPair
+	// companions are the round's companion backends, also the last of backends.
+	companions []*qaStackPreview
+	pairs      []*qaStackPair
 	// readsBackendBrowserRoles is true when the round's agentbox reads a
 	// backend entry's browser_roles (minOwnBrowserSignInAgentboxVersion).
 	readsBackendBrowserRoles bool
@@ -182,7 +202,7 @@ func (s *qaStage) deployStackAndSpawnQA(round int, imageRef, qaDir string, env [
 	}
 	previewDeps.Distributions = s.staticDistributions
 	label := fmt.Sprintf("QA round %d", round)
-	previews, err := s.deployStack(label, imageVersionAtLeast(imageRef, minOwnBrowserSignInAgentboxVersion), previewDeps)
+	previews, err := s.deployStack(label, imageVersionAtLeast(imageRef, minOwnBrowserSignInAgentboxVersion), imageVersionAtLeast(imageRef, minCompanionQAAgentboxVersion), previewDeps)
 	if err != nil {
 		return agentResult{}, err
 	}
@@ -214,17 +234,27 @@ func hasDeployedBackend(previews []qaPreview) bool {
 
 // deployStack deploys the round's previews and records how they connect
 // (roundWiring). readsBackendBrowserRoles is true when the round's agentbox
-// reads a backend entry's browser_roles. It returns QA_PREVIEWS' entries, or an error
-// when the user stopped the Step or no preview deployed.
-func (s *qaStage) deployStack(label string, readsBackendBrowserRoles bool, previewDeps *agenttools.DeployStaticSitePreviewDeps) ([]qaPreview, error) {
+// reads a backend entry's browser_roles, and companions when it reads a companion's
+// entry (minCompanionQAAgentboxVersion): the round then deploys the stage's
+// companion backends too. It returns QA_PREVIEWS' entries, or an error when the
+// user stopped the Step or no preview deployed.
+func (s *qaStage) deployStack(label string, readsBackendBrowserRoles, companions bool, previewDeps *agenttools.DeployStaticSitePreviewDeps) ([]qaPreview, error) {
 	ctx, cancel := s.stopContext()
 	defer cancel()
 	r := &qaStackRound{stage: s, label: label, ops: s.qaStackOps(), ctx: ctx, siteDeps: *previewDeps, webDeps: *s.roundWebPreviewDeps(previewDeps), readsBackendBrowserRoles: readsBackendBrowserRoles}
 	r.plan()
+	if companions {
+		s.lookupCompanions(r)
+		r.planCompanions()
+	}
 	reply, lookupFailed := s.stackWiringReply(r.ops)
-	r.pairs = pairStack(r.sites, r.backends, reply.Links, lookupFailed)
+	r.pairs = withCompanionPairs(pairStack(r.sites, r.taskBackends(), reply.Links, lookupFailed), r.sites, r.companions)
 	if err := r.deploy(); err != nil {
 		return nil, err
+	}
+	if companions {
+		s.roundCompanions = r.companionOutputs()
+		s.roundBackendsNotDeployed = s.backendsNotDeployedOutputs()
 	}
 	s.roundWiring = r.wiringOutputs()
 	s.roundSignIns = r.signIns()
@@ -249,11 +279,7 @@ func (s *qaStage) stackWiringReply(ops qaStackOps) (task_previews.StackWiringRep
 	}
 	if !s.wiringLooked {
 		s.wiringLooked = true
-		repositories := make([]task_previews.StackRepositoryV1, 0, len(s.ctx.Entries))
-		for i, e := range s.ctx.Entries {
-			repositories = append(repositories, task_previews.StackRepositoryV1{Repository: fmt.Sprintf("%d-%s", i, e.Name), CloneURL: e.CloneURL})
-		}
-		reply, err := ops.wiring(repositories)
+		reply, err := ops.wiring(s.stackRepositoriesArg())
 		if err != nil {
 			io.WriteString(s.logsWriter, fmt.Sprintf("QA stage: couldn't look up how the previews connect: %s\n", err))
 			s.wiringFailed = true
@@ -301,6 +327,11 @@ func (r *qaStackRound) plan() {
 		}
 		r.backends = append(r.backends, p)
 	}
+}
+
+// taskBackends are the round's backends but its companions: the Task's own.
+func (r *qaStackRound) taskBackends() []*qaStackPreview {
+	return r.backends[:len(r.backends)-len(r.companions)]
 }
 
 // linkedBackend is the gate's record of repository when it is a backend built
@@ -394,6 +425,12 @@ func (r *qaStackRound) deployBackends() error {
 		if backend.err != "" {
 			continue
 		}
+		var err error
+		if backend.companion != nil {
+			// Fetched once per stage, before the companion's first deploy, so
+			// its fetch line comes before its deploy lines.
+			err = r.stage.companionSource(r.ctx, backend.companion)
+		}
 		origins := stackOrigins(r.pairs, backend)
 		line := fmt.Sprintf("%s: deploying the backend preview of %s", r.label, backend.repository)
 		if len(origins) > 0 {
@@ -404,7 +441,10 @@ func (r *qaStackRound) deployBackends() error {
 		if linked, ok := r.stage.linkedBackend(backend.repository); ok {
 			webDeps.PrepareBuild = r.stage.crossRepoPrepareBuild(r.label, linked, r.siteDeps.MergeResult)
 		}
-		d, err := r.ops.deployBackend(r.ctx, webDeps, backend.backend, origins)
+		var d agenttools.WebServicePreviewDeployed
+		if err == nil {
+			d, err = r.ops.deployBackend(r.ctx, webDeps, backend.backend, origins)
+		}
 		if r.stage.stopped() {
 			return types.ErrJobStoppedByUser
 		}
@@ -507,11 +547,14 @@ func (r *qaStackRound) wiringOutputs() []qaWiringOutput {
 }
 
 // entryName is the Task's repository entry name of the work-dir name dir
-// ("<idx>-<name>"), as qaMergeResultOutput.Repository names it; dir itself when
-// no entry has it.
+// ("<idx>-<name>"), as qaMergeResultOutput.Repository names it — a companion's
+// repository name for a companion's name; dir itself when no entry has it.
 func (s *qaStage) entryName(dir string) string {
 	if name, ok := s.taskEntryName(dir); ok {
 		return name
+	}
+	if c := s.companionByName(dir); c != nil {
+		return c.backend.Repository.Name
 	}
 	return dir
 }
@@ -543,22 +586,30 @@ func (r *qaStackRound) previews() []qaPreview {
 			out = append(out, r.sitePreview(site))
 		}
 		if backend := backends[repository]; backend != nil {
-			entry := qaPreview{Repository: repository, Kind: qaPreviewBackend, Error: backend.err}
-			if backend.err == "" {
-				entry.URL, entry.HealthURL, entry.ServesPages = backend.url, backend.healthURL, backend.servesPages
-				for _, role := range backend.roles {
-					entry.Roles = append(entry.Roles, qaPreviewRole{Name: role.Name, Description: role.Description})
-				}
-				if r.ownBrowserSignIn(backend) {
-					for _, role := range backend.browserRoles {
-						entry.BrowserRoles = append(entry.BrowserRoles, qaPreviewBrowserRole{Name: role.Name, Description: role.Description, Backend: backend.repository})
-					}
-				}
-			}
-			out = append(out, entry)
+			out = append(out, r.backendPreview(backend))
 		}
 	}
+	for _, companion := range r.companions {
+		out = append(out, r.companionPreview(companion))
+	}
 	return out
+}
+
+// backendPreview is backend's QA_PREVIEWS entry.
+func (r *qaStackRound) backendPreview(backend *qaStackPreview) qaPreview {
+	entry := qaPreview{Repository: backend.repository, Kind: qaPreviewBackend, Error: backend.err}
+	if backend.err == "" {
+		entry.URL, entry.HealthURL, entry.ServesPages = backend.url, backend.healthURL, backend.servesPages
+		for _, role := range backend.roles {
+			entry.Roles = append(entry.Roles, qaPreviewRole{Name: role.Name, Description: role.Description})
+		}
+		if r.ownBrowserSignIn(backend) {
+			for _, role := range backend.browserRoles {
+				entry.BrowserRoles = append(entry.BrowserRoles, qaPreviewBrowserRole{Name: role.Name, Description: role.Description, Backend: backend.repository})
+			}
+		}
+	}
+	return entry
 }
 
 // signInRoles records on backend the roles QA may sign in as after its deploy
@@ -696,6 +747,7 @@ func (r *qaStackRound) sitePreview(site *qaStackPreview) qaPreview {
 			entry.BrowserRoles = append(entry.BrowserRoles, qaPreviewBrowserRole{Name: role.Name, Description: role.Description, Backend: backend.repository})
 		}
 	}
+	entry.BackendsNotDeployed = r.backendsNotDeployed(site)
 	return entry
 }
 

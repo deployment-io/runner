@@ -161,3 +161,41 @@ func (r *RunnerClient) StackWiring(organizationID, taskID string, repositories [
 	}
 	return reply, nil
 }
+
+// CompanionBackends returns the web services outside the Task that its static
+// sites call in production — its companion backends, to deploy unchanged previews
+// of from their production branch — and the frontend variables that link to one
+// whose preview won't be deployed, and why. repositories are every repository of
+// the Task; frontends the static-site deployments its site previews are built
+// like; region the runner's. The reply carries names only, never a value.
+//
+// Like StackWiring, the call runs over its own connection whose deadline is
+// timeout from now.
+func (r *RunnerClient) CompanionBackends(organizationID, taskID string, repositories []task_previews.StackRepositoryV1, frontends []task_previews.CompanionFrontendV1, region string, timeout time.Duration) (task_previews.CompanionBackendsReplyV1, error) {
+	if !r.isConnected || r.dial == nil {
+		return task_previews.CompanionBackendsReplyV1{}, ErrConnection
+	}
+	deadline := time.Now().Add(timeout)
+	conn, err := r.dial(timeout)
+	if err != nil {
+		return task_previews.CompanionBackendsReplyV1{}, err
+	}
+	if err := conn.SetDeadline(deadline); err != nil {
+		conn.Close()
+		return task_previews.CompanionBackendsReplyV1{}, err
+	}
+	c := rpc.NewClient(conn)
+	defer c.Close()
+	args := task_previews.CompanionBackendsArgsV1{}
+	args.OrganizationID = r.GetComputedOrganizationID(organizationID)
+	args.Token = r.token
+	args.TaskID = taskID
+	args.Repositories = repositories
+	args.Frontends = frontends
+	args.Region = region
+	var reply task_previews.CompanionBackendsReplyV1
+	if err := c.Call("TaskPreviews.CompanionBackendsV1", args, &reply); err != nil {
+		return task_previews.CompanionBackendsReplyV1{}, err
+	}
+	return reply, nil
+}

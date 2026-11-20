@@ -50,7 +50,7 @@ func TestPreviewSection_SixPreviews(t *testing.T) {
 			URL:         fmt.Sprintf("https://d%d.cloudfront.net", i),
 		})
 	}
-	got := formatPreviewSection(previews)
+	got := formatPreviewSection(previews, nil)
 	want := "**Previews**\n\n" +
 		"- svc-1: https://d1.cloudfront.net\n" +
 		"- svc-2: https://d2.cloudfront.net\n" +
@@ -66,7 +66,7 @@ func TestPreviewSection_SixPreviews(t *testing.T) {
 
 func TestPreviewSection_LongServiceName(t *testing.T) {
 	name := strings.Repeat("a", 150)
-	got := formatPreviewSection([]task_previews.TaskPreviewV1{{ServiceName: name, URL: "https://d1.cloudfront.net"}})
+	got := formatPreviewSection([]task_previews.TaskPreviewV1{{ServiceName: name, URL: "https://d1.cloudfront.net"}}, nil)
 	if !strings.Contains(got, "- "+strings.Repeat("a", 100)+": https://d1.cloudfront.net\n") {
 		t.Fatalf("name not cut to 100 characters:\n%s", got)
 	}
@@ -105,11 +105,62 @@ func TestPreviewSection_BackendSentence(t *testing.T) {
 			got := formatPreviewSection([]task_previews.TaskPreviewV1{
 				{ServiceName: "web", ServiceType: task_previews.ServiceTypeStaticSite, URL: "https://d1.cloudfront.net"},
 				{ServiceName: "svc", ServiceType: tc.serviceType, URL: "https://d2.cloudfront.net"},
-			})
+			}, nil)
 			want := "**Previews**\n\n- web: https://d1.cloudfront.net\n- svc: https://d2.cloudfront.net\n\n" + tc.want
 			if got != want {
 				t.Fatalf("got:\n%q\nwant:\n%q", got, want)
 			}
 		})
+	}
+}
+
+// A preview whose service name is a companion's of the final QA round says it
+// is an unchanged preview deployed for QA only; the other lines don't change.
+func TestPreviewSection_CompanionPreview(t *testing.T) {
+	previews := []task_previews.TaskPreviewV1{
+		{ServiceName: "web-1", ServiceType: task_previews.ServiceTypeStaticSite, URL: "https://d1.cloudfront.net"},
+		{ServiceName: "companion-0-acme-app-server-0a1b2c3d", ServiceType: task_previews.ServiceTypeWebService, URL: "https://d2.cloudfront.net"},
+	}
+	companions := []qaCompanionOutput{
+		{API: "app-server", Repository: "acme/app-server", Branch: "main", ServiceName: "companion-0-acme-app-server-0a1b2c3d", Deployed: true},
+		{API: "other", Repository: "acme/other", Branch: "main"},
+	}
+	got := formatPreviewSection(previews, companions)
+	want := "**Previews**\n\n- web-1: https://d1.cloudfront.net\n" +
+		"- companion-0-acme-app-server-0a1b2c3d: https://d2.cloudfront.net — an unchanged preview of app-server from main, deployed for QA only; not part of this change\n\n" +
+		backendPreviewSentence
+	if got != want {
+		t.Fatalf("got:\n%q\nwant:\n%q", got, want)
+	}
+	if without := formatPreviewSection(previews, nil); strings.Contains(without, "unchanged preview") {
+		t.Errorf("without companions:\n%s", without)
+	}
+	long := []qaCompanionOutput{{API: strings.Repeat("a", 150), Branch: strings.Repeat("b", 150), ServiceName: "web-1"}}
+	got = formatPreviewSection(previews[:1], long)
+	if !strings.Contains(got, "of "+strings.Repeat("a", 100)+" from "+strings.Repeat("b", 100)+", deployed") {
+		t.Errorf("API and branch not cut to 100 characters:\n%s", got)
+	}
+	markup := []qaCompanionOutput{{API: "app_*server*", Branch: "release/<details>", ServiceName: "web-1"}}
+	got = formatPreviewSection(previews[:1], markup)
+	if !strings.Contains(got, `of app\_\*server\* from release/&lt;details&gt;, deployed for QA only`) {
+		t.Errorf("API and branch not escaped:\n%s", got)
+	}
+}
+
+// The pull request's preview lines come from the final QA round's companions.
+func TestPreviewSection_UsesTheFinalRoundsCompanions(t *testing.T) {
+	lister := stubPreviewLister{previews: []task_previews.TaskPreviewV1{{ServiceName: "companion-svc", URL: "https://d2.cloudfront.net"}}}
+	opr := previewOpener(lister)
+	_, without := opr.buildPRTitleAndBody()
+	opr.qa = &qaOutput{Status: "completed", Rounds: []qaRoundOutput{
+		{Round: 1, Companions: []qaCompanionOutput{{API: "old", Branch: "main", ServiceName: "companion-svc"}}},
+		{Round: 2, Companions: []qaCompanionOutput{{API: "app-server", Branch: "main", ServiceName: "companion-svc"}}},
+	}}
+	_, body := opr.buildPRTitleAndBody()
+	if !strings.Contains(body, "- companion-svc: https://d2.cloudfront.net — an unchanged preview of app-server from main, deployed for QA only; not part of this change\n") {
+		t.Errorf("body:\n%s", body)
+	}
+	if strings.Contains(without, "unchanged preview") {
+		t.Errorf("without QA:\n%s", without)
 	}
 }
