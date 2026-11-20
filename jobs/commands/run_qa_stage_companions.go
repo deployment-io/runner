@@ -9,8 +9,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
-	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -74,8 +72,8 @@ func qaCompanionName(i int, c task_previews.CompanionBackendV1) string {
 	return fmt.Sprintf("companion-%d-%s", i, c.Repository.Name)
 }
 
-// qaCompanionOutput is a round's record of one companion. Names, branches and
-// SHAs only.
+// qaCompanionOutput is a round's record of one companion: names, branches and
+// SHAs, and the deploy error as a Task backend's is recorded.
 type qaCompanionOutput struct {
 	API        string `json:"api"`
 	Repository string `json:"repository"`
@@ -496,57 +494,10 @@ func qaPreviewText(s string, max int) string {
 	return s
 }
 
-// qaAddressPatterns match what names where a request went in an error: a URL,
-// an IP address (v4, or v6 in brackets) or a host name with a port, the host
-// names of a certificate that didn't match, the host name of a failed DNS
-// lookup, and any other dotted name.
-var qaAddressPatterns = []*regexp.Regexp{
-	regexp.MustCompile(`[A-Za-z][A-Za-z0-9+.-]*://[^\s"'<>]*`),
-	regexp.MustCompile(`\[[0-9A-Fa-f:.%]*:[0-9A-Fa-f:.%]*\](:[0-9]+)?`),
-	regexp.MustCompile(`\b[0-9]{1,3}(\.[0-9]{1,3}){3}(:[0-9]+)?\b`),
-	regexp.MustCompile(`\b(localhost|[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+):[0-9]+\b`),
-	regexp.MustCompile(`certificate is valid for .*?, not [^\s:;,]+`),
-	regexp.MustCompile(`certificate is not valid for any names, but wanted to match [^\s:;,]+`),
-	regexp.MustCompile(`\blookup [^\s:]+`),
-	regexp.MustCompile(`\b[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*\.[A-Za-z][A-Za-z0-9-]*\b`),
-}
-
-// qaWithoutAddresses is msg with every URL, address and host name in it
-// replaced by "<address>", so a companion's Job output record names no
-// endpoint. "deployment.io" and each of keep (the companion's own names) are
-// left as they are: only a dotted one could be taken for a host name.
-func qaWithoutAddresses(msg string, keep ...string) string {
-	keep = append([]string{"deployment.io"}, keep...)
-	sort.SliceStable(keep, func(i, j int) bool { return len(keep[i]) > len(keep[j]) })
-	var kept []string
-	for _, k := range keep {
-		if !strings.Contains(k, ".") || !strings.Contains(msg, k) {
-			continue
-		}
-		msg = strings.ReplaceAll(msg, k, fmt.Sprintf("\x00%d\x00", len(kept)))
-		kept = append(kept, k)
-	}
-	for _, p := range qaAddressPatterns {
-		msg = p.ReplaceAllStringFunc(msg, func(m string) string {
-			switch {
-			case strings.HasPrefix(m, "lookup "):
-				return "lookup <address>"
-			case strings.HasPrefix(m, "certificate is valid for "):
-				return "certificate is valid for <address>, not <address>"
-			case strings.HasPrefix(m, "certificate is not valid for any names"):
-				return "certificate is not valid for any names, but wanted to match <address>"
-			}
-			return "<address>"
-		})
-	}
-	for i := len(kept) - 1; i >= 0; i-- {
-		msg = strings.ReplaceAll(msg, fmt.Sprintf("\x00%d\x00", i), kept[i])
-	}
-	return msg
-}
-
 // companionOutputs is the round's record of each companion, in the reply's
-// order; nil when the stage has none.
+// order; nil when the stage has none. Its error is the deploy error's first
+// line as a Task backend's is (qaPreviewError): the same text the Step log
+// carries, which may name a host of the organization's own.
 func (r *qaStackRound) companionOutputs() []qaCompanionOutput {
 	var out []qaCompanionOutput
 	for _, p := range r.companions {
@@ -557,7 +508,7 @@ func (r *qaStackRound) companionOutputs() []qaCompanionOutput {
 			Branch:     c.backend.Repository.BaseBranch,
 			Commit:     c.commit,
 			Deployed:   p.err == "" && p.url != "",
-			Error:      qaWithoutAddresses(p.err, c.backend.API, c.backend.Repository.Name, c.backend.Repository.BaseBranch),
+			Error:      p.err,
 		}
 		if p.planErr == "" {
 			o.ServiceName = p.backend.ServiceName

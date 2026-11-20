@@ -783,24 +783,3 @@ func TestQACompanionBackendDeployAllowance(t *testing.T) {
 		t.Error("a stage with a companion has no allowance")
 	}
 }
-
-func TestQAWithoutAddresses(t *testing.T) {
-	for _, tc := range []struct{ in, want string }{
-		{`could not look up the preview settings: dial tcp 10.0.3.7:7443: connect: connection refused`, `could not look up the preview settings: dial tcp <address>: connect: connection refused`},
-		{`dial tcp: lookup deployment-server.internal on 10.0.0.2:53: no such host`, `dial tcp: lookup <address> on <address>: no such host`},
-		{`Post "https://api.example.com/v1/x?token=abc": EOF`, `Post "<address>": EOF`},
-		{`dial tcp [fd00::1]:443: i/o timeout`, `dial tcp <address>: i/o timeout`},
-		{`server.example.com:8443 refused`, `<address> refused`},
-		{`deployment.io no longer deploys acme-api from main as a web service`, `deployment.io no longer deploys acme-api from main as a web service`},
-		{`main couldn't be fetched`, `main couldn't be fetched`},
-		{`tls: failed to verify certificate: x509: certificate is valid for old-server.internal, other, not deployment-server.internal`, `tls: failed to verify certificate: x509: certificate is valid for <address>, not <address>`},
-		{`x509: certificate is valid for old-server, not deployment-server`, `x509: certificate is valid for <address>, not <address>`},
-		{`x509: certificate is not valid for any names, but wanted to match deployment-server`, `x509: certificate is not valid for any names, but wanted to match <address>`},
-		{`connection to deployment-server.internal reset`, `connection to <address> reset`},
-		{`deployment.io no longer deploys acme.api from release/v1.x as a web service`, `deployment.io no longer deploys acme.api from release/v1.x as a web service`},
-	} {
-		if got := qaWithoutAddresses(tc.in, "acme.api", "release/v1.x"); got != tc.want {
-			t.Errorf("qaWithoutAddresses(%q) = %q, want %q", tc.in, got, tc.want)
-		}
-	}
-}
