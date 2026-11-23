@@ -106,6 +106,47 @@ func (r *RunnerClient) UpdateTaskStepQA(organizationID string, update tasks.Upda
 	return nil
 }
 
+// updateTaskProductionWatchTimeout bounds one UpdateTaskProductionWatch call.
+// A var so tests can shorten it.
+var updateTaskProductionWatchTimeout = 30 * time.Second
+
+// UpdateTaskProductionWatch sends one poll of a production watch Job, to be
+// bounded and stored on the Task. Like UpdateTaskStepQA; stop is the reply's
+// Stop: the watch should end now.
+//
+// Like AppendTaskEvents it gives up after updateTaskProductionWatchTimeout, so
+// a stalled handler can't hold the watch past its stop signal or its cap.
+func (r *RunnerClient) UpdateTaskProductionWatch(organizationID string, update tasks.UpdateTaskProductionWatchDtoV1) (stop bool, err error) {
+	if !r.isConnected {
+		return false, ErrConnection
+	}
+	args := tasks.UpdateTaskProductionWatchArgsV1{}
+	args.OrganizationID = r.GetComputedOrganizationID(organizationID)
+	args.Token = r.token
+	args.Update = update
+	var reply tasks.UpdateTaskProductionWatchReplyV1
+	// rpc.Go writes the request before it returns, and that write can block on
+	// a stalled connection, so the whole call runs off this goroutine.
+	done := make(chan *rpc.Call, 1)
+	c := r.c
+	timer := time.NewTimer(updateTaskProductionWatchTimeout)
+	defer timer.Stop()
+	go c.Go("Jobs.UpdateTaskProductionWatchV1", args, &reply, done)
+	var call *rpc.Call
+	select {
+	case call = <-done:
+	case <-timer.C:
+		return false, fmt.Errorf("deployment.io didn't answer within %s", updateTaskProductionWatchTimeout)
+	}
+	if call.Error != nil {
+		return false, call.Error
+	}
+	if !reply.Done {
+		return false, fmt.Errorf("error receiving done from the server")
+	}
+	return reply.Stop, nil
+}
+
 // appendTaskEventsTimeout bounds one AppendTaskEvents call. A var so tests can
 // shorten it.
 var appendTaskEventsTimeout = 30 * time.Second
