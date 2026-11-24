@@ -32,6 +32,9 @@ func TestScrubLogLine(t *testing.T) {
 		{"headers authorization=xyz123 next", "headers authorization=[redacted] next"},
 		{`headers authorization="opaque-credential-123" next`, "headers authorization=[redacted] next"},
 		{"headers authorization='opaque credential' next", "headers authorization=[redacted] next"},
+		{`login password="prefix\"suffix-secret" next`, "login password=[redacted] next"},
+		{`login token='a\'b-secret' next`, "login token=[redacted] next"},
+		{`login api_key="unterminated\" tail`, "login api_key=[redacted]"},
 		{`{"authorization": "Digest username=\"bob\", response=\"6629fae4\"", "path": "/"}`, `{"authorization": "[redacted]", "path": "/"}`},
 		{`Authorization: Digest username="bob", response="6629fae4"`, "Authorization: [redacted]"},
 		{`headers authorization="Digest response=\"6629fae4\"" next`, "headers authorization=[redacted] next"},
@@ -371,7 +374,7 @@ func TestGatherProductionEvidenceWritesTheFiles(t *testing.T) {
 	}
 	p := evidenceParameters(t, evidence)
 	orgID, _ := jobs.GetParameterValue[string](p, parameters_enums.OrganizationIDNamespace)
-	contextDir := t.TempDir()
+	contextDir := filepath.Join(t.TempDir(), "work", "context")
 
 	var logs bytes.Buffer
 	p = gatherProductionEvidence(contextDir, p, &logs)
@@ -389,7 +392,7 @@ func TestGatherProductionEvidenceWritesTheFiles(t *testing.T) {
 		t.Errorf("second page token = %q", aws.ToString(eu.inputs[1].NextToken))
 	}
 
-	dir := filepath.Join(contextDir, "production-evidence")
+	dir := productionEvidenceHostDir(filepath.Dir(contextDir))
 	errorsLog, err := os.ReadFile(filepath.Join(dir, "acme-api", "errors.log"))
 	if err != nil {
 		t.Fatal(err)
@@ -461,12 +464,12 @@ func TestGatherProductionEvidenceChangesNothingWithoutAUsableParameter(t *testin
 			jobs.SetParameterValue[string](p, parameters_enums.StepPrompt, "Fix it.")
 			set(p)
 			before := fmt.Sprint(p)
-			contextDir := t.TempDir()
+			contextDir := filepath.Join(t.TempDir(), "work", "context")
 			p = gatherProductionEvidence(contextDir, p, &bytes.Buffer{})
 			if fmt.Sprint(p) != before {
 				t.Errorf("parameters changed: %v", p)
 			}
-			if _, err := os.Stat(filepath.Join(contextDir, "production-evidence")); !os.IsNotExist(err) {
+			if _, err := os.Stat(productionEvidenceHostDir(filepath.Dir(contextDir))); !os.IsNotExist(err) {
 				t.Errorf("evidence written: %v", err)
 			}
 		})
@@ -480,12 +483,12 @@ func TestGatherProductionEvidencePromptOnlyWhenTheReadmeWasWritten(t *testing.T)
 	evidence := tasks.ProductionEvidenceV1{SourceTaskID: "src", Skipped: []tasks.ProductionEvidenceSkippedV1{{Name: "site", Reason: "a static site has no runtime logs"}}}
 
 	p := evidenceParameters(t, evidence)
-	contextDir := t.TempDir()
+	contextDir := filepath.Join(t.TempDir(), "work", "context")
 	p = gatherProductionEvidence(contextDir, p, &bytes.Buffer{})
 	if prompt, _ := jobs.GetParameterValue[string](p, parameters_enums.StepPrompt); !strings.HasSuffix(prompt, productionEvidencePrompt) {
 		t.Errorf("StepPrompt = %q", prompt)
 	}
-	if _, err := os.Stat(filepath.Join(contextDir, "production-evidence", "README.md")); err != nil {
+	if _, err := os.Stat(filepath.Join(productionEvidenceHostDir(filepath.Dir(contextDir)), "README.md")); err != nil {
 		t.Error(err)
 	}
 
@@ -495,11 +498,13 @@ func TestGatherProductionEvidencePromptOnlyWhenTheReadmeWasWritten(t *testing.T)
 		t.Fatal(err)
 	}
 	var logs bytes.Buffer
-	p = gatherProductionEvidence(blocked, p, &logs) // a file where the context dir should be
+	// A file where the work dir's parent should be: the evidence directory
+	// beside the work dir can't be created.
+	p = gatherProductionEvidence(filepath.Join(blocked, "work", "context"), p, &logs)
 	if prompt, _ := jobs.GetParameterValue[string](p, parameters_enums.StepPrompt); prompt != "Fix the crash." {
 		t.Errorf("StepPrompt = %q, want it unchanged", prompt)
 	}
-	if !strings.Contains(logs.String(), "Production evidence: could not be written") {
+	if !strings.Contains(logs.String(), "Production evidence: could not") {
 		t.Errorf("job log:\n%s", logs.String())
 	}
 }
@@ -546,7 +551,7 @@ func TestReadServiceLogEventsStopsAtTheBudget(t *testing.T) {
 		{Name: "a", DeploymentID: "d", BuildID: "b", Region: region_enums.UsEast1, From: 60, To: 120},
 		{Name: "b", DeploymentID: "d", BuildID: "b", Region: region_enums.UsEast1, From: 60, To: 120},
 	}})
-	contextDir := t.TempDir()
+	contextDir := filepath.Join(t.TempDir(), "work", "context")
 	start := time.Now()
 	gatherProductionEvidence(contextDir, p, &bytes.Buffer{})
 	if elapsed := time.Since(start); elapsed > 5*time.Second {
@@ -555,7 +560,7 @@ func TestReadServiceLogEventsStopsAtTheBudget(t *testing.T) {
 	if len(slow.inputs) != 1 {
 		t.Errorf("calls = %d, want the second service not read once the budget was spent", len(slow.inputs))
 	}
-	readme, _ := os.ReadFile(filepath.Join(contextDir, "production-evidence", "README.md"))
+	readme, _ := os.ReadFile(filepath.Join(productionEvidenceHostDir(filepath.Dir(contextDir)), "README.md"))
 	if strings.Count(string(readme), "couldn't read the logs (timed out)") != 2 {
 		t.Errorf("README:\n%s", readme)
 	}
@@ -613,7 +618,7 @@ func TestMaterializeContextGathersProductionEvidence(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if b, err := os.ReadFile(filepath.Join(contextDir, "production-evidence", "api", "errors.log")); err != nil || !strings.Contains(string(b), "panic: nil map") {
+			if b, err := os.ReadFile(filepath.Join(productionEvidenceHostDir(filepath.Dir(contextDir)), "api", "errors.log")); err != nil || !strings.Contains(string(b), "panic: nil map") {
 				t.Errorf("errors.log = %q (%v)", b, err)
 			}
 			if prompt, _ := jobs.GetParameterValue[string](out, parameters_enums.StepPrompt); !strings.HasSuffix(prompt, productionEvidencePrompt) {
@@ -624,7 +629,11 @@ func TestMaterializeContextGathersProductionEvidence(t *testing.T) {
 }
 
 func TestProductionEvidenceMounts(t *testing.T) {
-	workDir := t.TempDir()
+	workDir := filepath.Join(t.TempDir(), "work")
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	host := productionEvidenceHostDir(workDir)
 	target := "/work/context/production-evidence"
 	find := func(mounts []mount.Mount) *mount.Mount {
 		for i := range mounts {
@@ -634,30 +643,66 @@ func TestProductionEvidenceMounts(t *testing.T) {
 		}
 		return nil
 	}
+	implement := func() *mount.Mount {
+		return find(agentboxMounts(implementSpawnSpec("img", workDir, "cache", nil, implementPreviewTools{})))
+	}
 
-	// No evidence written: no mount, whatever the spawn.
-	if m := find(agentboxMounts(implementSpawnSpec("img", workDir, "cache", nil, implementPreviewTools{}))); m != nil {
+	// No evidence gathered: no mount.
+	if m := implement(); m != nil {
 		t.Errorf("implement mount without evidence = %+v", m)
 	}
 
+	// A directory the agent made inside the work dir is never mounted: only the
+	// runner's own directory beside the work dir counts.
 	if err := os.MkdirAll(filepath.Join(workDir, "context", "production-evidence"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	// Implement: the evidence bound onto itself read-only.
-	m := find(agentboxMounts(implementSpawnSpec("img", workDir, "cache", nil, implementPreviewTools{})))
-	if m == nil || m.Type != mount.TypeBind || !m.ReadOnly || m.Source != filepath.Join(workDir, "context", "production-evidence") {
-		t.Errorf("implement mount = %+v, want a read-only bind of the evidence", m)
+	if m := implement(); m != nil {
+		t.Errorf("implement mount from inside the work dir = %+v", m)
 	}
 
-	// Review without a context copy: hidden under an empty tmpfs.
-	review := &reviewStage{}
-	m = find(agentboxMounts(review.reviewSpawnSpec("img", workDir, nil, nil)))
-	if m == nil || m.Type != mount.TypeTmpfs || !m.ReadOnly {
-		t.Errorf("review mount = %+v, want a read-only tmpfs over the evidence", m)
+	// A symlink in the evidence's place is never followed.
+	if err := os.Symlink("/", host); err != nil {
+		t.Fatal(err)
 	}
-	// Review with its copy: the copy covers /work/context already.
+	if m := implement(); m != nil {
+		t.Errorf("implement mount through a symlink = %+v", m)
+	}
+	if err := os.Remove(host); err != nil {
+		t.Fatal(err)
+	}
+
+	// Gathered evidence: a read-only bind of the runner's directory.
+	if err := os.MkdirAll(host, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	m := implement()
+	if m == nil || m.Type != mount.TypeBind || !m.ReadOnly || m.Source != host {
+		t.Errorf("implement mount = %+v, want a read-only bind of %s", m, host)
+	}
+
+	// Review never gets it, with or without its context copy.
+	review := &reviewStage{}
+	if m := find(agentboxMounts(review.reviewSpawnSpec("img", workDir, nil, nil))); m != nil {
+		t.Errorf("review mount = %+v", m)
+	}
 	review.contextCopyDir = t.TempDir()
 	if m := find(agentboxMounts(review.reviewSpawnSpec("img", workDir, nil, nil))); m != nil {
 		t.Errorf("review mount with a context copy = %+v", m)
+	}
+}
+
+// Evidence an earlier Job left is cleared even when this Job has none, so an
+// implement run never mounts evidence its own Job didn't gather.
+func TestGatherProductionEvidenceClearsStaleEvidence(t *testing.T) {
+	contextDir := filepath.Join(t.TempDir(), "work", "context")
+	stale := productionEvidenceHostDir(filepath.Dir(contextDir))
+	if err := os.MkdirAll(filepath.Join(stale, "api"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	p := map[string]interface{}{}
+	gatherProductionEvidence(contextDir, p, &bytes.Buffer{})
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Errorf("stale evidence kept: %v", err)
 	}
 }

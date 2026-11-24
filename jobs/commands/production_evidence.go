@@ -30,9 +30,15 @@ import (
 // stamps which services and windows (parameters_enums.ProductionEvidence, the
 // JSON of tasks.ProductionEvidenceV1) and MaterializeContext gathers them
 // here: read from CloudWatch Logs in the customer's account, capped, scrubbed
-// and written under <contextDir>/production-evidence/, which the agent reads
-// read-only at /work/context/production-evidence/. The logs never leave the
-// runner except to the organization's own model provider.
+// and written into a runner-owned directory BESIDE the work dir
+// (productionEvidenceHostDir), which implement runs see read-only at
+// /work/context/production-evidence/.
+//
+// Beside, not inside: the agent can write anywhere under the work dir, so a
+// mount whose host source lived there could be pointed at the host through a
+// symlink the agent planted (a later implement run in the same Job would bind
+// whatever the link names). The agent can't reach this directory at all, and
+// review and QA, which mount the work dir, never see it.
 
 const (
 	productionEvidenceDirName = "production-evidence"
@@ -87,12 +93,19 @@ type evidenceService struct {
 }
 
 // gatherProductionEvidence reads, when the parameters carry a production
-// evidence that parses, the logs it names and writes them under
-// <contextDir>/production-evidence/, and returns the parameters with
+// evidence that parses, the logs it names and writes them into
+// productionEvidenceHostDir of the work dir contextDir belongs to, and returns the parameters with
 // STEP_PROMPT telling the agent so when the README was written. It never
 // fails the Job: anything that can't be read is noted in the README and the
 // job log, and the Step runs on. The job log gets counts, never a log line.
 func gatherProductionEvidence(contextDir string, parameters map[string]interface{}, logsWriter io.Writer) map[string]interface{} {
+	dir := productionEvidenceHostDir(filepath.Dir(filepath.Clean(contextDir)))
+	// Whatever an earlier Job of this Task left goes first, so the implement
+	// run never mounts evidence this Job didn't gather.
+	if err := os.RemoveAll(dir); err != nil {
+		io.WriteString(logsWriter, fmt.Sprintf("Production evidence: could not clear the previous evidence, continuing without it: %s\n", err))
+		return parameters
+	}
 	raw, err := jobs.GetParameterValue[string](parameters, parameters_enums.ProductionEvidence)
 	if err != nil || len(raw) == 0 {
 		return parameters
@@ -111,7 +124,7 @@ func gatherProductionEvidence(contextDir string, parameters map[string]interface
 	defer cancel()
 	gathered := readProductionEvidence(ctx, orgID, evidence.Services, logsWriter)
 
-	if err := writeProductionEvidence(contextDir, evidence, gathered); err != nil {
+	if err := writeProductionEvidence(dir, evidence, gathered); err != nil {
 		io.WriteString(logsWriter, fmt.Sprintf("Production evidence: could not be written, continuing without it: %s\n", err))
 		return parameters
 	}
@@ -339,23 +352,12 @@ func productionEvidenceDirNames(services []tasks.ProductionEvidenceServiceV1) []
 }
 
 // writeProductionEvidence writes the README and each read service's files
-// under <contextDir>/production-evidence/, replacing what was there, with
-// the owner and modes writeContextFiles gives context files.
-func writeProductionEvidence(contextDir string, evidence tasks.ProductionEvidenceV1, gathered []evidenceService) error {
-	dir := filepath.Join(contextDir, productionEvidenceDirName)
-	if err := os.RemoveAll(dir); err != nil {
-		return err
-	}
+// into dir, which the caller has just cleared. They stay owned by the runner,
+// with modes the agent can read through the read-only mount but not change.
+func writeProductionEvidence(dir string, evidence tasks.ProductionEvidenceV1, gathered []evidenceService) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	// Owned by the agentbox user, as writeContextFiles leaves it; contextDir
-	// too, which this may have just created. A chown that fails (a runner
-	// not running as root) leaves the files readable through their modes.
-	defer func() {
-		_ = os.Lchown(contextDir, commandUtils.AgentboxUID, commandUtils.AgentboxGID)
-		_ = chownTreeToAgentbox(dir)
-	}()
 	for _, s := range gathered {
 		if s.readFailure != "" {
 			continue
@@ -457,7 +459,7 @@ var (
 		}},
 		// key=value and "key": "value" whose key names a secret.
 		{regexp.MustCompile(`(?i)("` + secretKeyName + `"\s*:\s*)(?:"(?:[^"\\]|\\.)*"|[^\s,}\]]+)`), scrubTemplate(`${1}"` + redactedValue + `"`)},
-		{regexp.MustCompile(`(?i)(\b` + secretKeyName + `\s*=\s*)(?:"[^"]*"|'[^']*'|[^\s&,;"']+)`), scrubTemplate("${1}" + redactedValue)},
+		{regexp.MustCompile(`(?i)(\b` + secretKeyName + `\s*=\s*)(?:"(?:[^"\\]|\\.)*"?|'(?:[^'\\]|\\.)*'?|[^\s&,;"']+)`), scrubTemplate("${1}" + redactedValue)},
 	}
 )
 
@@ -521,39 +523,25 @@ func lastMatchStart(re *regexp.Regexp, s string) int {
 	return matches[len(matches)-1][0]
 }
 
-// productionEvidenceAccess is what an agentbox spawn sees of the production
-// evidence the Task's MaterializeContext wrote.
-type productionEvidenceAccess int
+// productionEvidenceHostDir is where a work dir's production evidence lives
+// on the host: a sibling of the work dir, which no agent can write to.
+func productionEvidenceHostDir(workDirHost string) string {
+	return strings.TrimRight(workDirHost, "/") + "-" + productionEvidenceDirName
+}
 
-const (
-	// productionEvidenceAsIs adds no mount.
-	productionEvidenceAsIs productionEvidenceAccess = iota
-	// productionEvidenceReadOnly binds the evidence onto itself read-only,
-	// so the agent and the repositories' scripts can read it but neither
-	// change nor remove it.
-	productionEvidenceReadOnly
-	// productionEvidenceHidden lays an empty tmpfs over it.
-	productionEvidenceHidden
-)
-
-// productionEvidenceMounts is the mount spec.productionEvidence asks for,
-// when the work dir has production evidence. A review spawn with its own
-// read-only context copy needs none: the copy, which holds no evidence,
-// already covers /work/context.
+// productionEvidenceMounts binds the work dir's production evidence read-only
+// at /work/context/production-evidence for an implement spawn
+// (spec.mountProductionEvidence), when this Job gathered some. The source is
+// checked with Lstat: only a real directory is mounted, never a symlink.
 func productionEvidenceMounts(spec agentboxSpawnSpec) []mount.Mount {
-	if spec.productionEvidence == productionEvidenceAsIs || spec.workDirHost == "" {
+	if !spec.mountProductionEvidence || spec.workDirHost == "" {
 		return nil
 	}
-	host := filepath.Join(spec.workDirHost, reviewContextDirName, productionEvidenceDirName)
-	if info, err := os.Stat(host); err != nil || !info.IsDir() {
+	host := productionEvidenceHostDir(spec.workDirHost)
+	info, err := os.Lstat(host)
+	if err != nil || !info.IsDir() {
 		return nil
 	}
 	target := agentboxWorkDirInContainer + "/" + reviewContextDirName + "/" + productionEvidenceDirName
-	switch {
-	case spec.productionEvidence == productionEvidenceReadOnly:
-		return []mount.Mount{{Type: mount.TypeBind, Source: host, Target: target, ReadOnly: true}}
-	case spec.productionEvidence == productionEvidenceHidden && spec.readOnlyContextDir == "":
-		return []mount.Mount{{Type: mount.TypeTmpfs, Target: target, ReadOnly: true}}
-	}
-	return nil
+	return []mount.Mount{{Type: mount.TypeBind, Source: host, Target: target, ReadOnly: true}}
 }
