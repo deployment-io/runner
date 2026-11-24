@@ -873,10 +873,18 @@ func (rs *RunAgentStep) spawnAgentboxAndWait(spec agentboxSpawnSpec, logsWriter 
 	if _, err := cli.ContainerStart(dockerCtx, containerID, client.ContainerStartOptions{}); err != nil {
 		return agentResult{}, fmt.Errorf("error starting container: %s", err)
 	}
+	// A fix Task's implement run reads production logs with their real IP and
+	// email addresses; what it writes to the run log, which reaches
+	// deployment.io, gets placeholders for them (productionEvidenceRunLog).
+	streams := agentLogStreams(logsWriter, spec.env)
+	runLog := productionEvidenceRunLog(spec)
+	if runLog != nil {
+		streams = runLog.streams(streams)
+	}
 	logsWg.Add(1)
 	go func() {
 		defer logsWg.Done()
-		streamContainerLogs(dockerCtx, cli, containerID, agentLogStreams(logsWriter, spec.env))
+		streamContainerLogs(dockerCtx, cli, containerID, streams)
 	}()
 	// Phase 5.5b: parallel poller forwards live progress snapshots from
 	// agentbox's progress.json (in the bind-mounted output dir) to the
@@ -902,9 +910,16 @@ func (rs *RunAgentStep) spawnAgentboxAndWait(spec agentboxSpawnSpec, logsWriter 
 		// the only record of what the round managed to look at. Best-effort —
 		// the file is absent when the grace window expired first.
 		result, _ := readAgentResult(spec.workDirHost)
+		if runLog != nil {
+			runLog.result(&result)
+		}
 		return result, waitErr
 	}
-	return readAgentResult(spec.workDirHost)
+	result, err := readAgentResult(spec.workDirHost)
+	if runLog != nil {
+		runLog.result(&result)
+	}
+	return result, err
 }
 
 // createAgentboxContainer wires the container config and host config.

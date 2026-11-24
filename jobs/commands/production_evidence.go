@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -12,6 +13,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -24,6 +26,7 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner-kit/tasks"
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
+	"github.com/deployment-io/deployment-runner/utils/loggers"
 	"github.com/moby/moby/api/types/mount"
 )
 
@@ -100,7 +103,10 @@ type evidenceService struct {
 // fails the Job: anything that can't be read is noted in the README and the
 // job log, and the Step runs on. The job log gets counts, never a log line.
 func gatherProductionEvidence(contextDir string, parameters map[string]interface{}, logsWriter io.Writer) map[string]interface{} {
-	dir := productionEvidenceHostDir(filepath.Dir(filepath.Clean(contextDir)))
+	workDir := filepath.Dir(filepath.Clean(contextDir))
+	dir := productionEvidenceHostDir(workDir)
+	// A new Job starts a new placeholder table for its run log.
+	runLogTables.Delete(strings.TrimRight(workDir, "/"))
 	// Whatever an earlier Job of this Task left goes first, so the implement
 	// run never mounts evidence this Job didn't gather.
 	if err := os.RemoveAll(dir); err != nil {
@@ -151,9 +157,6 @@ func readProductionEvidence(ctx context.Context, orgID string, services []tasks.
 	clients := map[region_enums.Type]productionLogsAPI{}
 	clientErrs := map[region_enums.Type]error{}
 	gathered := make([]evidenceService, 0, len(services))
-	// One table for the whole gathering, so an address has the same
-	// placeholder in every service's files.
-	ps := newLogPseudonyms()
 	for i, service := range services {
 		s := evidenceService{service: service, dir: dirs[i]}
 		client, ok := clients[service.Region]
@@ -180,7 +183,7 @@ func readProductionEvidence(ctx context.Context, orgID string, services []tasks.
 				if len(events) >= productionEvidenceMaxEvents {
 					io.WriteString(logsWriter, fmt.Sprintf("Production evidence: %s: stopped reading at %d events\n", s.dir, productionEvidenceMaxEvents))
 				}
-				s.errorLines, s.tailLines = productionEvidenceLines(events, ps)
+				s.errorLines, s.tailLines = productionEvidenceLines(events)
 			}
 		}
 		if err != nil {
@@ -264,7 +267,7 @@ func productionEvidenceReadFailure(ctx context.Context, err error) string {
 // productionEvidenceLines turns the events into errors.log's and tail.log's
 // lines: in time order, each scrubbed, flattened to one line and cut, then
 // capped keeping the most recent.
-func productionEvidenceLines(events []cwTypes.FilteredLogEvent, ps *logPseudonyms) (errorLines, tailLines []string) {
+func productionEvidenceLines(events []cwTypes.FilteredLogEvent) (errorLines, tailLines []string) {
 	sorted := make([]cwTypes.FilteredLogEvent, len(events))
 	copy(sorted, events)
 	sort.SliceStable(sorted, func(i, j int) bool {
@@ -283,7 +286,7 @@ func productionEvidenceLines(events []cwTypes.FilteredLogEvent, ps *logPseudonym
 		if inPrivateKey[stream] {
 			scrubbed = redactedPrivateKey
 		} else {
-			scrubbed = scrubLogLine(message, ps)
+			scrubbed = scrubLogLine(message)
 		}
 		if privateKeyOpenAfter(message, inPrivateKey[stream]) {
 			inPrivateKey[stream] = true
@@ -395,7 +398,7 @@ func productionEvidenceReadme(evidence tasks.ProductionEvidenceV1, gathered []ev
 	b.WriteString("Each folder is one service:\n")
 	b.WriteString("- errors.log: the most recent lines that look like errors (at most 300 lines).\n")
 	b.WriteString("- tail.log: the last 200 lines of the window.\n\n")
-	b.WriteString("Lines were scrubbed of tokens, passwords, keys and query strings that look secret, and cut to 2,000 bytes. Public IP addresses, and the part of an email address before the @, were replaced with placeholders such as [ip-1] and [email-1]@example.com: the same placeholder means the same address in every file here. Private and internal IP addresses were kept.\n\n")
+	b.WriteString("Lines were scrubbed of tokens, passwords, keys and query strings that look secret, and cut to 2,000 bytes. IP addresses and email addresses are as logged.\n\n")
 	b.WriteString("## Services\n")
 	for _, s := range gathered {
 		fmt.Fprintf(&b, "- %s/ — %s, %s to %s: ", s.dir, s.service.Name,
@@ -483,17 +486,18 @@ func scrubTemplate(t string) func(re *regexp.Regexp, match string) string {
 
 // scrubLogLine redacts what looks secret in one log message: authorization
 // values, bearer and basic credentials, query strings, secret-named
-// key/value pairs, AWS access key ids and JWTs, then replaces public IP
-// addresses and email addresses with ps's placeholders. A line inside or starting a
+// key/value pairs, AWS access key ids and JWTs. IP and email addresses stay:
+// the agent may need the real value (an allowlist, a range); the run log gets
+// placeholders instead (productionEvidenceRunLog). A line inside or starting a
 // private key block becomes "[redacted private key]"; a message spanning
 // several lines is scrubbed line by line. Pure: the same line always scrubs
 // the same way.
-func scrubLogLine(line string, ps *logPseudonyms) string {
+func scrubLogLine(line string) string {
 	if !strings.Contains(line, "\n") {
 		if privateKeyBeginPattern.MatchString(line) {
 			return redactedPrivateKey
 		}
-		return scrubOneLine(line, ps)
+		return scrubOneLine(line)
 	}
 	lines := strings.Split(line, "\n")
 	inPrivateKey := false
@@ -502,30 +506,29 @@ func scrubLogLine(line string, ps *logPseudonyms) string {
 		case inPrivateKey, privateKeyBeginPattern.MatchString(l):
 			lines[i] = redactedPrivateKey
 		default:
-			lines[i] = scrubOneLine(l, ps)
+			lines[i] = scrubOneLine(l)
 		}
 		inPrivateKey = privateKeyOpenAfter(l, inPrivateKey)
 	}
 	return strings.Join(lines, "\n")
 }
 
-func scrubOneLine(line string, ps *logPseudonyms) string {
-	// Secrets first and in full: their value never helps and is the harm. A
-	// secret that contains an "@" or an address goes with it.
+func scrubOneLine(line string) string {
 	for _, rule := range logScrubRules {
 		line = rule.re.ReplaceAllStringFunc(line, func(match string) string { return rule.replace(rule.re, match) })
 	}
-	return ps.pseudonymize(line)
+	return line
 }
 
-// logPseudonyms replaces personal data in log lines with placeholders that
-// stay the same for the whole gathering: the same public IP address is
-// "[ip-1]" on every line of every service, the same email address
-// "[email-1]@<its domain>". The agent still sees which lines share an address,
-// without the address. Private and internal IP addresses are kept: they name
-// the organization's own infrastructure (a database, a pod), not a person,
-// and are often the clue.
+// logPseudonyms replaces personal data in a fix Task's RUN LOG, the text that
+// reaches deployment.io, with placeholders that stay the same for the whole
+// Job: the same public IP address is "[ip-1]" on every line, the same email
+// address "[email-1]@<its domain>". The agent itself reads the real values in
+// the evidence; what it quotes in its output is replaced on the way out.
+// Private and internal IP addresses are kept: they name the organization's own
+// infrastructure (a database, a pod), not a person.
 type logPseudonyms struct {
+	mu     sync.Mutex
 	ips    map[string]string
 	emails map[string]string
 }
@@ -538,6 +541,8 @@ func newLogPseudonyms() *logPseudonyms {
 // the email addresses in line. IPv6 first, so an IPv4-mapped address
 // ("::ffff:203.0.113.9") is taken whole.
 func (ps *logPseudonyms) pseudonymize(line string) string {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
 	line = ps.pseudonymizeIPv6(line)
 	line = ipv4Candidate.ReplaceAllStringFunc(line, func(match string) string {
 		return ps.ipPlaceholder(match)
@@ -659,4 +664,88 @@ func productionEvidenceMounts(spec agentboxSpawnSpec) []mount.Mount {
 	}
 	target := agentboxWorkDirInContainer + "/" + reviewContextDirName + "/" + productionEvidenceDirName
 	return []mount.Mount{{Type: mount.TypeBind, Source: host, Target: target, ReadOnly: true}}
+}
+
+// runLogTables holds each work dir's run-log placeholder table, so an
+// implement run and the fix rounds after it in one Job use the same
+// placeholders. gatherProductionEvidence starts a fresh one per Job.
+var runLogTables sync.Map
+
+// productionEvidenceRunLog is the placeholder table for a spawn's run log:
+// non-nil only for an implement spawn that mounts production evidence.
+func productionEvidenceRunLog(spec agentboxSpawnSpec) *logPseudonyms {
+	if len(productionEvidenceMounts(spec)) == 0 {
+		return nil
+	}
+	table, _ := runLogTables.LoadOrStore(strings.TrimRight(spec.workDirHost, "/"), newLogPseudonyms())
+	return table.(*logPseudonyms)
+}
+
+// streams wraps the spawn's log streams so every line is pseudonymized before
+// it reaches the job log.
+func (ps *logPseudonyms) streams(s containerLogStreams) containerLogStreams {
+	s.stdout = &pseudonymizingWriter{inner: s.stdout, ps: ps}
+	s.stderr = &pseudonymizingWriter{inner: s.stderr, ps: ps}
+	return s
+}
+
+// result pseudonymizes the result's free text, which reaches deployment.io as
+// the Job's output (the Task page) and the pull request's description.
+func (ps *logPseudonyms) result(r *agentResult) {
+	r.ChangesSummary = ps.pseudonymize(r.ChangesSummary)
+	r.PRTitle = ps.pseudonymize(r.PRTitle)
+	r.Error = ps.pseudonymize(r.Error)
+	if v := r.VerifyResult; v != nil {
+		v.Command = ps.pseudonymize(v.Command)
+		v.SkippedReason = ps.pseudonymize(v.SkippedReason)
+		v.StdoutTail = ps.pseudonymize(v.StdoutTail)
+		v.StderrTail = ps.pseudonymize(v.StderrTail)
+	}
+}
+
+// pseudonymizingWriterMaxLine flushes a line that never ends, so the buffer
+// stays bounded; an address split at that point can slip through.
+const pseudonymizingWriterMaxLine = 64 * 1024
+
+// pseudonymizingWriter pseudonymizes whole lines before passing them on: a
+// container's output arrives in arbitrary chunks, and an address split across
+// two of them would otherwise be missed.
+type pseudonymizingWriter struct {
+	inner io.Writer
+	ps    *logPseudonyms
+	mu    sync.Mutex
+	buf   []byte
+}
+
+func (w *pseudonymizingWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.buf = append(w.buf, p...)
+	for {
+		i := bytes.IndexByte(w.buf, '\n')
+		if i < 0 {
+			break
+		}
+		if _, err := io.WriteString(w.inner, w.ps.pseudonymize(string(w.buf[:i]))+"\n"); err != nil {
+			return len(p), err
+		}
+		w.buf = w.buf[i+1:]
+	}
+	if len(w.buf) > pseudonymizingWriterMaxLine {
+		_, err := io.WriteString(w.inner, w.ps.pseudonymize(string(w.buf)))
+		w.buf = nil
+		return len(p), err
+	}
+	return len(p), nil
+}
+
+// End writes the partial last line, then ends the inner stream.
+func (w *pseudonymizingWriter) End() {
+	w.mu.Lock()
+	if len(w.buf) > 0 {
+		_, _ = io.WriteString(w.inner, w.ps.pseudonymize(string(w.buf)))
+		w.buf = nil
+	}
+	w.mu.Unlock()
+	loggers.EndSource(w.inner)
 }
