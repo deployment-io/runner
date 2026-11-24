@@ -28,6 +28,12 @@ import (
 func TestScrubLogLine(t *testing.T) {
 	for _, tc := range []struct{ in, want string }{
 		{"GET / Authorization: Bearer abc.def", "GET / Authorization: [redacted]"},
+		{"signup failed for jane.doe+test@example.co.uk: duplicate", "signup failed for [redacted]: duplicate"},
+		{"request from 203.0.113.42 refused", "request from [redacted] refused"},
+		{"client 2001:db8:85a3:0:0:8a2e:370:7334 closed", "client [redacted] closed"},
+		{"listening on [::1]:8080", "listening on [[redacted]]:8080"},
+		{"peer fe80::1ff:fe23:4567:890a dropped.", "peer [redacted] dropped."},
+		{"mapped ::ffff:10.0.0.1 ok", "mapped [redacted] ok"},
 		{`{"authorization": "Basic dXNlcjpwYXNz", "path": "/"}`, `{"authorization": "[redacted]", "path": "/"}`},
 		{"headers authorization=xyz123 next", "headers authorization=[redacted] next"},
 		{`headers authorization="opaque-credential-123" next`, "headers authorization=[redacted] next"},
@@ -68,6 +74,10 @@ func TestScrubLogLineKeepsOrdinaryLines(t *testing.T) {
 	for _, line := range []string{
 		"Error: connection refused to db:5432",
 		"why? because the cache was cold",
+		"retry at 10:22:33 after backoff",
+		"std::vector<int> overflow in Foo::bar()",
+		"interface aa:bb:cc:dd:ee:ff up",
+		"upgraded to version 1.27.3 and 999.1.1.1 is no address",
 		"is it done? yes",
 		"the Basic plan has 3 seats",
 		"Bearer",
@@ -261,7 +271,7 @@ Each folder is one service:
 - errors.log: the most recent lines that look like errors (at most 300 lines).
 - tail.log: the last 200 lines of the window.
 
-Lines were scrubbed of tokens, passwords, keys and query strings that look secret, and cut to 2,000 bytes.
+Lines were scrubbed of tokens, passwords, keys and query strings that look secret, email addresses and IP addresses, and cut to 2,000 bytes.
 
 ## Services
 `
