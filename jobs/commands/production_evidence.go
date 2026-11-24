@@ -151,6 +151,9 @@ func readProductionEvidence(ctx context.Context, orgID string, services []tasks.
 	clients := map[region_enums.Type]productionLogsAPI{}
 	clientErrs := map[region_enums.Type]error{}
 	gathered := make([]evidenceService, 0, len(services))
+	// One table for the whole gathering, so an address has the same
+	// placeholder in every service's files.
+	ps := newLogPseudonyms()
 	for i, service := range services {
 		s := evidenceService{service: service, dir: dirs[i]}
 		client, ok := clients[service.Region]
@@ -177,7 +180,7 @@ func readProductionEvidence(ctx context.Context, orgID string, services []tasks.
 				if len(events) >= productionEvidenceMaxEvents {
 					io.WriteString(logsWriter, fmt.Sprintf("Production evidence: %s: stopped reading at %d events\n", s.dir, productionEvidenceMaxEvents))
 				}
-				s.errorLines, s.tailLines = productionEvidenceLines(events)
+				s.errorLines, s.tailLines = productionEvidenceLines(events, ps)
 			}
 		}
 		if err != nil {
@@ -261,7 +264,7 @@ func productionEvidenceReadFailure(ctx context.Context, err error) string {
 // productionEvidenceLines turns the events into errors.log's and tail.log's
 // lines: in time order, each scrubbed, flattened to one line and cut, then
 // capped keeping the most recent.
-func productionEvidenceLines(events []cwTypes.FilteredLogEvent) (errorLines, tailLines []string) {
+func productionEvidenceLines(events []cwTypes.FilteredLogEvent, ps *logPseudonyms) (errorLines, tailLines []string) {
 	sorted := make([]cwTypes.FilteredLogEvent, len(events))
 	copy(sorted, events)
 	sort.SliceStable(sorted, func(i, j int) bool {
@@ -280,7 +283,7 @@ func productionEvidenceLines(events []cwTypes.FilteredLogEvent) (errorLines, tai
 		if inPrivateKey[stream] {
 			scrubbed = redactedPrivateKey
 		} else {
-			scrubbed = scrubLogLine(message)
+			scrubbed = scrubLogLine(message, ps)
 		}
 		if privateKeyOpenAfter(message, inPrivateKey[stream]) {
 			inPrivateKey[stream] = true
@@ -392,7 +395,7 @@ func productionEvidenceReadme(evidence tasks.ProductionEvidenceV1, gathered []ev
 	b.WriteString("Each folder is one service:\n")
 	b.WriteString("- errors.log: the most recent lines that look like errors (at most 300 lines).\n")
 	b.WriteString("- tail.log: the last 200 lines of the window.\n\n")
-	b.WriteString("Lines were scrubbed of tokens, passwords, keys and query strings that look secret, email addresses and IP addresses, and cut to 2,000 bytes.\n\n")
+	b.WriteString("Lines were scrubbed of tokens, passwords, keys and query strings that look secret, and cut to 2,000 bytes. Public IP addresses, and the part of an email address before the @, were replaced with placeholders such as [ip-1] and [email-1]@example.com: the same placeholder means the same address in every file here. Private and internal IP addresses were kept.\n\n")
 	b.WriteString("## Services\n")
 	for _, s := range gathered {
 		fmt.Fprintf(&b, "- %s/ — %s, %s to %s: ", s.dir, s.service.Name,
@@ -461,21 +464,17 @@ var (
 		// key=value and "key": "value" whose key names a secret.
 		{regexp.MustCompile(`(?i)("` + secretKeyName + `"\s*:\s*)(?:"(?:[^"\\]|\\.)*"|[^\s,}\]]+)`), scrubTemplate(`${1}"` + redactedValue + `"`)},
 		{regexp.MustCompile(`(?i)(\b` + secretKeyName + `\s*=\s*)(?:"(?:[^"\\]|\\.)*"?|'(?:[^'\\]|\\.)*'?|[^\s&,;"']+)`), scrubTemplate("${1}" + redactedValue)},
-		// Personal data an application commonly logs: email addresses, and
-		// IPv4 addresses (net.ParseIP confirms each, so "999.1.1.1" stays).
-		// IPv6 needs its word boundaries checked, so redactIPv6 does it.
-		{regexp.MustCompile(`\b[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}\b`), scrubTemplate(redactedValue)},
-		{regexp.MustCompile(`\b\d{1,3}(?:\.\d{1,3}){3}\b`), func(re *regexp.Regexp, match string) string {
-			if net.ParseIP(match) == nil {
-				return match
-			}
-			return redactedValue
-		}},
 	}
 
 	// ipv6Candidate is a run of the characters an IPv6 address is made of;
-	// redactIPv6 decides which runs are addresses.
+	// pseudonymizeIPv6 decides which runs are addresses.
 	ipv6Candidate = regexp.MustCompile(`[0-9A-Fa-f:.]+`)
+	// ipv4Candidate is a dotted quad; net.ParseIP decides whether it is an
+	// address (so "999.1.1.1" stays).
+	ipv4Candidate = regexp.MustCompile(`\b\d{1,3}(?:\.\d{1,3}){3}\b`)
+	// emailAddress is an email address: the part before the "@" and the
+	// domain.
+	emailAddress = regexp.MustCompile(`\b([A-Za-z0-9._%+-]+)@([A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,})\b`)
 )
 
 func scrubTemplate(t string) func(re *regexp.Regexp, match string) string {
@@ -484,17 +483,17 @@ func scrubTemplate(t string) func(re *regexp.Regexp, match string) string {
 
 // scrubLogLine redacts what looks secret in one log message: authorization
 // values, bearer and basic credentials, query strings, secret-named
-// key/value pairs, AWS access key ids, JWTs, email addresses and IP
-// addresses. A line inside or starting a
+// key/value pairs, AWS access key ids and JWTs, then replaces public IP
+// addresses and email addresses with ps's placeholders. A line inside or starting a
 // private key block becomes "[redacted private key]"; a message spanning
 // several lines is scrubbed line by line. Pure: the same line always scrubs
 // the same way.
-func scrubLogLine(line string) string {
+func scrubLogLine(line string, ps *logPseudonyms) string {
 	if !strings.Contains(line, "\n") {
 		if privateKeyBeginPattern.MatchString(line) {
 			return redactedPrivateKey
 		}
-		return scrubOneLine(line)
+		return scrubOneLine(line, ps)
 	}
 	lines := strings.Split(line, "\n")
 	inPrivateKey := false
@@ -503,28 +502,88 @@ func scrubLogLine(line string) string {
 		case inPrivateKey, privateKeyBeginPattern.MatchString(l):
 			lines[i] = redactedPrivateKey
 		default:
-			lines[i] = scrubOneLine(l)
+			lines[i] = scrubOneLine(l, ps)
 		}
 		inPrivateKey = privateKeyOpenAfter(l, inPrivateKey)
 	}
 	return strings.Join(lines, "\n")
 }
 
-func scrubOneLine(line string) string {
-	// IPv6 first, so an IPv4-mapped address ("::ffff:10.0.0.1") goes whole
-	// rather than leaving its prefix behind the IPv4 rule.
-	line = redactIPv6(line)
+func scrubOneLine(line string, ps *logPseudonyms) string {
+	// Secrets first and in full: their value never helps and is the harm. A
+	// secret that contains an "@" or an address goes with it.
 	for _, rule := range logScrubRules {
 		line = rule.re.ReplaceAllStringFunc(line, func(match string) string { return rule.replace(rule.re, match) })
 	}
-	return line
+	return ps.pseudonymize(line)
 }
 
-// redactIPv6 replaces each IPv6 address in line: a run of hex digits, colons
-// and dots with at least two colons, standing alone as a word (so
+// logPseudonyms replaces personal data in log lines with placeholders that
+// stay the same for the whole gathering: the same public IP address is
+// "[ip-1]" on every line of every service, the same email address
+// "[email-1]@<its domain>". The agent still sees which lines share an address,
+// without the address. Private and internal IP addresses are kept: they name
+// the organization's own infrastructure (a database, a pod), not a person,
+// and are often the clue.
+type logPseudonyms struct {
+	ips    map[string]string
+	emails map[string]string
+}
+
+func newLogPseudonyms() *logPseudonyms {
+	return &logPseudonyms{ips: map[string]string{}, emails: map[string]string{}}
+}
+
+// pseudonymize replaces the IPv6 addresses, then the IPv4 addresses, then
+// the email addresses in line. IPv6 first, so an IPv4-mapped address
+// ("::ffff:203.0.113.9") is taken whole.
+func (ps *logPseudonyms) pseudonymize(line string) string {
+	line = ps.pseudonymizeIPv6(line)
+	line = ipv4Candidate.ReplaceAllStringFunc(line, func(match string) string {
+		return ps.ipPlaceholder(match)
+	})
+	return emailAddress.ReplaceAllStringFunc(line, func(match string) string {
+		parts := emailAddress.FindStringSubmatch(match)
+		domain := strings.ToLower(parts[2])
+		key := strings.ToLower(parts[1]) + "@" + domain
+		placeholder, ok := ps.emails[key]
+		if !ok {
+			placeholder = fmt.Sprintf("[email-%d]", len(ps.emails)+1)
+			ps.emails[key] = placeholder
+		}
+		return placeholder + "@" + domain
+	})
+}
+
+// ipPlaceholder is the placeholder for the address text, or the text
+// unchanged when it isn't an address or is a private or internal one.
+func (ps *logPseudonyms) ipPlaceholder(text string) string {
+	ip := net.ParseIP(text)
+	if ip == nil || internalIP(ip) {
+		return text
+	}
+	key := ip.String()
+	placeholder, ok := ps.ips[key]
+	if !ok {
+		placeholder = fmt.Sprintf("[ip-%d]", len(ps.ips)+1)
+		ps.ips[key] = placeholder
+	}
+	return placeholder
+}
+
+// internalIP reports whether ip names infrastructure rather than a person:
+// private (10/8, 172.16/12, 192.168/16, fc00::/7), loopback, link-local,
+// multicast or unspecified.
+func internalIP(ip net.IP) bool {
+	return ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() ||
+		ip.IsInterfaceLocalMulticast() || ip.IsMulticast() || ip.IsUnspecified()
+}
+
+// pseudonymizeIPv6 replaces each IPv6 address in line: a run of hex digits,
+// colons and dots with at least two colons, standing alone as a word (so
 // "std::vector" stays), that net.ParseIP accepts (so a time like "10:22:33"
 // or a MAC address stays). A trailing "." ends a sentence, not the address.
-func redactIPv6(line string) string {
+func (ps *logPseudonyms) pseudonymizeIPv6(line string) string {
 	var b strings.Builder
 	last := 0
 	for _, loc := range ipv6Candidate.FindAllStringIndex(line, -1) {
@@ -534,12 +593,15 @@ func redactIPv6(line string) string {
 		}
 		candidate := line[start:end]
 		if strings.Count(candidate, ":") < 2 ||
-			(start > 0 && isWordByte(line[start-1])) || (end < len(line) && isWordByte(line[end])) ||
-			net.ParseIP(candidate) == nil {
+			(start > 0 && isWordByte(line[start-1])) || (end < len(line) && isWordByte(line[end])) {
+			continue
+		}
+		replacement := ps.ipPlaceholder(candidate)
+		if replacement == candidate {
 			continue
 		}
 		b.WriteString(line[last:start])
-		b.WriteString(redactedValue)
+		b.WriteString(replacement)
 		last = end
 	}
 	if last == 0 {

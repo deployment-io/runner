@@ -28,12 +28,13 @@ import (
 func TestScrubLogLine(t *testing.T) {
 	for _, tc := range []struct{ in, want string }{
 		{"GET / Authorization: Bearer abc.def", "GET / Authorization: [redacted]"},
-		{"signup failed for jane.doe+test@example.co.uk: duplicate", "signup failed for [redacted]: duplicate"},
-		{"request from 203.0.113.42 refused", "request from [redacted] refused"},
-		{"client 2001:db8:85a3:0:0:8a2e:370:7334 closed", "client [redacted] closed"},
-		{"listening on [::1]:8080", "listening on [[redacted]]:8080"},
-		{"peer fe80::1ff:fe23:4567:890a dropped.", "peer [redacted] dropped."},
-		{"mapped ::ffff:10.0.0.1 ok", "mapped [redacted] ok"},
+		{"signup failed for jane.doe+test@Example.co.uk: duplicate", "signup failed for [email-1]@example.co.uk: duplicate"},
+		{"request from 203.0.113.42 refused", "request from [ip-1] refused"},
+		{"client 2001:db8:85a3:0:0:8a2e:370:7334 closed", "client [ip-1] closed"},
+		{"upstream [2001:db8::7]:443 reset", "upstream [[ip-1]]:443 reset"},
+		{"mapped ::ffff:203.0.113.9 ok", "mapped [ip-1] ok"},
+		{"from 203.0.113.42 to 198.51.100.7 and back to 203.0.113.42", "from [ip-1] to [ip-2] and back to [ip-1]"},
+		{"password=bob@example.com user=x", "password=[redacted] user=x"},
 		{`{"authorization": "Basic dXNlcjpwYXNz", "path": "/"}`, `{"authorization": "[redacted]", "path": "/"}`},
 		{"headers authorization=xyz123 next", "headers authorization=[redacted] next"},
 		{`headers authorization="opaque-credential-123" next`, "headers authorization=[redacted] next"},
@@ -64,7 +65,7 @@ func TestScrubLogLine(t *testing.T) {
 		{"-----BEGIN PRIVATE KEY-----\nMIIE\n-----END PRIVATE KEY----- -----BEGIN PRIVATE KEY-----\nMIIEsecond\n-----END PRIVATE KEY-----\nafter",
 			"[redacted private key]\n[redacted private key]\n[redacted private key]\n[redacted private key]\n[redacted private key]\nafter"},
 	} {
-		if got := scrubLogLine(tc.in); got != tc.want {
+		if got := scrubLogLine(tc.in, newLogPseudonyms()); got != tc.want {
 			t.Errorf("scrubLogLine(%q)\n = %q\nwant %q", tc.in, got, tc.want)
 		}
 	}
@@ -78,6 +79,10 @@ func TestScrubLogLineKeepsOrdinaryLines(t *testing.T) {
 		"std::vector<int> overflow in Foo::bar()",
 		"interface aa:bb:cc:dd:ee:ff up",
 		"upgraded to version 1.27.3 and 999.1.1.1 is no address",
+		"connection refused to 10.0.3.14:5432",
+		"listening on [::1]:8080 and 127.0.0.1:9090",
+		"peer fe80::1ff:fe23:4567:890a dropped.",
+		"mapped ::ffff:10.0.0.1 via 192.168.1.20 and fd00::12",
 		"is it done? yes",
 		"the Basic plan has 3 seats",
 		"Bearer",
@@ -87,7 +92,7 @@ func TestScrubLogLineKeepsOrdinaryLines(t *testing.T) {
 		"https://example.com/docs?",
 		"tokenizer ready",
 	} {
-		if got := scrubLogLine(line); got != line {
+		if got := scrubLogLine(line, newLogPseudonyms()); got != line {
 			t.Errorf("scrubLogLine(%q) = %q, want it unchanged", line, got)
 		}
 	}
@@ -124,7 +129,7 @@ func TestProductionEvidenceLinesErrors(t *testing.T) {
 	events = append(events, logEvent(2001, "terrorist is not an error word? no: errorless")) // "error" matches as a word only
 	events = append(events, logEvent(2002, "nothing to see here: terrorize"))
 
-	errorLines, _ := productionEvidenceLines(events)
+	errorLines, _ := productionEvidenceLines(events, newLogPseudonyms())
 	if len(errorLines) != 300 {
 		t.Fatalf("error lines = %d, want 300", len(errorLines))
 	}
@@ -152,7 +157,7 @@ func TestProductionEvidenceLinesByteCapsAndOrder(t *testing.T) {
 		// Out of time order: sorted before writing.
 		events = append(events, logEvent(int64(5000-i), fmt.Sprintf("error %03d %s", 249-i, long)))
 	}
-	errorLines, tailLines := productionEvidenceLines(events)
+	errorLines, tailLines := productionEvidenceLines(events, newLogPseudonyms())
 	for name, lines := range map[string][]string{"errors": errorLines, "tail": tailLines} {
 		size := len(joinLines(lines))
 		if size > 64*1024 {
@@ -178,7 +183,7 @@ func TestProductionEvidenceLinesByteCapsAndOrder(t *testing.T) {
 	for i := 0; i < 500; i++ {
 		short = append(short, logEvent(int64(i), fmt.Sprintf("line %d\n", i)))
 	}
-	_, tailLines = productionEvidenceLines(short)
+	_, tailLines = productionEvidenceLines(short, newLogPseudonyms())
 	if len(tailLines) != 200 || !strings.HasSuffix(tailLines[0], " line 300") || !strings.HasSuffix(tailLines[199], " line 499") {
 		t.Errorf("tail = %d lines, %q … %q", len(tailLines), tailLines[0], tailLines[len(tailLines)-1])
 	}
@@ -192,7 +197,7 @@ func TestProductionEvidenceLinesPrivateKeyAcrossEvents(t *testing.T) {
 		logEvent(4, "-----END PRIVATE KEY-----"),
 		logEvent(5, "loaded"),
 	}
-	_, tail := productionEvidenceLines(events)
+	_, tail := productionEvidenceLines(events, newLogPseudonyms())
 	var messages []string
 	for _, l := range tail {
 		messages = append(messages, strings.SplitN(l, " ", 2)[1])
@@ -220,7 +225,7 @@ func TestProductionEvidenceLinesPrivateKeyPerStream(t *testing.T) {
 		inStream(6, "a", "a again"),
 		inStream(7, "b", "b again"),
 	}
-	_, tail := productionEvidenceLines(events)
+	_, tail := productionEvidenceLines(events, newLogPseudonyms())
 	var messages []string
 	for _, l := range tail {
 		messages = append(messages, strings.SplitN(l, " ", 2)[1])
@@ -243,7 +248,7 @@ func TestProductionEvidenceLinesPrivateKeyEndThenBegin(t *testing.T) {
 		logEvent(5, "-----END PRIVATE KEY-----"),
 		logEvent(6, "after"),
 	}
-	_, tail := productionEvidenceLines(events)
+	_, tail := productionEvidenceLines(events, newLogPseudonyms())
 	var messages []string
 	for _, l := range tail {
 		messages = append(messages, strings.SplitN(l, " ", 2)[1])
@@ -271,7 +276,7 @@ Each folder is one service:
 - errors.log: the most recent lines that look like errors (at most 300 lines).
 - tail.log: the last 200 lines of the window.
 
-Lines were scrubbed of tokens, passwords, keys and query strings that look secret, email addresses and IP addresses, and cut to 2,000 bytes.
+Lines were scrubbed of tokens, passwords, keys and query strings that look secret, and cut to 2,000 bytes. Public IP addresses, and the part of an email address before the @, were replaced with placeholders such as [ip-1] and [email-1]@example.com: the same placeholder means the same address in every file here. Private and internal IP addresses were kept.
 
 ## Services
 `
@@ -714,5 +719,32 @@ func TestGatherProductionEvidenceClearsStaleEvidence(t *testing.T) {
 	gatherProductionEvidence(contextDir, p, &bytes.Buffer{})
 	if _, err := os.Stat(stale); !os.IsNotExist(err) {
 		t.Errorf("stale evidence kept: %v", err)
+	}
+}
+
+// One table for the whole gathering: an address keeps its placeholder across
+// lines and across services, and different addresses get different ones.
+func TestProductionEvidencePlaceholdersAreConsistent(t *testing.T) {
+	ps := newLogPseudonyms()
+	_, api := productionEvidenceLines([]cwTypes.FilteredLogEvent{
+		logEvent(1, "ERROR 500 for jane@example.com from 203.0.113.42"),
+		logEvent(2, "ERROR 500 for Jane@Example.com from 203.0.113.42"),
+		logEvent(3, "ok for bob@example.com from 198.51.100.7 via 10.0.0.5"),
+	}, ps)
+	_, worker := productionEvidenceLines([]cwTypes.FilteredLogEvent{
+		logEvent(4, "job for jane@example.com from 2001:db8::1 and 203.0.113.42"),
+	}, ps)
+	got := strings.Join(append(api, worker...), "\n")
+	for _, want := range []string{
+		"ERROR 500 for [email-1]@example.com from [ip-1]",
+		"ok for [email-2]@example.com from [ip-2] via 10.0.0.5",
+		"job for [email-1]@example.com from [ip-3] and [ip-1]",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("lines lack %q:\n%s", want, got)
+		}
+	}
+	if strings.Count(got, "ERROR 500 for [email-1]@example.com from [ip-1]") != 2 {
+		t.Errorf("the same address in different case got different placeholders:\n%s", got)
 	}
 }
