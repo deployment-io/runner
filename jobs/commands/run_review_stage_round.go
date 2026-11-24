@@ -108,6 +108,9 @@ func (s *reviewStage) reviewSpawnSpec(imageRef, workDirHost string, env, readOnl
 		// So is the deployment context the deploy readiness pass reads: the
 		// stage's own copy, not what the implement run left at /work/context.
 		readOnlyContextDir: s.contextCopyDir,
+		// Review never reads the production evidence: without a copy the
+		// Task's own /work/context shows, so the evidence is hidden.
+		productionEvidence: productionEvidenceHidden,
 	}
 }
 

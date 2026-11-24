@@ -1050,7 +1050,7 @@ func agentboxMounts(spec agentboxSpawnSpec) []mount.Mount {
 			ReadOnly: true,
 		})
 	}
-	return mounts
+	return append(mounts, productionEvidenceMounts(spec)...)
 }
 
 // pollProgressFile reads agentbox's progress.json from the bind-mounted
@@ -1987,6 +1987,11 @@ type agentboxSpawnSpec struct {
 	// deployment context (see prepareContextCopy). Set by REVIEW spawns only;
 	// a fix run is an implement run and never gets it.
 	readOnlyContextDir string
+	// productionEvidence is what the spawn sees of a fix Task's production
+	// evidence at /work/context/production-evidence/: read-only for an
+	// implement run, hidden for a review run that reads /work/context as the
+	// Task left it (see productionEvidenceMounts).
+	productionEvidence productionEvidenceAccess
 	// productionTools, set by a production QA run only, replaces the socket's
 	// tools with its two read-only checks (registerAgentTools); previewDeps is
 	// nil beside it.
@@ -2418,6 +2423,8 @@ func implementSpawnSpec(imageRef, workDirHost, cacheVolume string, env []string,
 		mcpSocketHost:  agentMCPSocketHostPath(workDirHost),
 		previewDeps:    tools.static,
 		webPreviewDeps: tools.web,
+		// The agent reads the production evidence; it can't change it.
+		productionEvidence: productionEvidenceReadOnly,
 	}
 }
 
