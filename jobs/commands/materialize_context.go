@@ -57,6 +57,15 @@ func (m *MaterializeContext) Run(parameters map[string]interface{}, logsWriter i
 		return parameters, nil
 	}
 
+	// Every path out gathers a fix Task's production evidence, whatever became of the context: it
+	// is read from CloudWatch, not from the control plane.
+	materializeStoredContext(orgID, contextDir, parameters, logsWriter)
+	return gatherProductionEvidence(contextDir, parameters, logsWriter), nil
+}
+
+// materializeStoredContext refreshes and writes the org's stored context into contextDir. Every
+// failure is logged and the run continues without it.
+func materializeStoredContext(orgID, contextDir string, parameters map[string]interface{}, logsWriter io.Writer) {
 	// Refresh stale context first (decided at Job creation), so this run reads the fresh copy.
 	// Every refresh failure degrades to the stored context.
 	if refreshInfra, _ := jobs.GetParameterValue[bool](parameters, parameters_enums.RefreshInfraContext); refreshInfra {
@@ -75,20 +84,19 @@ func (m *MaterializeContext) Run(parameters map[string]interface{}, logsWriter i
 	files, err := getContextClient().MaterializeContext(orgID, nil, refreshRepoCatalog)
 	if err != nil {
 		io.WriteString(logsWriter, fmt.Sprintf("Context unavailable, continuing without it: %s\n", err))
-		return parameters, nil
+		return
 	}
 	if len(files) == 0 {
 		io.WriteString(logsWriter, "No context to materialize (none built yet); continuing.\n")
-		return parameters, nil
+		return
 	}
 
 	written, err := writeContextFiles(contextDir, files, logsWriter)
 	if err != nil {
 		io.WriteString(logsWriter, fmt.Sprintf("Could not create context dir, continuing without it: %s\n", err))
-		return parameters, nil
+		return
 	}
 	io.WriteString(logsWriter, fmt.Sprintf("Materialized %d context file(s) into /work/context\n", written))
-	return parameters, nil
 }
 
 // writeContextFiles writes the context files under dir — creating it — and chowns the tree to

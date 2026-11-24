@@ -344,10 +344,11 @@ func AgentOutput(w io.Writer, agentType string) io.Writer {
 	return w
 }
 
-// EndSource ends w's stream when w is a source writer: its partial line is
-// emitted and it is dropped from the job's writer. Anything else is left as is.
+// EndSource ends w's stream when w is a source writer, or wraps one and ends
+// it (a writer with an End method): its partial line is emitted and it is
+// dropped from the job's writer. Anything else is left as is.
 func EndSource(w io.Writer) {
-	if s, ok := w.(*SourceWriter); ok {
+	if s, ok := w.(interface{ End() }); ok {
 		s.End()
 	}
 }

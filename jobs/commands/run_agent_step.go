@@ -873,10 +873,18 @@ func (rs *RunAgentStep) spawnAgentboxAndWait(spec agentboxSpawnSpec, logsWriter 
 	if _, err := cli.ContainerStart(dockerCtx, containerID, client.ContainerStartOptions{}); err != nil {
 		return agentResult{}, fmt.Errorf("error starting container: %s", err)
 	}
+	// A fix Task's implement run reads production logs with their real IP and
+	// email addresses; what it writes to the run log, which reaches
+	// deployment.io, gets placeholders for them (productionEvidenceRunLog).
+	streams := agentLogStreams(logsWriter, spec.env)
+	runLog := productionEvidenceRunLog(spec)
+	if runLog != nil {
+		streams = runLog.streams(streams)
+	}
 	logsWg.Add(1)
 	go func() {
 		defer logsWg.Done()
-		streamContainerLogs(dockerCtx, cli, containerID, agentLogStreams(logsWriter, spec.env))
+		streamContainerLogs(dockerCtx, cli, containerID, streams)
 	}()
 	// Phase 5.5b: parallel poller forwards live progress snapshots from
 	// agentbox's progress.json (in the bind-mounted output dir) to the
@@ -902,9 +910,16 @@ func (rs *RunAgentStep) spawnAgentboxAndWait(spec agentboxSpawnSpec, logsWriter 
 		// the only record of what the round managed to look at. Best-effort —
 		// the file is absent when the grace window expired first.
 		result, _ := readAgentResult(spec.workDirHost)
+		if runLog != nil {
+			runLog.result(&result)
+		}
 		return result, waitErr
 	}
-	return readAgentResult(spec.workDirHost)
+	result, err := readAgentResult(spec.workDirHost)
+	if runLog != nil {
+		runLog.result(&result)
+	}
+	return result, err
 }
 
 // createAgentboxContainer wires the container config and host config.
@@ -1050,7 +1065,7 @@ func agentboxMounts(spec agentboxSpawnSpec) []mount.Mount {
 			ReadOnly: true,
 		})
 	}
-	return mounts
+	return append(mounts, productionEvidenceMounts(spec)...)
 }
 
 // pollProgressFile reads agentbox's progress.json from the bind-mounted
@@ -1987,6 +2002,11 @@ type agentboxSpawnSpec struct {
 	// deployment context (see prepareContextCopy). Set by REVIEW spawns only;
 	// a fix run is an implement run and never gets it.
 	readOnlyContextDir string
+	// mountProductionEvidence binds a fix Task's production evidence
+	// read-only at /work/context/production-evidence/ when the Job gathered
+	// some (see productionEvidenceMounts). Set by IMPLEMENT spawns only: the
+	// evidence lives outside the work dir, so no other spawn sees it.
+	mountProductionEvidence bool
 	// productionTools, set by a production QA run only, replaces the socket's
 	// tools with its two read-only checks (registerAgentTools); previewDeps is
 	// nil beside it.
@@ -2418,6 +2438,8 @@ func implementSpawnSpec(imageRef, workDirHost, cacheVolume string, env []string,
 		mcpSocketHost:  agentMCPSocketHostPath(workDirHost),
 		previewDeps:    tools.static,
 		webPreviewDeps: tools.web,
+		// The agent reads the production evidence; it can't change it.
+		mountProductionEvidence: true,
 	}
 }
 
