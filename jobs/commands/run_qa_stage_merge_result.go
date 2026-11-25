@@ -595,16 +595,19 @@ func shortCommit(sha string) string {
 }
 
 // newQAMergeResults is a QA round's merge-result provider. The base branch is
-// fetched with an installation token obtained the way CommitAndPush obtains
-// its own.
+// fetched with an installation token looked up for that fetch, never one
+// cached for the round: a stored installation token can be handed out with
+// only 5 minutes left, and a round's previews take longer than that, so a
+// token cached at the first repository's fetch can have expired by a later
+// one's.
 func (s *qaStage) newQAMergeResults() *qaMergeResults {
 	fetchSource := s.mergeFetchSource
 	if fetchSource == nil {
-		tcp := &taskCommitPush{ctx: s.ctx, tokenCache: map[string]string{}, logsWriter: s.logsWriter}
-		// One lookup at a time shares tcp's token cache; waiting for the turn
-		// gives up with ctx, so a stalled lookup can't hold up another
-		// repository past its own timeout. The lookup itself stops polling a
-		// refresh in process once ctx is done, so it ends with the merge.
+		// One lookup at a time keeps a round's lookups from running at once;
+		// waiting for the turn gives up with ctx, so a stalled lookup can't
+		// hold up another repository past its own timeout. The lookup itself
+		// stops polling a refresh in process once ctx is done, so it ends
+		// with the merge.
 		turn := make(chan struct{}, 1)
 		fetchSource = func(ctx context.Context, entry tasks.RepositoryEntry) (string, string, error) {
 			select {
@@ -612,7 +615,7 @@ func (s *qaStage) newQAMergeResults() *qaMergeResults {
 			case <-ctx.Done():
 				return "", "", errors.New("the installation token lookup didn't finish in time")
 			}
-			token, err := tcp.getTokenContext(ctx, entry.InstallationID)
+			token, err := commandUtils.RefreshGitTokenForInstallationContext(ctx, entry.InstallationID, s.ctx.OrganizationID, "")
 			<-turn
 			if err != nil {
 				return "", "", err

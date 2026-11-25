@@ -13,8 +13,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/deployment-io/deployment-runner-kit/enums/git_provider_enums"
 	"github.com/deployment-io/deployment-runner-kit/tasks"
 	"github.com/deployment-io/deployment-runner/agenttools"
+	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
 )
 
 // --- the QA stage's merge result, with real git ------------------------------
@@ -862,5 +864,96 @@ func TestACancelledFirstBuildKeepsTheRoundAsBuilt(t *testing.T) {
 	m.remove()
 	if got := m.results(); len(got) != 1 || got[0].Merged || got[0].Reason == "" {
 		t.Errorf("results = %+v, want one fallback with a reason", got)
+	}
+}
+
+// --- the base branch fetch's token ---------------------------------------------
+
+type refreshGitTokenCall struct{ installationID, orgID, rejectedTokenSHA256 string }
+
+// swapRefreshGitTokenRPC stands in for the refresh RPC with one returning
+// tokens[i] (or errs[i]) for its i-th call, and records the calls. Tests using
+// it can't be parallel: the RPC is package-global.
+func swapRefreshGitTokenRPC(t *testing.T, tokens []string, errs []error) *[]refreshGitTokenCall {
+	t.Helper()
+	var calls []refreshGitTokenCall
+	restore := commandUtils.SwapRefreshGitTokenRPCForTest(func(installationID, orgID, rejectedTokenSHA256 string) (string, error) {
+		i := len(calls)
+		calls = append(calls, refreshGitTokenCall{installationID, orgID, rejectedTokenSHA256})
+		if i < len(errs) && errs[i] != nil {
+			return "", errs[i]
+		}
+		if i < len(tokens) {
+			return tokens[i], nil
+		}
+		return "", errors.New("unexpected refresh call")
+	})
+	t.Cleanup(restore)
+	return &calls
+}
+
+func newQAStageForFetchSource(t *testing.T) *qaStage {
+	t.Helper()
+	stage, _ := newQAStageForMergeResults(t)
+	stage.ctx = commandUtils.TaskJobContext{OrganizationID: "org-1", TaskID: "task-1"}
+	stage.ctx.Entries = []tasks.RepositoryEntry{
+		{Name: "acme/site", Provider: git_provider_enums.GitHub.String(), CloneURL: "https://github.com/acme/site.git", InstallationID: "inst-1"},
+		{Name: "acme/api", Provider: git_provider_enums.GitHub.String(), CloneURL: "https://github.com/acme/api.git", InstallationID: "inst-1"},
+	}
+	return stage
+}
+
+// Every fetch looks its token up: a later repository of the same installation
+// doesn't reuse the token the first one's fetch got, which may have expired.
+func TestEachBaseFetchLooksUpItsOwnToken(t *testing.T) {
+	calls := swapRefreshGitTokenRPC(t, []string{"token-1", "token-2"}, nil)
+	stage := newQAStageForFetchSource(t)
+	m := stage.newQAMergeResults()
+
+	for i, want := range []string{"token-1", "token-2"} {
+		entry := stage.ctx.Entries[i]
+		source, secret, err := m.fetchSource(context.Background(), entry)
+		if err != nil {
+			t.Fatalf("fetch %d: %v", i, err)
+		}
+		wantSource := "https://oauth2:" + want + "@" + strings.TrimPrefix(entry.CloneURL, "https://")
+		if source != wantSource || secret != want {
+			t.Errorf("fetch %d: source %q, secret %q; want %q, %q", i, source, secret, wantSource, want)
+		}
+	}
+	if len(*calls) != 2 {
+		t.Fatalf("%d refresh calls, want 2", len(*calls))
+	}
+	for i, c := range *calls {
+		if c != (refreshGitTokenCall{"inst-1", "org-1", ""}) {
+			t.Errorf("refresh call %d = %+v", i, c)
+		}
+	}
+}
+
+func TestABaseFetchTokenLookupErrorIsReturned(t *testing.T) {
+	lookupErr := errors.New("the server is down")
+	swapRefreshGitTokenRPC(t, nil, []error{lookupErr})
+	stage := newQAStageForFetchSource(t)
+	source, _, err := stage.newQAMergeResults().fetchSource(context.Background(), stage.ctx.Entries[0])
+	if !errors.Is(err, lookupErr) {
+		t.Errorf("err = %v, want %v", err, lookupErr)
+	}
+	if source != "" {
+		t.Errorf("source = %q, want none", source)
+	}
+}
+
+func TestADoneContextGivesUpTheBaseFetchTokenLookup(t *testing.T) {
+	calls := swapRefreshGitTokenRPC(t, []string{"token-1"}, nil)
+	stage := newQAStageForFetchSource(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	source, _, err := stage.newQAMergeResults().fetchSource(ctx, stage.ctx.Entries[0])
+	if err == nil || source != "" {
+		t.Errorf("source %q, err %v; want an error and no source", source, err)
+	}
+	if len(*calls) != 0 {
+		t.Errorf("%d refresh calls, want none", len(*calls))
 	}
 }
