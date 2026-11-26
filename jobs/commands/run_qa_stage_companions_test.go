@@ -12,6 +12,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -476,11 +477,13 @@ func TestQACompanionSourceFailures(t *testing.T) {
 			f := &fakeStackOps{sites: map[string]string{"0-web": "web"}, companionReply: task_previews.CompanionBackendsReplyV1{Companions: []task_previews.CompanionBackendV1{c}}}
 			stage, logs, specs, fetches := companionStage(t, []string{"web"}, []string{"0-web"}, nil, f, origin)
 			stage.companionTimeout = 300 * time.Millisecond
-			lookups := 0
+			// Atomic: in the timeout case lookupFetchSource leaves the stalled
+			// lookup running, so the count is written from its goroutine.
+			var lookups atomic.Int32
 			if tc.source != nil {
 				source := tc.source(t, origin)
 				stage.mergeFetchSource = func(ctx context.Context, e tasks.RepositoryEntry) (string, string, error) {
-					lookups++
+					lookups.Add(1)
 					return source(ctx, e)
 				}
 			}
@@ -511,8 +514,8 @@ func TestQACompanionSourceFailures(t *testing.T) {
 			if _, err := stage.finish(); err != nil {
 				t.Fatal(err)
 			}
-			if lookups > 1 || *fetches > 0 || len(f.built) != 0 {
-				t.Errorf("token lookups %d, default lookups %d, builds %d", lookups, *fetches, len(f.built))
+			if n := lookups.Load(); n > 1 || *fetches > 0 || len(f.built) != 0 {
+				t.Errorf("token lookups %d, default lookups %d, builds %d", n, *fetches, len(f.built))
 			}
 			qa := readQAFromJobOutput(stage.parameters)
 			for _, r := range qa.Rounds {
