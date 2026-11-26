@@ -990,6 +990,12 @@ func TestDependencyBumpMirrorAliases(t *testing.T) {
 		t.Errorf("mirrors = %v, want kit and priv once each", mirrors)
 	}
 	want := map[string]string{"kit.git": "kit", "Kit": "kit", "Kit.git": "kit", "priv.git": "priv"}
+	if caseInsensitiveDir(t, t.TempDir()) {
+		// "Kit" already resolves to "kit" there (macOS), so linkMirror
+		// makes no link for another case.
+		delete(want, "Kit")
+		delete(want, "Kit.git")
+	}
 	for link, target := range want {
 		if links[link] != target {
 			t.Errorf("mirror alias %s -> %q, want %q (aliases %v)", link, links[link], target, links)
@@ -1237,4 +1243,14 @@ func TestGetReturnsRunDependencyBump(t *testing.T) {
 	if _, ok := cmd.(*RunDependencyBump); !ok {
 		t.Errorf("Get = %T", cmd)
 	}
+}
+
+// caseInsensitiveDir reports whether dir's filesystem ignores case in names.
+func caseInsensitiveDir(t *testing.T, dir string) bool {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(dir, "case"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := os.Stat(filepath.Join(dir, "CASE"))
+	return err == nil
 }
