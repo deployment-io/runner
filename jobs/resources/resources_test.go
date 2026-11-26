@@ -237,6 +237,12 @@ func TestJobMemoryBytes(t *testing.T) {
 		t.Errorf("production QA = %d, want the agent cap %d", got, agentMem)
 	}
 
+	// A dependency bump Job's containers have the static-site build's limits.
+	staticMem, _ := LimitsForStaticSiteBuild()
+	if got := JobMemoryBytes([]commands_enums.Type{commands_enums.RunDependencyBump}); got != staticMem {
+		t.Errorf("dependency bump = %d, want the static-site build cap %d", got, staticMem)
+	}
+
 	// A session is sized for analysis, not a build, so it must ask for
 	// materially less than a Step — otherwise one interactive session
 	// reserves the whole host for hours and blocks every deploy.

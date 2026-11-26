@@ -355,7 +355,15 @@ func defaultCrossRepoDocker() *crossRepoDocker {
 // within the timeout, their output to out, stopping at the first that fails.
 // The container is removed in every case.
 func (d *crossRepoDocker) run(ctx context.Context, spec crossRepoContainerSpec, out io.Writer) error {
-	image := spec.commands.image
+	cfg, hostCfg := spec.containerConfig()
+	return d.runContainer(ctx, cfg, hostCfg, spec.commands.commands, out)
+}
+
+// runContainer pulls cfg's image, starts a container of cfg and hostCfg and
+// runs commands in it in order within the timeout, their output to out,
+// stopping at the first that fails. The container is removed in every case.
+func (d *crossRepoDocker) runContainer(ctx context.Context, cfg *container.Config, hostCfg *container.HostConfig, commands [][]string, out io.Writer) error {
+	image := cfg.Image
 	// Held until the container is gone, so no cleanup removes the image under it.
 	release := reclaim.MarkImageInUse(image)
 	defer release()
@@ -368,7 +376,6 @@ func (d *crossRepoDocker) run(ctx context.Context, spec crossRepoContainerSpec, 
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	cfg, hostCfg := spec.containerConfig()
 	// Not cancelled: a create cut off mid-request can leave a container
 	// without returning its ID to remove.
 	id, err := d.create(context.Background(), cfg, hostCfg)
@@ -385,7 +392,7 @@ func (d *crossRepoDocker) run(ctx context.Context, spec crossRepoContainerSpec, 
 	if err := d.start(ctx, id); err != nil {
 		return timedOut(fmt.Errorf("couldn't start the container: %w", err))
 	}
-	for _, cmd := range spec.commands.commands {
+	for _, cmd := range commands {
 		code, err := d.exec(ctx, id, cmd, nil, out)
 		if err != nil {
 			return timedOut(fmt.Errorf("%s: %w", strings.Join(cmd, " "), err))

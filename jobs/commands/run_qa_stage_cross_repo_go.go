@@ -4,8 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
-	"regexp"
-	"strings"
+
+	"github.com/deployment-io/deployment-runner/jobs/commands/dependencies"
 )
 
 // goCrossRepoLinker is the Go crossRepoLinker: a vendored Go backend whose
@@ -106,54 +106,10 @@ func goCrossRepoEnv() []string {
 	}
 }
 
-// goPlainVersion is a plain Go version number: 1.27 or 1.27.1.
-var goPlainVersion = regexp.MustCompile(`^[0-9]+\.[0-9]+(\.[0-9]+)?$`)
-
-// goBuildVersion is the Go version a go.mod builds with: its toolchain line's
-// (toolchain go<version>) when present and plain, else its go line's when
-// plain.
+// goBuildVersion is the Go version a go.mod builds with
+// (dependencies.GoBuildVersion).
 func goBuildVersion(data []byte) (string, bool) {
-	goLine, toolchain := parseGoModVersions(data)
-	if v, ok := strings.CutPrefix(toolchain, "go"); ok && goPlainVersion.MatchString(v) {
-		return v, true
-	}
-	if goPlainVersion.MatchString(goLine) {
-		return goLine, true
-	}
-	return "", false
-}
-
-// parseGoModVersions is a go.mod's go and toolchain directives' values ("" when
-// absent), outside any block.
-func parseGoModVersions(data []byte) (goLine, toolchain string) {
-	inBlock := false
-	for _, line := range strings.Split(string(data), "\n") {
-		if i := strings.Index(line, "//"); i >= 0 {
-			line = line[:i]
-		}
-		line = strings.NewReplacer("(", " ( ", ")", " ) ").Replace(line)
-		fields := strings.Fields(line)
-		if len(fields) == 0 {
-			continue
-		}
-		if inBlock {
-			if fields[0] == ")" {
-				inBlock = false
-			}
-			continue
-		}
-		if len(fields) >= 2 && fields[1] == "(" {
-			inBlock = fields[len(fields)-1] != ")"
-			continue
-		}
-		switch {
-		case fields[0] == "go" && len(fields) == 2 && goLine == "":
-			goLine = fields[1]
-		case fields[0] == "toolchain" && len(fields) == 2 && toolchain == "":
-			toolchain = fields[1]
-		}
-	}
-	return goLine, toolchain
+	return dependencies.GoBuildVersion(data)
 }
 
 // goModDependency is a changed repository whose Go module a backend requires.
@@ -189,10 +145,10 @@ func (s *qaStage) crossRepoGoDependencies(backendDir string, changed []string) [
 }
 
 // readHostFile reads path host-side through the stage's readFile seam, or as
-// a regular file of at most max bytes (readBoundedRegularFile).
+// a regular file of at most max bytes (dependencies.ReadBoundedRegularFile).
 func (s *qaStage) readHostFile(path string, max int64) ([]byte, error) {
 	if s.readFile != nil {
 		return s.readFile(path)
 	}
-	return readBoundedRegularFile(path, max)
+	return dependencies.ReadBoundedRegularFile(path, max)
 }

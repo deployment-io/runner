@@ -77,6 +77,8 @@ func Get(p commands_enums.Type) (jobs.Command, error) {
 		return &RunProductionQA{}, nil
 	case commands_enums.RunProductionWatch:
 		return &RunProductionWatch{}, nil
+	case commands_enums.RunDependencyBump:
+		return &RunDependencyBump{}, nil
 	case commands_enums.RunAssistantSession:
 		return &RunAssistantSession{}, nil
 	case commands_enums.CommitAndPush:

@@ -17,6 +17,7 @@ import (
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner-kit/task_previews"
+	"github.com/deployment-io/deployment-runner/jobs/commands/dependencies"
 )
 
 // webPreviewDockerFileMaxBytes bounds the Dockerfile read for secret mounts.
@@ -88,7 +89,7 @@ func webPreviewBuildSecrets(previewBuildSecrets map[string]string) map[string]st
 // service whose Previews tab holds them. A Dockerfile that can't be read as a
 // bounded regular file counts as mounting none: the preview builds as before.
 func setWebPreviewBuildSecrets(parameters map[string]interface{}, dockerFilePath string, service task_previews.WebServicePreviewSettingsV1, buildLogs io.Writer) {
-	data, err := readBoundedRegularFile(dockerFilePath, webPreviewDockerFileMaxBytes)
+	data, err := dependencies.ReadBoundedRegularFile(dockerFilePath, webPreviewDockerFileMaxBytes)
 	if err != nil {
 		return
 	}

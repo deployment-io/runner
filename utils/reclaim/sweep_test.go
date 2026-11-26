@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/moby/moby/api/types/container"
@@ -134,6 +135,19 @@ func TestSelectSweepVolumes(t *testing.T) {
 			name:    "a cache volume a container still mounts stays",
 			volumes: []volume.Volume{named("agentbox-cache-"+taskID+"-2", Labels(PurposeAgentboxCache))},
 			mounted: map[string]bool{"agentbox-cache-" + taskID + "-2": true},
+		},
+		{
+			name:    "a dependency bump cache volume is an orphan",
+			volumes: []volume.Volume{named("dependency-bump-cache-"+taskID, nil)},
+			want:    []string{"dependency-bump-cache-" + taskID},
+		},
+		{
+			name: "near misses of the dependency bump cache volume are never matched",
+			volumes: []volume.Volume{
+				named("dependency-bump-cache-x", nil),
+				named("dependency-bump-cache-"+taskID[:23], nil),
+				named("dependency-bump-cache-"+taskID+"-1", nil),
+			},
 		},
 		{
 			name: "customer volumes are never matched",
@@ -316,5 +330,31 @@ func TestIsBound(t *testing.T) {
 	}
 	if isBound("/tmp/org/task-2", bound) {
 		t.Error("a prefix match must respect path separators")
+	}
+}
+
+// The dependency bump work directories a killed runner left are reclaimed;
+// a symlink or a plain file of that name, near misses and other directories
+// are not.
+func TestSelectDependencyBumpWorkDirs(t *testing.T) {
+	root := t.TempDir()
+	stale := filepath.Join(root, "dependency-bump-"+taskID)
+	for _, dir := range []string{stale, filepath.Join(root, "dependency-bump-x"), filepath.Join(root, "other"), filepath.Join(root, "dependency-bump-"+taskID+"-1")} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	target := t.TempDir()
+	if err := os.Symlink(target, filepath.Join(root, "dependency-bump-"+orgID)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "dependency-bump-"+strings.Repeat("a", 24)), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := selectDependencyBumpWorkDirs(root), []string{stale}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("stale dependency bump dirs = %v, want %v", got, want)
+	}
+	if got := selectDependencyBumpWorkDirs(filepath.Join(root, "missing")); got != nil {
+		t.Errorf("a missing root gave %v", got)
 	}
 }

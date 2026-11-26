@@ -362,3 +362,22 @@ func TestParseGoModSkipsOtherBlocks(t *testing.T) {
 		t.Errorf("required = %v, want %v", required, want)
 	}
 }
+
+// The shared parser (dependencies.ParseGoMod) gives the QA gate the same
+// required module paths for every gate and linker fixture.
+func TestParseGoModKeysOfTheQAFixtures(t *testing.T) {
+	for _, tc := range []struct {
+		goMod string
+		want  map[string]bool
+	}{
+		{kitGoMod, map[string]bool{}},
+		{kitGoModCross, map[string]bool{}},
+		{libGoMod, map[string]bool{}},
+		{appServerGoMod, map[string]bool{"github.com/aws/aws-sdk-go-v2": true, "github.com/deployment-io/kit": true, "golang.org/x/sys": true}},
+		{crossAppGoMod, map[string]bool{"github.com/deployment-io/kit": true, "github.com/deployment-io/lib": true}},
+	} {
+		if _, got := parseGoMod([]byte(tc.goMod)); !reflect.DeepEqual(got, tc.want) {
+			t.Errorf("parseGoMod(%q) required = %v, want %v", tc.goMod, got, tc.want)
+		}
+	}
+}

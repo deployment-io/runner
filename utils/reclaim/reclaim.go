@@ -70,6 +70,9 @@ const (
 	PurposeBuildkitCache = "buildkit-cache"
 	PurposeAgentboxCache = "agentbox-cache"
 	PurposeVerifyBrowser = "verify-browser"
+	// PurposeDependencyBump is a dependency bump Job's containers and its
+	// cache volume.
+	PurposeDependencyBump = "dependency-bump"
 )
 
 // Labels returns the label set stamped on a Docker object the runner

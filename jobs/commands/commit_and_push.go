@@ -64,6 +64,9 @@ func (cap *CommitAndPush) Run(parameters map[string]interface{}, logsWriter io.W
 	if err := tcp.mergeRepositoriesIntoJobOutput(parameters, repoOutputs); err != nil {
 		return parameters, fmt.Errorf("error merging repositories into job output: %s", err)
 	}
+	// Best-effort, whether or not the repositories had changes: the graph
+	// between the Task's repositories as this Step left them.
+	recordTaskDependencies(parameters, ctx, logsWriter)
 	return parameters, nil
 }
 

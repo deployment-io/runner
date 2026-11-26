@@ -228,3 +228,69 @@ func (r *RunnerClient) UploadQAEvidence(organizationID string, upload tasks.Uplo
 	}
 	return reply.EvidenceID, nil
 }
+
+// taskDependenciesTimeout bounds one RecordTaskDependencies or
+// UpdateTaskDependencyBump call. A var so tests can shorten it.
+var taskDependenciesTimeout = 30 * time.Second
+
+// RecordTaskDependencies sends the dependency graph between a Task's
+// repositories, read after a Step run (Jobs.RecordTaskDependenciesV1), to be
+// validated, bounded and stored on the Task. The server replies Done without
+// storing it when the run isn't the Task's latest; that isn't an error. No
+// retry here: the caller decides.
+func (r *RunnerClient) RecordTaskDependencies(organizationID string, dto tasks.TaskDependenciesDtoV1) error {
+	if !r.isConnected {
+		return ErrConnection
+	}
+	args := tasks.RecordTaskDependenciesArgsV1{}
+	args.OrganizationID = r.GetComputedOrganizationID(organizationID)
+	args.Token = r.token
+	args.Dependencies = dto
+	var reply tasks.RecordTaskDependenciesReplyV1
+	if err := r.callWithTimeout("Jobs.RecordTaskDependenciesV1", args, &reply, taskDependenciesTimeout); err != nil {
+		return err
+	}
+	if !reply.Done {
+		return fmt.Errorf("error receiving done from the server")
+	}
+	return nil
+}
+
+// UpdateTaskDependencyBump sends the end of a dependency bump Job
+// (Jobs.UpdateTaskDependencyBumpV1), to be validated and stored on the Task
+// repository's bumps. No retry here: the caller decides.
+func (r *RunnerClient) UpdateTaskDependencyBump(organizationID string, dto tasks.UpdateTaskDependencyBumpDtoV1) error {
+	if !r.isConnected {
+		return ErrConnection
+	}
+	args := tasks.UpdateTaskDependencyBumpArgsV1{}
+	args.OrganizationID = r.GetComputedOrganizationID(organizationID)
+	args.Token = r.token
+	args.Update = dto
+	var reply tasks.UpdateTaskDependencyBumpReplyV1
+	if err := r.callWithTimeout("Jobs.UpdateTaskDependencyBumpV1", args, &reply, taskDependenciesTimeout); err != nil {
+		return err
+	}
+	if !reply.Done {
+		return fmt.Errorf("error receiving done from the server")
+	}
+	return nil
+}
+
+// callWithTimeout calls method, giving up after timeout. rpc.Go writes the
+// request before it returns, and that write can block on a stalled
+// connection, so the whole call runs off this goroutine; a late reply lands in
+// a buffered channel nobody reads.
+func (r *RunnerClient) callWithTimeout(method string, args, reply any, timeout time.Duration) error {
+	done := make(chan *rpc.Call, 1)
+	c := r.c
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	go c.Go(method, args, reply, done)
+	select {
+	case call := <-done:
+		return call.Error
+	case <-timer.C:
+		return fmt.Errorf("deployment.io didn't answer within %s", timeout)
+	}
+}
