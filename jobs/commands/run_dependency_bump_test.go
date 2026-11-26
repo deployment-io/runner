@@ -73,6 +73,17 @@ func (f *fakeEcosystem) Source(name string) (dependencies.RepositoryRef, bool) {
 	return dependencies.RepositoryRef{Host: parts[0], Owner: parts[1], Name: parts[2]}, true
 }
 
+// fakePinnedRe is a fake pin naming a commit, as fake-bump writes it.
+var fakePinnedRe = regexp.MustCompile(`^c-([0-9a-f]{12})$`)
+
+func (f *fakeEcosystem) PinnedCommit(_, version string) (string, bool) {
+	m := fakePinnedRe.FindStringSubmatch(version)
+	if m == nil {
+		return "", false
+	}
+	return m[1], true
+}
+
 func (f *fakeEcosystem) Bump(_ string, bumps []dependencies.Bump, private []string) (dependencies.Commands, error) {
 	cmd := []string{"fake-bump"}
 	for _, b := range bumps {
@@ -1253,4 +1264,191 @@ func caseInsensitiveDir(t *testing.T, dir string) bool {
 	}
 	_, err := os.Stat(filepath.Join(dir, "CASE"))
 	return err == nil
+}
+
+// --- a pin that already contains the merged commit ---------------------------------
+
+// pinKit makes the dependent's main pin kit at version.
+func (h *bumpHarness) pinKit(version string) {
+	h.host.Commit("acme/app", "main", map[string]string{"deps.txt": "provides " + h.name("app") + "\nrequires " + h.name("kit") + " " + version + "\n"})
+}
+
+// laterKitCommit is a kit commit on main after the merged commit.
+func (h *bumpHarness) laterKitCommit() string {
+	return h.host.Commit("acme/kit", "main", map[string]string{"later.txt": "after the merge\n"})
+}
+
+// wantNothingRan checks no container ran, nothing was pushed and no pull
+// request opened.
+func (h *bumpHarness) wantNothingRan(tipBefore string, report tasks.UpdateTaskDependencyBumpDtoV1) {
+	h.t.Helper()
+	if len(h.docker.commands) != 0 || len(h.docker.configs) != 0 {
+		h.t.Errorf("containers ran: %v", h.docker.commands)
+	}
+	if tip := h.branchTip(); tip != tipBefore || report.CommitSHA != "" || len(h.opened) != 0 || report.PRURL != "" {
+		h.t.Errorf("branch tip %q (was %q), CommitSHA %q, opened %v", tip, tipBefore, report.CommitSHA, h.opened)
+	}
+}
+
+// A pin of a kit commit after the merged commit is already current: nothing
+// runs and nothing is pushed.
+func TestDependencyBumpPinAlreadyContainsTheMergedCommit(t *testing.T) {
+	h := newBumpHarness(t)
+	pinned := "c-" + h.laterKitCommit()[:12]
+	h.pinKit(pinned)
+	report, err := h.run(h.kitTarget())
+	if err != nil {
+		t.Fatalf("err = %v\nlog:\n%s", err, h.log.String())
+	}
+	h.wantResult(report.Results[0], tasks.DependencyBumpStateAlreadyCurrent, pinned, pinned, "")
+	h.wantNothingRan("", report)
+	want := "acme/app already pins the fake package " + h.name("kit") + " at " + pinned + ", which contains acme/kit's merged commit " + h.kitCommit[:12]
+	if !strings.Contains(h.log.String(), want) {
+		t.Errorf("log doesn't say %q:\n%s", want, h.log.String())
+	}
+}
+
+// A pin of the merged commit itself is already current.
+func TestDependencyBumpPinIsTheMergedCommit(t *testing.T) {
+	h := newBumpHarness(t)
+	h.pinKit(h.bumpedVersion())
+	report, err := h.run(h.kitTarget())
+	if err != nil {
+		t.Fatalf("err = %v\nlog:\n%s", err, h.log.String())
+	}
+	h.wantResult(report.Results[0], tasks.DependencyBumpStateAlreadyCurrent, h.bumpedVersion(), h.bumpedVersion(), "")
+	h.wantNothingRan("", report)
+}
+
+// A pin of an older kit commit is bumped as before.
+func TestDependencyBumpPinOlderThanTheMergedCommit(t *testing.T) {
+	h := newBumpHarness(t)
+	older := "c-" + h.host.Git("acme/kit", "rev-parse", h.kitCommit+"^")[:12]
+	h.pinKit(older)
+	prTip := h.host.Commit("acme/app", bumpBranch, map[string]string{"feature.txt": "the Task's change\n"})
+	h.pr = oauth.GetOpenPullRequestForBranchDtoV1{Found: true, State: "open", PRNumber: 3, URL: "https://github.com/acme/app/pull/3"}
+	report, err := h.run(h.kitTarget())
+	if err != nil {
+		t.Fatalf("err = %v\nlog:\n%s", err, h.log.String())
+	}
+	h.wantBumpedOnto(report, older, prTip)
+}
+
+// wantBumpedOnto checks kit was bumped from from, in one commit on top of
+// parent, with no pull request opened.
+func (h *bumpHarness) wantBumpedOnto(report tasks.UpdateTaskDependencyBumpDtoV1, from, parent string) {
+	h.t.Helper()
+	h.wantResult(report.Results[0], tasks.DependencyBumpStateBumped, from, h.bumpedVersion(), "")
+	tip := h.branchTip()
+	if report.CommitSHA != tip || len(tip) != 40 || h.parentOf(tip) != parent {
+		h.t.Errorf("CommitSHA %q, branch tip %q, want on top of %s", report.CommitSHA, tip, parent)
+	}
+	if !strings.Contains(h.remoteFile("deps.txt"), "requires "+h.name("kit")+" "+h.bumpedVersion()) {
+		h.t.Errorf("deps.txt = %q", h.remoteFile("deps.txt"))
+	}
+	if len(h.opened) != 0 || report.PRURL != "" {
+		h.t.Errorf("opened %v, report PR %q", h.opened, report.PRURL)
+	}
+}
+
+// A pin on a branch that diverged from the merged commit is bumped.
+func TestDependencyBumpPinOnADivergedBranch(t *testing.T) {
+	h := newBumpHarness(t)
+	side := h.host.Commit("acme/kit", "side", map[string]string{"side.txt": "the PR head\n"})
+	h.kitCommit = h.laterKitCommit()
+	pinned := "c-" + side[:12]
+	h.pinKit(pinned)
+	report, err := h.run(h.kitTarget())
+	if err != nil {
+		t.Fatalf("err = %v\nlog:\n%s", err, h.log.String())
+	}
+	h.wantResult(report.Results[0], tasks.DependencyBumpStateBumped, pinned, h.bumpedVersion(), "")
+	if h.branchTip() == "" || report.CommitSHA != h.branchTip() {
+		t.Errorf("not pushed: %+v", report)
+	}
+}
+
+// A pin naming no commit (the harness's v0.9.0) is bumped.
+func TestDependencyBumpPinNamesNoCommit(t *testing.T) {
+	h := newBumpHarness(t)
+	report, err := h.run(h.kitTarget())
+	if err != nil {
+		t.Fatalf("err = %v\nlog:\n%s", err, h.log.String())
+	}
+	h.wantResult(report.Results[0], tasks.DependencyBumpStateBumped, "v0.9.0", h.bumpedVersion(), "")
+	if strings.Contains(h.log.String(), "couldn't check") {
+		t.Errorf("log:\n%s", h.log.String())
+	}
+}
+
+// A pin of a commit the mirror doesn't have is bumped, and that isn't an
+// error.
+func TestDependencyBumpPinNotInTheMirror(t *testing.T) {
+	h := newBumpHarness(t)
+	h.pinKit("c-0123456789ab")
+	report, err := h.run(h.kitTarget())
+	if err != nil {
+		t.Fatalf("err = %v\nlog:\n%s", err, h.log.String())
+	}
+	h.wantResult(report.Results[0], tasks.DependencyBumpStateBumped, "c-0123456789ab", h.bumpedVersion(), "")
+	if h.branchTip() == "" || report.CommitSHA != h.branchTip() {
+		t.Errorf("not pushed: %+v", report)
+	}
+	if strings.Contains(h.log.String(), "couldn't check") {
+		t.Errorf("log:\n%s", h.log.String())
+	}
+}
+
+// Of two targets, the one already current takes no part in the bump.
+func TestDependencyBumpOneContainedOneBumped(t *testing.T) {
+	h := newBumpHarness(t)
+	pinned := "c-" + h.laterKitCommit()[:12]
+	h.host.Commit("acme/app", "main", map[string]string{"deps.txt": "requires " + h.name("kit") + " " + pinned + "\nrequires " + h.name("kit") + "/v2 v2.0.0\n"})
+	v2 := h.kitTarget()
+	v2.Name = h.name("kit") + "/v2"
+	report, err := h.run(h.kitTarget(), v2)
+	if err != nil {
+		t.Fatalf("err = %v\nlog:\n%s", err, h.log.String())
+	}
+	h.wantResult(report.Results[0], tasks.DependencyBumpStateAlreadyCurrent, pinned, pinned, "")
+	h.wantResult(report.Results[1], tasks.DependencyBumpStateBumped, "v2.0.0", h.bumpedVersion(), "")
+	if len(h.docker.commands) == 0 {
+		t.Fatal("no bump ran")
+	}
+	if want := "fake-bump " + h.name("kit") + "/v2@" + h.kitCommit; h.docker.commands[0] != want {
+		t.Errorf("bump command = %q, want %q", h.docker.commands[0], want)
+	}
+	if h.branchTip() == "" || report.CommitSHA != h.branchTip() {
+		t.Errorf("not pushed: %+v", report)
+	}
+	if deps := h.remoteFile("deps.txt"); !strings.Contains(deps, "requires "+h.name("kit")+" "+pinned+"\n") || !strings.Contains(deps, "requires "+h.name("kit")+"/v2 "+h.bumpedVersion()) {
+		t.Errorf("deps.txt = %q", deps)
+	}
+}
+
+// The branch moving, while bumping, to a commit that pins a later kit commit:
+// the restart finds it already current and pushes nothing.
+func TestDependencyBumpStartsOverOntoAPinThatContainsTheMergedCommit(t *testing.T) {
+	h := newBumpHarness(t)
+	h.pr = oauth.GetOpenPullRequestForBranchDtoV1{Found: true, State: "open", PRNumber: 3}
+	h.host.Commit("acme/app", bumpBranch, map[string]string{"feature.txt": "one\n"})
+	pinned := "c-" + h.laterKitCommit()[:12]
+	var moved string
+	h.docker.run = func(src string, cmd []string) (int, string) {
+		if cmd[0] == "fake-bump" && moved == "" {
+			moved = h.host.Commit("acme/app", bumpBranch, map[string]string{"deps.txt": "requires " + h.name("kit") + " " + pinned + "\n"})
+		}
+		return applyFakeBump(src, cmd)
+	}
+	report, err := h.run(h.kitTarget())
+	if err != nil {
+		t.Fatalf("err = %v\nlog:\n%s", err, h.log.String())
+	}
+	h.wantResult(report.Results[0], tasks.DependencyBumpStateAlreadyCurrent, pinned, pinned, "")
+	if tip := h.branchTip(); moved == "" || tip != moved || report.CommitSHA != "" || len(h.opened) != 0 {
+		t.Errorf("branch tip %s, moved to %s, CommitSHA %q, opened %v", tip, moved, report.CommitSHA, h.opened)
+	}
+	if n := strings.Count(strings.Join(h.docker.commands, "\n"), "fake-bump"); n != 1 {
+		t.Errorf("%d bumps ran, want only the first try's: %v", n, h.docker.commands)
+	}
 }

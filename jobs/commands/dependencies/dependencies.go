@@ -24,6 +24,11 @@ type Ecosystem interface {
 	ReadManifest(repoDir string) (m Manifest, ok bool, err error)
 	// Source is the git repository that provides name; ok is false for a name no git repository on a known host provides.
 	Source(name string) (RepositoryRef, bool)
+	// PinnedCommit is the commit, full or abbreviated (at least 7
+	// lower-case hex characters), that version of name names in the
+	// repository providing name; ok is false when the version names no
+	// commit this adapter can tell (a tag, a range, a registry version).
+	PinnedCommit(name, version string) (commit string, ok bool)
 	// Bump is what runs with network but no credentials, in repoDir mounted at /src, to point the dependent at each bump's commit. private are the module-name prefixes served from the mirrors.
 	Bump(repoDir string, bumps []Bump, private []string) (Commands, error)
 	// Verify is what runs with no network after the bump, from the cache Bump filled.
