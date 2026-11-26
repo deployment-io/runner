@@ -283,7 +283,7 @@ type qaStage struct {
 	cacheExists    func(name string) bool
 	reviewer       func(rs *reviewStage)
 	// readFile reads a file host-side for the gate's go.mod and vendor checks;
-	// nil is readBoundedRegularFile.
+	// nil is dependencies.ReadBoundedRegularFile.
 	readFile func(path string) ([]byte, error)
 	// linkers are the gate's crossRepoLinkers; nil is Go's alone.
 	// crossRepoSource makes a dependency's build source (nil:

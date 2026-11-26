@@ -31,6 +31,14 @@ var (
 	// agentbox-cache-<taskID>-<stepIndex>.
 	cacheVolumeRe = regexp.MustCompile(`^agentbox-cache-[0-9a-fA-F]{24}-\d+$`)
 
+	// dependencyBumpCacheVolumeRe mirrors the dependency bump's cache volume
+	// (jobs/commands/run_dependency_bump.go): dependency-bump-cache-<jobID>.
+	dependencyBumpCacheVolumeRe = regexp.MustCompile(`^dependency-bump-cache-[0-9a-fA-F]{24}$`)
+
+	// dependencyBumpWorkDirRe mirrors the dependency bump's work directory
+	// (jobs/commands/run_dependency_bump.go): dependency-bump-<jobID>.
+	dependencyBumpWorkDirRe = regexp.MustCompile(`^dependency-bump-[0-9a-fA-F]{24}$`)
+
 	// objectIDRe matches the two path segments of
 	// commandUtils.GetTaskRepositoriesBaseDir — /<root>/<orgID>/<taskID>.
 	// Anything else under the root belongs to someone else.
@@ -83,6 +91,7 @@ func Sweep() {
 		reclaiming(nil, "orphaned cache volumes", func() { sweepVolumes(ctx, d, containers) })
 		reclaiming(nil, "stale task working directories", func() { sweepWorkDirs(containers) })
 		reclaiming(nil, "stale BuildKit output directories", func() { sweepBuildkitOutputDirs() })
+		reclaiming(nil, "stale dependency bump directories", func() { sweepDependencyBumpWorkDirs() })
 	})
 	PruneBuildCache(nil)
 }
@@ -230,7 +239,7 @@ func selectSweepVolumes(volumes []volume.Volume, mounted map[string]bool) []stri
 		if mounted[v.Name] {
 			continue
 		}
-		if ownedByRunner(v.Labels) || cacheVolumeRe.MatchString(v.Name) {
+		if ownedByRunner(v.Labels) || cacheVolumeRe.MatchString(v.Name) || dependencyBumpCacheVolumeRe.MatchString(v.Name) {
 			names = append(names, v.Name)
 		}
 	}
@@ -319,6 +328,13 @@ const (
 	BuildkitOutputDirPattern = "buildkit-out-*"
 )
 
+// DependencyBumpWorkRoot is where a dependency bump Job's work directory,
+// dependency-bump-<jobID>, lives (jobs/commands/run_dependency_bump.go). A
+// literal "/tmp" like BuildkitOutputRoot: the bump's containers bind-mount it
+// through the host's Docker daemon. The bump removes its own; a killed runner
+// leaves it.
+const DependencyBumpWorkRoot = "/tmp"
+
 // sweepBuildkitOutputDirs removes BuildKit output directories a previous
 // process never cleaned up. None is in use before the job loop starts: a
 // buildkitd container a killed runner left running may still mount one, but
@@ -351,6 +367,36 @@ func selectBuildkitOutputDirs(root string) []string {
 			continue
 		}
 		stale = append(stale, filepath.Join(root, entry.Name()))
+	}
+	return stale
+}
+
+// sweepDependencyBumpWorkDirs removes dependency bump work directories a
+// previous process never cleaned up. None is in use before the job loop
+// starts.
+func sweepDependencyBumpWorkDirs() {
+	for _, dir := range selectDependencyBumpWorkDirs(DependencyBumpWorkRoot) {
+		if err := os.RemoveAll(dir); err != nil {
+			logSweep("Startup sweep: could not remove dependency bump dir %s: %s", dir, err)
+			continue
+		}
+		logSweep("Startup sweep: removed stale dependency bump dir %s", dir)
+	}
+}
+
+// selectDependencyBumpWorkDirs lists the real directories in root named
+// exactly dependency-bump-<24 hex>. A symlink or a plain file of that name is
+// left alone.
+func selectDependencyBumpWorkDirs(root string) []string {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return nil
+	}
+	var stale []string
+	for _, entry := range entries {
+		if entry.IsDir() && dependencyBumpWorkDirRe.MatchString(entry.Name()) {
+			stale = append(stale, filepath.Join(root, entry.Name()))
+		}
 	}
 	return stale
 }

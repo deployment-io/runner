@@ -115,12 +115,22 @@ func isTaskStepJob(parameters map[string]interface{}, commandEnums []commands_en
 	return slices.Contains(commandEnums, commands_enums.RunAgentStep)
 }
 
-// isProductionWatchJob reports whether a job is a production watch Job. Its
-// Task's working directory isn't its own — the watch has its own queue and can
-// run while a re-run of the Task uses /tmp/<org>/<task> on this runner — so
-// MarkStepDone is never called for it.
-func isProductionWatchJob(commandEnums []commands_enums.Type) bool {
-	return slices.Contains(commandEnums, commands_enums.RunProductionWatch)
+// isNonStepTaskJob reports whether a job belongs to a Task but isn't its
+// Step: a production watch Job or a dependency bump Job. These Jobs have their
+// own queue key and their own working directory, and can run while a Step of
+// the same Task uses /tmp/<org>/<task> on this runner, so MarkStepDone — which
+// removes /tmp/<org>/<task> and the Step's cache volume — is never called for
+// them.
+func isNonStepTaskJob(commandEnums []commands_enums.Type) bool {
+	return slices.Contains(commandEnums, commands_enums.RunProductionWatch) ||
+		slices.Contains(commandEnums, commands_enums.RunDependencyBump)
+}
+
+// needsMarkStepDone reports whether a job's end cleans up its Task Step's
+// working directory with MarkStepDone: a Tasks-mode job that is neither an
+// Assistant session nor a non-Step Task job.
+func needsMarkStepDone(parameters map[string]interface{}, commandEnums []commands_enums.Type) bool {
+	return commandUtils.IsTasksMode(parameters) && !commandUtils.IsSessionMode(parameters) && !isNonStepTaskJob(commandEnums)
 }
 
 // stageForCommand returns the log stage a Task Step job's command runs in;
@@ -283,7 +293,7 @@ func executeJobs(jobsStream <-chan pendingJobType, noOfWorkers int, mode runner_
 							result := getJobResult(pendingJob, err.Error(), nil)
 							// A Task Step's cleanup — its progress events included —
 							// finishes before its result is sent.
-							if commandUtils.IsTasksMode(parameters) && !commandUtils.IsSessionMode(parameters) && !isProductionWatchJob(pendingJob.commandEnums) {
+							if needsMarkStepDone(parameters, pendingJob.commandEnums) {
 								<-commands.MarkStepDone(parameters, err)
 							}
 							resultsStream <- result
@@ -333,7 +343,7 @@ func executeJobs(jobsStream <-chan pendingJobType, noOfWorkers int, mode runner_
 								result := getJobResult(pendingJob, errStoppedByUser.Error(), parameters)
 								// A Task Step's cleanup — its progress events included —
 								// finishes before its result is sent.
-								if commandUtils.IsTasksMode(parameters) && !commandUtils.IsSessionMode(parameters) && !isProductionWatchJob(pendingJob.commandEnums) {
+								if needsMarkStepDone(parameters, pendingJob.commandEnums) {
 									<-commands.MarkStepDone(parameters, errStoppedByUser)
 								}
 								resultsStream <- result
@@ -352,7 +362,7 @@ func executeJobs(jobsStream <-chan pendingJobType, noOfWorkers int, mode runner_
 									result := getJobResult(pendingJob, err.Error(), parameters)
 									// A Task Step's cleanup — its progress events included —
 									// finishes before its result is sent.
-									if commandUtils.IsTasksMode(parameters) && !commandUtils.IsSessionMode(parameters) && !isProductionWatchJob(pendingJob.commandEnums) {
+									if needsMarkStepDone(parameters, pendingJob.commandEnums) {
 										<-commands.MarkStepDone(parameters, err)
 									}
 									resultsStream <- result
@@ -418,7 +428,7 @@ func executeJobs(jobsStream <-chan pendingJobType, noOfWorkers int, mode runner_
 						// commands themselves.
 						if commandUtils.IsSessionMode(parameters) {
 							cleanupSessionWorkDir(parameters)
-						} else if commandUtils.IsTasksMode(parameters) && !isProductionWatchJob(pendingJob.commandEnums) {
+						} else if needsMarkStepDone(parameters, pendingJob.commandEnums) {
 							<-commands.MarkStepDone(parameters, nil)
 						}
 						handleLogEnd(nil, pendingJob.jobID, logsWriter)

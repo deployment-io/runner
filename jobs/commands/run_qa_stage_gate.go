@@ -9,14 +9,13 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
-	"syscall"
 
 	"github.com/deployment-io/deployment-runner-kit/enums/parameters_enums"
 	"github.com/deployment-io/deployment-runner-kit/jobs"
 	"github.com/deployment-io/deployment-runner-kit/tasks"
 	"github.com/deployment-io/deployment-runner/agenttools"
+	"github.com/deployment-io/deployment-runner/jobs/commands/dependencies"
 )
 
 // gitEmptyTree is git's empty tree: the base a repository with no recorded
@@ -322,125 +321,23 @@ func (s *qaStage) readGoMod(dir string) (module string, required map[string]bool
 }
 
 // goModMaxBytes bounds a go.mod read host-side.
-const goModMaxBytes = 4 << 20
+const goModMaxBytes = dependencies.GoModMaxBytes
 
 // readGoModFile reads path when it is a regular file of at most goModMaxBytes
-// (readBoundedRegularFile).
+// (dependencies.ReadBoundedRegularFile).
 func readGoModFile(path string) ([]byte, error) {
-	return readBoundedRegularFile(path, goModMaxBytes)
+	return dependencies.ReadBoundedRegularFile(path, goModMaxBytes)
 }
 
-// readBoundedRegularFile reads path when it is a regular file of at most max bytes:
-// never through a symlink, never a FIFO or device (opened non-blocking, so a
-// FIFO can't hang it). A missing file is fs.ErrNotExist; anything else that
-// isn't such a file is another error.
-func readBoundedRegularFile(path string, max int64) ([]byte, error) {
-	info, err := os.Lstat(path)
-	if err != nil {
-		return nil, err
-	}
-	if !info.Mode().IsRegular() {
-		return nil, fmt.Errorf("not a regular file (%s)", info.Mode().Type())
-	}
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	// Re-checked on the opened file: the path may have been swapped since Lstat.
-	if info, err := f.Stat(); err != nil {
-		return nil, err
-	} else if !info.Mode().IsRegular() {
-		return nil, fmt.Errorf("not a regular file (%s)", info.Mode().Type())
-	}
-	data, err := io.ReadAll(io.LimitReader(f, max+1))
-	if err != nil {
-		return nil, err
-	}
-	if int64(len(data)) > max {
-		return nil, fmt.Errorf("larger than %d bytes", max)
-	}
-	return data, nil
-}
-
-// parseGoMod is a small go.mod reader: the module path (module path or
-// module ( path )) and the paths of every require, single-line or in a
-// require ( … ) block, // indirect included. Every other directive's block is
-// skipped whole.
+// parseGoMod is the QA gate's view of a go.mod (dependencies.ParseGoMod): the
+// module path and the paths of every require, // indirect included.
 func parseGoMod(data []byte) (module string, required map[string]bool) {
+	gomod := dependencies.ParseGoMod(data)
 	required = map[string]bool{}
-	// inOther is inside another directive's block (replace, exclude,
-	// retract, …): its lines are never read as directives.
-	inRequire, inModule, inOther := false, false, false
-	for _, line := range strings.Split(string(data), "\n") {
-		if i := strings.Index(line, "//"); i >= 0 {
-			line = line[:i]
-		}
-		// Module paths hold no parentheses: spacing them out makes
-		// "require(" and "require ( )" ordinary fields.
-		line = strings.NewReplacer("(", " ( ", ")", " ) ").Replace(line)
-		fields := strings.Fields(line)
-		if len(fields) == 0 {
-			continue
-		}
-		if inModule {
-			// module ( path ): the block holds the one module path.
-			if fields[0] == ")" {
-				inModule = false
-			} else if module == "" {
-				module = goModPath(fields[0])
-			}
-			continue
-		}
-		if inOther {
-			if fields[0] == ")" {
-				inOther = false
-			}
-			continue
-		}
-		if inRequire {
-			if fields[0] == ")" {
-				inRequire = false
-				continue
-			}
-			required[goModPath(fields[0])] = true
-			continue
-		}
-		switch fields[0] {
-		case "module":
-			switch {
-			case len(fields) >= 3 && fields[1] == "(" && fields[2] != ")":
-				// module ( path ) on one line.
-				module = goModPath(fields[2])
-				inModule = len(fields) < 4 || fields[3] != ")"
-			case len(fields) >= 2 && fields[1] == "(":
-				inModule = len(fields) < 3
-			case len(fields) >= 2:
-				module = goModPath(fields[1])
-			}
-		case "require":
-			switch {
-			case len(fields) >= 3 && fields[1] == "(" && fields[2] == ")":
-				// An empty block on one line: require ( ).
-			case len(fields) >= 2 && fields[1] == "(":
-				inRequire = true
-			case len(fields) >= 2:
-				required[goModPath(fields[1])] = true
-			}
-		default:
-			// Another directive's block, unless it closes on the same line.
-			inOther = len(fields) >= 2 && fields[1] == "(" && fields[len(fields)-1] != ")"
-		}
+	for path := range gomod.Requires {
+		required[path] = true
 	}
-	return module, required
-}
-
-// goModPath unquotes a quoted go.mod path.
-func goModPath(field string) string {
-	if unquoted, err := strconv.Unquote(field); err == nil {
-		return unquoted
-	}
-	return field
+	return gomod.Module, required
 }
 
 // readQARepositoriesFromJobOutput is every checked-out repository recorded in

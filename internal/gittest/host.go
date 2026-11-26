@@ -42,10 +42,15 @@ type answer int
 const (
 	answerUnauthorized answer = iota + 1
 	answerStall
+	answerRejectPushOnce
 )
 
 // Unauthorized makes every request for repository repo get a 401.
 func (h *Host) Unauthorized(repo string) { h.setAnswer(repo, answerUnauthorized) }
+
+// RejectPushOnce makes the next push request (git-receive-pack) for
+// repository repo get a 401; every other request is served.
+func (h *Host) RejectPushOnce(repo string) { h.setAnswer(repo, answerRejectPushOnce) }
 
 // Stall makes every request for repository repo hang until the client gives up.
 func (h *Host) Stall(repo string) { h.setAnswer(repo, answerStall) }
@@ -66,6 +71,15 @@ func (h *Host) answerFor(path string) answer {
 		}
 	}
 	return 0
+}
+
+// clearAnswer drops the answer for the repository path names; h.mu is held.
+func (h *Host) clearAnswer(path string) {
+	for repo := range h.answers {
+		if strings.HasPrefix(path, "/"+repo+"/") {
+			delete(h.answers, repo)
+		}
+	}
 }
 
 // Request is one request a Host received.
@@ -133,6 +147,14 @@ func (h *Host) handler() http.Handler {
 		h.mu.Lock()
 		h.requests = append(h.requests, Request{Path: r.URL.Path, Authorization: r.Header.Get("Authorization")})
 		a := h.answerFor(r.URL.Path)
+		if a == answerRejectPushOnce {
+			if r.URL.Query().Get("service") == "git-receive-pack" || strings.HasSuffix(r.URL.Path, "/git-receive-pack") {
+				h.clearAnswer(r.URL.Path)
+				a = answerUnauthorized
+			} else {
+				a = 0
+			}
+		}
 		h.mu.Unlock()
 		switch a {
 		case answerUnauthorized:
@@ -193,6 +215,40 @@ func (h *Host) AddRepo(name string, submodules ...Submodule) string {
 	h.run(h.root, "clone", "-q", "--bare", work, bare)
 	h.run(bare, "config", "http.receivepack", "true")
 	return strings.TrimSpace(h.output(work, "rev-parse", "HEAD"))
+}
+
+// Commit commits files (slash-separated path → content) onto branch of the
+// repository <name>, creating branch from "main" when it doesn't exist, and
+// returns the commit's hash.
+func (h *Host) Commit(name, branch string, files map[string]string) string {
+	h.t.Helper()
+	work := filepath.Join(h.t.TempDir(), "work")
+	h.run(h.root, "clone", "-q", h.RepoDir(name), work)
+	if strings.TrimSpace(h.output(work, "branch", "-r", "--list", "origin/"+branch)) != "" {
+		h.run(work, "checkout", "-q", branch)
+	} else {
+		h.run(work, "checkout", "-q", "-b", branch, "origin/main")
+	}
+	for path, content := range files {
+		full := filepath.Join(work, filepath.FromSlash(path))
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			h.t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte(content), 0o644); err != nil {
+			h.t.Fatal(err)
+		}
+	}
+	h.run(work, "add", "-A")
+	h.run(work, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-q", "--allow-empty", "-m", "commit on "+branch)
+	h.run(work, "push", "-q", "origin", branch)
+	return strings.TrimSpace(h.output(work, "rev-parse", "HEAD"))
+}
+
+// Git runs git with args in the bare repository <name> and returns its
+// output, trimmed.
+func (h *Host) Git(name string, args ...string) string {
+	h.t.Helper()
+	return strings.TrimSpace(h.output(h.RepoDir(name), args...))
 }
 
 // RepoDir is the bare repository <name> on disk.

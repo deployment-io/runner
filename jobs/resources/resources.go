@@ -340,7 +340,9 @@ func JobMemoryBytes(commandEnums []commands_enums.Type) int64 {
 			consider(bytes)
 		case commands_enums.RunAssistantSession:
 			consider(MemoryForAssistantSession())
-		case commands_enums.BuildStaticSite:
+		case commands_enums.BuildStaticSite, commands_enums.RunDependencyBump:
+			// A dependency bump's two containers run one after the other
+			// with the static-site build's limits.
 			bytes, _ := LimitsForStaticSiteBuild()
 			consider(bytes)
 		case commands_enums.BuildDockerImage:
