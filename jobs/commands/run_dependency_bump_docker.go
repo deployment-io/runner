@@ -6,6 +6,7 @@ import (
 	"io"
 	"path/filepath"
 
+	"github.com/deployment-io/deployment-runner-kit/tasks"
 	"github.com/deployment-io/deployment-runner/jobs/commands/dependencies"
 	"github.com/deployment-io/deployment-runner/jobs/resources"
 	"github.com/deployment-io/deployment-runner/utils/reclaim"
@@ -188,7 +189,8 @@ func (b *dependencyBump) runBumps() bool {
 }
 
 // runVerify is step 8: each ecosystem with a bumped target verifies, offline.
-// A failure fails every target; nothing is pushed.
+// A failure fails every target; nothing is pushed. In start-up mode it fails
+// none: the bump is kept, with the build's error for the agent.
 func (b *dependencyBump) runVerify() bool {
 	verified := map[string]bool{}
 	for _, t := range b.bumped() {
@@ -198,16 +200,32 @@ func (b *dependencyBump) runVerify() bool {
 		}
 		verified[eco.Name()] = true
 		cmds, err := eco.Verify(b.repoDir(), b.private())
-		if err != nil {
+		if err == nil {
+			b.logf("verifying %s with %s in %s", b.entry.Name, cmds.Summary, cmds.Image)
+			cfg, hostCfg := b.verifyContainer(cmds)
+			if err = b.runContainer(cmds, cfg, hostCfg); err != nil {
+				err = fmt.Errorf("%s doesn't build after the bump: %s", b.entry.Name, err)
+			}
+		}
+		if err == nil {
+			continue
+		}
+		if b.stepDir == "" {
 			b.failOpen(err.Error())
 			return false
 		}
-		b.logf("verifying %s with %s in %s", b.entry.Name, cmds.Summary, cmds.Image)
-		cfg, hostCfg := b.verifyContainer(cmds)
-		if err := b.runContainer(cmds, cfg, hostCfg); err != nil {
-			b.failOpen(fmt.Sprintf("%s doesn't build after the bump: %s", b.entry.Name, err))
-			return false
-		}
+		b.buildFailed(eco, err)
 	}
 	return true
+}
+
+// buildFailed is a verify failure in start-up mode: eco's bumped targets
+// stay bumped and keep the error for the agent, who fixes the build.
+func (b *dependencyBump) buildFailed(eco dependencies.Ecosystem, err error) {
+	b.logf("%s doesn't build after the bump; keeping the bump for the agent", b.entry.Name)
+	for _, t := range b.bumped() {
+		if t.ecosystem.Name() == eco.Name() {
+			t.buildError = truncateKeepingTail(b.scrub(err.Error()), tasks.DependencyErrorMaxBytes, "\n[...]\n")
+		}
+	}
 }

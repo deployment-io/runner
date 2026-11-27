@@ -480,6 +480,10 @@ type jobOutputData struct {
 	// diffs against these; see recordBaseCommit for why HEAD at review time
 	// is not a substitute.
 	BaseCommits []baseCommitOutput `json:"base_commits,omitempty"`
+	// StartUpBumps is every target of the start-up bump CheckoutRepository
+	// made before the agent ran: the Task's repositories bumped to the
+	// libraries upstream Tasks merged (checkout_start_up_bump.go).
+	StartUpBumps []startUpBumpOutput `json:"start_up_bumps,omitempty"`
 	// Review is the Review stage's record: every round, what was fixed
 	// inside the loop, and whether a must-fix finding was still open at the
 	// end. Nil when the stage did not run (participation Off, or a runner

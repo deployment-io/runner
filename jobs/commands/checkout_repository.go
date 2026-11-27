@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -18,6 +19,11 @@ import (
 
 // CheckoutRepository is responsible for managing the cloning and updating of repository branches and commits.
 type CheckoutRepository struct {
+	// The start-up bump's seams, as RunDependencyBump's (tests only; nil, or
+	// "", is the real thing).
+	bumpWorkRoot string
+	bumpToken    func(ctx context.Context, installationID, organizationID, rejectedToken string) (string, error)
+	bumpDocker   *dependencyBumpDocker
 }
 
 // addFile creates a file at the specified filePath with the provided contents. Returns an error if file creation or writing fails.

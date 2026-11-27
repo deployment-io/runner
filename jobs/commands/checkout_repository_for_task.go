@@ -24,7 +24,10 @@ import (
 // Subsequent Steps: fetch + checkout the shared Task branch from origin
 // (where the prior Step pushed). Tokens are minted on demand and cached
 // per-installation across the loop, so multi-repo Tasks sharing one GitHub
-// App installation don't trigger redundant refresh RPCs.
+// App installation don't trigger redundant refresh RPCs. When upstream Tasks
+// merged libraries the Task's repositories require (StartUpBumpSources), each
+// repository is bumped to them right after its checkout, before its base
+// commit is recorded (checkout_start_up_bump.go).
 func (cr *CheckoutRepository) runForTask(parameters map[string]interface{}, logsWriter io.Writer) (map[string]interface{}, error) {
 	ctx, err := commandUtils.ParseTaskJobContext(parameters)
 	if err != nil {
@@ -48,10 +51,16 @@ func (cr *CheckoutRepository) runForTask(parameters map[string]interface{}, logs
 	}
 	baseDir := commandUtils.GetTaskRepositoriesBaseDir(ctx.OrganizationID, ctx.TaskID)
 	baseCommits := make([]baseCommitOutput, 0, len(ctx.Entries))
+	startUp := cr.newStartUpBumps(parameters, ctx, jobID, logsWriter)
 	for idx, entry := range ctx.Entries {
 		repoDir := commandUtils.GetTaskRepositoryDir(ctx.OrganizationID, ctx.TaskID, idx, entry.Name)
 		io.WriteString(logsWriter, fmt.Sprintf("Checking out repo %s into %s\n", entry.Name, repoDir))
 		if err := tc.checkoutOne(repoDir, entry); err != nil {
+			return parameters, fmt.Errorf("error checking out repo %s: %s", entry.Name, err)
+		}
+		// The start-up bump goes before the base commit, so the Review
+		// stage's diff and QA see only the agent's change.
+		if err := startUp.bump(idx, repoDir); err != nil {
 			return parameters, fmt.Errorf("error checking out repo %s: %s", entry.Name, err)
 		}
 		baseCommits = append(baseCommits, recordBaseCommit(idx, entry.Name, repoDir, baseDir, logsWriter))
@@ -63,6 +72,7 @@ func (cr *CheckoutRepository) runForTask(parameters map[string]interface{}, logs
 		// that and proceeds — and costs nothing else.
 		io.WriteString(logsWriter, fmt.Sprintf("warning: could not record base commits: %s\n", err))
 	}
+	startUp.finish(parameters)
 	return parameters, nil
 }
 
@@ -249,8 +259,13 @@ func (tc *taskCheckout) checkoutOne(repoDir string, entry tasks.RepositoryEntry)
 	// its container). Chown the entire repo tree to the agentbox `agent`
 	// user so the spawned RunAgentStep container can modify these files
 	// through the bind mount.
-	return chownTreeToAgentbox(repoDir)
+	return chownTaskCheckout(repoDir)
 }
+
+// chownTaskCheckout hands a Task repository's checkout to the agentbox user:
+// after checkoutOne and after a start-up bump. A seam so tests run as a user
+// that may not chown to the agentbox user.
+var chownTaskCheckout = chownTreeToAgentbox
 
 // chownTreeToAgentbox lchowns every entry under root (including root itself)
 // to the agentbox `agent` user. lchown so symlinks themselves are retargeted
