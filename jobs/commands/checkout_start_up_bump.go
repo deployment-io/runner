@@ -113,7 +113,7 @@ func (su *startUpBumps) bump(idx int, repoDir string) error {
 	if moveErr != nil {
 		return moveErr
 	}
-	return chownTreeToAgentbox(repoDir)
+	return chownTaskCheckout(repoDir)
 }
 
 // targets is every source's Provides that the repository at repoDir requires,

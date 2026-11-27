@@ -7,7 +7,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"testing"
 	"time"
 
@@ -31,6 +30,8 @@ type startUpHarness struct {
 	// stepTips is each entry's Task branch on the remote before the run.
 	stepTips []string
 	params   map[string]interface{}
+	// chowned is every directory handed to the agentbox user, in order.
+	chowned []string
 }
 
 const (
@@ -43,6 +44,14 @@ func newStartUpHarness(t *testing.T) *startUpHarness {
 	t.Helper()
 	h := &startUpHarness{bumpHarness: newBumpHarness(t), org: "org-" + filepath.Base(filepath.Dir(t.TempDir()))}
 	t.Cleanup(func() { _ = os.RemoveAll(filepath.Join("/tmp", h.org)) })
+	// The test may run as a user that can't chown to the agentbox user:
+	// record the chowns instead.
+	originalChown := chownTaskCheckout
+	chownTaskCheckout = func(dir string) error {
+		h.chowned = append(h.chowned, dir)
+		return nil
+	}
+	t.Cleanup(func() { chownTaskCheckout = originalChown })
 	h.entries = []tasks.RepositoryEntry{h.entry("app")}
 	fakeRefresh(t, "checkout-token", "push-token")
 	recordTaskEvents(t)
@@ -254,12 +263,9 @@ func TestStartUpBumpBumpsTheCheckout(t *testing.T) {
 			t.Errorf("the prompt's block says %q", word)
 		}
 	}
-	info, err := os.Lstat(filepath.Join(h.repoDir(0), "deps.txt"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if st := info.Sys().(*syscall.Stat_t); st.Uid != commandUtils.AgentboxUID || st.Gid != commandUtils.AgentboxGID {
-		t.Errorf("deps.txt is owned by %d:%d", st.Uid, st.Gid)
+	// Chowned after the checkout, and again after the bump wrote its files.
+	if !equalStrings(h.chowned, []string{h.repoDir(0), h.repoDir(0)}) {
+		t.Errorf("chowned %v, want the checkout twice", h.chowned)
 	}
 	if !equalStrings(h.docker.created, []string{"dependency-bump-cache-" + bumpJobID + "-0"}) {
 		t.Errorf("volumes %v", h.docker.created)

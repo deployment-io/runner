@@ -259,8 +259,13 @@ func (tc *taskCheckout) checkoutOne(repoDir string, entry tasks.RepositoryEntry)
 	// its container). Chown the entire repo tree to the agentbox `agent`
 	// user so the spawned RunAgentStep container can modify these files
 	// through the bind mount.
-	return chownTreeToAgentbox(repoDir)
+	return chownTaskCheckout(repoDir)
 }
+
+// chownTaskCheckout hands a Task repository's checkout to the agentbox user:
+// after checkoutOne and after a start-up bump. A seam so tests run as a user
+// that may not chown to the agentbox user.
+var chownTaskCheckout = chownTreeToAgentbox
 
 // chownTreeToAgentbox lchowns every entry under root (including root itself)
 // to the agentbox `agent` user. lchown so symlinks themselves are retargeted
