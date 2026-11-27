@@ -32,12 +32,16 @@ var (
 	cacheVolumeRe = regexp.MustCompile(`^agentbox-cache-[0-9a-fA-F]{24}-\d+$`)
 
 	// dependencyBumpCacheVolumeRe mirrors the dependency bump's cache volume
-	// (jobs/commands/run_dependency_bump.go): dependency-bump-cache-<jobID>.
-	dependencyBumpCacheVolumeRe = regexp.MustCompile(`^dependency-bump-cache-[0-9a-fA-F]{24}$`)
+	// (jobs/commands/run_dependency_bump.go): dependency-bump-cache-<jobID>,
+	// and a start-up bump's (jobs/commands/checkout_start_up_bump.go):
+	// dependency-bump-cache-<jobID>-<repository index>.
+	dependencyBumpCacheVolumeRe = regexp.MustCompile(`^dependency-bump-cache-[0-9a-fA-F]{24}(-\d+)?$`)
 
 	// dependencyBumpWorkDirRe mirrors the dependency bump's work directory
-	// (jobs/commands/run_dependency_bump.go): dependency-bump-<jobID>.
-	dependencyBumpWorkDirRe = regexp.MustCompile(`^dependency-bump-[0-9a-fA-F]{24}$`)
+	// (jobs/commands/run_dependency_bump.go): dependency-bump-<jobID>, and a
+	// start-up bump's (jobs/commands/checkout_start_up_bump.go):
+	// dependency-bump-<jobID>-<repository index>.
+	dependencyBumpWorkDirRe = regexp.MustCompile(`^dependency-bump-[0-9a-fA-F]{24}(-\d+)?$`)
 
 	// objectIDRe matches the two path segments of
 	// commandUtils.GetTaskRepositoriesBaseDir — /<root>/<orgID>/<taskID>.
@@ -329,7 +333,7 @@ const (
 )
 
 // DependencyBumpWorkRoot is where a dependency bump Job's work directory,
-// dependency-bump-<jobID>, lives (jobs/commands/run_dependency_bump.go). A
+// dependency-bump-<jobID> (-<repository index> for a start-up bump), lives (jobs/commands/run_dependency_bump.go). A
 // literal "/tmp" like BuildkitOutputRoot: the bump's containers bind-mount it
 // through the host's Docker daemon. The bump removes its own; a killed runner
 // leaves it.
@@ -385,7 +389,7 @@ func sweepDependencyBumpWorkDirs() {
 }
 
 // selectDependencyBumpWorkDirs lists the real directories in root named
-// exactly dependency-bump-<24 hex>. A symlink or a plain file of that name is
+// exactly dependency-bump-<24 hex>, or that and -<repository index>. A symlink or a plain file of that name is
 // left alone.
 func selectDependencyBumpWorkDirs(root string) []string {
 	entries, err := os.ReadDir(root)

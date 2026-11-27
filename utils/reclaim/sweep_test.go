@@ -138,15 +138,16 @@ func TestSelectSweepVolumes(t *testing.T) {
 		},
 		{
 			name:    "a dependency bump cache volume is an orphan",
-			volumes: []volume.Volume{named("dependency-bump-cache-"+taskID, nil)},
-			want:    []string{"dependency-bump-cache-" + taskID},
+			volumes: []volume.Volume{named("dependency-bump-cache-"+taskID, nil), named("dependency-bump-cache-"+taskID+"-1", nil)},
+			want:    []string{"dependency-bump-cache-" + taskID, "dependency-bump-cache-" + taskID + "-1"},
 		},
 		{
 			name: "near misses of the dependency bump cache volume are never matched",
 			volumes: []volume.Volume{
 				named("dependency-bump-cache-x", nil),
 				named("dependency-bump-cache-"+taskID[:23], nil),
-				named("dependency-bump-cache-"+taskID+"-1", nil),
+				named("dependency-bump-cache-"+taskID+"-x", nil),
+				named("dependency-bump-cache-"+taskID+"-", nil),
 			},
 		},
 		{
@@ -339,7 +340,8 @@ func TestIsBound(t *testing.T) {
 func TestSelectDependencyBumpWorkDirs(t *testing.T) {
 	root := t.TempDir()
 	stale := filepath.Join(root, "dependency-bump-"+taskID)
-	for _, dir := range []string{stale, filepath.Join(root, "dependency-bump-x"), filepath.Join(root, "other"), filepath.Join(root, "dependency-bump-"+taskID+"-1")} {
+	startUp := filepath.Join(root, "dependency-bump-"+taskID+"-1")
+	for _, dir := range []string{stale, startUp, filepath.Join(root, "dependency-bump-x"), filepath.Join(root, "other"), filepath.Join(root, "dependency-bump-"+taskID+"-x")} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -351,7 +353,7 @@ func TestSelectDependencyBumpWorkDirs(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "dependency-bump-"+strings.Repeat("a", 24)), []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if got, want := selectDependencyBumpWorkDirs(root), []string{stale}; !reflect.DeepEqual(got, want) {
+	if got, want := selectDependencyBumpWorkDirs(root), []string{stale, startUp}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("stale dependency bump dirs = %v, want %v", got, want)
 	}
 	if got := selectDependencyBumpWorkDirs(filepath.Join(root, "missing")); got != nil {

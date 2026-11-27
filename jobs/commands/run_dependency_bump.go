@@ -158,6 +158,10 @@ type bumpTarget struct {
 	tasks.DependencyBumpTargetV1
 	ecosystem dependencies.Ecosystem
 	result    tasks.DependencyBumpResultDtoV1
+	// buildError is, in start-up mode, why the dependent doesn't build after
+	// the bump: the verify's error and last output lines. The target stays
+	// bumped.
+	buildError string
 }
 
 // open reports whether the target is still in play: not yet resolved, or
@@ -213,6 +217,14 @@ type dependencyBump struct {
 	// scrubbed from every message.
 	token  string
 	tokens []string
+
+	// stepDir is, in start-up mode (runStartUp), the Step's checkout of the
+	// dependent; "" for a dependency bump Job.
+	stepDir string
+	// superseded is, in start-up mode, each target whose library another
+	// target bumps to a commit that contains its merged commit; it takes that
+	// target's result once the bump is done (settleSuperseded).
+	superseded map[*bumpTarget]*bumpTarget
 
 	// What one attempt (steps 2 to 10) found; reset when it starts over.
 	attemptState dependencyBumpAttempt
@@ -382,6 +394,46 @@ func truncateUTF8(s string, max int) string {
 		cut--
 	}
 	return s[:cut]
+}
+
+// tailUTF8 is the last max bytes of s at most, from a UTF-8 boundary.
+func tailUTF8(s string, max int) string {
+	if len(s) <= max {
+		return s
+	}
+	if max <= 0 {
+		return ""
+	}
+	cut := len(s) - max
+	for cut < len(s) && (s[cut]&0xC0) == 0x80 {
+		cut++
+	}
+	return s[cut:]
+}
+
+// truncateKeepingTail bounds s to max bytes, keeping its first line (a
+// quarter of max at most) and as much of its end as fits, joined by marker:
+// a build's error and its last lines, where the end is what matters.
+func truncateKeepingTail(s string, max int, marker string) string {
+	return truncateHeadTail(s, max, max/4, marker)
+}
+
+// truncateHeadTail bounds s to max bytes, keeping its first line (headMax
+// bytes at most) and as much of its end as fits, joined by marker.
+func truncateHeadTail(s string, max, headMax int, marker string) string {
+	if len(s) <= max {
+		return s
+	}
+	if max <= 0 {
+		return ""
+	}
+	head, _, _ := strings.Cut(s, "\n")
+	head = truncateUTF8(head, headMax)
+	rest := max - len(head) - len(marker)
+	if rest <= 0 {
+		return truncateUTF8(s, max)
+	}
+	return head + marker + tailUTF8(s[len(head):], rest)
 }
 
 // scrub removes every token the bump used from s.
