@@ -243,3 +243,46 @@ func TestLookup(t *testing.T) {
 		t.Errorf("Registered = %v", got)
 	}
 }
+
+func TestGoPinnedCommit(t *testing.T) {
+	for _, tc := range []struct {
+		version string
+		want    string
+	}{
+		{"v0.0.0-20261126101500-abcdef123456", "abcdef123456"},
+		{"v1.2.4-0.20261126101500-abcdef123456", "abcdef123456"},
+		{"v1.2.3-pre.0.20261126101500-abcdef123456", "abcdef123456"},
+		{"v2.0.0-20261126101500-abcdef123456+incompatible", "abcdef123456"},
+		{"v1.2.4-0.20261126101500-abcdef123456+incompatible", "abcdef123456"},
+		{"v1.2.3", ""},
+		{"v1.2.3-20261126101500-abcdef123456", ""},
+		{"v1.1.0-20261126101500-abcdef123456", ""},
+		{"v1.0.1-20261126101500-abcdef123456", ""},
+		{"v1.2.3+incompatible", ""},
+		{"", ""},
+		{"v0.0.0-20261126101500-abcdef12345", ""},
+		{"v0.0.0-20261126101500-abcdef1234567", ""},
+		{"v0.0.0-20261126101500-ABCDEF123456", ""},
+		{"v0.0.0-2026112610150-abcdef123456", ""},
+		{"v0.0.0-202611261015000-abcdef123456", ""},
+		{"v1.2.4-0.2026112610150-abcdef123456", ""},
+		{"v1.2.3-pre.0.2026112610150a-abcdef123456", ""},
+		{"v1.2.3-rc.1-x.0.20261126101500-abcdef123456", "abcdef123456"},
+		{"v1.2.3-pre+meta.0.20261126101500-abcdef123456", ""},
+		{"v1.2.3-pre..0.20261126101500-abcdef123456", ""},
+		{"v1.2.3-pre_x.0.20261126101500-abcdef123456", ""},
+		{"0.0.0-20261126101500-abcdef123456", ""},
+		{"v0.0.0-20261126101500-abcdef123456+meta", ""},
+		{"abcdef123456", ""},
+		{"v01.0.0-20261126101500-abcdef123456", ""},
+		{"v1.02.3-0.20261126101500-abcdef123456", ""},
+		{"v1.2.3-01.0.20261126101500-abcdef123456", ""},
+		{"v10.0.0-20261126101500-abcdef123456", "abcdef123456"},
+		{"v1.2.3-rc.10.0.20261126101500-abcdef123456", "abcdef123456"},
+	} {
+		commit, ok := goEcosystem{}.PinnedCommit("github.com/acme/kit", tc.version)
+		if commit != tc.want || ok != (tc.want != "") {
+			t.Errorf("PinnedCommit(%q) = %q, %v, want %q", tc.version, commit, ok, tc.want)
+		}
+	}
+}

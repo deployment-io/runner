@@ -230,6 +230,11 @@ type dependencyBumpAttempt struct {
 	ran       []dependencies.Ecosystem
 	mirrors   map[string]*bumpMirror
 	mirrorOrd []string
+	// sources is each target's library mirror, as fetchMirrors fetched it.
+	sources map[*bumpTarget]*bumpMirror
+	// skipped are the targets skipContained left alone: their pins must
+	// come out of the other targets' bump unchanged.
+	skipped   []*bumpTarget
 	commitSHA string
 	subject   string
 	prURL     string
@@ -297,7 +302,7 @@ func (b *dependencyBump) run() {
 // the push; moved is true when the push found the Task
 // branch moved, and the bump starts over.
 func (b *dependencyBump) attempt() (moved bool) {
-	steps := []func() bool{b.checkout, b.readBefore, b.fetchMirrors, b.runBumps, b.checkChanges, b.readAfter, b.runVerify, b.recheckPR}
+	steps := []func() bool{b.checkout, b.readBefore, b.fetchMirrors, b.skipContained, b.runBumps, b.checkChanges, b.readAfter, b.checkSkipped, b.runVerify, b.recheckPR}
 	for _, step := range steps {
 		if !step() || !b.anyOpen() {
 			return false

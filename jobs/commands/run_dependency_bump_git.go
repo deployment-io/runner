@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -269,6 +270,7 @@ func (b *dependencyBump) tooManyMirrors() bool {
 // merged commit, mirrored bare under mirrors/.
 func (b *dependencyBump) fetchMirrors() bool {
 	sources := map[*bumpTarget]*bumpMirror{}
+	b.attemptState.sources = sources
 	for _, t := range b.targets {
 		if t.open() {
 			ref, _ := cloneURLRef(b.in.repos[t.Source].CloneURL)
@@ -308,6 +310,103 @@ func (b *dependencyBump) fetchMirrors() bool {
 	}
 	return true
 }
+
+// skipContained leaves alone every open target whose pin already contains
+// its library's merged commit: the commit the pin names, resolved in the
+// library's mirror, is the merged commit or a descendant of it. Bumping it
+// would move the dependent back. A pin that names no commit, or one the
+// mirror doesn't have, is bumped as before; so is one the check fails on,
+// since the check only removes work.
+func (b *dependencyBump) skipContained() bool {
+	for _, t := range b.targets {
+		m := b.attemptState.sources[t]
+		if m == nil || !t.open() {
+			continue
+		}
+		version := t.result.FromVersion
+		commit, ok := t.ecosystem.PinnedCommit(t.Name, version)
+		if !ok {
+			continue
+		}
+		contained, err := b.pinContains(m, commit, t.Commit)
+		if err != nil {
+			b.logf("couldn't check whether %s's pin of %s contains %s's merged commit; bumping it", b.entry.Name, t.ecosystem.Describe(t.Name), b.in.repos[t.Source].Name)
+			continue
+		}
+		if !contained {
+			continue
+		}
+		b.logf("%s already pins %s at %s, which contains %s's merged commit %s", b.entry.Name, t.ecosystem.Describe(t.Name), version, b.in.repos[t.Source].Name, t.Commit[:dependencyBumpShortCommit])
+		t.result.State = tasks.DependencyBumpStateAlreadyCurrent
+		t.result.ToVersion = version
+		b.attemptState.skipped = append(b.attemptState.skipped, t)
+	}
+	return true
+}
+
+// checkSkipped runs after readAfter: a target skipContained left alone must
+// still pin what it did. Bumping another target can move it (go get may
+// lower, or raise, a module the bumped one requires), and readAfter doesn't
+// read it, so the push would carry a pin the report doesn't show. Then the
+// bump fails and nothing is pushed.
+func (b *dependencyBump) checkSkipped() bool {
+	manifests := map[string]dependencies.Manifest{}
+	for _, t := range b.attemptState.skipped {
+		name := t.ecosystem.Name()
+		m, read := manifests[name]
+		if !read {
+			var err error
+			if m, _, err = t.ecosystem.ReadManifest(b.repoDir()); err != nil {
+				b.failOpen(fmt.Sprintf("couldn't read %s's manifest after the bump: %s", b.entry.Name, err))
+				return false
+			}
+			manifests[name] = m
+		}
+		if version := m.Requires[t.Name]; version != t.result.FromVersion {
+			b.logf("the bump moved %s from %s to %q, which already contained %s's merged commit", t.ecosystem.Describe(t.Name), t.result.FromVersion, version, b.in.repos[t.Source].Name)
+			b.failOpen(fmt.Sprintf("the bump also changed %s, which %s already pinned at a commit containing %s's merged commit; nothing was pushed", t.ecosystem.Describe(t.Name), b.entry.Name, b.in.repos[t.Source].Name))
+			return false
+		}
+	}
+	return true
+}
+
+// pinContains reports whether pinned, a full or abbreviated commit, resolves
+// in m to merged or a descendant of it. A pinned commit m doesn't have isn't
+// an error: it contains nothing.
+func (b *dependencyBump) pinContains(m *bumpMirror, pinned, merged string) (bool, error) {
+	if !dependencyPinnedCommitRe.MatchString(pinned) {
+		return false, nil
+	}
+	repository, err := git.PlainOpen(b.mirrorDir(m.dir))
+	if err != nil {
+		return false, err
+	}
+	hash, err := repository.ResolveRevision(plumbing.Revision(pinned))
+	if errors.Is(err, plumbing.ErrReferenceNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	// ResolveRevision also reads a ref of that name; only a commit id counts.
+	if !strings.HasPrefix(hash.String(), pinned) {
+		return false, nil
+	}
+	pinnedCommit, err := repository.CommitObject(*hash)
+	if err != nil {
+		return false, err
+	}
+	mergedCommit, err := repository.CommitObject(plumbing.NewHash(merged))
+	if err != nil {
+		return false, err
+	}
+	return mergedCommit.IsAncestor(pinnedCommit)
+}
+
+// dependencyPinnedCommitRe is a commit id, full or abbreviated, as
+// Ecosystem.PinnedCommit returns it.
+var dependencyPinnedCommitRe = regexp.MustCompile(`^[0-9a-f]{7,64}$`)
 
 // linkMirror points every other spelling of m's name at mirrors/<dir>: some
 // hosts (GitLab) advertise their repositories with ".git", and a module path

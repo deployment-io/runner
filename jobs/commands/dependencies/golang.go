@@ -60,6 +60,88 @@ func (goEcosystem) Source(name string) (RepositoryRef, bool) {
 	return RepositoryRef{Host: parts[0], Owner: parts[1], Name: parts[2]}, true
 }
 
+// PinnedCommit is the revision of a pseudo-version, with or without
+// +incompatible: vX.0.0-<timestamp>-<rev>, vX.Y.Z-0.<timestamp>-<rev> or
+// vX.Y.Z-<pre>.0.<timestamp>-<rev>, where timestamp is 14 digits and rev 12
+// lower-case hex characters. A tagged version names no commit.
+func (goEcosystem) PinnedCommit(_, version string) (string, bool) {
+	version = strings.TrimSuffix(version, "+incompatible")
+	dash := strings.LastIndexByte(version, '-')
+	if dash < 0 {
+		return "", false
+	}
+	base, rev := version[:dash], version[dash+1:]
+	if len(rev) != 12 || !allBytes(rev, isLowerHex) || len(base) < 14 {
+		return "", false
+	}
+	prefix, timestamp := base[:len(base)-14], base[len(base)-14:]
+	if !allBytes(timestamp, isDigit) {
+		return "", false
+	}
+	core, rest, ok := strings.Cut(prefix, "-")
+	if !ok || !isSemverCore(core) {
+		return "", false
+	}
+	switch {
+	case rest == "" && strings.SplitN(core, ".", 2)[1] == "0.0":
+	case rest == "0.":
+	case strings.HasSuffix(rest, ".0.") && isPrerelease(strings.TrimSuffix(rest, ".0.")):
+	default:
+		return "", false
+	}
+	return rev, true
+}
+
+// isSemverCore reports whether s is v<major>.<minor>.<patch>.
+func isSemverCore(s string) bool {
+	if !strings.HasPrefix(s, "v") {
+		return false
+	}
+	parts := strings.Split(s[1:], ".")
+	if len(parts) != 3 {
+		return false
+	}
+	for _, p := range parts {
+		if !isNumericID(p) {
+			return false
+		}
+	}
+	return true
+}
+
+// isNumericID reports whether s is a semver numeric identifier: digits, with
+// no leading zero unless it is "0".
+func isNumericID(s string) bool {
+	return s != "" && allBytes(s, isDigit) && (s == "0" || s[0] != '0')
+}
+
+// isPrerelease reports whether s is a semver prerelease: dot-separated,
+// non-empty identifiers of ASCII letters, digits and hyphens.
+func isPrerelease(s string) bool {
+	for _, id := range strings.Split(s, ".") {
+		if id == "" || !allBytes(id, isIdentChar) || (allBytes(id, isDigit) && !isNumericID(id)) {
+			return false
+		}
+	}
+	return true
+}
+
+func isIdentChar(c byte) bool {
+	return isDigit(c) || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '-'
+}
+
+func allBytes(s string, f func(byte) bool) bool {
+	for i := 0; i < len(s); i++ {
+		if !f(s[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+func isDigit(c byte) bool    { return c >= '0' && c <= '9' }
+func isLowerHex(c byte) bool { return isDigit(c) || (c >= 'a' && c <= 'f') }
+
 // Bump is go get of every bump's commit at once, go mod tidy, and go mod
 // vendor when the repository vendors. Public modules come from the default
 // proxy and checksum database; private ones, by git, from the mirrors.
