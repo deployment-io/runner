@@ -196,7 +196,9 @@ func TestGoVerify(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if want := [][]string{{"go", "build", "-o", "/dev/null", "./..."}, {"go", "vet", "./..."}}; !reflect.DeepEqual(c.Commands, want) {
+		// go build only: vet's lint checks can fail on code the bump didn't
+		// touch.
+		if want := [][]string{{"go", "build", "-o", "/dev/null", "./..."}}; !reflect.DeepEqual(c.Commands, want) {
 			t.Errorf("%s: commands = %v", tc.name, c.Commands)
 		}
 		env := strings.Join(c.Env, " ")
