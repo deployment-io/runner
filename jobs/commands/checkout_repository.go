@@ -14,7 +14,6 @@ import (
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
-	"github.com/go-git/go-git/v5/plumbing/object"
 )
 
 // CheckoutRepository is responsible for managing the cloning and updating of repository branches and commits.
@@ -204,28 +203,22 @@ func (cr *CheckoutRepository) Run(parameters map[string]interface{}, logsWriter 
 		}
 		var reference *plumbing.Reference
 		reference, err = repository.Reference(referenceName, true)
-		hash := reference.Hash()
-		var commitObject *object.Commit
-		commitObject, err = repository.CommitObject(hash)
 		if err != nil {
 			return parameters, err
 		}
-		commitHash := hash.String()
-		commitMessage := strings.TrimSpace(commitObject.Message)
+		commitHash := reference.Hash().String()
 
 		if !isPreview {
 			commandUtils.UpdateBuildsPipeline.Add(organizationIdFromJob, builds.UpdateBuildDtoV1{
-				ID:            buildOrPreviewID,
-				CommitHash:    commitHash,
-				CommitMessage: commitMessage,
-				Status:        build_enums.Running,
+				ID:         buildOrPreviewID,
+				CommitHash: commitHash,
+				Status:     build_enums.Running,
 			})
 		} else {
 			commandUtils.UpdatePreviewsPipeline.Add(organizationIdFromJob, previews.UpdatePreviewDtoV1{
-				ID:            buildOrPreviewID,
-				CommitHash:    commitHash,
-				CommitMessage: commitMessage,
-				Status:        build_enums.Running,
+				ID:         buildOrPreviewID,
+				CommitHash: commitHash,
+				Status:     build_enums.Running,
 			})
 		}
 
