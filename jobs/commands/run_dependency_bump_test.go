@@ -1452,3 +1452,29 @@ func TestDependencyBumpStartsOverOntoAPinThatContainsTheMergedCommit(t *testing.
 		t.Errorf("%d bumps ran, want only the first try's: %v", n, h.docker.commands)
 	}
 }
+
+// Bumping one target moves the pin of a target left alone because it already
+// contains the merged commit: the bump fails and nothing is pushed.
+func TestDependencyBumpFailsWhenTheBumpMovesASkippedPin(t *testing.T) {
+	h := newBumpHarness(t)
+	pinned := "c-" + h.laterKitCommit()[:12]
+	h.host.Commit("acme/app", "main", map[string]string{"deps.txt": "requires " + h.name("kit") + " " + pinned + "\nrequires " + h.name("kit") + "/v2 v2.0.0\n"})
+	v2 := h.kitTarget()
+	v2.Name = h.name("kit") + "/v2"
+	h.docker.run = func(src string, cmd []string) (int, string) {
+		if cmd[0] == "fake-bump" {
+			// As go get lowering a module the bumped one requires.
+			rewriteVersion(src, "deps.txt", `(?m)^requires `+regexp.QuoteMeta(h.name("kit"))+` \S+$`, "requires "+h.name("kit")+" v0.8.0")
+		}
+		return applyFakeBump(src, cmd)
+	}
+	report, err := h.run(h.kitTarget(), v2)
+	if err == nil {
+		t.Fatalf("err = nil, want the failed target\nlog:\n%s", h.log.String())
+	}
+	h.wantResult(report.Results[0], tasks.DependencyBumpStateAlreadyCurrent, pinned, pinned, "")
+	h.wantResult(report.Results[1], tasks.DependencyBumpStateFailed, "v2.0.0", "", "nothing was pushed")
+	if h.branchTip() != "" || report.CommitSHA != "" || len(h.opened) != 0 {
+		t.Errorf("pushed: tip %q, report %+v", h.branchTip(), report)
+	}
+}

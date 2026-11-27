@@ -339,6 +339,34 @@ func (b *dependencyBump) skipContained() bool {
 		b.logf("%s already pins %s at %s, which contains %s's merged commit %s", b.entry.Name, t.ecosystem.Describe(t.Name), version, b.in.repos[t.Source].Name, t.Commit[:dependencyBumpShortCommit])
 		t.result.State = tasks.DependencyBumpStateAlreadyCurrent
 		t.result.ToVersion = version
+		b.attemptState.skipped = append(b.attemptState.skipped, t)
+	}
+	return true
+}
+
+// checkSkipped runs after readAfter: a target skipContained left alone must
+// still pin what it did. Bumping another target can move it (go get may
+// lower, or raise, a module the bumped one requires), and readAfter doesn't
+// read it, so the push would carry a pin the report doesn't show. Then the
+// bump fails and nothing is pushed.
+func (b *dependencyBump) checkSkipped() bool {
+	manifests := map[string]dependencies.Manifest{}
+	for _, t := range b.attemptState.skipped {
+		name := t.ecosystem.Name()
+		m, read := manifests[name]
+		if !read {
+			var err error
+			if m, _, err = t.ecosystem.ReadManifest(b.repoDir()); err != nil {
+				b.failOpen(fmt.Sprintf("couldn't read %s's manifest after the bump: %s", b.entry.Name, err))
+				return false
+			}
+			manifests[name] = m
+		}
+		if version := m.Requires[t.Name]; version != t.result.FromVersion {
+			b.logf("the bump moved %s from %s to %q, which already contained %s's merged commit", t.ecosystem.Describe(t.Name), t.result.FromVersion, version, b.in.repos[t.Source].Name)
+			b.failOpen(fmt.Sprintf("the bump also changed %s, which %s already pinned at a commit containing %s's merged commit; nothing was pushed", t.ecosystem.Describe(t.Name), b.entry.Name, b.in.repos[t.Source].Name))
+			return false
+		}
 	}
 	return true
 }

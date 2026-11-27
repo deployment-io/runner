@@ -274,6 +274,11 @@ func TestGoPinnedCommit(t *testing.T) {
 		{"0.0.0-20261126101500-abcdef123456", ""},
 		{"v0.0.0-20261126101500-abcdef123456+meta", ""},
 		{"abcdef123456", ""},
+		{"v01.0.0-20261126101500-abcdef123456", ""},
+		{"v1.02.3-0.20261126101500-abcdef123456", ""},
+		{"v1.2.3-01.0.20261126101500-abcdef123456", ""},
+		{"v10.0.0-20261126101500-abcdef123456", "abcdef123456"},
+		{"v1.2.3-rc.10.0.20261126101500-abcdef123456", "abcdef123456"},
 	} {
 		commit, ok := goEcosystem{}.PinnedCommit("github.com/acme/kit", tc.version)
 		if commit != tc.want || ok != (tc.want != "") {

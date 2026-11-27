@@ -102,18 +102,24 @@ func isSemverCore(s string) bool {
 		return false
 	}
 	for _, p := range parts {
-		if p == "" || !allBytes(p, isDigit) {
+		if !isNumericID(p) {
 			return false
 		}
 	}
 	return true
 }
 
+// isNumericID reports whether s is a semver numeric identifier: digits, with
+// no leading zero unless it is "0".
+func isNumericID(s string) bool {
+	return s != "" && allBytes(s, isDigit) && (s == "0" || s[0] != '0')
+}
+
 // isPrerelease reports whether s is a semver prerelease: dot-separated,
 // non-empty identifiers of ASCII letters, digits and hyphens.
 func isPrerelease(s string) bool {
 	for _, id := range strings.Split(s, ".") {
-		if id == "" || !allBytes(id, isIdentChar) {
+		if id == "" || !allBytes(id, isIdentChar) || (allBytes(id, isDigit) && !isNumericID(id)) {
 			return false
 		}
 	}
