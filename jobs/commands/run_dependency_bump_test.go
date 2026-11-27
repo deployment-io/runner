@@ -1166,7 +1166,7 @@ func TestDependencyBumpReportNeverSent(t *testing.T) {
 }
 
 // The real Go adapter through the whole command: go get, go mod tidy, then
-// go build and go vet, offline.
+// go build, offline.
 func TestDependencyBumpWithTheGoAdapter(t *testing.T) {
 	h := newBumpHarness(t)
 	kit := h.host.Commit("acme/kit", "main", map[string]string{"go.mod": "module github.com/acme/kit\n\ngo 1.27\n"})
@@ -1177,7 +1177,7 @@ func TestDependencyBumpWithTheGoAdapter(t *testing.T) {
 		t.Fatalf("err = %v\nlog:\n%s", err, h.log.String())
 	}
 	h.wantResult(report.Results[0], tasks.DependencyBumpStateBumped, "v1.4.0", "v0.0.0-20261126000000-"+kit[:12], "")
-	want := []string{"go get github.com/acme/kit@" + kit, "go mod tidy", "go build -o /dev/null ./...", "go vet ./..."}
+	want := []string{"go get github.com/acme/kit@" + kit, "go mod tidy", "go build -o /dev/null ./..."}
 	if !equalStrings(h.docker.commands, want) {
 		t.Errorf("commands %v, want %v", h.docker.commands, want)
 	}

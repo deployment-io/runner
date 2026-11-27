@@ -176,10 +176,15 @@ func (g goEcosystem) Bump(repoDir string, bumps []Bump, private []string) (Comma
 	}, nil
 }
 
-// Verify is go build and go vet of every package, offline from the module
-// cache Bump filled (or the vendor directory). The build writes nothing:
-// /src is read-only. Tests aren't run: they may need services the offline
-// container doesn't have, and the pull request's own CI runs them.
+// Verify is go build of every package, offline from the module cache Bump
+// filled (or the vendor directory): whether the dependent still compiles
+// against the bumped library, which is what an API change breaks. The build
+// writes nothing: /src is read-only. Neither go vet nor the tests run: vet's
+// checks are a repository's lint rules, which code already on its base branch
+// may not meet (an unkeyed composite literal fails vet's default checks and
+// would make the bump fail for code it never touched), and tests may need
+// services the offline container doesn't have. The pull request's own CI runs
+// both.
 func (goEcosystem) Verify(repoDir string, private []string) (Commands, error) {
 	image, err := goImage(repoDir)
 	if err != nil {
@@ -191,7 +196,7 @@ func (goEcosystem) Verify(repoDir string, private []string) (Commands, error) {
 	}
 	return Commands{
 		Image:    image,
-		Commands: [][]string{{"go", "build", "-o", "/dev/null", "./..."}, {"go", "vet", "./..."}},
+		Commands: [][]string{{"go", "build", "-o", "/dev/null", "./..."}},
 		Env: []string{
 			"GOWORK=off",
 			"GOPROXY=off",
@@ -203,7 +208,7 @@ func (goEcosystem) Verify(repoDir string, private []string) (Commands, error) {
 			"GOTMPDIR=/tmp",
 			"GOFLAGS=" + mod,
 		},
-		Summary: "go build, go vet",
+		Summary: "go build",
 	}, nil
 }
 
