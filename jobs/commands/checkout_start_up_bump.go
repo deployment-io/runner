@@ -18,7 +18,6 @@ import (
 	"github.com/deployment-io/deployment-runner/jobs/commands/dependencies"
 	commandUtils "github.com/deployment-io/deployment-runner/jobs/commands/utils"
 	"github.com/go-git/go-git/v5"
-	"github.com/go-git/go-git/v5/config"
 	"github.com/go-git/go-git/v5/plumbing"
 )
 
@@ -550,27 +549,29 @@ func (b *dependencyBump) cloneStepSubmodules(repository *git.Repository) error {
 	return submodules.Update(&git.SubmoduleUpdateOptions{Init: true, NoFetch: true, RecurseSubmodules: git.DefaultSubmoduleRecursionDepth})
 }
 
-// startUpBumpRef holds the bump commit in the Step's checkout while it is
-// moved there.
-const startUpBumpRef = plumbing.ReferenceName("refs/deployment-io/start-up-bump")
-
-// moveStepCheckout fetches the bump commit from the clone into the Step's
-// checkout and hard-resets its Task branch to it.
+// moveStepCheckout copies the bump commit from the clone into the Step's
+// checkout and hard-resets its Task branch to it. The copy is in-process
+// (copyBumpCommit), not a fetch: a fetch over go-git's in-process file
+// transport (local_git_transport.go) fails with "object not found" when the
+// checkout has commits the clone doesn't, and the host's git must not run on
+// the checkout.
 func (b *dependencyBump) moveStepCheckout(hash string) error {
 	repository, err := git.PlainOpen(b.stepDir)
 	if err != nil {
 		return err
 	}
 	branch := plumbing.NewBranchReferenceName(b.in.branch)
-	if head, err := repository.Head(); err != nil || head.Name() != branch {
+	head, err := repository.Head()
+	if err != nil || head.Name() != branch {
 		return errors.New("the checkout isn't on the Task branch")
 	}
-	remote := git.NewRemote(repository.Storer, &config.RemoteConfig{Name: "start-up-bump", URLs: []string{b.repoDir()}})
-	refSpec := config.RefSpec("+" + branch.String() + ":" + startUpBumpRef.String())
-	if err := remote.Fetch(&git.FetchOptions{RefSpecs: []config.RefSpec{refSpec}, Tags: git.NoTags}); err != nil && !errors.Is(err, git.NoErrAlreadyUpToDate) {
+	clone, err := git.PlainOpen(b.repoDir())
+	if err != nil {
 		return err
 	}
-	defer repository.Storer.RemoveReference(startUpBumpRef)
+	if err := copyBumpCommit(clone.Storer, repository.Storer, plumbing.NewHash(hash), head.Hash()); err != nil {
+		return err
+	}
 	worktree, err := repository.Worktree()
 	if err != nil {
 		return err
