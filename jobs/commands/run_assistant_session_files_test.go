@@ -169,7 +169,7 @@ func TestSessionOutputFilesAsLinksReadAsNotWritten(t *testing.T) {
 
 	logs := &bytes.Buffer{}
 	files := newSessionFiles(workDir, logs)
-	sf := &specForwarder{path: filepath.Join(out, "task-spec.json"), files: files, logsWriter: logs}
+	sf := &specForwarder{path: filepath.Join(out, "task-spec.json"), planPath: filepath.Join(out, "task-plan.json"), files: files, logsWriter: logs}
 	sink := &suggestionSink{}
 	rf := &repoSuggestionForwarder{path: filepath.Join(out, "repo-suggestion.json"), files: files, logsWriter: logs, send: sink.send}
 	for i := 0; i < 3; i++ {
