@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -276,6 +277,10 @@ func buildSessionSpawnEnvVars(parameters map[string]interface{}, logsWriter io.W
 		// corepack cannot write to the image's /opt/corepack under
 		// ReadonlyRootfs — see agentboxCorepackHomeInCtr.
 		"COREPACK_HOME": agentboxCorepackHomeInCtr,
+		// How many Tasks a task-plan block may have: agentbox checks it, so
+		// the agent hears of an oversized plan before deployment-server
+		// refuses it. The number lives only in deployment-runner-kit.
+		"AGENTBOX_MAX_PLAN_TASKS": strconv.Itoa(sessions.MaxPlanTasks),
 	}
 	if creds, err := jobs.GetParameterValue[map[string]string](parameters, parameters_enums.AgentEnvVars); err == nil {
 		for k, v := range creds {
@@ -367,9 +372,10 @@ func (rs *RunAssistantSession) runSession(run sessionRun) error {
 		clones:     map[string]*sessionCloneState{},
 	}
 	sf := &specForwarder{
-		path:  filepath.Join(workDirHost, ".agentbox-output", "task-spec.json"),
-		files: files,
-		orgID: orgID, jobID: jobID, logsWriter: logsWriter,
+		path:     filepath.Join(workDirHost, ".agentbox-output", "task-spec.json"),
+		planPath: filepath.Join(workDirHost, ".agentbox-output", "task-plan.json"),
+		files:    files,
+		orgID:    orgID, jobID: jobID, logsWriter: logsWriter,
 	}
 	rf := &repoSuggestionForwarder{
 		path:  filepath.Join(workDirHost, ".agentbox-output", "repo-suggestion.json"),
@@ -390,7 +396,7 @@ func (rs *RunAssistantSession) runSession(run sessionRun) error {
 	close(stopBridge)
 	bridgeWg.Wait()
 	mf.tick() // final drain of any buffered output
-	sf.tick() // final spec snapshot
+	sf.tick() // final spec / plan snapshot
 	rf.tick() // final repo-suggestion snapshot
 	logSessionOutcome(files, logsWriter)
 	if errors.Is(waitErr, types.ErrJobStoppedByUser) {
@@ -1024,7 +1030,7 @@ func (ip *inputPump) writeAttachment(a sessions.SessionAttachmentDtoV1) error {
 }
 
 // logSessionOutcome best-effort surfaces the final agent result and whether a
-// task spec was produced. Spec persistence to the Session record is wired in a
+// task spec or a task plan was produced. Spec persistence to the Session record is wired in a
 // later phase (app-server convert flow).
 func logSessionOutcome(files *sessionFiles, logsWriter io.Writer) {
 	if result, err := files.readAgentResult(); err == nil {
@@ -1034,22 +1040,43 @@ func logSessionOutcome(files *sessionFiles, logsWriter io.Writer) {
 	if b, err := files.read(specPath); err == nil && len(b) > 0 {
 		io.WriteString(logsWriter, "session produced a task spec\n")
 	}
+	planPath := filepath.Join(files.root, ".agentbox-output", "task-plan.json")
+	if b, err := files.read(planPath); err == nil && len(b) > 0 {
+		io.WriteString(logsWriter, "session produced a task plan\n")
+	}
 }
 
-// specForwarder reads agentbox's task-spec.json each tick and forwards it to
-// deployment-server (which persists it to Session.StructuredSpec) whenever the
-// content changes — the planning agent refines the spec across turns. The
-// convert flow reads the persisted spec. Best-effort: a failed forward leaves
-// lastContent unchanged so the next tick retries.
+// specForwarder reads agentbox's task-spec.json and task-plan.json each tick
+// and forwards each to deployment-server whenever its content changes — the
+// planning agent refines the spec (persisted to Session.StructuredSpec) or the
+// plan (validated and persisted to Session.StructuredPlan) across turns. The
+// convert flow reads what was persisted. agentbox keeps at most one of the two
+// files, the newer, so forwarding one clears what was last forwarded for the
+// other: the same spec sent again after a plan (or the reverse) is forwarded
+// again. Both files are handled on this one goroutine, so its state needs no
+// locking. Best-effort: a failed forward leaves the last content unchanged so
+// the next tick retries; a plan deployment-server refused is logged once and
+// not resent until it changes.
 type specForwarder struct {
-	path         string
+	path         string        // task-spec.json
+	planPath     string        // task-plan.json
 	files        *sessionFiles // reads without following links
 	orgID, jobID string
 	logsWriter   io.Writer
-	lastContent  string
+	lastContent  string // task-spec.json as last forwarded
+	lastPlan     string // task-plan.json as last forwarded
+	// sendSpec and sendPlan are the RPC calls, injected in tests. Nil means
+	// the real client.
+	sendSpec func(sessions.UpdateSpecDtoV1, string) error
+	sendPlan func(sessions.UpdatePlanDtoV1, string) (sessions.UpdatePlanReplyV1, error)
 }
 
 func (sf *specForwarder) tick() {
+	sf.tickSpec()
+	sf.tickPlan()
+}
+
+func (sf *specForwarder) tickSpec() {
 	b, err := sf.files.read(sf.path)
 	if err != nil {
 		return // not written yet (or a link: treated as not written)
@@ -1071,7 +1098,11 @@ func (sf *specForwarder) tick() {
 	if json.Unmarshal(b, &rec) != nil {
 		return
 	}
-	if err := runnerclient.Get().UpdateSessionSpec(sessions.UpdateSpecDtoV1{
+	send := sf.sendSpec
+	if send == nil {
+		send = runnerclient.Get().UpdateSessionSpec
+	}
+	if err := send(sessions.UpdateSpecDtoV1{
 		JobID:       sf.jobID,
 		Title:       rec.Title,
 		Goal:        rec.Goal,
@@ -1087,6 +1118,85 @@ func (sf *specForwarder) tick() {
 		return // keep lastContent unchanged → retry next tick
 	}
 	sf.lastContent = string(b)
+	sf.lastPlan = ""
+}
+
+// planFile is task-plan.json as agentbox writes it.
+type planFile struct {
+	Tasks []struct {
+		Key          string   `json:"key"`
+		Title        string   `json:"title"`
+		Goal         string   `json:"goal"`
+		Context      string   `json:"context"`
+		Acceptance   []string `json:"acceptance_criteria"`
+		Assumptions  []string `json:"assumptions"`
+		OutOfScope   []string `json:"out_of_scope"`
+		Complexity   string   `json:"complexity"`
+		Readiness    string   `json:"readiness"`
+		Notes        string   `json:"readiness_notes"`
+		Repositories []string `json:"repositories"`
+	} `json:"tasks"`
+	Edges []struct {
+		From   string `json:"from"`
+		To     string `json:"to"`
+		When   string `json:"when"`
+		Reason string `json:"reason"`
+	} `json:"edges"`
+}
+
+func (p planFile) dto(jobID string) sessions.UpdatePlanDtoV1 {
+	dto := sessions.UpdatePlanDtoV1{JobID: jobID}
+	for _, t := range p.Tasks {
+		dto.Tasks = append(dto.Tasks, sessions.PlanTaskDtoV1{
+			Key:          t.Key,
+			Title:        t.Title,
+			Goal:         t.Goal,
+			Context:      t.Context,
+			Acceptance:   t.Acceptance,
+			Assumptions:  t.Assumptions,
+			OutOfScope:   t.OutOfScope,
+			Complexity:   t.Complexity,
+			Readiness:    t.Readiness,
+			Notes:        t.Notes,
+			Repositories: t.Repositories,
+		})
+	}
+	for _, e := range p.Edges {
+		dto.Edges = append(dto.Edges, sessions.PlanEdgeDtoV1{From: e.From, To: e.To, When: e.When, Reason: e.Reason})
+	}
+	return dto
+}
+
+func (sf *specForwarder) tickPlan() {
+	b, err := sf.files.read(sf.planPath)
+	if err != nil {
+		return // not written yet (or a link: treated as not written)
+	}
+	if string(b) == sf.lastPlan {
+		return // unchanged since the last forward
+	}
+	var rec planFile
+	if json.Unmarshal(b, &rec) != nil {
+		return
+	}
+	send := sf.sendPlan
+	if send == nil {
+		send = runnerclient.Get().UpdateSessionPlan
+	}
+	reply, err := send(rec.dto(sf.jobID), sf.orgID)
+	if err != nil {
+		io.WriteString(sf.logsWriter, fmt.Sprintf("session: error forwarding plan: %s\n", err))
+		return // keep lastPlan unchanged → retry next tick
+	}
+	sf.lastPlan = string(b)
+	if reply.Refused != "" {
+		// Not an error: the plan breaks a rule only deployment-server can
+		// check. Resending it can't help, so it waits for the next plan.
+		io.WriteString(sf.logsWriter, fmt.Sprintf("session: plan refused: %s\n", reply.Refused))
+	}
+	// Forwarded, stored or refused: a spec written after it is sent again,
+	// which clears lastPlan so the same plan re-sent after that is too.
+	sf.lastContent = ""
 }
 
 // repoSuggestionForwarder reads agentbox's repo-suggestion.json each tick and

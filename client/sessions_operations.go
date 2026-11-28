@@ -110,3 +110,25 @@ func (r *RunnerClient) UpdateSessionSpec(spec sessions.UpdateSpecDtoV1, organiza
 	}
 	return nil
 }
+
+// UpdateSessionPlan forwards the latest plan of Tasks the planning agent
+// emitted to deployment-server, which validates it and persists it to
+// Session.StructuredPlan, or refuses it: reply.Refused says why. A refusal is
+// not an error.
+func (r *RunnerClient) UpdateSessionPlan(plan sessions.UpdatePlanDtoV1, organizationID string) (sessions.UpdatePlanReplyV1, error) {
+	if !r.isConnected {
+		return sessions.UpdatePlanReplyV1{}, ErrConnection
+	}
+	args := sessions.UpdatePlanArgsV1{Plan: plan}
+	args.OrganizationID = r.GetComputedOrganizationID(organizationID)
+	args.Token = r.token
+	var reply sessions.UpdatePlanReplyV1
+	err := r.c.Call("Sessions.UpdatePlanV1", args, &reply)
+	if err != nil {
+		return sessions.UpdatePlanReplyV1{}, err
+	}
+	if !reply.Done && reply.Refused == "" {
+		return sessions.UpdatePlanReplyV1{}, fmt.Errorf("error receiving done from the server")
+	}
+	return reply, nil
+}
